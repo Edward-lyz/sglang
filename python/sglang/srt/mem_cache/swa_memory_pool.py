@@ -394,7 +394,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
         assert self.page_size > 1

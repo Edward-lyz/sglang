@@ -26,6 +26,12 @@ class SchedulerRuntimeCheckerMixin:
             return self.tree_cache.session_held_tokens()
         return 0
 
+    def _sparse_reserved_tokens(self: Scheduler) -> int:
+        """Tokens carved out by the DSA sparse cache allocator (not a leak)."""
+        from sglang.srt.mem_cache.sparsity.core import get_sparse_reserved_token_count
+
+        return get_sparse_reserved_token_count()
+
     def _session_held_full_tokens(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
             return self.tree_cache.session_held_full_tokens()
@@ -184,10 +190,11 @@ class SchedulerRuntimeCheckerMixin:
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
         session_held = self._session_held_tokens()
+        reserved_sparse = self._sparse_reserved_tokens()
         memory_leak = (available_size + evictable_size) != (
-            self.max_total_num_tokens - protected_size - session_held
+            self.max_total_num_tokens - protected_size - session_held - reserved_sparse
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}\n"
+        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}, {reserved_sparse=}\n"
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:

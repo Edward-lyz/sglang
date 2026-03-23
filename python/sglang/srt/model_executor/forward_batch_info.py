@@ -70,6 +70,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
+    from sglang.srt.mem_cache.sparsity.runtime.dsa_runtime import (
+        DSAPrecomputedMetadata,
+    )
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -419,6 +422,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
     # Record the split metadata of the sequence number of NSA context parallels.
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
+
+    # DSA decode-only metadata prepared outside the cuda graph replay path.
+    dsa_precomputed: Optional["DSAPrecomputedMetadata"] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

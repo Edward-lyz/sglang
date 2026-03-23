@@ -3293,6 +3293,16 @@ class ServerArgs:
         )
 
     def _handle_cache_compatibility(self):
+        sparse_extra_config = parse_sparse_extra_config(
+            self.hierarchical_sparse_attention_extra_config
+        )
+
+        decode_deepseek_nsa_offload = (
+            isinstance(sparse_extra_config, dict)
+            and sparse_extra_config.get("algorithm", "").lower() == "deepseek_nsa"
+            and self.disaggregation_mode == "decode"
+        )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -3307,6 +3317,20 @@ class ServerArgs:
             if self.hicache_storage_backend is None:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
+                )
+
+        if decode_deepseek_nsa_offload:
+            if self.disable_cuda_graph:
+                raise ValueError(
+                    "deepseek_nsa offload on decode workers requires cuda graph and does not support --disable-cuda-graph."
+                )
+            if self.disaggregation_decode_enable_offload_kvcache:
+                raise ValueError(
+                    "deepseek_nsa offload cannot be combined with disaggregation-decode-enable-offload-kvcache."
+                )
+            if self.hicache_mem_layout != "layer_first":
+                raise ValueError(
+                    "deepseek_nsa offload currently requires hicache_mem_layout=layer_first."
                 )
 
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
@@ -6359,6 +6383,21 @@ def set_global_server_args_for_scheduler(server_args: ServerArgs):
 
 
 set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
+
+
+def parse_sparse_extra_config(config_str: Optional[str]) -> Optional[dict]:
+    """Parse the hierarchical sparse attention JSON config string.
+
+    Centralizes JSON parsing so that both ServerArgs validation and the sparse
+    coordinator factory share one code path instead of parsing the same string
+    independently.
+    """
+    if config_str is None:
+        return None
+    try:
+        return json.loads(config_str)
+    except json.JSONDecodeError:
+        return None
 
 
 def get_global_server_args() -> ServerArgs:

@@ -612,6 +612,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
+        # Hook sparse/DSA setup after memory pool init and before graph capture.
+        from sglang.srt.mem_cache.sparsity.factory import maybe_create_sparse_coordinator
+
+        maybe_create_sparse_coordinator(self)
+
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
@@ -2680,6 +2685,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
+
+        from sglang.srt.mem_cache.sparsity.core import (
+            is_sparse_cuda_graph_required,
+            prepare_sparse_decode_step,
+        )
+
+        if (
+            forward_batch.forward_mode.is_decode()
+            and is_sparse_cuda_graph_required()
+            and not can_run_graph
+        ):
+            raise RuntimeError(
+                "deepseek_nsa offload only supports decode batches that can run with "
+                "cuda graph replay. Check disable_cuda_graph, cuda_graph_max_bs, and "
+                "decode batch shapes."
+            )
+
+        prepare_sparse_decode_step(forward_batch)
 
         if can_run_graph:
             ret = self.graph_runner.replay(

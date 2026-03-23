@@ -581,6 +581,14 @@ class CudaGraphRunner:
         self.model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
+        from sglang.srt.mem_cache.sparsity.core import (
+            init_sparse_cuda_graph_state_for_model,
+        )
+
+        init_sparse_cuda_graph_state_for_model(
+            max_bs=self.max_bs,
+            model_config=self.model_runner.model_config,
+        )
 
         # Init PDMux if needed
         self.maybe_init_pdmux()

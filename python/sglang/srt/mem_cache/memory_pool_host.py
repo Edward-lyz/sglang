@@ -51,6 +51,41 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def create_host_kv_pool(
+    device_pool: KVCache,
+    *,
+    host_to_device_ratio: float,
+    host_size: int,
+    page_size: int,
+    layout: str,
+    pin_memory: bool = True,
+    device: str = "cpu",
+    allocator_type: str = "default",
+    override_kv_cache_dim: Optional[int] = None,
+):
+    common_kwargs = dict(
+        device_pool=device_pool,
+        host_to_device_ratio=host_to_device_ratio,
+        host_size=host_size,
+        page_size=page_size,
+        layout=layout,
+        pin_memory=pin_memory,
+        device=device,
+        allocator_type=allocator_type,
+    )
+
+    if isinstance(device_pool, MHATokenToKVPool):
+        return MHATokenToKVPoolHost(**common_kwargs)
+    if isinstance(device_pool, NSATokenToKVPool):
+        return NSATokenToKVPoolHost(**common_kwargs)
+    if isinstance(device_pool, MLATokenToKVPool):
+        return MLATokenToKVPoolHost(
+            **common_kwargs,
+            override_kv_cache_dim=override_kv_cache_dim,
+        )
+    raise ValueError("Unsupported KV cache type for host pool creation")
+
+
 def synchronized(func):
     @wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -850,6 +885,17 @@ class MLATokenToKVPoolHost(HostKVCache):
             allocator=self.allocator,
         )
         return buffer
+
+    def get_contiguous_buf_infos(self):
+        assert self.layout == "layer_first", (
+            "Host contiguous buffer infos are only defined for layer-first MLA/NSA pools"
+        )
+        kv_data_ptrs = [self.data_refs[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.data_refs[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [
+            self.data_refs[i][0].nbytes * self.page_size for i in range(self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
