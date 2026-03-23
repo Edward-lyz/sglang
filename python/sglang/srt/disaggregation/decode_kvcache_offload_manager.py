@@ -13,14 +13,17 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.common import free_committed_and_overallocated_kv
 from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    create_host_kv_pool,
+    MHATokenToKVPoolHost,
+    MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -53,13 +56,24 @@ class DecodeKVCacheOffloadManager:
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        self.decode_host_mem_pool = create_host_kv_pool(
-            kv_cache,
-            host_to_device_ratio=server_args.hicache_ratio,
-            host_size=server_args.hicache_size,
-            page_size=self.page_size,
-            layout=server_args.hicache_mem_layout,
-        )
+        if isinstance(kv_cache, MHATokenToKVPool):
+            self.decode_host_mem_pool = MHATokenToKVPoolHost(
+                kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+            )
+        elif isinstance(kv_cache, MLATokenToKVPool):
+            self.decode_host_mem_pool = MLATokenToKVPoolHost(
+                kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+            )
+        else:
+            raise ValueError("Unsupported KV cache type for decode offload")
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -221,13 +235,24 @@ class DecodeKVCacheOffloadManager:
             finish_count -= 1
 
     def _release_finished_req(self, req: Req, start_offset: int):
-        free_committed_and_overallocated_kv(
-            req=req,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            page_size=self.page_size,
-            release_start=start_offset,
-        )
+        kv_committed_len = req.pop_committed_kv_cache()
+        start = start_offset
+        end = kv_committed_len
+        # Free the incremental part of the request (NSA-aware)
+        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, start:end]
+        self.token_to_kv_pool_allocator.free(kv_indices)
+
+        # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
+        # Without spec v2, start_p == end_p so this is a no-op.
+        start_p, end_p = req.pop_overallocated_kv_cache()
+        if self.page_size > 1:
+            start_p = ceil_align(start_p, self.page_size)
+        if start_p < end_p:
+            overalloc_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, start_p:end_p
+            ]
+            self.token_to_kv_pool_allocator.free(overalloc_indices)
+
         self.req_to_token_pool.free(req)
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
         if req.rid in self.offloaded_state:

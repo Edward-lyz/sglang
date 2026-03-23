@@ -9,7 +9,6 @@ import triton.language as tl
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.sparsity.core import finish_sparse_request
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
@@ -477,26 +476,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
-    bypass_tree_cache_finish, released_prefix_len = finish_sparse_request(req, tree_cache)
-    if bypass_tree_cache_finish:
-        free_committed_and_overallocated_kv(
-            req=req,
-            req_to_token_pool=tree_cache.req_to_token_pool,
-            token_to_kv_pool_allocator=tree_cache.token_to_kv_pool_allocator,
-            page_size=tree_cache.page_size,
-            release_start=int(released_prefix_len),
-        )
-
-        if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
-            not tree_cache.supports_mamba()
-        ):
-            assert (
-                req.mamba_pool_idx is not None
-            ), "mamba state is freed while the tree cache does not manage mamba states"
-            tree_cache.req_to_token_pool.free_mamba_cache(req)
-        tree_cache.req_to_token_pool.free(req)
-        return
-
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     # FIXME: SessionAwareCache.cache_finished_req sets req_pool_idx = None to
@@ -534,31 +513,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     tree_cache.req_to_token_pool.free(req)
-
-
-def free_committed_and_overallocated_kv(
-    req: "Req",
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator,
-    page_size: int,
-    release_start: int = 0,
-) -> None:
-    # DSA finish and decode-side offload both need this exact release order.
-    committed_end = req.pop_committed_kv_cache()
-
-    if release_start < committed_end:
-        live_indices = req_to_token_pool.req_to_token[req.req_pool_idx][
-            release_start:committed_end
-        ]
-        token_to_kv_pool_allocator.free(live_indices)
-
-    start_p, end_p = req.pop_overallocated_kv_cache()
-    if page_size > 1:
-        start_p = ceil_align(start_p, page_size)
-
-    if start_p < end_p:
-        indices_to_free = req_to_token_pool.req_to_token[req.req_pool_idx][start_p:end_p]
-        token_to_kv_pool_allocator.free(indices_to_free)
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

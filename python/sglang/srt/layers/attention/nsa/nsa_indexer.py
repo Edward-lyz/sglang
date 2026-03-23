@@ -48,7 +48,6 @@ from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.mem_cache.sparsity.core import get_sparse_indexer_write_loc
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -958,12 +957,6 @@ class Indexer(MultiPlatformOp):
         Preferred: fused_store_index_k_cache(key, cache, out_cache_loc, page_size)
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
         """
-        indexer_out_cache_loc = forward_batch.out_cache_loc
-        sparse_indexer_out_cache_loc = get_sparse_indexer_write_loc(forward_batch)
-        if sparse_indexer_out_cache_loc is not None:
-            indexer_out_cache_loc = sparse_indexer_out_cache_loc
-        if indexer_out_cache_loc.dtype != torch.int64:
-            indexer_out_cache_loc = indexer_out_cache_loc.to(torch.int64)
 
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
         if (
@@ -971,7 +964,7 @@ class Indexer(MultiPlatformOp):
             and (not _is_fp8_fnuz)
             and can_use_nsa_fused_store(
                 key.dtype,
-                indexer_out_cache_loc.dtype,
+                forward_batch.out_cache_loc.dtype,
                 forward_batch.token_to_kv_pool.page_size,
             )
         ):
@@ -982,7 +975,7 @@ class Indexer(MultiPlatformOp):
             fused_store_index_k_cache(
                 key,
                 buf,
-                indexer_out_cache_loc,
+                forward_batch.out_cache_loc,
                 forward_batch.token_to_kv_pool.page_size,
             )
             return
@@ -991,7 +984,7 @@ class Indexer(MultiPlatformOp):
         assert act_quant is not None
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
-        out_loc = indexer_out_cache_loc
+        out_loc = forward_batch.out_cache_loc
         if not out_loc.is_contiguous():
             out_loc = out_loc.contiguous()
 
@@ -1023,25 +1016,15 @@ class Indexer(MultiPlatformOp):
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
 
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+
         enable_dual_stream = (
             self.alt_stream is not None
             and get_is_capture_mode()
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
-        )
-
-        if not return_indices and forward_batch.forward_mode.is_decode_or_idle():
-            key = self._get_k_bf16(x, positions, enable_dual_stream)
-            self._store_index_k_cache(
-                forward_batch=forward_batch,
-                layer_id=layer_id,
-                key=key,
-                act_quant=act_quant,
-            )
-            return None
-
-        metadata = forward_batch.attn_backend.get_indexer_metadata(
-            layer_id, forward_batch
         )
 
         # skip NSA if attention backend choose to skip this batch

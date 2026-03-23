@@ -20,7 +20,7 @@ Page-aligned memory pool.
 """
 
 import abc
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 import triton
@@ -451,7 +451,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
         if self.debug_mode:
@@ -476,14 +476,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        if seq_lens_cpu is None:
-            num_new_pages = int((seq_lens % self.page_size == 1).sum().item())
-        else:
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=self.page_size,
-                decode=True,
-            )
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            decode=True,
+        )
         if num_new_pages > len(self.free_pages):
             return None
 
@@ -505,20 +502,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
-
-    def reserve_free_pages(self, num_pages: int) -> Optional[torch.Tensor]:
-        if num_pages <= 0:
-            return torch.empty((0,), dtype=torch.int64, device=self.device)
-
-        if self.need_sort and num_pages > len(self.free_pages):
-            self.merge_and_sort_free()
-
-        if num_pages > len(self.free_pages):
-            return None
-
-        reserved_pages = self.free_pages[-num_pages:]
-        self.free_pages = self.free_pages[:-num_pages]
-        return reserved_pages * self.page_size
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
