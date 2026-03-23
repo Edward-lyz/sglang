@@ -61,6 +61,14 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.sparsity.core import (
+    get_disagg_state_indices,
+    get_sparse_host_available_token_count,
+    get_sparse_host_kv_pool,
+    get_sparse_indexer_available_token_count,
+    handle_disagg_cache_received,
+    notify_sparse_request_begin,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -293,9 +301,15 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            self.token_to_kv_pool.get_contiguous_buf_infos()
-        )
+        host_kv_pool = get_sparse_host_kv_pool()
+        if host_kv_pool is not None:
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                host_kv_pool.get_contiguous_buf_infos()
+            )
+        else:
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                self.token_to_kv_pool.get_contiguous_buf_infos()
+            )
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -667,13 +681,19 @@ class DecodePreallocQueue:
             allocatable_tokens -= required_tokens_for_request
             self._pre_alloc(decode_req.req)
 
-            kv_indices = (
-                self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
+            prompt_host_indices = getattr(decode_req.req, "_dsa_prompt_host_indices", None)
+            if prompt_host_indices is not None:
+                kv_indices = prompt_host_indices[
                     : len(decode_req.req.origin_input_ids)
-                ]
-                .cpu()
-                .numpy()
-            )
+                ].cpu().numpy()
+            else:
+                kv_indices = (
+                    self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
+                        : len(decode_req.req.origin_input_ids)
+                    ]
+                    .cpu()
+                    .numpy()
+                )
             page_size = self.token_to_kv_pool_allocator.page_size
 
             # Prepare extra pool indices for hybrid models
@@ -710,7 +730,12 @@ class DecodePreallocQueue:
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
-                state_indices = kv_indices_full.cpu().numpy()
+                state_indices_full = get_disagg_state_indices(
+                    decode_req.req.req_pool_idx,
+                    seq_len,
+                    kv_indices_full,
+                )
+                state_indices = state_indices_full.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
             else:
                 state_indices = None
@@ -739,6 +764,26 @@ class DecodePreallocQueue:
             len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
         )
 
+    def _reserved_tokens_for_retracted(self) -> int:
+        return sum(
+            len(req.origin_input_ids) + len(req.output_ids) + self.num_reserved_decode_tokens
+            for req in self.retracted_queue
+        )
+
+    def _deduct_shared_reservations(
+        self, allocatable_tokens: int, count_retracted: bool
+    ) -> int:
+        if (
+            self.scheduler.last_batch
+            and self.scheduler.last_batch.forward_mode.is_prebuilt()
+        ):
+            allocatable_tokens -= self.num_reserved_decode_tokens * len(
+                self.scheduler.last_batch.reqs
+            )
+        if count_retracted:
+            allocatable_tokens -= self._reserved_tokens_for_retracted()
+        return allocatable_tokens
+
     def _allocatable_tokens(
         self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
     ) -> int:
@@ -756,7 +801,7 @@ class DecodePreallocQueue:
             else 0
         )
         available_size = self.token_to_kv_pool_allocator.available_size()
-        allocatable_tokens = available_size - max(
+        reserve_tokens = max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
             * (
@@ -767,58 +812,81 @@ class DecodePreallocQueue:
             # make sure each request can finish if reach max_tokens with all other requests retracted
             need_space_for_single_req,
         )
+        allocatable_tokens = self._deduct_shared_reservations(
+            available_size - reserve_tokens,
+            count_retracted,
+        )
 
-        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
-        #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
-        if (
-            self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_prebuilt()
-        ):
-            allocatable_tokens -= self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
+        indexer_available_size = get_sparse_indexer_available_token_count()
+        if indexer_available_size is not None:
+            indexer_allocatable_tokens = self._deduct_shared_reservations(
+                indexer_available_size - reserve_tokens,
+                count_retracted,
             )
-
-        if count_retracted:
-            allocatable_tokens -= sum(
-                [
-                    len(req.origin_input_ids)
-                    + len(req.output_ids)
-                    + self.num_reserved_decode_tokens
-                    for req in self.retracted_queue
-                ]
+            allocatable_tokens = min(allocatable_tokens, indexer_allocatable_tokens)
+        host_available_size = get_sparse_host_available_token_count()
+        if host_available_size is not None:
+            host_allocatable_tokens = self._deduct_shared_reservations(
+                host_available_size - reserve_tokens,
+                count_retracted,
             )
+            allocatable_tokens = min(allocatable_tokens, host_allocatable_tokens)
         return allocatable_tokens
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
+        needs_sparse_begin = req.req_pool_idx is None
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert (
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
+        if needs_sparse_begin:
+            notify_sparse_request_begin(req)
 
         # Alloc all tokens for the prebuilt req (except for the reserved input token for decoding)
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
-        if self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
+        use_dsa_host_prealloc = (
+            get_sparse_host_kv_pool() is not None and len(req.output_ids) == 0
+        )
+        if use_dsa_host_prealloc:
+            page_size = self.token_to_kv_pool_allocator.page_size
+            host_backing_len = ((fill_len + page_size - 1) // page_size) * page_size
+            host_kv_pool = get_sparse_host_kv_pool()
+            if host_backing_len > 0:
+                kv_loc = host_kv_pool.alloc(host_backing_len)
+                assert kv_loc is not None, (
+                    "Host KV cache is full! There is a bug in memory estimation."
+                )
+            else:
+                kv_loc = torch.empty(0, dtype=torch.int64)
+            req._dsa_prompt_host_indices = kv_loc
+            req._dsa_prompt_host_backing_len = host_backing_len
+            req._dsa_prompt_finalized = False
         else:
-            device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
-            )
+            req._dsa_prompt_host_indices = None
+            req._dsa_prompt_host_backing_len = 0
+            req._dsa_prompt_finalized = False
+            if self.token_to_kv_pool_allocator.page_size == 1:
+                kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
+            else:
+                device = self.token_to_kv_pool_allocator.device
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                    extend_num_tokens=fill_len,
+                )
 
-        assert (
-            kv_loc is not None
-        ), "KV cache is full! There is a bug in memory estimation."
+            assert (
+                kv_loc is not None
+            ), "KV cache is full! There is a bug in memory estimation."
 
-        self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
+            self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
 
         # populate metadata
         req.fill_ids = req.origin_input_ids + req.output_ids
@@ -911,6 +979,10 @@ class DecodeTransferQueue:
             return True
 
         # Case 3: Success - commit the transfer
+        handle_disagg_cache_received(
+            decode_req.req,
+            self.scheduler.token_to_kv_pool_allocator,
+        )
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
         if not self.spec_algorithm.is_none():

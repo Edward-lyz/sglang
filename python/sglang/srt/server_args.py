@@ -506,7 +506,7 @@ class ServerArgs:
     speculative_ngram_min_bfs_breadth: int = 1
     speculative_ngram_max_bfs_breadth: int = 10
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
-    speculative_ngram_max_trie_depth: int = 18
+    speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
 
@@ -562,8 +562,7 @@ class ServerArgs:
     hicache_storage_backend_extra_config: Optional[str] = None
 
     # Hierarchical sparse attention
-    enable_hisparse: bool = False
-    hisparse_config: Optional[str] = None
+    hierarchical_sparse_attention_extra_config: Optional[str] = None
 
     # LMCache
     enable_lmcache: bool = False
@@ -3293,6 +3292,16 @@ class ServerArgs:
         )
 
     def _handle_cache_compatibility(self):
+        sparse_extra_config = parse_sparse_extra_config(
+            self.hierarchical_sparse_attention_extra_config
+        )
+
+        decode_deepseek_nsa_offload = (
+            isinstance(sparse_extra_config, dict)
+            and sparse_extra_config.get("algorithm", "").lower() == "deepseek_nsa"
+            and self.disaggregation_mode == "decode"
+        )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -3307,6 +3316,20 @@ class ServerArgs:
             if self.hicache_storage_backend is None:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
+                )
+
+        if decode_deepseek_nsa_offload:
+            if self.disable_cuda_graph:
+                raise ValueError(
+                    "deepseek_nsa offload on decode workers requires cuda graph and does not support --disable-cuda-graph."
+                )
+            if self.disaggregation_decode_enable_offload_kvcache:
+                raise ValueError(
+                    "deepseek_nsa offload cannot be combined with disaggregation-decode-enable-offload-kvcache."
+                )
+            if self.hicache_mem_layout != "layer_first":
+                raise ValueError(
+                    "deepseek_nsa offload currently requires hicache_mem_layout=layer_first."
                 )
 
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
@@ -4766,10 +4789,10 @@ class ServerArgs:
             help="The match type for cache tree.",
         )
         parser.add_argument(
-            "--speculative-ngram-max-trie-depth",
+            "--speculative-ngram-branch-length",
             type=int,
-            default=ServerArgs.speculative_ngram_max_trie_depth,
-            help="The max trie depth for ngram speculative decoding.",
+            default=ServerArgs.speculative_ngram_branch_length,
+            help="The branch length for ngram speculative decoding.",
         )
         parser.add_argument(
             "--speculative-ngram-capacity",
@@ -5074,17 +5097,13 @@ class ServerArgs:
 
         # Hierarchical sparse attention
         parser.add_argument(
-            "--enable-hisparse",
-            action="store_true",
-            help="Enable hierarchical sparse attention",
-        )
-
-        parser.add_argument(
-            "--hisparse-config",
+            "--hierarchical-sparse-attention-extra-config",
             type=str,
-            default=ServerArgs.hisparse_config,
+            default=ServerArgs.hierarchical_sparse_attention_extra_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
-            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
+            "Required fields: algorithm (str), backend (str). "
+            "All other fields are algorithm-specific and passed to the algorithm constructor. "
+            'Example: \'{"algorithm": "quest", "backend": "flashattention", "sparsity_ratio": 0.7, "min_sparse_prompt_len": 2048}\'',
         )
 
         # LMCache
@@ -6057,12 +6076,6 @@ class ServerArgs:
                 "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."
             )
 
-        # Check hisparse
-        if self.enable_hisparse:
-            assert (
-                self.disable_radix_cache
-            ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-
         assert (
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"
@@ -6359,6 +6372,21 @@ def set_global_server_args_for_scheduler(server_args: ServerArgs):
 
 
 set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
+
+
+def parse_sparse_extra_config(config_str: Optional[str]) -> Optional[dict]:
+    """Parse the hierarchical sparse attention JSON config string.
+
+    Centralizes JSON parsing so that both ServerArgs validation and the sparse
+    coordinator factory share one code path instead of parsing the same string
+    independently.
+    """
+    if config_str is None:
+        return None
+    try:
+        return json.loads(config_str)
+    except json.JSONDecodeError:
+        return None
 
 
 def get_global_server_args() -> ServerArgs:

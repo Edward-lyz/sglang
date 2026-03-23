@@ -43,6 +43,10 @@ def cache_once(fn: F) -> F:
     return wrapper  # type: ignore
 
 
+def run_jit_kernel(get_module: Callable[..., Any], *args) -> None:
+    get_module().run(*args)
+
+
 def _make_wrapper(tup: Tuple[str, str]) -> str:
     export_name, kernel_name = tup
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
