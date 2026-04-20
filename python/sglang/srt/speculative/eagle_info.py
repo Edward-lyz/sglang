@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -131,15 +132,35 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.req_pool_indices,
                 prefix_lens,
             )
-            batch.out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                prefix_lens,
-                prefix_lens_cpu,
-                end_offset,
-                end_offset_cpu,
-                last_loc,
-                len(batch.input_ids),
-            )
+            if batch.hisparse_coordinator is not None:
+                allocator = batch.tree_cache.token_to_kv_pool_allocator
+                evict_from_tree_cache(
+                    batch.tree_cache,
+                    len(batch.input_ids) + len(prefix_lens_cpu) * allocator.page_size,
+                )
+                device_slots = batch.hisparse_coordinator.get_draft_device_slots(
+                    batch.req_pool_indices,
+                    self.draft_token_num,
+                )
+                batch.out_cache_loc = allocator.alloc_extend_with_device_mapping(
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    len(batch.input_ids),
+                    device_slots,
+                )
+            else:
+                batch.out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    len(batch.input_ids),
+                )
             self.last_loc = last_loc
 
         bs = batch.batch_size()
@@ -475,6 +496,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         num_accepted_drafts_list = num_accepted_drafts_cpu.tolist()
         num_accepted_tokens_list = num_accepted_tokens_cpu.tolist()
 
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+        if hisparse_coordinator is not None:
+            hisparse_coordinator.finalize_accepted_tokens(
+                batch.req_pool_indices,
+                batch.out_cache_loc[accept_index],
+                batch.out_cache_loc,
+                num_accepted_drafts,
+                num_accepted_drafts_cpu,
+                batch.seq_lens + num_accepted_tokens_cpu.to(batch.seq_lens.device),
+            )
+
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
@@ -530,6 +562,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 token_to_kv_pool_allocator.free(to_free_slots)
 
                 # Copy the kv cache
+                if hisparse_coordinator is not None:
+                    raise NotImplementedError(
+                        "HiSparse + speculative topk > 1 + page_size > 1 needs "
+                        "hisparse-aware move_kv_cache translation."
+                    )
                 batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
                     tgt_cache_loc, src_cache_loc
                 )
@@ -805,6 +842,28 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = self.new_seq_lens[new_indices]
+            if self.hidden_states is not None:
+                self.hidden_states = self.hidden_states[new_indices]
+            if self.verified_id is not None:
+                self.verified_id = self.verified_id[new_indices]
+            if self.num_accepted_drafts is not None:
+                self.num_accepted_drafts = self.num_accepted_drafts[new_indices]
+            if self.num_accepted_tokens is not None:
+                self.num_accepted_tokens = self.num_accepted_tokens[new_indices]
+            if self.num_accepted_drafts_cpu is not None:
+                self.num_accepted_drafts_cpu = [
+                    self.num_accepted_drafts_cpu[i] for i in new_indices.tolist()
+                ]
+            if self.num_accepted_tokens_cpu is not None:
+                self.num_accepted_tokens_cpu = [
+                    self.num_accepted_tokens_cpu[i] for i in new_indices.tolist()
+                ]
+            if self.topk_p is not None:
+                self.topk_p = self.topk_p[new_indices]
+            if self.topk_index is not None:
+                self.topk_index = self.topk_index[new_indices]
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -829,6 +888,59 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
 
+    def slice_single(self, batch_index: int) -> "EagleDraftInput":
+        sli = slice(batch_index, batch_index + 1)
+        future_indices = None
+        if self.future_indices is not None:
+            future_indices = FutureIndices(indices=self.future_indices.indices[sli])
+        return EagleDraftInput(
+            topk_p=None if self.topk_p is None else self.topk_p[sli],
+            topk_index=None if self.topk_index is None else self.topk_index[sli],
+            hidden_states=(
+                None if self.hidden_states is None else self.hidden_states[sli]
+            ),
+            capture_hidden_mode=self.capture_hidden_mode,
+            verified_id=None if self.verified_id is None else self.verified_id[sli],
+            num_accepted_drafts=(
+                None
+                if self.num_accepted_drafts is None
+                else self.num_accepted_drafts[sli]
+            ),
+            num_accepted_tokens=(
+                None
+                if self.num_accepted_tokens is None
+                else self.num_accepted_tokens[sli]
+            ),
+            num_accepted_drafts_cpu=(
+                None
+                if self.num_accepted_drafts_cpu is None
+                else self.num_accepted_drafts_cpu[batch_index : batch_index + 1]
+            ),
+            num_accepted_tokens_cpu=(
+                None
+                if self.num_accepted_tokens_cpu is None
+                else self.num_accepted_tokens_cpu[batch_index : batch_index + 1]
+            ),
+            seq_lens_for_draft_extend=(
+                None
+                if self.seq_lens_for_draft_extend is None
+                else self.seq_lens_for_draft_extend[sli]
+            ),
+            seq_lens_for_draft_extend_cpu=(
+                None
+                if self.seq_lens_for_draft_extend_cpu is None
+                else self.seq_lens_for_draft_extend_cpu[sli]
+            ),
+            req_pool_indices_for_draft_extend=(
+                None
+                if self.req_pool_indices_for_draft_extend is None
+                else self.req_pool_indices_for_draft_extend[sli]
+            ),
+            future_indices=future_indices,
+            new_seq_lens=None if self.new_seq_lens is None else self.new_seq_lens[sli],
+            verify_done=self.verify_done,
+        )
+
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
@@ -837,11 +949,63 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
             )
+            if self.new_seq_lens is None:
+                self.new_seq_lens = spec_info.new_seq_lens
+            elif spec_info.new_seq_lens is not None:
+                self.new_seq_lens = torch.cat(
+                    [self.new_seq_lens, spec_info.new_seq_lens], axis=0
+                )
+            if self.hidden_states is None:
+                self.hidden_states = spec_info.hidden_states
+            elif spec_info.hidden_states is not None:
+                self.hidden_states = torch.cat(
+                    [self.hidden_states, spec_info.hidden_states], axis=0
+                )
+            if self.verified_id is None:
+                self.verified_id = spec_info.verified_id
+            elif spec_info.verified_id is not None:
+                self.verified_id = torch.cat(
+                    [self.verified_id, spec_info.verified_id], axis=0
+                )
+            if self.num_accepted_drafts is None:
+                self.num_accepted_drafts = spec_info.num_accepted_drafts
+            elif spec_info.num_accepted_drafts is not None:
+                self.num_accepted_drafts = torch.cat(
+                    [self.num_accepted_drafts, spec_info.num_accepted_drafts], axis=0
+                )
+            if self.num_accepted_tokens is None:
+                self.num_accepted_tokens = spec_info.num_accepted_tokens
+            elif spec_info.num_accepted_tokens is not None:
+                self.num_accepted_tokens = torch.cat(
+                    [self.num_accepted_tokens, spec_info.num_accepted_tokens], axis=0
+                )
+            if self.num_accepted_drafts_cpu is None:
+                self.num_accepted_drafts_cpu = spec_info.num_accepted_drafts_cpu
+            elif spec_info.num_accepted_drafts_cpu is not None:
+                self.num_accepted_drafts_cpu += spec_info.num_accepted_drafts_cpu
+            if self.num_accepted_tokens_cpu is None:
+                self.num_accepted_tokens_cpu = spec_info.num_accepted_tokens_cpu
+            elif spec_info.num_accepted_tokens_cpu is not None:
+                self.num_accepted_tokens_cpu += spec_info.num_accepted_tokens_cpu
+            if self.topk_p is None:
+                self.topk_p = spec_info.topk_p
+            elif spec_info.topk_p is not None:
+                self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], axis=0)
+            if self.topk_index is None:
+                self.topk_index = spec_info.topk_index
+            elif spec_info.topk_index is not None:
+                self.topk_index = torch.cat(
+                    [self.topk_index, spec_info.topk_index], axis=0
+                )
             return
 
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id
+            self.num_accepted_drafts = spec_info.num_accepted_drafts
+            self.num_accepted_tokens = spec_info.num_accepted_tokens
+            self.num_accepted_drafts_cpu = spec_info.num_accepted_drafts_cpu
+            self.num_accepted_tokens_cpu = spec_info.num_accepted_tokens_cpu
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             return
@@ -851,6 +1015,30 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             [self.hidden_states, spec_info.hidden_states], axis=0
         )
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
+        if (
+            self.num_accepted_drafts is not None
+            and spec_info.num_accepted_drafts is not None
+        ):
+            self.num_accepted_drafts = torch.cat(
+                [self.num_accepted_drafts, spec_info.num_accepted_drafts], axis=0
+            )
+        if (
+            self.num_accepted_tokens is not None
+            and spec_info.num_accepted_tokens is not None
+        ):
+            self.num_accepted_tokens = torch.cat(
+                [self.num_accepted_tokens, spec_info.num_accepted_tokens], axis=0
+            )
+        if (
+            self.num_accepted_drafts_cpu is not None
+            and spec_info.num_accepted_drafts_cpu is not None
+        ):
+            self.num_accepted_drafts_cpu += spec_info.num_accepted_drafts_cpu
+        if (
+            self.num_accepted_tokens_cpu is not None
+            and spec_info.num_accepted_tokens_cpu is not None
+        ):
+            self.num_accepted_tokens_cpu += spec_info.num_accepted_tokens_cpu
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
 

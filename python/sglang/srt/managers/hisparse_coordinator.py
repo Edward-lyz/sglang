@@ -486,6 +486,155 @@ class HiSparseCoordinator:
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
 
+    def get_draft_device_slots(
+        self,
+        req_pool_indices: torch.Tensor,
+        num_tokens_per_req: int,
+    ) -> torch.Tensor:
+        """Return extra-page device slots for a uniform draft allocation."""
+        start = self.device_buffer_size + 1
+        end = start + num_tokens_per_req
+        if end > self.padded_buffer_size:
+            raise ValueError(
+                f"Requested {num_tokens_per_req} draft slots but extra page only "
+                f"has {self.padded_buffer_size - self.device_buffer_size - 1} "
+                f"available (padded_buffer_size={self.padded_buffer_size}, "
+                f"device_buffer_size={self.device_buffer_size})."
+            )
+        return self.req_to_device_buffer[req_pool_indices, start:end].reshape(-1)
+
+    def get_draft_device_slots_variable(
+        self,
+        req_pool_indices: torch.Tensor,
+        tokens_per_req_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return extra-page device slots when each request needs a different count."""
+        if tokens_per_req_cpu.numel() == 0:
+            return torch.empty(0, dtype=torch.int64, device=req_pool_indices.device)
+
+        start = self.device_buffer_size + 1
+        max_tokens = int(tokens_per_req_cpu.max().item())
+        if start + max_tokens > self.padded_buffer_size:
+            raise ValueError(
+                f"Max per-request draft slots ({max_tokens}) exceeds extra page "
+                f"capacity ({self.padded_buffer_size - self.device_buffer_size - 1})."
+            )
+
+        total_slots = int(tokens_per_req_cpu.sum().item())
+        if total_slots == 0:
+            return torch.empty(0, dtype=torch.int64, device=req_pool_indices.device)
+
+        tokens_per_req = tokens_per_req_cpu.to(
+            device=req_pool_indices.device, dtype=torch.int64
+        )
+
+        # Build fixed-shape gather indices. Zero-repeat requests naturally disappear.
+        row_indices = torch.repeat_interleave(req_pool_indices, tokens_per_req)
+        offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=tokens_per_req.device),
+                tokens_per_req.cumsum(0),
+            ]
+        )
+        pos_in_segment = torch.arange(total_slots, device=tokens_per_req.device) - (
+            torch.repeat_interleave(offsets[:-1], tokens_per_req)
+        )
+        col_indices = start + pos_in_segment
+
+        return self.req_to_device_buffer[row_indices, col_indices]
+
+    def finalize_accepted_tokens(
+        self,
+        req_pool_indices: torch.Tensor,
+        accepted_cache_locs: torch.Tensor,
+        draft_cache_locs: torch.Tensor,
+        num_accepted_drafts: torch.Tensor,
+        num_accepted_drafts_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        """Persist accepted speculative tokens and remap the newest token slot."""
+        if accepted_cache_locs.numel() == 0:
+            return
+
+        counts = num_accepted_drafts.to(torch.int64) + 1
+        counts_cpu = num_accepted_drafts_cpu.to(torch.int64) + 1
+        total_accepted = int(counts_cpu.sum().item())
+        if total_accepted != accepted_cache_locs.numel():
+            raise ValueError(
+                "HiSparse accepted token bookkeeping mismatch: "
+                f"expected {total_accepted} cache locs, got {accepted_cache_locs.numel()}."
+            )
+
+        all_device_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
+            accepted_cache_locs
+        )
+        mapping = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        mapping[draft_cache_locs] = 0
+        host_locs = self.mem_pool_host.alloc(total_accepted)
+        if host_locs is None:
+            logger.error(
+                "HiSparse: host alloc failed for %d accepted draft tokens",
+                total_accepted,
+            )
+            raise RuntimeError(
+                f"HiSparse host alloc failed for {total_accepted} accepted draft tokens"
+            )
+        host_locs = host_locs.to(device=self.device)
+
+        device_locs_for_backup = all_device_locs.contiguous()
+        with device_module.stream(self.decode_backup_stream):
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs_for_backup,
+                io_backend="kernel",
+            )
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            if device_locs_for_backup.is_cuda:
+                device_locs_for_backup.record_stream(self.decode_backup_stream)
+        event = device_module.Event()
+        event.record(self.decode_backup_stream)
+        device_module.current_stream().wait_event(event)
+
+        # Vectorized: get newest_slots for all requests at once
+        newest_slots = self.req_to_device_buffer[
+            req_pool_indices, self.device_buffer_size
+        ]
+
+        # Vectorized: set skip flag for all requests
+        self._skip_first_backup[req_pool_indices] = True
+
+        # Compute segment boundaries: cumsum gives end offsets
+        offsets = torch.cat(
+            [torch.zeros(1, dtype=torch.int64, device=counts.device), counts.cumsum(0)]
+        )
+
+        # Vectorized: get last indices for each request segment
+        last_offsets = offsets[1:] - 1  # index of last element in each segment
+        last_logical = accepted_cache_locs[last_offsets]
+        last_device = all_device_locs[last_offsets]
+
+        # Vectorized: update mapping for last tokens
+        mapping[last_logical] = newest_slots
+
+        all_indices = torch.arange(total_accepted, device=counts.device)
+
+        # Vectorized: write host_locs to req_to_host_pool
+        # Build row and col indices for scatter
+        # row[i] = which request, col[i] = position within that request's seq
+        req_indices_expanded = torch.repeat_interleave(req_pool_indices, counts)
+        starts = seq_lens - counts  # start position for each request
+        # Position within each segment: 0, 1, ..., count-1 for each request
+        pos_in_segment = all_indices - torch.repeat_interleave(offsets[:-1], counts)
+        col_indices = torch.repeat_interleave(starts, counts) + pos_in_segment
+        self.req_to_host_pool[req_indices_expanded, col_indices] = host_locs
+
+        self.mem_pool_device.transfer_values_on_device(
+            dst_indices=newest_slots,
+            src_indices=last_device,
+        )
+
     def get_front_topk_tokens(
         self,
         req_pool_indices: torch.Tensor,
@@ -629,9 +778,10 @@ class HiSparseCoordinator:
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_allocated_len
         ]
-        self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
-            allocated_locs
-        ] = 0
+        if current_cap > 0:
+            self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+                allocated_locs
+            ] = 0
 
         host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]
         host_indices = host_indices[host_indices >= 0]
