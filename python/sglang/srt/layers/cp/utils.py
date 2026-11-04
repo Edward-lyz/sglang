@@ -266,6 +266,23 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
     return strategy.gather_hidden_states(x, forward_batch, stream)
 
 
+def cp_gather_rank_major(x: Any, forward_batch, stream: Optional[Any] = None):
+    """[MEM-P3] Gather without materializing the global token order.
+
+    Returns ``(gathered, row_to_token)``. ``row_to_token`` is ``None`` when the
+    active strategy cannot skip the reorder, in which case ``gathered`` is in the
+    usual global token order and callers need no permutation.
+    """
+    assert is_cp_active(forward_batch)
+    strategy = get_cp_strategy()
+    assert strategy is not None
+
+    gather_rank_major = getattr(strategy, "gather_hidden_states_rank_major", None)
+    if gather_rank_major is None:
+        return strategy.gather_hidden_states(x, forward_batch, stream), None
+    return gather_rank_major(x, forward_batch)
+
+
 def cp_materialize_global_token_order(
     x: Any, forward_batch, stream: Optional[Any] = None
 ):
@@ -324,6 +341,11 @@ def cp_shard_model_inputs(
         )
 
     try:
+        # [MEM-R3] Everything that needs the full-order inputs has already been sharded
+        # above, but this generator frame stays alive for the whole model body, so the
+        # reference would pin the full [T, hidden] embedding (640 MiB at a 65532-token
+        # chunk) across the layer loop. The restore path below never touches it.
+        complete_hidden_states = None
         yield sharded_hidden_states, sharded_positions, model_input_ids
     finally:
         if num_token_non_padded_backup is not None:

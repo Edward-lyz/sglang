@@ -26,6 +26,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_gather_rank_major,
     cp_shard_model_inputs,
     get_cp_strategy,
     is_cp_active,

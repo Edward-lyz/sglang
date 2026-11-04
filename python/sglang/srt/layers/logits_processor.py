@@ -215,6 +215,14 @@ class LogitsProcessorOutput:
     # Original flattened token indices when only a subset of hidden rows is captured.
     hidden_states_token_indices: Optional[torch.Tensor] = None
 
+    # [MEM-P3] Captured hidden rows that are NOT in global token order: prefill-CP
+    # gathers the DSpark aux rank-major to avoid a full-size reorder copy. Carried
+    # in a dedicated field because the MLP-sync unpadding prefix-slices
+    # ``hidden_states``, which is invalid for this layout. ``row_token_index[m]`` is
+    # the global token index of row m; entries >= the real token count are
+    # all-gather padding rows and must not be committed.
+    hidden_states_rank_major: Optional[torch.Tensor] = None
+    hidden_states_row_token_index: Optional[torch.Tensor] = None
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
