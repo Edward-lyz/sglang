@@ -3,6 +3,12 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.attention.fused_mla_prepare_fp8 import (
+    can_use_fused_mla_prepare_fp8 as can_use_fused_mla_prepare_fp8,
+)
+from sglang.kernels.ops.attention.fused_mla_prepare_fp8 import (
+    fused_mla_prepare_fp8 as fused_mla_prepare_fp8,
+)
 from sglang.kernels.ops.attention.pad import (
     pad_sequence_with_mask as pad_sequence_with_mask,
 )
@@ -48,6 +54,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.kernels.ops.kvcache.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -185,6 +192,11 @@ def mla_quantize_without_rope_for_fp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize MLA components to FP8 without applying rotary embeddings."""
     attn_dtype = torch.float8_e4m3fn
+    if envs.SGLANG_OPT_USE_FUSED_MLA_PREPARE_FP8.get() and can_use_fused_mla_prepare_fp8(
+        q_nope, q_rope, k_nope, k_rope
+    ):
+        # One Triton launch instead of concat + three casts; bit-identical.
+        return fused_mla_prepare_fp8(q_nope, q_rope, k_nope, k_rope)
     q = concat_mla_absorb_q_general(q_nope, q_rope).to(attn_dtype)
     return q, k_nope.to(attn_dtype), k_rope.to(attn_dtype)
 

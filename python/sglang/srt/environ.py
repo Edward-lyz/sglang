@@ -1062,6 +1062,33 @@ class Envs:
     # ====================================================================
 
     # ====================================================================
+    # Decode context parallel (DCP)
+    # Stage the a2a payload of dcp_a2a_lse_reduce with one fused Triton pack
+    # (kernels/ops/attention/dcp_fused_pack.py) instead of four elementwise
+    # launches. Off by default: the packed bytes are identical, but the combine
+    # kernel is re-specialised on the new strides and can differ from the
+    # original path on elements where the rank partials nearly cancel.
+    SGLANG_OPT_USE_FUSED_DCP_A2A_PACK = EnvBool(False)
+    # With SGLANG_OPT_USE_FUSED_DCP_A2A_PACK: replace the pack kernel + NCCL
+    # all_to_all_single by one kernel that stores each chunk straight into the
+    # peers' symmetric receive buffers (same layout, unchanged combine, so the
+    # result is bit-identical). Buffer capacity in tokens per call; larger
+    # calls fall back to the NCCL path. Default off.
+    SGLANG_K3_DCP_PUSH = EnvBool(False)
+    SGLANG_K3_DCP_PUSH_MAX_TOKENS = EnvInt(512)
+    # Grid = dcp_size x SLICES blocks of BLOCK threads.
+    SGLANG_K3_DCP_PUSH_SLICES = EnvInt(8)
+    SGLANG_K3_DCP_PUSH_BLOCK = EnvInt(512)
+    # MLA decode: apply w_vc (kv_lora_rank -> v_head_dim) to every DCP-group
+    # head before the a2a exchange instead of after the LSE combine. The combine
+    # is a per-(token, head) scalar weighting of the rank partials, so it
+    # commutes with the per-head w_vc, and the exchanged partials shrink from
+    # kv_lora_rank to v_head_dim. Needs the full-head w_vc gathered next to
+    # --dcp-replicate-q-proj. Off by default: the rounding order changes.
+    SGLANG_OPT_DCP_VC_BEFORE_A2A = EnvBool(False)
+    # ====================================================================
+
+    # ====================================================================
     # Inkling
     SGLANG_OPT_USE_FUSED_GATE_TOPK = EnvBool(True)
     # Inside the fused gate: use the CUDA JIT top-k+renorm kernel (v2) instead
