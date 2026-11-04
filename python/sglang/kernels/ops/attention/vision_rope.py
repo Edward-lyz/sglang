@@ -30,7 +30,11 @@ def _fused_qk_complex_rope_kernel(
     freq_stride_complex: tl.constexpr,
     BLOCK: tl.constexpr,
 ) -> None:
-    pair_offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # Use int64 index arithmetic: with large vision-token counts (e.g. long K3
+    # videos) the strided QKV-view address token*q_stride_token overflows int32
+    # even for in-bounds lanes, producing a wild pointer -> CUDA illegal memory
+    # access. Widening the base offset to int64 keeps every computed address exact.
+    pair_offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     mask = pair_offsets < n_pairs
     pairs_per_row = head_dim // 2
     row = pair_offsets // pairs_per_row
