@@ -41,6 +41,10 @@ def serve(args, extra_argv):
         parser.print_help()
         return
 
+    from sglang.srt.plugins import load_plugins
+
+    load_plugins()
+
     model_path = get_model_path(extra_argv)
     try:
         is_diffusion_model = get_is_diffusion_model(model_path)

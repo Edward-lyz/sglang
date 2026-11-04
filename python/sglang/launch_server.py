@@ -29,6 +29,9 @@ def run_server(server_args):
 
 
 if __name__ == "__main__":
+    from sglang.srt.plugins import load_plugins
+    load_plugins()
+
     server_args = prepare_server_args(sys.argv[1:])
 
     try:

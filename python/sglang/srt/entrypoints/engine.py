@@ -69,6 +69,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
+from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
@@ -141,6 +142,10 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/server_args.py::ServerArgs`.
         Please refer to `ServerArgs` for the documentation.
         """
+
+        # Ensure plugins are loaded before ServerArgs construction,
+        # so hooks on ServerArgs.__post_init__ fire correctly.
+        load_plugins()
 
         # Parse server_args
         if "server_args" in kwargs:
@@ -993,6 +998,9 @@ def _launch_subprocesses(
     # Configure global environment
     configure_logger(server_args)
     _set_envs_and_config(server_args)
+    # Defensive: ensure plugins loaded (may already be loaded by
+    # Engine.__init__ or CLI entry).
+    load_plugins()
     server_args.check_server_args()
 
     # Allocate ports for inter-process communications

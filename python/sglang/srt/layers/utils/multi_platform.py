@@ -1,7 +1,9 @@
-from typing import Callable
+"""Utilities for dispatching layer operators across supported platforms."""
+
+from typing import Callable, ClassVar
 
 from torch import nn
-
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -22,7 +24,18 @@ _is_musa = is_musa()
 
 
 class MultiPlatformOp(nn.Module):
+    """Base module that dispatches forward implementations by platform."""
+
+    # OOT forward registry: maps dispatch_key -> {op_cls -> forward_fn}
+    _oot_forward_registry: ClassVar[dict[str, dict[type, Callable]]] = {}
+
+    @classmethod
+    def register_oot_forward(cls, op_cls: type, fn: Callable, platform_key: str):
+        """Register an OOT forward implementation for a specific op class and platform."""
+        cls._oot_forward_registry.setdefault(platform_key, {})[op_cls] = fn
+
     def __init__(self):
+        """Initialize the dispatched forward method state."""
         super().__init__()
         self._forward_method: Callable = self.dispatch_forward()
 
@@ -31,6 +44,7 @@ class MultiPlatformOp(nn.Module):
         self.is_torch_compile = False
 
     def enter_torch_compile(self, num_tokens: int):
+        """Switch to the torch.compile-compatible forward implementation."""
         # Skip if Op is already entered compile mode.
         # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
         # among layers and `enter_torch_compile` will be called many times.
@@ -58,6 +72,7 @@ class MultiPlatformOp(nn.Module):
         self.is_torch_compile = True
 
     def leave_torch_compile(self):
+        """Restore the forward implementation used before torch.compile."""
         # Skip if Op is already exited compile mode.
         if not self.is_torch_compile:
             return
@@ -68,36 +83,57 @@ class MultiPlatformOp(nn.Module):
 
     # Please do not override this method, because `self._forward_method` can change when in torch compile mode
     def forward(self, *args, **kwargs):
+        """Run the platform-dispatched forward implementation."""
         return self._forward_method(*args, **kwargs)
 
     def forward_native(self, *args, **kwargs):
+        """Run the native PyTorch forward implementation."""
         raise NotImplementedError
 
     def forward_cuda(self, *args, **kwargs):
+        """Run the CUDA forward implementation."""
         raise NotImplementedError
 
     def forward_npu(self, *args, **kwargs):
+        """Run the NPU forward implementation."""
         raise NotImplementedError
 
     def forward_hip(self, *args, **kwargs):
+        """Run the HIP forward implementation."""
         return self.forward_cuda(*args, **kwargs)
 
     def forward_xpu(self, *args, **kwargs):
+        """Run the XPU forward implementation."""
         return self.forward_native(*args, **kwargs)
 
     def forward_musa(self, *args, **kwargs):
+        """Run the MUSA forward implementation."""
         # XXX (MUSA): MUSA kernels follow the CUDA path by default.
         # At this stage, sgl-kernel support for MUSA is still under active
         # development, so we fall back to the PyTorch-native implementation.
         return self.forward_native(*args, **kwargs)
 
     def forward_hpu(self, *args, **kwargs):
+        """Run the HPU forward implementation."""
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs):
+        """Run the CPU forward implementation."""
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self):
+        """Select the forward implementation for the current platform."""
+        # OOT platform dispatch: check registry then method lookup
+        if current_platform.is_out_of_tree():
+            key = current_platform.get_dispatch_key_name()
+            oot = self._oot_forward_registry.get(key, {})
+            if type(self) in oot:
+                return oot[type(self)].__get__(self)
+            method = getattr(self, f"forward_{key}", None)
+            if method is not None:
+                return method
+            return self.forward_native
+
         if _is_cuda:
             return self.forward_cuda
         elif _is_hip:
