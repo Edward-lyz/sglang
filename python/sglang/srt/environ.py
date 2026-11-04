@@ -1753,6 +1753,13 @@ class Envs:
     # Tuned launch for the candidate-block visibility mask (_candidate_mask_kernel),
     # bit-exact, ~1.1x at bs256. OFF by default (must pass the live decode boot gate).
     SGLANG_FUSE_CANDIDATE_MASK_OPT = EnvBool(False)
+    # Live-prefix candidate-block visibility mask for the paged top-k_v2 consumer:
+    # grid=(rows, <=16) initializes only [0, round_up(max(seq_len,1), 4)) and skips
+    # the dead page-capacity tail. Takes priority over ROWLOOP / MASK_OPT when on;
+    # only applies to rows >= 128 on the use_topk_v2 consumer, otherwise falls
+    # through. Faster than ROWLOOP at long context (up to ~9x at 190k live length).
+    # OFF by default (must pass the live decode CUDA-graph boot gate).
+    SGLANG_FUSE_CANDIDATE_MASK_LIVE_PREFIX = EnvBool(False)
     # Row-loop candidate-block visibility mask: grid=(rows,), each row loops only its
     # live [0:seq_len] tiles and skips writing the dead page-capacity tail (the vendor
     # paged top-k reads only [0:seq_len]). Bit-exact final top-k selection (as a set),
