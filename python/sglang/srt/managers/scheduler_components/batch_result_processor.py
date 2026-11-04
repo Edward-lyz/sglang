@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     List,
     Optional,
@@ -80,7 +82,9 @@ class SchedulerBatchResultProcessor:
     model_worker: BaseTpWorker
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
+    fire_pending_trace: Callable[[Req], None]
     abort_request: Callable
+    future_map: Optional[Any] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -227,6 +231,14 @@ class SchedulerBatchResultProcessor:
 
             self._validate_pp_skip_output_comm(batch, result)
 
+            if self.server_args.enable_metrics:
+                self.metrics_reporter.iter_forward_finish_time = time.time()
+                run_batch_time = (
+                    self.metrics_reporter.iter_forward_finish_time
+                    - self.metrics_reporter.iter_forward_start_time
+                )
+                self.metrics_reporter.stats.run_batch_time = run_batch_time
+
             hidden_state_offset = 0
 
             # Check finish conditions
@@ -253,8 +265,13 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
+                        self.fire_pending_trace(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        if self.server_args.enable_metrics:
+                            self.metrics_collector.observe_request_first_token_forward_time(
+                                req.time_stats.get_request_first_token_forward_time()
+                            )
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if self.server_args.enable_hisparse:
@@ -342,6 +359,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
+                        self.fire_pending_trace(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
@@ -775,6 +793,7 @@ class SchedulerBatchResultProcessor:
                 value=can_run_cuda_graph
             )
 
+        self.metrics_reporter.iter_forward_finish_time = time.time()
         self.token_to_kv_pool_allocator.free_group_begin()
 
         for i, req in enumerate(batch.reqs):
@@ -997,6 +1016,7 @@ class SchedulerBatchResultProcessor:
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
+                    self.fire_pending_trace(req)
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
                 if self.server_args.enable_hisparse:
@@ -1011,6 +1031,7 @@ class SchedulerBatchResultProcessor:
                     if get_server_args().enable_mamba_extra_buffer_lazy()
                     else True
                 )
+                self.fire_pending_trace(req)
                 draft_req_pool_idx = req.req_pool_idx
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
                 if draft_req_pool_idx is not None and isinstance(

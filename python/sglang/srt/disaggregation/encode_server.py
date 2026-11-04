@@ -1930,6 +1930,7 @@ class MMEncoder:
                 serialized_data = pickle.dumps(new_mm_data)
                 buffer = embedding_tensor.__buffer__()
 
+        _zmq_xfer_start = time.perf_counter()
         if (
             self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
             and url is not None
@@ -1974,6 +1975,11 @@ class MMEncoder:
                     sock.close(linger=0)
                 raise
 
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.observe_transfer(
+                    time.perf_counter() - _zmq_xfer_start,
+                    backend=self.server_args.encoder_transfer_backend,
+                )
             return
 
         # Per-request sockets remain for zmq_to_tokenizer and legacy direct
@@ -1997,7 +2003,6 @@ class MMEncoder:
             finally:
                 sock.close(linger=5000)
 
-        _zmq_xfer_start = time.perf_counter()
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
         if (
             encoder_metrics_collector is not None

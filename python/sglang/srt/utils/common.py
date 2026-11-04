@@ -2152,7 +2152,7 @@ def configure_logger(server_args, prefix: str = ""):
         logging.config.dictConfig(custom_config)
         return
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
-    format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
+    format = f"%(levelname)s [%(asctime)s{maybe_ms}{prefix}] %(message)s"
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
@@ -2355,6 +2355,8 @@ def add_prometheus_middleware(app):
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
 
+    _patch_prometheus_mmap_empty_file_tolerant()
+
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
     metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
@@ -2362,6 +2364,42 @@ def add_prometheus_middleware(app):
     # Workaround for 307 Redirect for /metrics
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
     app.routes.append(metrics_route)
+
+
+def _patch_prometheus_mmap_empty_file_tolerant():
+    """Monkey-patch prometheus_client to tolerate empty / partially-written
+    mmap files in PROMETHEUS_MULTIPROC_DIR.
+
+    When a child process creates an mmap file but dies (or is slow) before
+    writing the 4-byte header, scraping /metrics raises:
+        struct.error: unpack_from requires a buffer of at least 4 bytes
+    See https://github.com/prometheus/client_python/issues/861.
+
+    We replace `MmapedDict.read_all_values_from_file` with a wrapper that
+    silently skips files smaller than the 4-byte header.
+    """
+    from prometheus_client import mmap_dict
+
+    if getattr(mmap_dict.MmapedDict, "_sglang_empty_file_patched", False):
+        return
+
+    _original = mmap_dict.MmapedDict.read_all_values_from_file
+
+    def _safe_read_all_values_from_file(filename):
+        try:
+            # `read_all_values_from_file` receives a path, not a file object.
+            size = os.path.getsize(filename)
+        except OSError:
+            return _original(filename)
+        if size < 4:
+            # Header not yet written — treat as empty.
+            return []
+        return _original(filename)
+
+    mmap_dict.MmapedDict.read_all_values_from_file = staticmethod(
+        _safe_read_all_values_from_file
+    )
+    mmap_dict.MmapedDict._sglang_empty_file_patched = True
 
 
 class RefCountedGauge:
@@ -3014,13 +3052,14 @@ class UvicornAccessLogFilter(logging.Filter):
 def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
+    maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
     LOGGING_CONFIG["formatters"]["default"][
         "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    ] = f"%(levelname)s [%(asctime)s{maybe_ms} Server] %(message)s"
     LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
     LOGGING_CONFIG["formatters"]["access"][
         "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    ] = f'%(levelname)s [%(asctime)s{maybe_ms} Server] %(client_addr)s - "%(request_line)s" %(status_code)s'
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
     _configure_uvicorn_access_log_filter(LOGGING_CONFIG, server_args)

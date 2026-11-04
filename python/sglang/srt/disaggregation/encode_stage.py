@@ -19,6 +19,7 @@ import torch
 from transformers import AutoImageProcessor
 
 from sglang.srt.disaggregation.encode_utils import (
+    BatchExecutorCollector,
     compute_num_tokens_per_item,
     get_image_grid_dim,
     to_tensor,
@@ -204,6 +205,7 @@ class MMLoaderImpl:
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
 
+        self.collector = BatchExecutorCollector(self.name, labels=labels)
 
         from concurrent.futures import ThreadPoolExecutor
 
@@ -592,6 +594,7 @@ class MMDecodeImpl:
             if server_args.served_model_name
             else {}
         )
+        self.collector = BatchExecutorCollector(self.name, labels=labels)
 
         if use_gpu:
             torch.cuda.set_device(device)
@@ -831,6 +834,7 @@ class MMGPUProcessImpl:
             if server_args.served_model_name
             else {}
         )
+        self.collector = BatchExecutorCollector(self.name, labels=labels)
 
         torch.cuda.set_device(device)
         self._preprocess_stream = torch.cuda.Stream(device=device)
@@ -1001,6 +1005,7 @@ class MMProcessImpl:
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
 
+        self.collector = BatchExecutorCollector(self.name, labels=labels)
 
         # Pool recovery state
         self._recovery_lock = threading.Lock()
@@ -1277,6 +1282,7 @@ class EmbeddingImpl:
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
 
+        self.collector = BatchExecutorCollector(self.name, labels=labels)
 
     def __call__(self, reqs: List[EmbedReq]) -> Iterable[EmbedResult]:
         """Run vision encoding on a batch of embed requests.
@@ -1458,6 +1464,7 @@ class TransferImpl:
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
 
+        self.collector = BatchExecutorCollector(self.name, labels=labels)
 
         from mooncake.engine import TransferEngine
 
@@ -1824,6 +1831,7 @@ class VideoDecodeImpl:
             if server_args.served_model_name
             else {}
         )
+        self.collector = BatchExecutorCollector(self.name, labels=labels)
         from concurrent.futures import ThreadPoolExecutor
 
         self._pool = ThreadPoolExecutor(max_batch_size)

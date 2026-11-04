@@ -29,6 +29,10 @@ from pydantic import BaseModel, Field
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.encode_collector import (
+    EncoderMetricsCollector,
+    TransferEndpointCollector,
+)
 from sglang.srt.disaggregation.encode_health import (
     HEALTH_CHECK_TIMEOUT,
     PROBE_IMAGE_BASE64,
@@ -356,6 +360,13 @@ class MMEncoder:
                     f"create MultiModalStaticCache size={embedding_cache_size} MB"
                 )
 
+        self.metrics_collector = EncoderMetricsCollector(
+            labels=(
+                {"model_name": server_args.served_model_name}
+                if server_args.served_model_name
+                else None
+            )
+        )
 
         self.embed_executor = BatchExecutor(
             EmbeddingImpl(
@@ -1442,6 +1453,7 @@ class MMEncoder:
                     cached = None
                 if cached is not None:
                     emb_bytes = cached.nbytes
+                    self.metrics_collector.record_cache_hit(emb_bytes, source=source)
                     logger.info(
                         f"[encode] Cache HIT for task_id={task_id}, bytes={emb_bytes}"
                     )
@@ -1496,6 +1508,9 @@ class MMEncoder:
                         else None
                     ),
                     original_image_sizes=embed_res.original_image_sizes,
+                )
+                self.metrics_collector.record_cache_miss(
+                    embedding_result.nbytes, source=source
                 )
                 success = self.mm_cache.set(task_id, embedding_result)
                 if success:
@@ -1645,6 +1660,7 @@ class EncoderProfiler:
         self.profiler.stop()
         filename = f"{self.prefix}-rank{self.rank}-{self.profile_id}.trace.json"
         trace_path = os.path.join(self.output_dir, filename)
+        self.profiler.export_chrome_trace(trace_path)
         logger.info("Encoder profiling saved to: %s", trace_path)
         self.profiler = None
         self.steps_left = None
@@ -1658,6 +1674,7 @@ _encode_poll_task: asyncio.Task[None] | None = None
 vit_cache_handler: Optional[VitCacheHandler] = None
 send_sockets: List[zmq.Socket] = []
 ENCODER_WARMUP_COMPLETE = False
+transfer_endpoint_collector: Optional[TransferEndpointCollector] = None
 
 
 @app.on_event("startup")
@@ -1712,6 +1729,7 @@ async def _startup_warmup():
                 num_parts=request["num_parts"],
                 part_idx=request["part_idx"],
                 task_id=request["task_id"],
+                source="warmup",
             ),
             timeout=600,  # FA4 JIT can take several minutes
         )
@@ -1770,6 +1788,10 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
 def launch_server(server_args: ServerArgs):
     """Launch the encode server."""
     global encoder, vit_cache_handler, transfer_endpoint_collector
+    if server_args.served_model_name:
+        transfer_endpoint_collector = TransferEndpointCollector(
+            labels={"model_name": server_args.served_model_name}
+        )
     ctx = mp.get_context("spawn")
     zmq_ctx = zmq.Context(10)
     ipc_path_prefix = random_uuid()
@@ -1981,11 +2003,13 @@ async def handle_epd_transfer_request(req: TransferRequest):
     Flow: encode (handles cache hit/miss) → transfer via executor → ack
     RAII on ScatteredTensor guarantees memory safety during transfer.
     """
+    tc = transfer_endpoint_collector
     start_time = time.perf_counter()
 
     try:
         # Step 1: encode (内部处理 cache hit/miss)
         if not req.image_url:
+            tc.on_request_end("400", time.perf_counter() - start_time)
             return req.make_ack(
                 400,
                 f"No image_url provided for task_id={req.task_id}",
@@ -2031,6 +2055,18 @@ async def handle_epd_transfer_request(req: TransferRequest):
         # 将 Tensor 拷贝到 pool 中，返回 handler(注意此方法线程不安全)
         embedding = encoder.mem_pool.place(embed_res.mm_embedding)
 
+        grid_shape = (
+            embed_res.image_grid_dim.shape
+            if embed_res.image_grid_dim is not None
+            else None
+        )
+        logger.info(
+            f"[epd_transfer] encode done task_id={req.task_id}, "
+            f"embedding_shape={embed_res.mm_embedding.shape}, "
+            f"grid_dim_shape={grid_shape}"
+        )
+
+        # Step 2: Compute embed digest (optional)
         embed_digest = None
         if _ENABLE_EMBED_DIGEST:
             try:
@@ -2073,6 +2109,7 @@ async def handle_epd_transfer_request(req: TransferRequest):
             )
 
         # Step 4: Build ack
+        tc.on_request_end(str(tr.status_code), time.perf_counter() - start_time)
         return TransferAck(
             req_id=tr.rid,
             task_id=tr.task_id,
@@ -2089,6 +2126,7 @@ async def handle_epd_transfer_request(req: TransferRequest):
             f"Transfer failed for req_id={req.req_id}, task_id={req.task_id}: {e}",
             exc_info=True,
         )
+        tc.on_request_end("500", time.perf_counter() - start_time)
         return req.make_ack(500, f"Transfer failed: {e}").to_response()
 
 
@@ -2129,6 +2167,12 @@ async def flush_cache():
     )
 
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 def _stopped_by_external():

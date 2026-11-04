@@ -178,6 +178,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
+    configure_logger,
     delete_directory,
     get_bool_env_var,
     is_mps,
@@ -247,6 +248,13 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
+
+    # Configure logger to align with other sglang subprocess entry points;
+    # uvicorn spawns this worker via multiprocessing.get_context("spawn"),
+    # so without this call the worker inherits whatever misconfiguration
+    # the parent left on the root logger after re-import.
+    configure_logger(server_args, f" Tokenizer {os.getpid()}")
+
     logger.info(
         f"Start multi-tokenizer worker process {os.getpid()}, "
         f"ipc_name={port_args.tokenizer_ipc_name}"
@@ -939,6 +947,7 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
     methods=["POST", "PUT"],
     response_class=SGLangORJSONResponse,
 )
+@time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
@@ -2715,6 +2724,7 @@ def _wait_and_warmup(
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
 ):
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_and_warmup start")
     if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
 
@@ -2734,6 +2744,7 @@ def _wait_and_warmup(
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     # The server is ready for requests
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_and_warmup done")
     logger.info("The server is fired up and ready to roll!")
 
     if server_args.delete_ckpt_after_loading:
@@ -3116,6 +3127,8 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     # Launch subprocesses
+    configure_logger(server_args)
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] launch_server start")
     (
         tokenizer_manager,
         template_manager,

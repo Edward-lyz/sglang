@@ -2356,7 +2356,13 @@ class TestDumperE2E:
             "Qwen/Qwen3-0.6B",
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--tp", "2", "--max-total-tokens", "128"],
+            other_args=[
+                "--tp",
+                "2",
+                "--max-total-tokens",
+                "128",
+                "--disable-piecewise-cuda-graph",
+            ],
             env=env,
         )
         try:

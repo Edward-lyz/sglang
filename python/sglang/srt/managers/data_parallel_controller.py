@@ -46,7 +46,9 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
-from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
+from sglang.srt.observability.req_time_stats import (
+    DPControllerReqTimeStats,
+)
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
@@ -830,7 +832,7 @@ def run_data_parallel_controller_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
-    configure_logger(server_args)
+    configure_logger(server_args, " DPController")
     if server_args.enable_trace:
         process_tracing_init(
             server_args.otlp_traces_endpoint,

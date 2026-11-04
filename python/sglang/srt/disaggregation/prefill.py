@@ -830,6 +830,14 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
 
+        if self.enable_metrics:
+            self.metrics_reporter.iter_forward_finish_time = time.time()
+            run_batch_time = (
+                self.metrics_reporter.iter_forward_finish_time
+                - self.metrics_reporter.iter_forward_start_time
+            )
+            self.metrics_reporter.stats.run_batch_time = run_batch_time
+
         logprob_pt = 0
         # A skipped output comm hands back _pp_make_skip_output_result's
         # placeholder, which carries no draft input, while batch.spec_info still
@@ -975,6 +983,11 @@ class SchedulerDisaggregationPrefillMixin:
                         req, last_chunk=True, send_aux=self._pp_pd_owns_aux
                     )
                 req.time_stats.set_prefill_transfer_queue_entry_time()
+                if self.enable_metrics:
+                    self.metrics_collector.observe_prompt_calculation_time(
+                        req.time_stats.prefill_transfer_queue_entry_time
+                        - req.time_stats.forward_entry_time
+                    )
 
                 # Only the aux owner holds the real sampled token; a non-owner's
                 # next_token_id is _pp_make_skip_output_result's placeholder zero,
@@ -1143,6 +1156,16 @@ class SchedulerDisaggregationPrefillMixin:
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
+                if self.enable_metrics:
+                    self.metrics_collector.observe_kvcache_transfer_time(
+                        req.time_stats.prefill_kv_transfer_finish_time
+                        - req.time_stats.prefill_transfer_queue_entry_time
+                    )
+                    if not envs.SGLANG_PP_PD_PREFILL_EARLY_STREAM_OUTPUT.get():
+                        self.metrics_collector.observe_time_to_first_token(
+                            req.time_stats.prefill_kv_transfer_finish_time
+                            - req.time_stats.prefill_bootstrap_queue_entry_time
+                        )
             elif poll == KVPoll.Failed:
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
@@ -1175,11 +1198,29 @@ class SchedulerDisaggregationPrefillMixin:
             # timestamp: the kv-transfer metric below falls back to it whenever
             # the backend reports no transfer latency (mooncake never does), and
             # the early value would collapse the reported latency to one round.
+            for req in done_reqs:
+                if req.finished_output:
+                    req.time_stats.set_completion_time()
 
             for req in stream_reqs:
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
+                req.time_stats.set_completion_time()
+                if self.enable_metrics and not isinstance(
+                    req.finished_reason, FINISH_ABORT
+                ):
+                    self.metrics_collector.observe_request_first_token_forward_time(
+                        req.time_stats.get_request_first_token_forward_time()
+                    )
         else:
+            for req in done_reqs:
+                req.time_stats.set_completion_time()
+                if self.enable_metrics and not isinstance(
+                    req.finished_reason, FINISH_ABORT
+                ):
+                    self.metrics_collector.observe_request_first_token_forward_time(
+                        req.time_stats.get_request_first_token_forward_time()
+                    )
             stream_reqs = done_reqs
 
         for req in done_reqs:
@@ -1525,6 +1566,11 @@ class SchedulerDisaggregationPrefillMixin:
             # Tells process_batch_result_disagg_prefill not to send it again.
             req.pp_early_final_kv_done = True
             req.time_stats.set_prefill_transfer_queue_entry_time()
+            if self.enable_metrics:
+                self.metrics_collector.observe_prompt_calculation_time(
+                    req.time_stats.prefill_transfer_queue_entry_time
+                    - req.time_stats.forward_entry_time
+                )
         self.disagg_prefill_pending_final_kv = still_pending
 
     def _pp_drop_pending_final_kv(self: Scheduler, req: Req) -> None:

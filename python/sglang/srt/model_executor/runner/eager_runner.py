@@ -244,7 +244,7 @@ class EagerRunner(BaseRunner):
         )
 
         with ctx, pdmux_ctx:
-            return model_runner.model.forward(
+            return model_runner.model_forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
@@ -333,7 +333,7 @@ class EagerRunner(BaseRunner):
             elif cp_v2_active:
                 ret = self._execute_extend_cp_v2(forward_batch, kwargs)
             else:
-                ret = model_runner.model.forward(
+                ret = model_runner.model_forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
                     forward_batch,

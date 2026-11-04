@@ -121,6 +121,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.io_struct import TraceReq
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -777,6 +778,7 @@ class Req(ReqDllmMixin):
         routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        dispatch_to_scheduler_time: Optional[float] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
@@ -797,6 +799,7 @@ class Req(ReqDllmMixin):
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
+        trace_config=None,
     ):
         # Input and output info
         self.rid = rid
@@ -969,6 +972,10 @@ class Req(ReqDllmMixin):
         self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # for trace
+        self.trace_config: Optional[Dict[str, Any]] = trace_config
+        self.to_trace_req: Optional[TraceReq] = self.build_trace_req()
+        self.trace_info: Optional[Dict[str, Any]] = None
         # AttentionStore (AS) parameters
         self.as_block_hashs = None
         self.as_kv_cache_params = None
@@ -1116,6 +1123,12 @@ class Req(ReqDllmMixin):
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
 
+        # Timestamp when tokenizer dispatches the request to the scheduler
+        self.dispatch_to_scheduler_time = dispatch_to_scheduler_time
+        # TODO (suhang): Move the dispatch_to_scheduler_time synchronization into Req’s own initializer:
+        # Once dispatch_to_scheduler_time is passed into Req
+        # TimeStats can synchronize it automatically, so the scheduler no longer needs that extra getattr check.
+
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
@@ -1170,6 +1183,28 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+
+    def build_trace_req(self):
+        """Build TraceReq from trace_config at init time.
+
+        Parses trace_config to create a TraceReq. Returns None if tracing is
+        not enabled or trace_type is missing.
+        """
+        from sglang.srt.content_detection.config import DETECTION_CONFIG
+        from sglang.srt.managers.io_struct import TraceReq, TraceTrigger, TraceType
+
+        cfg = self.trace_config or {}
+        if not cfg.get("enable_trace") or not cfg.get("trace_type"):
+            return None
+        return TraceReq(
+            rid=self.rid,
+            trace_type=cfg.get("trace_type", TraceType.METADATA),
+            dump_dir=cfg.get("dump_dir") or DETECTION_CONFIG.trace_dump_dir,
+            trigger=cfg.get("trigger", TraceTrigger.ON_FINISH),
+            payload=cfg.get("payload"),
+            return_logprob=cfg.get("return_logprob", False),
+            return_online=cfg.get("online", False),
+        )
 
     @property
     def seqlen(self) -> int:
@@ -2251,6 +2286,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+    dp_global_num_tokens_for_metric: Optional[List[int]] = None
+
+    # DP all_gather latency for this batch
+    all_gather_latency: float = 0.0
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
     # Sampling info
@@ -2546,7 +2585,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             multimodal_inputs.append(req.multimodal_inputs)
 
-            # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
             # flag will always True
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
@@ -3385,6 +3423,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            dp_global_num_tokens_for_metric=self.dp_global_num_tokens_for_metric,
+            all_gather_latency=self.all_gather_latency,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,

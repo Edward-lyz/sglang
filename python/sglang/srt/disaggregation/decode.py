@@ -2352,6 +2352,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 else:
                     transferred_reqs.append(decode_req.req)
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.observe_kvcache_transfer_time(
+                            time.perf_counter()
+                            - decode_req.req.time_stats.decode_transfer_queue_entry_time
+                        )
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -2418,6 +2423,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
+            self.iter_start_time = time.perf_counter()
+            self.metrics_reporter.iter_start_time = self.iter_start_time
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -2457,6 +2464,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
+            self.iter_start_time = time.perf_counter()
+            self.metrics_reporter.iter_start_time = self.iter_start_time
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -2598,6 +2607,12 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+
+        if self.enable_metrics:
+            for req in can_run_list:
+                self.metrics_collector.observe_request_waiting_time(
+                    req.time_stats.get_request_waiting_time(),
+                )
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

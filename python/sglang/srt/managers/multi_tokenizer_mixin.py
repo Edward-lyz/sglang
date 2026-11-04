@@ -258,6 +258,9 @@ def _handle_output_by_index(output, i):
                 output, "customized_info", i, check_length=False
             ),
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
+            trace_infos=_extract_field_by_index(
+                output, "trace_infos", i, check_length=False
+            ),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
@@ -268,6 +271,7 @@ def _handle_output_by_index(output, i):
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            detokenize_completed_time=output.detokenize_completed_time,
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
@@ -292,6 +296,9 @@ def _handle_output_by_index(output, i):
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),
+            generated_token_nums=_extract_field_by_index(
+                output, "generated_token_nums", i
+            ),
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
@@ -365,6 +372,10 @@ def _handle_output_by_index(output, i):
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
+            ),
+            detokenize_completed_time=output.detokenize_completed_time,
+            trace_infos=_extract_field_by_index(
+                output, "trace_infos", i, check_length=False
             ),
         )
     else:

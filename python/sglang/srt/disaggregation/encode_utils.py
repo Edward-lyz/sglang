@@ -28,6 +28,7 @@ def normalize_transfer_type(backend: str) -> str:
     return _TRANSFER_TYPE_MAP.get(backend, backend)
 
 
+from sglang.srt.disaggregation.encode_collector import BatchExecutorCollector  # noqa: F401
 
 
 # ==================== GPU Processor Registry ====================
@@ -75,6 +76,7 @@ class QueueEntry:
 class BatchImplProto(Protocol[ReqType, ResType]):
     """非流式批处理 impl：一次接收一批请求，返回全部结果。"""
     name: str
+    collector: BatchExecutorCollector
 
     def __call__(self, reqs: List[ReqType]) -> Iterable[ResType]:
         """Execute a batch of requests and return all results."""
@@ -88,6 +90,7 @@ class StreamingImplProto(Protocol[ReqType, ResType]):
     不必等一整批全部完成才调度新任务。
     """
     name: str
+    collector: BatchExecutorCollector
 
     def submit(self, req: ReqType) -> Future[ResType]:
         """Submit a single request and return a Future for its result."""
@@ -97,7 +100,7 @@ class StreamingImplProto(Protocol[ReqType, ResType]):
 class _BaseExecutor(Generic[ReqType, ResType]):
     """BatchExecutor 和 StreamExecutor 的公共基类。"""
 
-    def __init__(self, name: str, 
+    def __init__(self, name: str, collector: BatchExecutorCollector,
                  backlog: int = 100000):
         """Initialize the base executor.
 
@@ -107,6 +110,7 @@ class _BaseExecutor(Generic[ReqType, ResType]):
             backlog: Maximum queue capacity for pending requests.
         """
         self._name = name
+        self._collector = collector
         self.stopped = False
         self.requests: queue.Queue[Optional[QueueEntry]] = queue.Queue(backlog)
         self._pending_num_tokens = 0
@@ -155,7 +159,7 @@ class BatchExecutor(_BaseExecutor[ReqType, ResType]):
                    candidate requests to execute. Defaults to scheduling all.
             backlog: Maximum queue capacity for pending requests.
         """
-        super().__init__(impl.name, backlog=backlog)
+        super().__init__(impl.name, impl.collector, backlog=backlog)
         self._impl = impl
         self._sched = sched or (lambda reqs: reqs)
         self._waiting: List[QueueEntry] = []
@@ -227,6 +231,7 @@ class BatchExecutor(_BaseExecutor[ReqType, ResType]):
 
         batch = self.__split(candidates, scheduled_reqs)
 
+        self._collector.set_queue_wait_num_reqs(self.requests.qsize() + len(self._waiting))
 
         logger.debug(f"{self._name} sched {[e.req.rid for e in batch]}"
                      + (f", waiting {len(self._waiting)}" if self._waiting else ""))
@@ -239,7 +244,10 @@ class BatchExecutor(_BaseExecutor[ReqType, ResType]):
 
         start = time.monotonic()
 
+        for e in batch:
+            self._collector.observe_queue_wait_seconds(start - e.enqueue_time)
 
+        self._collector.observe_sched_bubble_seconds(start - self._last_step_end_tic)
 
         try:
             outs = list(self._impl(inputs))
@@ -269,10 +277,13 @@ class BatchExecutor(_BaseExecutor[ReqType, ResType]):
             self._last_step_end_tic = now = time.monotonic()
             cost = now - start
             if batch_size and num_tokens:
+                self._collector.observe_batch_size(batch_size)
+                self._collector.observe_num_tokens(num_tokens)
                 logger.debug(
                     f"{self._name} batch: {batch_size}, tokens: {num_tokens}, "
                     f"cost: {cost:.3f}s, throughput: {num_tokens/cost:.1f} tokens/s"
                 )
+            self._collector.observe_run_batch_seconds(cost)
 
     def serve(self):
         """Run the batch serve loop until stopped and all queued requests are drained."""
@@ -305,7 +316,7 @@ class StreamExecutor(_BaseExecutor[ReqType, ResType]):
             impl: The streaming implementation that provides a submit() method.
             backlog: Maximum queue capacity for pending requests.
         """
-        super().__init__(impl.name, backlog=backlog)
+        super().__init__(impl.name, impl.collector, backlog=backlog)
         self._impl = impl
         # impl_future -> (user_future, submit_time)
         self.in_flight: Dict[Future[ResType], Tuple[Future[ResType], float]] = {}
@@ -343,7 +354,11 @@ class StreamExecutor(_BaseExecutor[ReqType, ResType]):
         while True:
             entries = self.__get_reqs()
 
+            self._collector.set_queue_wait_num_reqs(self.requests.qsize())
             for entry in entries:
+                self._collector.observe_queue_wait_seconds(
+                    time.monotonic() - entry.enqueue_time
+                )
                 logger.debug(f"{self._name} submit {entry.req.rid}")
                 impl_fut = self._impl.submit(entry.req)
                 self.in_flight[impl_fut] = (entry.future, time.monotonic())
@@ -358,6 +373,9 @@ class StreamExecutor(_BaseExecutor[ReqType, ResType]):
 
             for impl_fut in done:
                 user_fut, start_time = self.in_flight.pop(impl_fut)
+                self._collector.observe_run_batch_seconds(
+                    time.monotonic() - start_time
+                )
                 try:
                     result = impl_fut.result()
                     if not user_fut.done():
@@ -714,9 +732,11 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, 
                         format='%(asctime)s %(filename)s:%(lineno)d - %(levelname)s - %(message)s')
 
+    collector = BatchExecutorCollector("test")
 
     def _wrap(impl):
         impl.name = "test"
+        impl.collector = collector
         return impl
 
     @dataclass
@@ -1109,6 +1129,7 @@ if __name__ == "__main__":
         class StreamImpl:
             """Stream implementation for testing."""
             name = "test_stream"
+            collector = collector
             def __init__(self):
                 self._pool = ThreadPoolExecutor(4)
             def submit(self, req):
@@ -1142,6 +1163,7 @@ if __name__ == "__main__":
         class StreamImpl:
             """Stream implementation for testing."""
             name = "test_stream_sw"
+            collector = collector
             def __init__(self):
                 self._pool = ThreadPoolExecutor(2)
             def submit(self, req):
@@ -1177,6 +1199,7 @@ if __name__ == "__main__":
         class StreamImpl:
             """Stream implementation for testing."""
             name = "test_stream_err"
+            collector = collector
             def __init__(self):
                 self._pool = ThreadPoolExecutor(4)
             def submit(self, req):
@@ -1214,6 +1237,7 @@ if __name__ == "__main__":
         class StreamImpl:
             """Stream implementation for testing."""
             name = "test_stream_drain"
+            collector = collector
             def __init__(self):
                 self._pool = ThreadPoolExecutor(2)
             def submit(self, req):
@@ -1243,6 +1267,7 @@ if __name__ == "__main__":
         class StreamImpl:
             """Stream implementation for testing."""
             name = "test_stream_cancel"
+            collector = collector
             def __init__(self):
                 self._pool = ThreadPoolExecutor(4)
             def submit(self, req):

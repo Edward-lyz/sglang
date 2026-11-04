@@ -18,6 +18,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from sglang.srt.observability.req_time_stats import monotonic_time
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
         request: Union[ChatCompletionRequest, CompletionRequest],
         raw_request: Request,
     ) -> Union[TokenizeResponse, ErrorResponse]:
+        received_time = monotonic_time()
         try:
             error_msg = serving._validate_request(request)
             if error_msg:
@@ -120,6 +122,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
             adapted_request, _ = serving._convert_to_internal_request(
                 request, raw_request
             )
+            adapted_request.received_time = received_time
             token_ids = await self.tokenizer_manager.tokenize_request(
                 adapted_request, raw_request
             )

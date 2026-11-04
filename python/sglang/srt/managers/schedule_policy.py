@@ -610,6 +610,7 @@ class PrefillAdder:
         self.batch_has_partial_req = False
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
+        self.log_host_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
@@ -1017,6 +1018,7 @@ class PrefillAdder:
         extend_input_len: int,
         max_new_tokens: int,
         retracted_stain: bool,
+        host_hit_len: int,
         mamba_gap_reserve: int = 0,
         cost=None,
         mamba_slots_needed: int = 0,
@@ -1058,6 +1060,7 @@ class PrefillAdder:
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
         self.log_hit_tokens += prefix_len
+        self.log_host_hit_tokens += host_hit_len
         self.log_input_tokens += extend_input_len
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
@@ -1093,6 +1096,7 @@ class PrefillAdder:
             trunc_len,
             0,
             req.retracted_stain,
+            host_hit_len=req.host_hit_length,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             mamba_slots_needed=self._mamba_slots_for_req(req),
         )
@@ -1143,6 +1147,7 @@ class PrefillAdder:
             req.extend_range.length,
             max_new_tokens,
             req.retracted_stain,
+            host_hit_len=req.host_hit_length,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             mamba_slots_needed=self._mamba_slots_for_req(req),
         )
@@ -1273,6 +1278,7 @@ class PrefillAdder:
                 else 0
             ),
             req.retracted_stain,
+            host_hit_len=0,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             mamba_slots_needed=self._mamba_slots_for_req(req),
             # Decision-side only: charging the replay ranks would let their
@@ -1495,6 +1501,7 @@ class PrefillAdder:
                 req.extend_range.length,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
+                host_hit_len=0,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 mamba_slots_needed=self._mamba_slots_for_req(req),
                 cost=self._req_cost(len(req.prefix_indices), req.extend_range.length),
@@ -1524,6 +1531,7 @@ class PrefillAdder:
                 trunc_len,
                 0,
                 req.retracted_stain,
+                host_hit_len=0,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 mamba_slots_needed=self._mamba_slots_for_req(req),
                 cost=self._req_cost(len(req.prefix_indices), trunc_len),
@@ -2004,6 +2012,7 @@ class PrefillAdder:
                     trunc_len,
                     0,
                     req.retracted_stain,
+                    host_hit_len=req.host_hit_length,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                     mamba_slots_needed=self._mamba_slots_for_req(req),
                     cost=self._req_cost(prefix_len, trunc_len),

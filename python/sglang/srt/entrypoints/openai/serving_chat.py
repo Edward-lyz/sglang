@@ -1249,6 +1249,8 @@ class OpenAIServingChat(OpenAIServingBase):
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
+            trace_config=request.trace_config,
+            continuation_token_ids=request.continuation_token_ids,  # appended to input_ids in tokenizer_manager
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
             return_prompt_token_ids=request.return_prompt_token_ids
             or request.return_token_ids,
@@ -2771,10 +2773,20 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         adapted_request: GenerateReqInput,
     ) -> RequestContext:
+        custom_params = request.custom_params or {}
+        request_trace_config = (
+            getattr(request, "trace_config", None)
+            or custom_params.get("trace_config", None)
+            or {}
+        )
+        trace_config = DETECTION_CONFIG.build_trace_config()
+        trace_config.update(request_trace_config)
+        adapted_request.trace_config
 
         req_ctx = RequestContext(
             rid=request.rid,
             tokenizer_manager=self.tokenizer_manager,
+            trace_config=trace_config,
         )
         return req_ctx
 

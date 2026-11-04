@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -255,7 +256,7 @@ def _fill_static_sync_values(
 
 
 def prepare_mlp_sync_batch_raw(
-    local_batch: ScheduleBatch,
+    local_batch: Optional[ScheduleBatch],
     dp_size: int,
     attn_tp_size: int,
     attn_cp_size: int,
@@ -331,6 +332,9 @@ def prepare_mlp_sync_batch_raw(
         group = tp_group.cpu_group
         device = "cpu"
 
+    # Start timing DP all_gather
+    start_time = time.perf_counter()
+
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
     if use_world_group:
         dp_size = _resolve_elastic_world_dp_size(
@@ -378,7 +382,15 @@ def prepare_mlp_sync_batch_raw(
     else:
         need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
 
+    # DP all_gather latency (seconds)
+    all_gather_latency = time.perf_counter() - start_time
+
+    if local_batch is not None:
+        local_batch.dp_global_num_tokens_for_metric = mlp_sync_info.global_num_tokens
+        local_batch.all_gather_latency = all_gather_latency
+
     batch_to_gather = local_batch
+
     if need_idle_batch:
         if local_batch is None:
             batch_to_gather = local_batch = get_idle_batch()
@@ -390,6 +402,7 @@ def prepare_mlp_sync_batch_raw(
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
+        batch_to_gather.all_gather_latency = all_gather_latency
 
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
     # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.

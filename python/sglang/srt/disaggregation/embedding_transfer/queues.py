@@ -176,6 +176,10 @@ class MMTransferQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        if self.mm_receiver.mm_receiver_metrics_collector is not None:
+            self.mm_receiver.mm_receiver_metrics_collector.set_waiting_requests(
+                len(self.queue)
+            )
 
         if ready_reqs:
             rids = [
@@ -253,6 +257,9 @@ class MMTransferQueue:
             # assembly can fail on its own.  Abort rather than hand the
             # scheduler a request without mm_inputs.
             if waiting_req.recv_req.mm_inputs is None:
+                metrics = self.mm_receiver.mm_receiver_metrics_collector
+                if metrics is not None:
+                    metrics.increment_failed_requests()
                 error_msg = waiting_req.error_msg or "Image embedding assembly failed"
                 logger.error(
                     f"Waiting request {waiting_req.recv_req.rid} assembly failed: "
@@ -267,6 +274,11 @@ class MMTransferQueue:
                 )
                 return True
             ready_reqs.append(waiting_req.recv_req)
+            metrics = self.mm_receiver.mm_receiver_metrics_collector
+            if metrics is not None:
+                metrics.observe_embedding_transfer_time(
+                    time.time() - waiting_req.start_time
+                )
             return True
 
         if status_value == int(WaitingImageRequestStatus.FAIL):
@@ -277,6 +289,9 @@ class MMTransferQueue:
                     waiting_req.error_msg or "Image embedding failed on another rank",
                     waiting_req.error_code or err_code or HTTPStatus.BAD_GATEWAY,
                 )
+            metrics = self.mm_receiver.mm_receiver_metrics_collector
+            if metrics is not None:
+                metrics.increment_failed_requests()
             logger.error(
                 f"Waiting request {waiting_req.recv_req.rid} failed: "
                 f"{waiting_req.error_msg} error_code={waiting_req.error_code}"
@@ -298,6 +313,9 @@ class MMTransferQueue:
             )
             if waiting_req.status == WaitingImageRequestStatus.PENDING:
                 waiting_req.mark_timeout(timeout_msg)
+            metrics = self.mm_receiver.mm_receiver_metrics_collector
+            if metrics is not None:
+                metrics.increment_timeout_requests()
             logger.error(
                 f"Timed out waiting for image embeddings for request "
                 f"{waiting_req.recv_req.rid}"

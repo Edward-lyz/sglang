@@ -1479,6 +1479,7 @@ class CommonKVReceiver(BaseKVReceiver):
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
+        self.bootstrap_infos = None
         self.kv_mgr = mgr
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False

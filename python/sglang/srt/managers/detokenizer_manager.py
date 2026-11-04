@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """DetokenizerManager is a process that detokenizes the token ids."""
-
+import time
 import dataclasses
 import logging
 import os
@@ -109,8 +109,31 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Init dispatcher
         self.init_request_dispatcher()
+
+        # Init metrics
+        self.init_metrics(server_args)
+
         # Init disaggregation vars
         self.disaggregation_mode = DisaggregationMode(server_args.disaggregation_mode)
+
+
+    def init_metrics(self, server_args: ServerArgs):
+        """Initialize metrics"""
+        from sglang.srt.observability.metrics_collector import (
+            DetokenizerMetricsCollector,
+        )
+
+        self.enable_metrics = server_args.enable_metrics
+        if self.enable_metrics:
+            self.metrics_collector = DetokenizerMetricsCollector(
+                labels={
+                    "model_name": server_args.served_model_name,
+                    "node_rank": server_args.node_rank,
+                    "dp_rank": 0,
+                    # TODO: Add lora name/path in the future,
+                },
+            )
+
 
     def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):
         context = zmq.Context(2)
@@ -294,12 +317,20 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
         vocab_size = self.vocab_size
+        generated_token_nums = []
+
+        # Check for duplicate rids
+        if len(set(recv_obj.rids)) != len(recv_obj.rids):
+            logger.info(f"Found duplicate rids in batch: {recv_obj.rids}")
 
         # Initialize decode status
         read_ids, surr_ids = [], []
+        token_num = 0
         for i in range(bs):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
+                if len(self.decode_status) == DETOKENIZER_MAX_STATES:
+                    logger.info("Decode status is at capacity in batch: {recv_obj.rids}, dropping new requests")
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=self._clamp_decode_ids(
@@ -314,6 +345,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 s.decode_ids.extend(
                     self._clamp_decode_ids(recv_obj.decode_ids[i], vocab_size)
                 )
+                token_num = len(recv_obj.decode_ids[i])
+
+            generated_token_nums.append(token_num)
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -410,7 +444,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
-        return output_strs
+        return output_strs, generated_token_nums
 
     @staticmethod
     def _b64_encode_per_request(
@@ -433,11 +467,32 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
-        output_strs = (
+        logfunc = logger.debug \
+            if self.disaggregation_mode != DisaggregationMode.PREFILL else \
+                logger.info
+        if recv_obj.rids:
+            rids = [r for r in recv_obj.rids if not r.startswith("HEALTH_CHECK")]
+            if rids:
+                logfunc("[trace] detokenizer received %s from scheduler", rids)
+
+        start = time.perf_counter()
+
+        output_strs, generated_token_nums = (
             self._decode_batch_token_id_output(recv_obj)
             if len(recv_obj.rids) > 0
-            else []
+            else ([], [])
         )
+        detokenize_completed_perf = time.perf_counter()
+        # Wall-clock timestamp used for the cross-process
+        # detokenizer->tokenizer zmq latency metric. `perf_counter` is
+        # process-local and not comparable across processes, so we must
+        # use `time.time()` here for the value we ship out.
+        detokenize_completed_time = time.time()
+
+        if self.enable_metrics:
+            self.metrics_collector.observe_detokenizer_time(
+                detokenize_completed_perf - start
+            )
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
@@ -446,6 +501,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
             output_ids=recv_obj.output_ids,
+            generated_token_nums=generated_token_nums,
             prompt_tokens=recv_obj.prompt_tokens,
             reasoning_tokens=recv_obj.reasoning_tokens,
             completion_tokens=recv_obj.completion_tokens,
@@ -479,12 +535,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,
             customized_info=recv_obj.customized_info,
+            trace_infos=recv_obj.trace_infos,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
+            detokenize_completed_time=detokenize_completed_time,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
@@ -520,7 +578,7 @@ def run_detokenizer_process(
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
-    configure_logger(server_args)
+    configure_logger(server_args, " Detokenizer")
     parent_process = psutil.Process().parent()
 
     manager = None

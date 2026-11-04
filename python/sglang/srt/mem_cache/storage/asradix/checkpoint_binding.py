@@ -28,6 +28,9 @@ from .transport import (
     _PassiveStore,
     _sdk_pod_config,
     _standard_namespace,
+    cache_digest_enabled,
+    cache_digest_logger,
+    page_digest,
 )
 from .types import (
     AttentionStoreBinding,
@@ -120,6 +123,57 @@ class KDACheckpointStore:
             )
         return dict(slot_map), int(slot_map[self._slot_group])
 
+    def _snapshot_digests(self, slot_id: int) -> Optional[list]:
+        """Hash one KDA state slot in HBM, first and last layer per component.
+
+        State buffers are ``[layer, slot, ...]``, so the slot has to be indexed
+        inside a layer row. Only the first and last component (temporal head,
+        conv tail) and the first and last layer are hashed: hashing every
+        component of every layer costs a D2H copy each and adds nothing when the
+        point is to compare a write against its read-back.
+        """
+        if not cache_digest_enabled():
+            return None
+        try:
+            tensors = getattr(self.layout, "tensors", ())
+            if not tensors:
+                return None
+            names = getattr(self.layout, "payload_fields", ())
+            components = [0] if len(tensors) == 1 else [0, len(tensors) - 1]
+            snapshot = []
+            for component in components:
+                tensor = tensors[component]
+                layer_num = int(tensor.shape[0])
+                layers = [0] if layer_num == 1 else [0, layer_num - 1]
+                name = names[component] if component < len(names) else str(component)
+                for layer in layers:
+                    snapshot.append((name, layer, page_digest(tensor[layer], slot_id)))
+            return snapshot
+        except Exception as exc:  # diagnostic only, never break the transfer
+            cache_digest_logger.warning("AS kda digest snapshot failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _emit_digests(
+        action: str,
+        snapshot: Optional[list],
+        block_hash_id: int,
+        slot_id: int,
+        transferred: int,
+    ) -> None:
+        """Print a captured KDA state digest so read-back can be compared."""
+        if not snapshot:
+            return
+        cache_digest_logger.info(
+            "AS %s digest: family=kda_state slot=%d block_hash_id=%d "
+            "transferred=%s digests=%s",
+            action,
+            int(slot_id),
+            int(block_hash_id),
+            transferred,
+            snapshot,
+        )
+
     def match(self, block_hash_ids: Sequence[int], timeout: float = 1.0) -> int:
         """Return the matched KDA checkpoint prefix length."""
         from attentionstore_sdk.sdk import MatchRequest
@@ -162,10 +216,12 @@ class KDACheckpointStore:
         )
         self._acquire_sdk_lock(remaining, "write")
         # Snapshot before the SDK call: this is the state content the Agent gets.
+        snapshot = self._snapshot_digests(slot_id)
         try:
             written = self._sdk.write(request)
         finally:
             self._sdk_lock.release()
+        self._emit_digests("write", snapshot, block_hash_id, slot_id, written)
         return written
 
     def read(
@@ -202,6 +258,9 @@ class KDACheckpointStore:
                 self._unpack_hook([slot_map])
         finally:
             self._sdk_lock.release()
+        self._emit_digests(
+            "read", self._snapshot_digests(slot_id), block_hash_id, slot_id, count
+        )
         return count
 
     def stop(self) -> None:

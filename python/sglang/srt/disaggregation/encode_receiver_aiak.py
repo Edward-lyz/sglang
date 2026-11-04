@@ -35,6 +35,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.metrics.encode_collector import MMReceiverMetricsCollector
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_local_ip_auto, get_zmq_socket_on_host
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -129,6 +130,18 @@ class MMReceiverHTTP(MMReceiverBase):
             self.nnodes = server_args.nnodes
             self.scheduler = scheduler
             self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
+            self.mm_receiver_metrics_collector = None
+            if (
+                self.scheduler is not None
+                and self.scheduler.enable_metrics
+                and hasattr(self.scheduler, "metrics_collector")
+            ):
+                labels = dict(self.scheduler.metrics_collector.labels)
+                labels["mm_transfer_mode"] = "zmq_to_scheduler"
+                self.mm_receiver_metrics_collector = MMReceiverMetricsCollector(
+                    labels=labels
+                )
+                self.mm_receiver_metrics_collector.set_waiting_requests(0)
             if hf_config is not None:
                 transport_mode = _determine_tensor_transport_mode(server_args)
                 import_processors("sglang.srt.multimodal.processors")
@@ -192,6 +205,11 @@ class MMReceiverHTTP(MMReceiverBase):
             disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
             vocab_size=self.scheduler.model_config.vocab_size,
             priority=recv_req.priority,
+            metrics_collector=(
+                self.scheduler.metrics_collector
+                if self.scheduler.enable_metrics
+                else None
+            ),
             http_worker_ipc=recv_req.http_worker_ipc,
             dllm_config=self.scheduler.dllm_config,
         )
@@ -252,6 +270,30 @@ class MMReceiverHTTP(MMReceiverBase):
         )
         return packed.tolist()
 
+    def _report_buffer_pool_metrics(self) -> None:
+        """Report pinned embedding pool utilization if available.
+
+        The metric names say "gpu" for historical reasons; the pool is CPU
+        pinned memory (see _MooncakeBufferManager).
+        """
+        if self.mm_receiver_metrics_collector is None or not self.enable_mooncake_in_zmq_mode:
+            return
+        # Followers do not register a Mooncake buffer pool; touching the
+        # singleton would force the multi-GB pinned buffer to be allocated
+        # (SGLANG_MC_POOL_GB, default 2).
+        if not self._is_first_rank():
+            return
+        try:
+            buf_mgr = _MooncakeBufferManager.get_instance()
+            pool = buf_mgr._pool
+            self.mm_receiver_metrics_collector.set_gpu_buffer_pool_used_bytes(
+                pool.used_bytes()
+            )
+            self.mm_receiver_metrics_collector.set_gpu_buffer_pool_total_bytes(
+                pool.total_bytes
+            )
+        except Exception:
+            pass
 
     # For zmq_to_scheduler
     def process_waiting_requests(self, recv_reqs):
@@ -264,6 +306,7 @@ class MMReceiverHTTP(MMReceiverBase):
         Returns:
             (non_mm_recv_reqs, mm_waiting_reqs, abort_reqs)
         """
+        self._report_buffer_pool_metrics()
         new_recv_reqs = []
         mm_waiting_reqs: List[WaitingImageRequest] = []
         abort_reqs = []

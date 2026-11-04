@@ -156,6 +156,19 @@ class TestAttentionStorePageWriteBarrier(unittest.TestCase):
         self.assertIs(store.kwargs.get("producer_ready"), event)
 
 
+class TestAttentionStoreCacheDigestSwitch(unittest.TestCase):
+    """摘要日志默认关闭,只在排查缓存内容问题时通过接口临时打开。"""
+
+    def tearDown(self):
+        transport_mod.set_cache_digest_enabled(None)
+
+    def test_override_turns_the_digest_log_on_and_off(self):
+        transport_mod.set_cache_digest_enabled(True)
+        self.assertTrue(transport_mod.cache_digest_enabled())
+
+        transport_mod.set_cache_digest_enabled(False)
+        self.assertFalse(transport_mod.cache_digest_enabled())
+
 
 if __name__ == "__main__":
     unittest.main()

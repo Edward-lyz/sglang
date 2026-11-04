@@ -10,7 +10,7 @@ from typing import (
     Optional,
     Tuple,
 )
-
+from sglang.srt.environ import envs
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -64,8 +64,8 @@ class PoolStats:
         usage = self.full_token_usage
         if self.is_hybrid_swa:
             usage = max(usage, self.swa_token_usage)
-        if self.is_hybrid_ssm:
-            usage = max(usage, self.mamba_usage)
+        if self.is_hybrid_ssm and not envs.SGLANG_BLOCK_METRICS_K3.get():
+            usage = max(usage, self.mamba_usage) 
         assert usage is not None and usage >= 0, f"{usage=} is not valid"
         return usage
 

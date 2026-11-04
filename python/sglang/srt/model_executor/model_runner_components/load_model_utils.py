@@ -291,6 +291,7 @@ def load_model_with_memory_saver(
             load_config=load_config,
             model_config=model_config,
         )
+        loader._role = "draft" if is_draft_worker else "target"
         model = loader.load_model(
             model_config=model_config,
             device_config=DeviceConfig(device, gpu_id),

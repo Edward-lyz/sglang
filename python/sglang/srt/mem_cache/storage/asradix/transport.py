@@ -2,35 +2,92 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import time
 from numbers import Integral
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+import torch
+
 from .types import AttentionStoreInitContext
 
 logger = logging.getLogger(__name__)
 # Cache-content diagnostic. Separate logger so it can be silenced or routed to
 # its own file without touching the normal AS logs.
+cache_digest_logger = logging.getLogger("asradix.cache_digest")
 # Runtime override for the digest log, set through /set_internal_state. None
 # means "no override", so the env default applies. Each PP rank keeps its own
 # copy: the control request walks the whole PP chain, so every rank gets it.
+_cache_digest_override: Optional[bool] = None
 
 
+def set_cache_digest_enabled(enabled: Optional[bool]) -> None:
+    """Turn the AttentionStore cache-content digest log on or off at runtime.
+
+    The digest costs a D2H copy plus a hash per page, so it stays off by default
+    and is only switched on while a cache-content problem is being chased.
+    Passing ``None`` drops the override and restores the env default.
+    """
+    global _cache_digest_override
+    _cache_digest_override = None if enabled is None else bool(enabled)
+    cache_digest_logger.info(
+        "AS cache digest log %s",
+        "off (env default)" if enabled is None else ("on" if enabled else "off"),
+    )
 
 
+def cache_digest_enabled() -> bool:
+    """Report whether the AttentionStore cache-content digest log is on."""
+    if _cache_digest_override is not None:
+        return _cache_digest_override
+
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_LOG_AS_CACHE_DIGEST.get()
 
 
 # Runtime override for the producer-event barrier diagnostic. Same on/off
 # split as the cache digest: it logs whether an event fenced anything and,
 # on read, whether the page content matches what the SDK gathered.
+_barrier_debug_override: Optional[bool] = None
 
 
+def set_barrier_debug_enabled(enabled: Optional[bool]) -> None:
+    """Turn the producer-event barrier diagnostic on or off at runtime."""
+    global _barrier_debug_override
+    _barrier_debug_override = None if enabled is None else bool(enabled)
+    cache_digest_logger.info(
+        "AS barrier debug log %s",
+        "off (env default)" if enabled is None else ("on" if enabled else "off"),
+    )
 
 
+def barrier_debug_enabled() -> bool:
+    """Report whether the producer-event barrier diagnostic is on."""
+    if _barrier_debug_override is not None:
+        return _barrier_debug_override
+
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_LOG_AS_BARRIER_DEBUG.get()
 
 
+def page_digest(tensor, page_id: int, rows_per_page: int = 1) -> str:
+    """MD5 the buffer rows one page occupies inside a layer buffer.
+
+    A token-major KV buffer stores ``rows_per_page`` token rows per page, so the
+    digest has to cover the whole row range the transfer moves, not just row
+    ``page_id``. Bytes are taken through a uint8 view because fp8 and bf16 have
+    no numpy dtype, and the digest is truncated to 12 hex chars: the log is only
+    ever compared against another line from the same run.
+    """
+    rows_per_page = max(1, int(rows_per_page))
+    start = int(page_id) * rows_per_page
+    rows = tensor[start : start + rows_per_page]
+    host = rows.detach().to("cpu", copy=True).contiguous()
+    return hashlib.md5(host.view(torch.uint8).numpy()).hexdigest()[:12]
 
 
 def wait_for_producer_event(
@@ -47,11 +104,17 @@ def wait_for_producer_event(
     read a page that is still being written.
     """
     if event is None:
+        if barrier_debug_enabled():
+            cache_digest_logger.info(
+                "AS barrier %s: producer_ready=None (no event to wait on)",
+                debug_tag,
+            )
         return
     query = getattr(event, "query", None)
     if query is None:
         raise RuntimeError(f"{operation} event does not support bounded polling")
     already_done = query()
+    started = time.monotonic() if barrier_debug_enabled() else 0.0
     deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
     polls = 0
     while not query():
@@ -59,6 +122,19 @@ def wait_for_producer_event(
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"{operation} producer wait timed out")
         time.sleep(0.001)
+    if barrier_debug_enabled():
+        # already_done=True at the top of this call means the event fenced
+        # nothing: whatever kernels were still running when it was recorded
+        # had already finished by the time we got here, or it was recorded
+        # against a stream with nothing relevant queued on it (e.g. an
+        # alt_stream side branch the default-stream event never covers).
+        cache_digest_logger.info(
+            "AS barrier %s: already_done=%s waited_polls=%d wait_ms=%.3f",
+            debug_tag,
+            already_done,
+            polls,
+            (time.monotonic() - started) * 1000,
+        )
 
 
 def _once(release: Callable[[], None]) -> Callable[[], None]:
@@ -242,10 +318,146 @@ class _BufferPageIO:
             result.append((int(hash_id), pages))
         return tuple(result)
 
+    def _read_prefix(self, block_hash_ids, page_ids, read: int):
+        """Narrow a read request to the blocks the Agent actually filled.
 
+        A partial read leaves the tail buffers holding whatever was there
+        before, so digesting them would report a mismatch that says nothing
+        about the blocks that did come back.
+        """
+        count = max(0, min(int(read), len(block_hash_ids)))
+        pages = count * self._pages_per_block
+        return block_hash_ids[:count], page_ids[:pages]
 
+    def _rows_per_page(self, name: str, position: int, tensor) -> int:
+        """Return how many buffer rows one local page occupies.
 
+        Mirrors the layout split in ``_uniform_page_bytes``: a token-major
+        buffer (first dim covers every token slot in the pool) holds one row per
+        token, while a page-major buffer already holds one row per local page.
+        """
+        page_size = self._local_page_size or 1
+        pools = self._buffer_pools.get(name, ())
+        pool = pools[position] if position < len(pools) else None
+        pool_size = getattr(pool, "size", None)
+        if pool_size is not None and int(tensor.shape[0]) >= int(pool_size):
+            return int(page_size)
+        pool_page_size = int(getattr(pool, "page_size", page_size) or page_size)
+        return max(1, int(page_size) // pool_page_size)
 
+    def _snapshot_digests(
+        self,
+        block_hash_ids: Sequence[int],
+        page_ids: Sequence[int],
+    ) -> Optional[list]:
+        """Hash the HBM pages a transfer touches, grouped per logical block.
+
+        Only the first and last local layer are hashed: hashing every layer costs
+        a D2H copy per layer per page, and a corruption that spares both ends of
+        the layer range is not a case worth paying for by default.
+        """
+        if not cache_digest_enabled() or not block_hash_ids:
+            return None
+        try:
+            blocks = self._logical_blocks(block_hash_ids, page_ids)
+            snapshot = []
+            for name, tensors in self._buffer_tensors.items():
+                if not tensors:
+                    continue
+                positions = [0] if len(tensors) == 1 else [0, len(tensors) - 1]
+                for position in positions:
+                    tensor = tensors[position]
+                    rows_per_page = self._rows_per_page(name, position, tensor)
+                    snapshot.append(
+                        (
+                            name,
+                            position,
+                            (
+                                self._layer_ids[position]
+                                if position < len(self._layer_ids)
+                                else -1
+                            ),
+                            [
+                                (
+                                    hash_id,
+                                    [
+                                        page_digest(tensor, page, rows_per_page)
+                                        for page in pages
+                                    ],
+                                )
+                                for hash_id, pages in blocks
+                            ],
+                        )
+                    )
+            return snapshot
+        except Exception as exc:  # diagnostic only, never break the transfer
+            cache_digest_logger.warning("AS digest snapshot failed: %s", exc)
+            return None
+
+    def _debug_recheck_after_sync(
+        self, block_hash_ids: Sequence[int], page_ids: Sequence[int], tag: str
+    ) -> None:
+        """After a full device sync, re-hash the same pages the write snapshot
+        saw. If the barrier fenced everything, these digests must equal the
+        write-time snapshot. Any page that was all-zero at write time but
+        non-zero here proves the producer had NOT finished when the barrier
+        released -- i.e. the event missed that page's real producer stream.
+        Guarded by the barrier-debug switch because it forces a hard sync.
+        """
+        if not barrier_debug_enabled() or not block_hash_ids:
+            return
+        try:
+            torch.cuda.synchronize()
+            blocks = self._logical_blocks(block_hash_ids, page_ids)
+            for name, tensors in self._buffer_tensors.items():
+                if not tensors:
+                    continue
+                positions = [0] if len(tensors) == 1 else [0, len(tensors) - 1]
+                for position in positions:
+                    tensor = tensors[position]
+                    rows_per_page = self._rows_per_page(name, position, tensor)
+                    layer_id = (
+                        self._layer_ids[position]
+                        if position < len(self._layer_ids)
+                        else -1
+                    )
+                    post = [
+                        (
+                            hash_id,
+                            [
+                                page_digest(tensor, page, rows_per_page)
+                                for page in pages
+                            ],
+                        )
+                        for hash_id, pages in blocks
+                    ]
+                    cache_digest_logger.info(
+                        "AS post-sync recheck %s: family=%s layer_id=%s digests=%s",
+                        tag,
+                        name,
+                        layer_id,
+                        post,
+                    )
+        except Exception as exc:
+            cache_digest_logger.warning("AS post-sync recheck failed: %s", exc)
+
+    @staticmethod
+    def _emit_digests(action: str, snapshot: Optional[list], transferred: int) -> None:
+        """Print a previously captured digest snapshot once the transfer is done."""
+        if not snapshot:
+            return
+        for name, position, layer_id, digests in snapshot:
+            cache_digest_logger.info(
+                "AS %s digest: family=%s layer_pos=%d layer_id=%s "
+                "blocks=%d transferred=%s digests=%s",
+                action,
+                name,
+                position,
+                layer_id,
+                len(digests),
+                transferred,
+                digests,
+            )
 
     def match(self, block_hash_ids: Sequence[int], timeout: float = 1.0) -> int:
         """Return the matched page prefix length."""
@@ -273,6 +485,7 @@ class _BufferPageIO:
             self._logical_blocks(block_hash_ids, page_ids)
             # Snapshot before the SDK call: the D2H gather happens inside write(),
             # so this is the source content actually handed to the Agent.
+            snapshot = self._snapshot_digests(block_hash_ids, page_ids)
             written = self._sdk.write(
                 WriteRequest(
                     blocks=BlockBatch(
@@ -286,8 +499,13 @@ class _BufferPageIO:
                     h2h_copy=False,
                 )
             )
+            self._emit_digests("write", snapshot, written)
+            self._debug_recheck_after_sync(
+                block_hash_ids, page_ids, "write hash=%s" % (block_hash_ids[:1],)
+            )
             return written
         blocks = self._logical_blocks(block_hash_ids, page_ids)
+        snapshot = self._snapshot_digests(block_hash_ids, page_ids)
         written = self._sdk.write(
             WriteRequest(
                 blocks=BlockBatch(
@@ -300,6 +518,10 @@ class _BufferPageIO:
                 params=params or {},
                 h2h_copy=False,
             )
+        )
+        self._emit_digests("write", snapshot, written)
+        self._debug_recheck_after_sync(
+            block_hash_ids, page_ids, "write hash=%s" % (block_hash_ids[:1],)
         )
         return written
 
@@ -332,12 +554,23 @@ class _BufferPageIO:
                     remote_addrs=remote_addrs or (),
                 )
             )
+            self._emit_digests(
+                "read",
+                self._snapshot_digests(
+                    *self._read_prefix(block_hash_ids, page_ids, read)
+                ),
+                read,
+            )
+            rp_hashes, rp_pages = self._read_prefix(block_hash_ids, page_ids, read)
+            self._debug_recheck_after_sync(
+                rp_hashes, rp_pages, "read hash=%s" % (rp_hashes[:1],)
+            )
             return read
         blocks = self._logical_blocks(block_hash_ids, page_ids)
         block_kwargs = (
             {"logical_start": logical_start} if logical_start is not None else {}
         )
-        return self._sdk.read(
+        read = self._sdk.read(
             ReadRequest(
                 blocks=BlockBatch(
                     hash_ids=tuple(block[0] for block in blocks),
@@ -349,6 +582,15 @@ class _BufferPageIO:
                 timeout=timeout,
                 remote_addrs=remote_addrs or (),
             )
+        )
+        self._emit_digests(
+            "read",
+            self._snapshot_digests(*self._read_prefix(block_hash_ids, page_ids, read)),
+            read,
+        )
+        rp_hashes, rp_pages = self._read_prefix(block_hash_ids, page_ids, read)
+        self._debug_recheck_after_sync(
+            rp_hashes, rp_pages, "read hash=%s" % (rp_hashes[:1],)
         )
         return read
 

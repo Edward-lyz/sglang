@@ -750,6 +750,10 @@ class ModelRunner:
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
+        _role = "draft" if self.is_draft_worker else "target"
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} init_memory_pool start"
+        )
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
@@ -770,6 +774,9 @@ class ModelRunner:
         self._unified_memory_pool = result.unified_memory_pool
 
         self._init_post_memory_pool_components()
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} init_memory_pool done"
+        )
 
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
@@ -862,6 +869,10 @@ class ModelRunner:
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
+        _role = "draft" if self.is_draft_worker else "target"
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} init_attention_backend start"
+        )
         # Must be called BEFORE init_decode_cuda_graph() so CUDA graph capture
         # runs with aux hidden state capture enabled.
         configure_aux_hidden_state_capture(
@@ -881,6 +892,9 @@ class ModelRunner:
 
         if self.server_args.dcp_size > 1 and self.server_args.dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} init_attention_backend done"
+        )
 
     @staticmethod
     def _gather_block_fp8_q_proj(qp, dcp_group):
@@ -1083,6 +1097,8 @@ class ModelRunner:
         )
 
     def load_model(self):
+        _role = "draft" if self.is_draft_worker else "target"
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model start")
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
@@ -1127,6 +1143,7 @@ class ModelRunner:
             server_args=self.server_args, tp_rank=self.ps.tp_rank
         )
 
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights start")
         loaded = load_model_with_memory_saver(
             server_args=self.server_args,
             model_config=self.model_config,
@@ -1142,6 +1159,7 @@ class ModelRunner:
             self.remote_instance_weight_transporter.weight_info = (
                 loaded.remote_instance_weight_info
             )
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights done")
 
         if not self.is_draft_worker:
             get_offloader().post_init()
@@ -1198,18 +1216,26 @@ class ModelRunner:
             dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.rope_cache start")
         reserve_rope_cache_for_long_sequences(
             self.model,
             self.server_args,
             self.model_config,
             logger,
         )
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.rope_cache done")
 
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.sync_barrier start")
         dist_barrier_after_load(
             elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
             is_ep_joiner=self.server_args.is_ep_joiner,
         )
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.sync_barrier done")
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model done")
+
+    def maybe_precompile_model_kernels_after_loading(self) -> None:
+        maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:

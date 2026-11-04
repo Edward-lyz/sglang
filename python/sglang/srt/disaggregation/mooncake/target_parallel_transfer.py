@@ -42,6 +42,11 @@ import numpy.typing as npt
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.utils import FastQueue, TransferKVChunk
+from sglang.srt.observability.mooncake_trace import (
+    MooncakeRequestStage,
+    mooncake_trace_slice,
+)
+from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
@@ -53,6 +58,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+TraceCtx = Union["TraceReqContext", TraceNullContext]
 
 class _RoomCompletion:
     """Cross-thread convergence state for one room's last chunk.
@@ -203,6 +209,12 @@ def process_target_parallel_chunk(
     resolve no destination and drop out, which is the intended blast radius for
     an exception.
     """
+    if mgr.enable_trace:
+        kv_chunk.trace_ctx.rebuild_thread_context()
+        kv_chunk.trace_ctx.trace_slice_start(
+            MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+            MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+        )
 
     if (
         kv_chunk.room not in mgr.request_status
@@ -211,12 +223,14 @@ def process_target_parallel_chunk(
         logger.debug(
             f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
         )
+        _end_worker_trace(mgr, kv_chunk)
         return
 
     # None means the room's bookkeeping is gone (concluded, aborted, or dropped by
     # a sibling unit's exception handler): nothing to transfer, nothing to settle.
     req = mgr.transfer_infos.get(kv_chunk.room, {}).get(kv_chunk.target_session_id)
     if req is None:
+        _end_worker_trace(mgr, kv_chunk)
         return
 
     # Unique id per prefill sender so decode's response set size matches expected_response_num.
@@ -237,6 +251,12 @@ def process_target_parallel_chunk(
         prefill_unique_rank=prefill_unique_rank,
     )
 
+    if mgr.enable_trace:
+        mooncake_trace_slice(
+            kv_chunk.trace_ctx,
+            MooncakeRequestStage.MOONCAKE_WORKER_SEND_SESSION,
+            start_ts,
+        )
 
     if outcome != _OK:
         # _DEFERRED: staging re-enqueued this unit, it reports on the retry.
@@ -245,6 +265,7 @@ def process_target_parallel_chunk(
         # n_targets, so no sibling publishes a status over the failure. Neither
         # case cleans up transfer_infos, matching the legacy path (its cleanup is
         # gated on a Success/absent status too).
+        _end_worker_trace(mgr, kv_chunk)
         return
 
     if kv_chunk.is_last_chunk:
@@ -256,11 +277,19 @@ def process_target_parallel_chunk(
             prefill_unique_rank=prefill_unique_rank,
         )
 
+    _end_worker_trace(mgr, kv_chunk)
     # Gated on the room's terminal status, so a unit that is not the last arrival
     # leaves the bookkeeping its siblings still need.
     _cleanup_finished_room(mgr, kv_chunk.room)
 
 
+def _end_worker_trace(mgr: "MooncakeKVManager", kv_chunk: PerTargetKVChunk) -> None:
+    if mgr.enable_trace:
+        kv_chunk.trace_ctx.trace_slice_end(
+            MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+            MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+            thread_finish_flag=True,
+        )
 
 
 # _transfer_one_target outcomes.

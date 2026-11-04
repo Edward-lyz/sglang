@@ -133,6 +133,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
+            # AttentionStore parameters (populated below from kv_transfer_params)
+            as_kv_cache_params=None,
+            as_max_hit_host_ip=None,
+            as_max_hit_token_len=None,
+            trace_config=request.trace_config,
         )
 
         # Convert kv_cache_params and kv_transfer_params to as_* flat fields

@@ -458,6 +458,8 @@ class CompletionRequest(BaseModel):
     data_parallel_rank: Optional[int] = None
     peer_data_parallel_rank: Optional[int] = None
 
+    # For tracing
+    trace_config: Optional[Dict[str, Any]] = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -935,6 +937,11 @@ class ChatCompletionRequest(BaseModel):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # For AttentionStore (AS) secondary cache
+    kv_transfer_params: Optional[KVTransferParams] = None
+    kv_cache_params: Optional[KVCacheParams] = None
+    # For tracing
+    trace_config: Optional[Dict[str, Any]] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
     # Deprecated: use disagg_prefill_dp_rank instead

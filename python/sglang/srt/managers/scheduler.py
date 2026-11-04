@@ -145,6 +145,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     TokenizeReqOutput,
+    TraceReq,
+    TraceTrigger,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -229,6 +231,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.trace_manager import TraceManager
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
@@ -364,6 +367,7 @@ class Scheduler(
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] Scheduler.__init__ start")
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -404,6 +408,7 @@ class Scheduler(
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
+        self.enable_metrics = self.server_args.enable_metrics
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -496,7 +501,7 @@ class Scheduler(
             attn_tp_cpu_group=self.attn_tp_cpu_group,
             tp_cpu_group=self.tp_cpu_group,
             attn_cp_cpu_group=self.attn_cp_cpu_group,
-            enable_metrics=self.server_args.enable_metrics,
+            enable_metrics=self.enable_metrics,
             enable_kv_cache_events=bool(
                 self.server_args.kv_events_config
                 and self.ps.pp_rank == 0
@@ -600,6 +605,20 @@ class Scheduler(
         # Init LoRA overlap loader
         self.init_lora_overlap_loader()
 
+        # Init trace manager
+        self.trace_manager = TraceManager(
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
+            num_hidden_layers=self.model_config.num_hidden_layers,
+            dp_rank=0 if self.ps.dp_rank is None else self.ps.dp_rank,
+            dp_size=self.ps.dp_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tokenizer=self.tokenizer,
+        )
+
         # Init the grammar backend for constrained generation
         self.init_grammar_manager()
 
@@ -682,7 +701,7 @@ class Scheduler(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
             skip_tokenizer_init=self.server_args.skip_tokenizer_init,
-            metrics_enabled=self.server_args.enable_metrics
+            metrics_enabled=self.enable_metrics
             and (
                 self.ps.attn_tp_rank == 0
                 or self.server_args.enable_metrics_for_all_schedulers
@@ -927,6 +946,7 @@ class Scheduler(
 
     def init_model_worker(self):
         # Load model weights.
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_model_worker start")
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
 
@@ -1024,7 +1044,7 @@ class Scheduler(
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
-        if self.server_args.enable_metrics:
+        if self.enable_metrics:
             self.metrics_collector.emit_constants(
                 max_total_num_tokens=self.max_total_num_tokens,
                 # TODO: max_running_requests_under_SLO has no setter — dead chain.
@@ -1038,6 +1058,8 @@ class Scheduler(
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
             )
+
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_model_worker done")
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -1752,6 +1774,7 @@ class Scheduler(
             configure_gc_logger()
 
     def init_disaggregation(self):
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_disaggregation start")
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
         self.disagg_prefill_inflight_queue = None
@@ -2138,6 +2161,7 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (TraceReq, self.trace_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (
@@ -2318,6 +2342,8 @@ class Scheduler(
                 break
 
             # Receive requests
+            self.iter_start_time = time.perf_counter()
+            self.metrics_reporter.iter_start_time = self.iter_start_time
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -2361,6 +2387,8 @@ class Scheduler(
                 break
 
             # Receive requests
+            self.iter_start_time = time.perf_counter()
+            self.metrics_reporter.iter_start_time = self.iter_start_time
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -2721,6 +2749,7 @@ class Scheduler(
                 server_args=self.server_args, model_config=self.model_config
             ),
             output_streamer=self.output_streamer,
+            fire_pending_trace=self._fire_pending_trace,
             abort_request=self.abort_request,
         )
 
@@ -3006,6 +3035,15 @@ class Scheduler(
             and self.server_args.enable_session_radix_cache
         )
 
+        if envs.AIAK_ENABLE_MSIT_TRACE.get():
+            if recv_req.trace_config is not None and recv_req.trace_config.get(
+                "trace_model"
+            ):
+                self.msit_tracer.enable_trace()
+                self.msit_tracer.configure_new_request(recv_req)
+            else:
+                self.msit_tracer.disable_trace()
+
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request
             if recv_req.input_embeds is not None:
@@ -3039,6 +3077,7 @@ class Scheduler(
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                dispatch_to_scheduler_time=recv_req.dispatch_to_scheduler_time,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
@@ -3059,6 +3098,7 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                trace_config=recv_req.trace_config,
             )
             req.tokenizer = self.tokenizer
             req.continuation_token_ids = recv_req.continuation_token_ids
@@ -3071,6 +3111,17 @@ class Scheduler(
                 req.as_kv_cache_params = recv_req.as_kv_cache_params
                 req.as_max_hit_host_ip = recv_req.as_max_hit_host_ip or []
                 req.as_max_hit_token_len = recv_req.as_max_hit_token_len or []
+            if getattr(recv_req, "dispatch_to_scheduler_time", 0.0):
+                # Keep dispatch timestamp only when present, clamp to zero to avoid negative values
+                req.time_stats.dispatch_to_scheduler_time = max(
+                    0.0, recv_req.dispatch_to_scheduler_time
+                )
+            req.time_stats.arrive_scheduler_time = time.perf_counter()
+            if self.enable_metrics:
+                zmq_time = req.time_stats.get_request_zmq_time()
+                if zmq_time > 0:
+                    self.metrics_collector.observe_request_zmq_time(zmq_time)
+
             if (
                 not is_tokenize_only
                 and self.disaggregation_mode != DisaggregationMode.NULL
@@ -3631,6 +3682,7 @@ class Scheduler(
             recv_req.input_text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            dispatch_to_scheduler_time=recv_req.dispatch_to_scheduler_time,
             positional_embed_overrides=recv_req.positional_embed_overrides,
             token_type_ids=recv_req.token_type_ids,
             routed_dp_rank=recv_req.routed_dp_rank,
@@ -4391,7 +4443,20 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.inflight_middle_chunks += 1
 
+        # Record metrics for reqs that are newly entering forward this round
+        newly_forwarded_reqs = [
+            req for req in can_run_list if req.time_stats.forward_entry_time == 0
+        ]
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if self.enable_metrics:
+            for req in newly_forwarded_reqs:
+                self.metrics_collector.observe_request_waiting_time(
+                    req.time_stats.get_request_waiting_time(),
+                )
+        if can_run_list:
+            rids = [r.rid for r in can_run_list if not r.rid.startswith("HEALTH_CHECK")]
+            if rids:
+                logger.info(f"[trace] run batch: {rids}")
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -4572,6 +4637,11 @@ class Scheduler(
                     f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
                 )
             logger.warning(msg_prefix + msg_details)
+            if retracted_reqs:
+                logger.info(
+                    "Retracted request ids: %s",
+                    [req.rid for req in retracted_reqs],
+                )
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
@@ -4655,6 +4725,8 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        self.iter_forward_start_time = time.time()
+        self.metrics_reporter.iter_forward_start_time = self.iter_forward_start_time
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
 
@@ -4960,6 +5032,13 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+            # With DP attention the ranks must stay in lockstep, so a rank with
+            # nothing to run executes an idle batch instead of falling through to
+            # on_idle(). The metrics refresh hung off on_idle() therefore never
+            # fires there and the "mostrecent" gauges keep exporting the last
+            # busy value -- a flat line on the dashboards. Refresh here as well;
+            # the callee is rate-limited internally, so this stays cheap.
+            self.metrics_reporter._maybe_log_idle_metrics()
 
         self._record_step_counters(batch, result)
 
@@ -5449,6 +5528,21 @@ class Scheduler(
                 )
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
+            # The AS cache digest is a diagnostic log switch, not a server arg:
+            # apply it on this rank and keep it out of the override. The control
+            # request walks every PP rank, so all of them flip together.
+            if "log_as_cache_digest" in server_args_dict:
+                from sglang.srt.mem_cache.storage.asradix.transport import (
+                    set_cache_digest_enabled,
+                )
+
+                set_cache_digest_enabled(bool(remaining.pop("log_as_cache_digest")))
+            if "log_as_barrier_debug" in server_args_dict:
+                from sglang.srt.mem_cache.storage.asradix.transport import (
+                    set_barrier_debug_enabled,
+                )
+
+                set_barrier_debug_enabled(bool(remaining.pop("log_as_barrier_debug")))
             if remaining:
                 get_context().override(source="update_server_args", **remaining)
             logger.info(f"Config updated via context override: {remaining}")
@@ -5644,6 +5738,54 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+
+    def trace_request(self, recv_req: TraceReq):
+        """Handle a trace request from the frontend.
+
+        The frontend only sends the rid. The TraceReq was already built at
+        Req init time from trace_config. We look up the Req and decide
+        whether to execute the trace immediately or defer to on_finish.
+        """
+        req = self._find_req_by_rid(recv_req.rid)
+        if req is None:
+            logger.warning(
+                f"trace_request: rid={recv_req.rid} not found in any queue; skipping"
+            )
+            return
+
+        cfg = req.trace_config
+        if cfg and not cfg.get("enable_trace"):
+            cfg.update({"enable_trace": True})
+        req.to_trace_req = req.build_trace_req()
+        trace_req = req.to_trace_req
+        if trace_req is None:
+            return
+        if trace_req.trigger is not TraceTrigger.IMMEDIATE:
+            # Already stored in req.to_trace_req; _fire_pending_trace will pick it up
+            return
+        self._run_trace(trace_req, req)
+
+    def _fire_pending_trace(self, req: Req) -> None:
+        if req.to_trace_req is None:
+            return
+        trace_req = req.to_trace_req
+        if trace_req.trigger is not TraceTrigger.IMMEDIATE:
+            self._run_trace(trace_req, req)
+
+    def _find_req_by_rid(self, rid: str) -> Optional[Req]:
+        """Find a request by its rid across all queues."""
+        reqs = list(self.running_batch.reqs) if self.running_batch else []
+        cur_batch = self.cur_batch_for_debug
+        if cur_batch is not None and cur_batch is not self.running_batch:
+            reqs = reqs + list(cur_batch.reqs)
+        reqs = reqs + list(self.waiting_queue)
+        for req in reqs:
+            if req.rid == rid:
+                return req
+        return None
+
+    def _run_trace(self, trace_req: TraceReq, req: Req):
+        self.trace_manager.run_trace(trace_req, req)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

@@ -276,6 +276,14 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Log an MD5 digest of every AttentionStore page/state buffer at write and
+    # read time, so a cache read can be matched byte-for-byte against the write
+    # that produced it. Costs a D2H copy plus a hash per page — diagnostic only.
+    SGLANG_LOG_AS_CACHE_DIGEST = EnvBool(False)
+    # Log whether the producer event fenced before an AttentionStore write/read
+    # actually had anything in flight, plus per-page freshness/ownership right
+    # before the SDK gather. Diagnostic only, off by default.
+    SGLANG_LOG_AS_BARRIER_DEBUG = EnvBool(False)
 
     # IPC
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
@@ -1346,6 +1354,11 @@ class Envs:
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+    SGLANG_BLOCK_METRICS_K3 = EnvBool(False)
+    # Keep decode latency histograms' _count advancing with throttled zero
+    # observations while idle, so rate(_sum)/rate(_count) panels fall back to 0
+    # instead of going NaN (a gap) after traffic stops. Off by default.
+    SGLANG_IDLE_METRIC_HEARTBEAT = EnvBool(False)
 
     # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
     SGLANG_PATCH_TOKENIZER = EnvBool(True)

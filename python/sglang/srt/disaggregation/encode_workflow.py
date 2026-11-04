@@ -24,6 +24,10 @@ from typing import Any, List, Optional
 import aiohttp
 from pydantic import BaseModel
 
+from sglang.srt.disaggregation.encode_collector import (
+    BatchExecutorCollector,
+    VitFetchCollector,
+)
 from sglang.srt.disaggregation.encode_health import update_encoder_output_timestamp
 from sglang.srt.disaggregation.encode_utils import (
     StreamExecutor,
@@ -315,6 +319,10 @@ class TaskProcessor:
                     sample_fps = item_fps
         image_url = mm_items[0] if mm_items else ""
 
+        logger.info(f"[Task] fetched task: req_id={request_id} task_id={task_id} "
+                    f"type={modality} budget_tokens={task.get('tokens', 0)} "
+                    f"sample_fps={sample_fps} ")
+
         session_id = task.get("session_id", "")
         buffer_address = task.get("buffer_address", 0)
         rdma_port = task.get("rdma_port", 0)
@@ -344,6 +352,12 @@ class TaskProcessor:
                 img_grid_thw = embed_res.image_grid_dim.tolist()
 
             elapsed = time.monotonic() - start
+            logger.info(
+                f"[Task] done req_id={request_id} task_id={task_id} "
+                f"type={modality} out_tokens={embedding_len} "
+                f"shape=[{embedding_len},{embedding_dim}] compute_e2e={elapsed:.3f}s"
+            )
+            self._encoder.metrics_collector.observe_one_finished_request()
 
             return TaskResult(
                 model_id=model_id,
@@ -389,6 +403,7 @@ class TaskProcessor:
                 f"type={modality} url={str(image_url).split('?')[0]} "
                 f"code={error_code} error={e} time={elapsed:.3f}s"
             )
+            self._encoder.metrics_collector.observe_one_failed_request()
             return TaskResult(
                 model_id=model_id,
                 task_id=task_id,
@@ -465,7 +480,7 @@ class VitTaskImpl:
     # Tune via SGLANG_ENCODER_TASK_TIMEOUT_S.
     TASK_TIMEOUT_S: float = float(os.environ.get("SGLANG_ENCODER_TASK_TIMEOUT_S", "30"))
 
-    def __init__(self, encoder, process_fn):
+    def __init__(self, encoder, process_fn, collector: BatchExecutorCollector = None):
         """Initialize VitTaskImpl.
 
         Args:
@@ -476,6 +491,15 @@ class VitTaskImpl:
         """
         self.name = "vit_task"
         self._encoder = encoder
+        if collector is not None:
+            self.collector = collector
+        else:
+            labels = (
+                {"model_name": encoder.server_args.served_model_name}
+                if encoder.server_args.served_model_name
+                else {}
+            )
+            self.collector = BatchExecutorCollector(self.name, labels=labels)
         self._process_fn = process_fn
 
         # Dedicated event loop for running async encode calls
@@ -505,6 +529,7 @@ class VitTaskImpl:
                 "the encoder). Likely a stalled decode/embed on a saturated GPU.",
                 self.TASK_TIMEOUT_S, tid,
             )
+            self._encoder.metrics_collector.observe_one_aborted_request()
             raise
         return VitTaskResult(task_result=task_result)
 
@@ -571,6 +596,10 @@ class EncodeWorkflow:
         self._client = VitServerClient(encoder.server_args.vit_server_url)
         self._processor = TaskProcessor(encoder)
         self._model_id = os.environ["MODEL_ID"]
+        self._fetch_collector = VitFetchCollector(
+            labels={"model_name": encoder.server_args.served_model_name}
+            if encoder.server_args.served_model_name else None
+        )
         self.is_alive: bool = False
         self._stopped: bool = False
         self._stop_time: float | None = None
@@ -759,6 +788,7 @@ class EncodeWorkflow:
                             self._build_fetch_request()
                         )
                         if result.success and result.tasks:
+                            self._fetch_collector.observe_task_count(len(result.tasks))
                             for task in result.tasks:
                                 task_id = task.get("task_id", "")
                                 req = VitTaskReq(rid=task_id, task=task)
@@ -791,6 +821,9 @@ class EncodeWorkflow:
                                 )
                     except Exception as e:
                         logger.error(f"Error fetching tasks: {e}")
+                    self._fetch_collector.observe_duration(
+                        time.monotonic() - fetch_start
+                    )
                 else:
                     self._fetch_skip_count += 1
                     if self._fetch_skip_count % 200 == 1 and self.active_task_count > 0:
@@ -803,6 +836,7 @@ class EncodeWorkflow:
                         )
 
                 # Always update free_tokens gauge so monitoring reflects real-time usage
+                self._fetch_collector.set_free_tokens(self._encoder.free_tokens)
 
                 # ---- Flush completed results ----
                 await self._flush_submit()
