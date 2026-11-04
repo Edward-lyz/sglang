@@ -37,6 +37,9 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
+from sglang.srt.content_detection.config import DETECTION_CONFIG
+from sglang.srt.content_detection.pipeline import build_detection_pipeline
+from sglang.srt.content_detection.recorder import ChunkInfo, RequestContext
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.encoding_kimi_k3 import (
     use_official_kimi_k3_encoding,
@@ -560,6 +563,11 @@ class OpenAIServingChat(OpenAIServingBase):
             os.getenv("SGLANG_TOOL_CALL_EMPTY_RETURN_INTERVAL", "5")
         )
 
+        # Content detection pipeline
+        if DETECTION_CONFIG.enable_detection:
+            self.detection_pipeline = build_detection_pipeline(
+                self.tokenizer_manager.server_args
+            )
 
     def _handle_last_assistant_message(
         self,
@@ -1976,6 +1984,10 @@ class OpenAIServingChat(OpenAIServingBase):
         pending_logprobs = {}  # Accumulate logprob entries, flush on SSE chunk emit
 
         stream_started = False
+        # content detection
+        if DETECTION_CONFIG.enable_detection:
+            req_ctx = self._process_content_detection(request, adapted_request)
+
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -2108,6 +2120,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 else:
                     delta = content["text"][offset:]
                 stream_offsets[index] = len(content["text"])
+
+                if DETECTION_CONFIG.enable_detection:
+                    chunk_info = ChunkInfo(delta, pending_output_token_ids.get(index))
+                    await self.detection_pipeline.process(req_ctx, chunk_info)
 
                 needs_tool_processing = (
                     request.tool_choice != "none"
@@ -2749,6 +2765,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
             )
             return tool_call_id
+
+    def _process_content_detection(
+        self,
+        request: ChatCompletionRequest,
+        adapted_request: GenerateReqInput,
+    ) -> RequestContext:
+
+        req_ctx = RequestContext(
+            rid=request.rid,
+            tokenizer_manager=self.tokenizer_manager,
+        )
+        return req_ctx
 
     def _process_tool_calls(
         self,
