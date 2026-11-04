@@ -1,15 +1,14 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 
-MODEL_PATH="/Kimi-K3"
-export MODEL_PATH
-
-DRAFT_MODEL_PATH="/Kimi-K3-DSpark"
-export DRAFT_MODEL_PATH
+export MODEL_ID="$MODEL_ID"
 
 MASTER_IP=$(cut -d ',' -f 1 "$FED_MEMBER_FILE")
 export MASTER_IP
+
+export MODEL_PATH="/Kimi-K3-ATTN-MOE-DENSE-FP8"
+export DRAFT_MODEL_PATH="/Kimi-K3-DSpark"
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 NUM_NODES=2
@@ -80,9 +79,8 @@ export AS_AGENT_ADDRESS="${HOST_IP}:7070"
 export AS_SHARED_MEMORY_SIZE_BYTES=429496729600
 export AIAK_HOST_CACHE_PORT=7070
 
-export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}/sgl-workspace/sglang/python"
-
-LOG_TO_FILE="${LOG_TO_FILE:-false}"
+export PYTHONPATH="/sgl-workspace/sglang/python:${PYTHONPATH:-}"
+LOG_TO_FILE="${LOG_TO_FILE:-0}"
 LOG_FILE="${LOG_FILE:-/sgl-workspace/prefill.log}"
 
 PARALLEL_ARGS=(
@@ -110,8 +108,15 @@ CACHE_OPT=(
     --enable-asradix-cache
 )
 
-if [[ "$LOG_TO_FILE" == "true" ]]; then
-    exec >"$LOG_FILE" 2>&1
+if [[ "${PROFILE_NSYS:-0}" == "1" ]]; then
+    export SGLANG_ENABLE_NVTX_SCHEDULER=1
+    nsys start --session-new=sglprof \
+        -c cudaProfilerApi \
+        --capture-range-end=repeat:3:sync \
+        -o "/sgl-workspace/ascache_pp${FED_POD_INDEX}"
+    NSYS_PREFIX="nsys launch --session=sglprof -t cuda,nvtx,osrt --cuda-graph-trace=node --trace-fork-before-exec=true --cuda-memory-usage=false"
+else
+    NSYS_PREFIX=""
 fi
 
 sglang serve \

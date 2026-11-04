@@ -36,15 +36,60 @@ if TYPE_CHECKING:
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
 
+    def device_value_allocator(self) -> ComponentDeviceValueAllocator:
+        """Describe allocation of the cache's complete token-slot bundle."""
+        allocator = self.cache.token_to_kv_pool_allocator
+        # Host page IDs are only meaningful when allocator pages match cache pages.
+        alloc_with_page_ids = (
+            self._alloc_with_page_ids_and_refill
+            if getattr(allocator, "alloc_with_page_ids", None) is not None
+            and getattr(allocator, "page_size", None) == self.cache.page_size
+            else None
+        )
+        return ComponentDeviceValueAllocator(
+            alloc=allocator.alloc,
+            free=allocator.free,
+            evict=lambda count: self.cache.evict(EvictParams(num_tokens=count)),
+            available=allocator.available_size,
+            eviction_margin=self.cache.page_size,
+            alloc_with_metadata=alloc_with_page_ids,
+            values_per_host_id=self.cache.page_size,
+        )
+
+    def _alloc_with_page_ids_and_refill(self, count: int):
+        allocator = self.cache.token_to_kv_pool_allocator
+        value, page_ids = allocator.alloc_with_page_ids(count)
+        if value is not None:
+            self._refill_free_pages(allocator=allocator, count=count)
+        return value, page_ids
+
+    def _refill_free_pages(self, *, allocator, count: int) -> None:
+        # Page-ID D2H waits on the last free_pages rebuild; evicting and merging
+        # for the next load_back now keeps that rebuild a forward behind.
+        # 2x leaves room for the extend chunks allocated in between.
+        shortfall = 2 * count - allocator.available_size()
+        if shortfall > 0:
+            self.cache.evict(EvictParams(num_tokens=shortfall + self.cache.page_size))
+        allocator.merge_and_sort_free()
+
     def __init__(self, cache, params):
         super().__init__(cache, params)
         allocator = cache.token_to_kv_pool_allocator
         # When SWA is present, only free full-attention KV here;
         # SWA KV will be freed by cascade via SWAComponent.evict_component.
-        if ComponentType.SWA in cache.tree_components:
-            self._free_full = allocator.full_attn_allocator.free
+        full_allocator = (
+            allocator.full_attn_allocator
+            if ComponentType.SWA in cache.tree_components
+            else allocator
+        )
+        # Node values are whole cache pages, so free_segment skips free()'s
+        # torch.unique, a device sync that waits on the in-flight forward.
+        if cache.page_size % full_allocator.page_size == 0:
+            self._free_full = lambda value: full_allocator.free_segment(
+                value, start_pos=0
+            )
         else:
-            self._free_full = allocator.free
+            self._free_full = full_allocator.free
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
 

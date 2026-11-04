@@ -74,6 +74,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.parameter import BlockQuantScaleParameter
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -2787,6 +2788,19 @@ class KimiK3LinearModel(nn.Module):
                 )
         else:
             self.norm = PPMissingLayer()
+            if config.attn_res_block_size is not None:
+                # DSPARK capture at this stage's last layer needs layer
+                # end_layer's attention-side mixture weights (lives on next stage).
+                self.next_stage_attn_res_norm = RMSNorm(
+                    config.hidden_size, eps=config.rms_norm_eps
+                )
+                self.next_stage_attn_res_proj = ReplicatedLinear(
+                    config.hidden_size,
+                    1,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.next_stage_attn_res_proj",
+                )
 
     def forward(
         self,
@@ -2968,10 +2982,14 @@ class KimiK3LinearModel(nn.Module):
             score_proj = next_layer.self_attention_res_proj
             score_norm = next_layer.self_attention_res_norm
             nvb = next_layer.prev_valid_blocks
-        else:
+        elif self.pp_group.is_last_rank:
             # Last layer: the model's own output-side aggregation weights.
             score_proj = self.output_attn_res_proj
             score_norm = self.output_attn_res_norm
+            nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
+        else:
+            score_proj = self.next_stage_attn_res_proj
+            score_norm = self.next_stage_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
         return aggregate_stream(
             hidden_states, attn_res.block_residual, nvb, score_proj, score_norm
@@ -3086,6 +3104,22 @@ class KimiK3LinearForCausalLM(nn.Module):
             kv_cache_device=kv_cache_device,
             create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
         )
+
+    def _next_stage_weight_map(self) -> dict[str, str]:
+        """Checkpoint-name suffix -> param name for the next stage's first-layer
+        attn-res weights that a non-last PP stage loads for DSPARK capture."""
+        if not hasattr(self.model, "next_stage_attn_res_proj"):
+            return {}
+        end = self.model.end_layer
+        return {
+            f"layers.{end}.self_attention_res_proj.weight": "model.next_stage_attn_res_proj.weight",
+            f"layers.{end}.self_attention_res_norm.weight": "model.next_stage_attn_res_norm.weight",
+        }
+
+    def pp_extra_weight_suffixes(self) -> tuple[str, ...]:
+        """Return weight-name suffixes kept across pipeline-parallel boundaries."""
+        # Keeps the PP weight filter from dropping the out-of-range tensors above.
+        return tuple(self._next_stage_weight_map())
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         use_full_rank_gate = bool(
@@ -3328,6 +3362,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                 _warm_cw(layer.mlp_res_proj, layer.mlp_res_norm)
         if hasattr(self.model, "output_attn_res_proj"):
             _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
+        if hasattr(self.model, "next_stage_attn_res_proj"):
+            _warm_cw(
+                self.model.next_stage_attn_res_proj, self.model.next_stage_attn_res_norm
+            )
 
         # Post-load: merge the horizontally-fused decode weights. Module
         # weights are re-pointed to views of the merged buffers (net extra
@@ -3561,6 +3599,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.language_model is None:
             return self.config.text_config.num_hidden_layers
         return self.language_model.model.end_layer
+
+    def pp_extra_weight_suffixes(self) -> tuple[str, ...]:
+        """Delegate PP extra weight suffixes to the underlying language model."""
+        if self.language_model is None:
+            return ()
+        return self.language_model.pp_extra_weight_suffixes()
 
     def prepare_context_parallel_metadata_for_dcp(
         self,
