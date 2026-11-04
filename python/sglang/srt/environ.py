@@ -796,6 +796,10 @@ class Envs:
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
+    # Block M of the masked grouped FP8 GEMM (DeepEP-LL decode MoE); 0 keeps
+    # DeepGEMM's mk alignment (128). Decode has ~1-8 tokens per expert, so 32
+    # cuts the wasted UMMA N / epilogue work per tile. Results are bitwise equal.
+    SGLANG_DEEPGEMM_MASKED_BLOCK_M = EnvInt(0)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # DeepSeek MHA Optimization
