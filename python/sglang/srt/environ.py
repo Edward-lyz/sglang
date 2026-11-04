@@ -1298,6 +1298,11 @@ class Envs:
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
 
+    # Fuse DSV4.1-Flash shared-expert Reuse-layer silu_and_mul_clamp (op79) and the
+    # flashinfer MXFP8 swizzled activation-quant (op80) into one Triton launch, then run
+    # the UNCHANGED flashinfer blockscaled down_proj GEMM (op81) on the pre-quantized
+    # (e4m3, ue8m0 128x4-swizzled) output. Byte-identical; graph-safe. Default OFF.
+    SGLANG_FUSE_SHARED_SILU_MXFP8_QUANT = EnvBool(False)
 
     # ===================================================================
     # DeepGEMM Mega MoE
