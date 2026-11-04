@@ -231,6 +231,12 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 class Indexer(MultiPlatformOp):
+    # Cache the chunk-decision budget per device to avoid per-layer cudaMemGetInfo host sync.
+    _MQA_LOGITS_BYTES_PER_ELEM = 4
+    _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
+    _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
+    _mqa_logits_budget_bytes: Dict[int, int] = {}
+
     @staticmethod
     def _mqa_logits_free_mem_fraction() -> float:
         return envs.SGLANG_NSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
@@ -630,24 +636,44 @@ class Indexer(MultiPlatformOp):
             topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
 
+    def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
+        # Process-level budget cache; first prefill primes from free_mem, capture mode stays static-only.
+        cached = self._mqa_logits_budget_bytes.get(device_index)
+        if cached is not None:
+            return cached
+
+        total_mem = torch.cuda.get_device_properties(device_index).total_memory
+        total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
+        mem_fraction_static = get_global_server_args().mem_fraction_static
+        if mem_fraction_static is None:
+            static_budget = total_mem_budget
+        else:
+            static_free_mem = int(total_mem * max(0.0, 1.0 - mem_fraction_static))
+            static_budget = min(
+                int(static_free_mem * self._mqa_logits_free_mem_fraction()),
+                total_mem_budget,
+            )
+        static_budget = max(1, static_budget)
+
+        if get_is_capture_mode():
+            return static_budget
+
+        free_mem, _ = torch.cuda.mem_get_info(device_index)
+        budget_bytes = max(
+            1, min(int(free_mem * self._mqa_logits_free_mem_fraction()), static_budget)
+        )
+        self._mqa_logits_budget_bytes[device_index] = budget_bytes
+        return budget_bytes
+
     def _should_chunk_mqa_logits(
-        self, num_q: int, num_k: int, device: torch.device
+        self, num_q: int, num_k: int, device_index: int
     ) -> Tuple[bool, int]:
-        """
-        Detect whether we need to chunk the MQA logits computation to avoid OOM
-        Return: (need_chunk, free_mem)
-        """
-        # Quick static check for normal batches
-        if num_q * num_k < 8_000_000:  # 8M elements ≈ 32MB logits
+        """Return (need_chunk, logits_budget_bytes)."""
+        if num_q * num_k < self._MQA_LOGITS_STATIC_SKIP_ELEMS:
             return False, 0
-
-        free_mem, total_mem = torch.cuda.mem_get_info(device)
-        bytes_per_elem = 4  # float32
-        logits_bytes = num_q * num_k * bytes_per_elem
-
-        # Logits should not exceed 50% of free memory or 30% of total memory
-        need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
-        return need_chunk, free_mem
+        logits_bytes = num_q * num_k * self._MQA_LOGITS_BYTES_PER_ELEM
+        budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
+        return logits_bytes > budget_bytes, budget_bytes
 
     def _get_topk_ragged(
         self,
@@ -693,22 +719,22 @@ class Indexer(MultiPlatformOp):
 
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         assert len(indexer_seq_lens_cpu) == batch_size
-        for i in range(batch_size):
-            seq_len = indexer_seq_lens_cpu[i].item()
-            assert isinstance(seq_len, int)
-            # Use fused Triton kernel to get both K and scale in a single call
-            k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
-                layer_id,
-                seq_len,
-                block_tables[i],
-            )
-            k_fp8_list.append(k_fp8)
-            k_scale_list.append(k_scale)
+        seq_len_sum = int(torch.sum(indexer_seq_lens_cpu).item())
+        max_seq_len = int(torch.max(indexer_seq_lens_cpu).item())
+        # No device-side indexer_seq_lens on glm5 metadata; transfer once per layer.
+        indexer_seq_lens = indexer_seq_lens_cpu.to(device, non_blocking=True)
+        k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+            layer_id,
+            indexer_seq_lens,
+            block_tables,
+            seq_len_sum,
+            max_seq_len,
+        )
         if _is_fp8_fnuz:
-            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fnuz)
+            k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
         else:
-            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
-        k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
+            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+        k_scale = k_scale.view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
         ks, ke = metadata.get_indexer_kvcache_range()
         seq_lens_expanded = metadata.get_seqlens_expanded()
@@ -717,7 +743,9 @@ class Indexer(MultiPlatformOp):
         k_offset = k_fp8.shape[0]
 
         # Check if we need to chunk to avoid OOM
-        need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
+        need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
+            q_offset, k_offset, device.index
+        )
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
@@ -746,10 +774,8 @@ class Indexer(MultiPlatformOp):
             return topk_result
 
         # Chunk path
-        bytes_per_elem = 4  # float32
-        bytes_per_row = k_offset * bytes_per_elem
-        # Reserve 50% of free memory for logits
-        max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
+        bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
+        max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
         max_rows = min(max_rows, q_offset)
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
