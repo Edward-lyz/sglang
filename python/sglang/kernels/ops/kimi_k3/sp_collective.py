@@ -43,18 +43,27 @@ DEFAULT_TUNING = Tuning(num_blocks=16, block_size=256)
 _CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs", "sp_collective")
 _TABLES: dict[str, Optional[dict]] = {}
 
+# Tables are keyed by SM architecture, not by the reported device name: OEM
+# boards report arbitrary SKU strings (e.g. "CF-NG-BZZ2-O" for B200) for the
+# same silicon. Map each measured architecture onto its checked-in table.
+_SM_TABLE_DEVICE_NAMES = {
+    100: "NVIDIA_B200",
+    103: "NVIDIA_GB300",
+}
 
-def _device_name(device: torch.device) -> str:
-    return torch.cuda.get_device_name(device).replace(" ", "_").replace("/", "_")
+
+def _sm_arch(device: torch.device) -> int:
+    major, minor = torch.cuda.get_device_capability(device)
+    return major * 10 + minor
 
 
 def _table(world_size: int, hidden_size: int, device: torch.device) -> Optional[dict]:
+    table_name = _SM_TABLE_DEVICE_NAMES.get(_sm_arch(device))
+    if table_name is None:
+        return None
     path = os.path.join(
         _CONFIG_DIR,
-        (
-            f"world={world_size},H={hidden_size},"
-            f"device_name={_device_name(device)}.json"
-        ),
+        f"world={world_size},H={hidden_size},device_name={table_name}.json",
     )
     if path not in _TABLES:
         if os.path.exists(path):
