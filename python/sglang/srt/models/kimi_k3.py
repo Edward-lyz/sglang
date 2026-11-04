@@ -106,6 +106,14 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.sharding import (
+    WeightShardForwardPlanner,
+    finalize_model_weight_shard,
+    get_weight_sharding_config,
+    get_weight_sharding_side_stream,
+    prepare_layer_weight_shard_forward,
+    setup_layer_weight_shard_flat,
+)
 from sglang.srt.utils import is_blackwell_supported, is_hip, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -581,6 +589,11 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
 
+        # Set by KimiK3DecoderLayer when it hosts a runtime weight shard that
+        # covers this MoE's weights. The front merge re-points the very same
+        # `weight.data` the shard owns, so the two are mutually exclusive.
+        self._weight_shard_hosted = False
+
         # Static eligibility for fusing the fused-front latent all-reduce with
         # the RMSNorm epilogue (SGLANG_K3_AR_FUSION). The kernel views the flat
         # [latent | shared] buffer as [3N, NORM_DIM] rows and norms the first N,
@@ -607,6 +620,31 @@ class KimiK3MoE(nn.Module):
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
             and self.routed_expert_up_proj.weight.is_contiguous()
         )
+
+    def weight_shard_targets(self) -> List[str]:
+        """Dotted paths of MoE weights that runtime weight sharding may split.
+
+        Only the latent-MoE projections and — when the shared experts are
+        built at tp1 (EP a2a) and therefore replicated — their fused
+        gate_up / down weights.
+        """
+        if not self.use_latent_moe:
+            return []
+        targets = ["routed_expert_down_proj", "routed_expert_up_proj"]
+        if self._shared_experts_tp1 and self.shared_experts is not None:
+            if self.shared_experts._mixed_gate_up:
+                targets.extend(
+                    [
+                        "shared_experts.gate_proj",
+                        "shared_experts.up_proj",
+                        "shared_experts.down_proj",
+                    ]
+                )
+            else:
+                targets.extend(
+                    ["shared_experts.gate_up_proj", "shared_experts.down_proj"]
+                )
+        return targets
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -1497,6 +1535,22 @@ class KimiK3DeltaAttention(nn.Module):
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
 
+    def weight_shard_targets(self) -> List[str]:
+        """Dotted paths of KDA weights that runtime weight sharding may split.
+
+        Only the big 2-D bf16 projections. Deliberately excluded:
+        ``f_a_proj`` / ``b_proj`` (``_merge_bfa_weights`` re-points their
+        ``weight.data`` at a merged buffer), ``qkv_conv1d`` (fp32 3-D, and
+        ``RadixLinearAttention`` captured a squeezed view by reference), and
+        the ``do_fuse_qkvbfg`` batched-linear variants (3-D weights).
+        """
+        if self.do_fuse_qkvbfg or self._fuse_full_rank_qkvg:
+            return []
+        targets = ["qkv_proj", "f_b_proj", "o_proj"]
+        if self.use_full_rank_gate:
+            targets.append("g_proj")
+        return targets
+
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
         beta = self.b_proj(hidden_states)[0]
@@ -2026,6 +2080,61 @@ class KimiK3DecoderLayer(nn.Module):
 
                 o_proj.forward = _sp_o_proj_forward
 
+                # GEMM-RS replaces only the GEMM, at the quant-method level:
+                # the attention's own o_proj wraps (MLA output gate + its
+                # alt-stream join, prequant registration) run first, so the
+                # pushed rows are exactly what the plain GEMM would produce.
+                quant_method = getattr(o_proj, "quant_method", None)
+                if quant_method is not None:
+                    _sp_inner_apply = quant_method.apply
+
+                    def _sp_push_rs_apply(layer, x, bias=None, **kwargs):
+                        if layer is o_proj and bias is None and not kwargs:
+                            pushed = k3_sp_collective.maybe_o_proj_push_rs(layer, x)
+                            if pushed is not None:
+                                return pushed
+                        return _sp_inner_apply(layer, x, bias=bias, **kwargs)
+
+                    quant_method.apply = _sp_push_rs_apply
+
+        # Must stay last in __init__: it shrinks `weight.data` to this rank's
+        # row slice, and every init-time eligibility gate that inspects a
+        # weight shape (fused_a_gemm, min-latency q_b GEMM, gemm_ag up-proj,
+        # k3_gemm_ar) must have been decided against the full shape above.
+        self._setup_weight_shard()
+
+    def _setup_weight_shard(self) -> None:
+        """Host one flat AllGather covering this layer's replicated weights.
+
+        Attention and MoE are concatenated into a single layout so the layer
+        costs exactly one AllGather, launched one layer ahead by
+        `WeightShardForwardPlanner` and consumed at the top of `forward`.
+
+        Attention weights only qualify when `attn_tp_size == 1` (full DP
+        attention): at attn_tp > 1 the TP narrow already sliced them and
+        sharding again would be wrong.
+        """
+        if not get_weight_sharding_config().enabled:
+            return
+        targets: List[str] = []
+        if get_parallel().attn_tp_size == 1:
+            targets += [f"self_attn.{p}" for p in self.self_attn.weight_shard_targets()]
+        mlp_targets = (
+            self.mlp.weight_shard_targets() if isinstance(self.mlp, KimiK3MoE) else []
+        )
+        targets += [f"mlp.{p}" for p in mlp_targets]
+        if not targets:
+            return
+        # The layout entry name doubles as the role, and the dotted path is
+        # already unique within the layer.
+        sched = setup_layer_weight_shard_flat(
+            self,
+            targets=[(p, p) for p in targets],
+            side_stream=get_weight_sharding_side_stream(),
+        )
+        if sched is not None and mlp_targets:
+            self.mlp._weight_shard_hosted = True
+
     def _finish_attn_reduce(
         self,
         attn_out: torch.Tensor,
@@ -2149,6 +2258,10 @@ class KimiK3DecoderLayer(nn.Module):
         input_sharded: bool = False,
         keep_sharded: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
+        # First statement: attention reads sharded weights before the MoE, so
+        # the layer's AllGather must be joined and `weight.data` rebound here,
+        # ahead of both residual paths.
+        prepare_layer_weight_shard_forward(self)
         if attn_res is not None:
             return self._forward_attn_residual(
                 positions,
@@ -2375,6 +2488,17 @@ class KimiK3LinearModel(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
+        self._weight_shard_layers = [
+            (i, self.layers[i])
+            for i in range(self.start_layer, self.end_layer)
+            if isinstance(self.layers[i], KimiK3DecoderLayer)
+            and getattr(self.layers[i], "_weight_shard_sched", None) is not None
+        ]
+        self._weight_shard_planner = WeightShardForwardPlanner(
+            self._weight_shard_layers
+        )
+        self._weight_shard_pool = None
+        self._weight_shard_finalized = False
 
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -2460,7 +2584,10 @@ class KimiK3LinearModel(nn.Module):
         )
         sp_sharded = False
         aux_hidden_states = []
+        self._weight_shard_planner.reset()
+        self._weight_shard_planner.pre_dispatch(self.start_layer)
         for i in range(self.start_layer, self.end_layer):
+            self._weight_shard_planner.maybe_dispatch(i + 1)
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
                 sp_sharded = False
@@ -2475,6 +2602,7 @@ class KimiK3LinearModel(nn.Module):
                     input_sharded=sp_sharded,
                     keep_sharded=sp_attn_res,
                 )
+            self._weight_shard_planner.update_done_event(i, self.layers[i])
             if (
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
