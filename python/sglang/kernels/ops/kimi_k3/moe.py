@@ -8,6 +8,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 
 
 def _make_name(*args):
@@ -58,4 +59,5 @@ def situ_and_mul_masked_post_quant(
         transposed,
         float(beta),
         float(linear_beta),
+        envs.SGLANG_K3_SITU_QUANT_PERSISTENT_GRID.get(),
     )
