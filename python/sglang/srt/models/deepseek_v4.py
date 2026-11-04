@@ -299,6 +299,8 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
         and isinstance(quant_config, Fp8Config)
         and quant_config.weight_block_size == [128, 128]
     )
+
+
 _FUSED_WO_A_BLOCK_ORDER: dict = {}
 
 
@@ -698,8 +700,10 @@ def hc_head_torch(
 _FREQS_CIS_TO_COS_SIN: dict[
     Tuple[int, torch.dtype, torch.device], Tuple[torch.Tensor, torch.Tensor]
 ] = {}
+
 # fp32 [N, 64] = [cos | sin] per shared freqs_cis, for flash_mla's fused attention-o op.
 _FUSED_O_COS_SIN: dict[Tuple[int, torch.device], torch.Tensor] = {}
+
 
 def _rope_table_len(config) -> int:
     """Rows of the RoPE tables (freqs_cis / cos_sin caches).
@@ -1303,6 +1307,7 @@ class MQALayer(MqaAttentionBase):
         self.use_fused_qk_norm_rope = (
             _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
+
         # FlashMLA fused norm+RoPE+attn+inv-RoPE+fp8-cast (sparse prefill, sm100). Needs all 64
         # heads on this rank so the op's wv groups line up with wo_a's groups, and a bf16 wo_a
         # (re-quantized to per-32 ue8m0 fp8 on first use). wq_b's rows are permuted at load.
@@ -1339,6 +1344,7 @@ class MQALayer(MqaAttentionBase):
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
+
     def _wq_b(self, x):
         """wq_b with its output restored to the plain [T, H*D] row order when the weight was
         permuted for the fused attention op; callers that rope/consume q themselves use this."""
@@ -2481,6 +2487,7 @@ class MQALayer(MqaAttentionBase):
         if swa_finish is not None:
             swa_finish()
         return q, kv
+
     def forward_kv(
         self,
         x: torch.Tensor,
@@ -2688,6 +2695,7 @@ class MQALayer(MqaAttentionBase):
                 q_out,
                 x_quant=x_quant,
             )
+
         if self._fused_o_q_raw:
             from sglang.srt.layers.attention.dsv4.fused_o_attn import wo_a_einsum
 
@@ -3232,6 +3240,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+
         # Fused Reuse-layer *attention-input* glue (sinkhorn + hc_combine + input RMSNorm)
         # in ONE Triton launch. OFF by default (SGLANG_FUSE_MHC_PRE_INPUT). Restricted to the
         # attention side (norm is self.input_layernorm): the FFN/MoE side also calls hc_pre
@@ -5369,7 +5378,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.pp_group = get_pp_group()
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
@@ -5528,7 +5536,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         forward per image.
         """
 
-        spans = []
         device, dtype = self.image_start.device, self.image_start.dtype
         prepared = []
         for item in items:
@@ -5785,6 +5792,51 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "built in-kernel shared-expert weights for %d MegaMoE layers (%s)",
                 num_built,
                 type(self).__name__,
+            )
+
+    def warmup_triton_kernels(self, *, token_to_kv_pool) -> None:
+        """Compile the prefill Triton kernel variants serving can select before ready.
+
+        Each would otherwise JIT (~75 ms per rank) inside the first live request
+        that hits it. Local-only launches, no collectives.
+        """
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        device = torch.cuda.current_device()
+        if (
+            envs.SGLANG_FUSE_CP_CANDIDATE_MASK.get()
+            and self.config.candidate_topk_blocks > 0
+        ):
+            from sglang.kernels.ops.attention.dsv4.candidate_block_score import (
+                warmup_mask_candidate_logits,
+            )
+
+            warmup_mask_candidate_logits(
+                max_topk_blocks=self.config.candidate_topk_blocks,
+                block_size=self.config.candidate_block_size,
+                device=device,
+            )
+        # Same pool gate as DeepseekV4Attention._cp_kv_store_local_first_ok.
+        if (
+            envs.SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST.get()
+            and is_dsa_enable_prefill_cp()
+            and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and token_to_kv_pool.request_window is None
+            and not token_to_kv_pool.uniform_fp8
+            and token_to_kv_pool.kv_layout in (KVLayout.V4, KVLayout.V41)
+        ):
+            from sglang.kernels.ops.attention.dsv4.cp_kv_store import (
+                warmup_scatter_kv_rows,
+            )
+
+            warmup_scatter_kv_rows(
+                page_size=token_to_kv_pool.swa_page_size,
+                layout=token_to_kv_pool.kv_layout,
+                cp_size=get_parallel().attn_cp_size,
+                device=device,
             )
 
     def warmup_deepgemm_mega_kernels(
@@ -6113,6 +6165,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+
         if self.encoder_only:
             self._load_encoder_only_weights(weights, params_dict)
             return
