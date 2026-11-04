@@ -4,7 +4,7 @@ import enum
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, flatten_arrays_to_int64_tensor
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,6 +42,7 @@ import dataclasses
 import logging
 import re
 import time
+from array import array
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
@@ -550,16 +551,18 @@ class Req(ReqDllmMixin):
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
+        if not isinstance(origin_input_ids, array):
+            origin_input_ids = array("q", origin_input_ids)
         self.origin_input_ids_unpadded = (
-            origin_input_ids_unpadded
+            array("q", origin_input_ids_unpadded)
             if origin_input_ids_unpadded
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
-        self.output_ids = []
+        self.output_ids = array("q")
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
-        self.fill_ids = []
+        self.fill_ids = array("q")
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -1309,7 +1312,9 @@ class Req(ReqDllmMixin):
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
         self.grammar = None
-        self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.origin_input_ids = array(
+            "q", [0]
+        )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
         self.to_finish = FINISH_ABORT(
@@ -1505,7 +1510,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_dllm(self):
         return self.dllm_config is not None
 
-    def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
+    def prepare_encoder_info_extend(
+        self, input_ids: List[array[int]], seq_lens: List[int]
+    ):
+        """Prepare encoder info for extend phase with multimodal inputs."""
         self.encoder_lens_cpu = []
         self.encoder_cached = []
 
@@ -1553,9 +1561,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             pt += req.extend_input_len
 
         # Reassign
-        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int64).to(
-            self.device, non_blocking=True
-        )
+        self.input_ids = flatten_arrays_to_int64_tensor(input_ids, self.device, False)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
@@ -1608,9 +1614,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             r.token_type_ids for r in reqs if r.token_type_ids is not None
         ]
 
-        input_ids_tensor = torch.tensor(
-            list(chain.from_iterable(input_ids)), dtype=torch.int64
-        ).to(self.device, non_blocking=True)
+        input_ids_tensor = flatten_arrays_to_int64_tensor(input_ids, self.device, False)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )

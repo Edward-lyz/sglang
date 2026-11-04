@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import os
 import signal
+import time
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -235,16 +236,26 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         token_num = 0
         for i in range(bs):
             rid = recv_obj.rids[i]
-            if rid not in self.decode_status:
+            key = status_keys[i]
+            if key not in self.decode_status:
+                if len(self.decode_status) == DETOKENIZER_MAX_STATES:
+                    logger.info(
+                        "Decode status is at capacity in batch: {recv_obj.rids}, dropping new requests"
+                    )
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
-                    decode_ids=recv_obj.decode_ids[i],
+                    decode_ids=list(recv_obj.decode_ids[i]),
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
                 if not is_health_check_rid(rid):
                     # for health check requests, we do not store the decode status
-                    self.decode_status[rid] = s
+                    self.decode_status[key] = s
+                    logger.info(
+                        f"Decode status update, add a new req status: {key}, "
+                        f"decode_status len is {len(self.decode_status)}."
+                    )
+                    token_num = len(s.decode_ids) - s.read_offset
             else:
                 s = self.decode_status[rid]
                 s.decode_ids.extend(recv_obj.decode_ids[i])
@@ -309,7 +320,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if is_health_check_rid(rid):
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
-                    decode_ids=recv_obj.decode_ids[i],
+                    decode_ids=list(recv_obj.decode_ids[i]),
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
@@ -336,8 +347,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 else:
                     new_text = find_printable_text(new_text)
             else:
-                if rid in self.decode_status:
-                    del self.decode_status[rid]
+                if key in self.decode_status:
+                    del self.decode_status[key]
+                    logger.info(
+                        f"Decode status is deleted: {key} has a "
+                        f"finish reason, [{recv_obj.finished_reasons[i]}], "
+                        f"decode_status len is {len(self.decode_status)}."
+                    )
 
             output_str = self.trim_matched_stop(
                 s.decoded_text + new_text,
@@ -432,7 +448,10 @@ class LimitedCapacityDict(OrderedDict):
     def __setitem__(self, key, value):
         if len(self) >= self.capacity:
             # Remove the oldest element (first item in the dict)
-            self.popitem(last=False)
+            last = self.popitem(last=False)
+            logger.info(
+                f"Current capacity is not enough, we must drop the last item [{last}]."
+            )
         # Set the new item
         super().__setitem__(key, value)
 

@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from array import array
 from enum import IntEnum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -234,7 +235,7 @@ class WaitingImageRequest:
             self.recv_req.input_text, recv_embedding, img_grid_thw
         )
         self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = mm_inputs["input_ids"]
+        self.recv_req.input_ids = array("q", mm_inputs["input_ids"])
         self.status = WaitingImageRequestStatus.SUCCESS
         self.recv_socket.close()
 

@@ -71,7 +71,7 @@ class RadixKey:
 
     def __init__(
         self,
-        token_ids: List[int],
+        token_ids: array[int],
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
     ):
@@ -425,7 +425,7 @@ class RadixCache(BasePrefixCache):
     def reset(self):
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
-        self.root_node.key = RadixKey(token_ids=[], extra_key=None)
+        self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
         self.root_node.value = []
         self.root_node.host_value = []
         self.root_node.lock_ref = 1

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+from array import array
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.dllm.config import DllmConfig
@@ -19,7 +20,7 @@ class DllmReqPhase(str, enum.Enum):
 class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
         self.dllm_phase: Optional[DllmReqPhase] = None
-        self.dllm_ids = []
+        self.dllm_ids = array("q")
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
@@ -56,12 +57,13 @@ class ReqDllmMixin:
 
     def _init_fill_ids_for_dllm(self: Req):
         if not self.dllm_ids:
-            self.dllm_ids = (
-                self.origin_input_ids
-                + [self.dllm_config.mask_id] * self.dllm_config.block_size
+            self.dllm_ids = self.origin_input_ids + array(
+                "q", [self.dllm_config.mask_id] * self.dllm_config.block_size
             )
         else:
             self.dllm_block_offset += self.dllm_config.block_size
-            self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
+            self.dllm_ids += array(
+                "q", [self.dllm_config.mask_id] * self.dllm_config.block_size
+            )
 
         self.fill_ids = self.dllm_ids
