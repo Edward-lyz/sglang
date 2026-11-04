@@ -231,6 +231,10 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 class Indexer(MultiPlatformOp):
+    @staticmethod
+    def _mqa_logits_free_mem_fraction() -> float:
+        return envs.SGLANG_NSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
+
     def __init__(
         self,
         hidden_size: int,
