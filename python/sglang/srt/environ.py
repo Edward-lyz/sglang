@@ -589,6 +589,16 @@ class Envs:
     SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Fuse the draft-sampling exp-noise RNG into the online sampling kernel:
+    # draw the Exp(1) Gumbel noise inline with Triton philox (tl.rand -> -log u)
+    # instead of a separate exponential_() launch, a persistent [bs, vocab] noise
+    # buffer, and the kernel's read of it -- one fewer per-step kernel. Graph-safe:
+    # the philox seed is read from a per-step counter tensor the host bumps each
+    # decode step, so cuda-graph replays redraw rather than freezing one noise
+    # pattern (a python-int seed would be baked into the capture). Draft proposals
+    # only (target verify guards correctness), so the fused path is distribution-
+    # equivalent, not bit-exact. OFF keeps the exact precomputed-noise path.
+    SGLANG_FUSE_DSPARK_INLINE_RNG = EnvBool(False)
     SGLANG_OPT_DSPARK_CORRECTED_INPLACE = EnvBool(True)
     # DSpark commit-KV projection (target hidden rows -> every draft stage's wkv): with
     # DeepGEMM MXFP8-ready wkv weights, quantize the rows once and run one DeepGEMM
