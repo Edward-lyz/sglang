@@ -142,6 +142,35 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             )
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
+        # KV-balanced decode for the DCP decode / target-verify launches of the
+        # target model (draft backends never pass DCP arguments).
+        self._kvb_decoder = None
+        if (
+            envs.SGLANG_K3_KV_BALANCED_MLA_DECODE.get()
+            and get_parallel().dcp_enabled
+            and not skip_prefill
+        ):
+            try:
+                from sglang.kernels.ops.attention.kv_balanced_mla.decoder import (
+                    KvBalancedMlaDecoder,
+                )
+            except (ImportError, AttributeError) as e:
+                raise RuntimeError(
+                    "SGLANG_K3_KV_BALANCED_MLA_DECODE needs nvidia-cutlass-dsl "
+                    f">= 4.8 and apache-tvm-ffi: {e}"
+                ) from e
+            parallel = get_parallel()
+            self._kvb_decoder = KvBalancedMlaDecoder(
+                torch.device("cuda", torch.cuda.current_device()),
+                self.page_size,
+                parallel.dcp_size,
+                parallel.dcp_rank,
+            )
+            heads = self.num_q_heads * parallel.attn_dcp_size
+            self._kvb_shapes = [(heads, 1)] + (
+                [(heads, self.num_draft_tokens)] if self.num_draft_tokens else []
+            )
+            self._kvb_decoder.reserve(model_runner.max_running_requests, self._kvb_shapes)
         if is_tokenspeed_mla_available():
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
                 self.device,
