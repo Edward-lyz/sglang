@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import vocab_dp_static_rows
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -144,7 +145,9 @@ class DsparkDraftSampler:
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.gamma
-        base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
+        base_logits, confidence_tap = self.model.compute_base_logits(
+            hidden_states, dp_rows_capacity=self.dp_rows_capacity
+        )
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.gamma)[:, 0]
 
@@ -508,9 +511,20 @@ class DraftBlockProposer:
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
         else:
+            rows_capacity = self._dp_rows_capacity(batch)
+            if (
+                getattr(self.draft_model, "lm_head_dp_gather", False)
+                and rows_capacity is None
+            ):
+                raise RuntimeError(
+                    "DSpark's DP-gathered lm head needs batch.global_num_tokens to "
+                    "agree on a per-rank row capacity; without it the ranks would "
+                    "enter the row gather with different shapes and deadlock."
+                )
             with self._base_logits_context():
                 base_logits, confidence_tap = self.draft_model.compute_base_logits(
-                    fwd.raw_hidden
+                    fwd.raw_hidden,
+                    dp_rows_capacity=rows_capacity,
                 )
                 base_logits = base_logits.view(bs, self.gamma, -1)
             draft_block = sample_draft_block(
@@ -531,7 +545,19 @@ class DraftBlockProposer:
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:
-        if not self._dp_moe_sync or batch.global_num_tokens is None:
+        # A weight-sharded dense draft also needs idle participation: its
+        # per-layer flat AllGather runs on the node-local shard group, so every
+        # rank must enter the draft forward. It MUST take the same graph-vs-
+        # eager branch as busy ranks, so it goes through the bs=1 dummy-tier
+        # path below -- the generic bs=0 IDLE forward underneath cannot replay
+        # and would be the only eager AG producer while every busy rank replays.
+        draft_weight_sharded = bool(
+            getattr(self.draft_model, "_weight_shard_layers", None)
+        )
+        if draft_weight_sharded:
+            self._run_weight_shard_idle_participation(batch)
+            return
+        if not self._dp_sync or batch.global_num_tokens is None:
             return
         device = self.draft_model_runner.device
         empty_long = torch.empty((0,), dtype=torch.int64, device=device)
@@ -550,8 +576,157 @@ class DraftBlockProposer:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
+        self._publish_dp_embed_rows_capacity(batch)
         with torch.inference_mode():
-            self.draft_model_runner.forward(idle_batch)
+            draft_out = self.draft_model_runner.forward(idle_batch)
+        if self._dp_vocab_sync and not draft_out.can_run_graph:
+            # A graph replay already ran the folded sampler (hence the
+            # base-logits collectives) on this rank; the eager path did not.
+            with torch.inference_mode(), self._base_logits_context():
+                self.draft_model.join_dp_vocab_idle(
+                    rows_capacity=self._dp_rows_capacity(batch)
+                )
+
+    def _publish_dp_embed_rows_capacity(self, batch: ScheduleBatch) -> None:
+        """The draft's embed runs INSIDE the model forward (and inside the draft
+        graph), so it reads its row capacity off the model. A graph replay baked
+        the capture-time value; refresh it for the eager path from the same
+        DP-synced rule the lm-head path uses."""
+        if not getattr(self.draft_model, "embed_dp_gather", False):
+            return
+        capacity = self._dp_rows_capacity(batch)
+        if capacity is not None:
+            self.draft_model.dp_embed_rows_capacity = capacity
+
+    def _dp_rows_capacity(self, batch: ScheduleBatch) -> Optional[int]:
+        """Per-rank row capacity of the DP-gathered vocab collectives (embed and
+        lm head).
+
+        Must be identical on every attention-DP rank in a step, including the
+        idle ones, or the ranks enter the row gather with different shapes and
+        NCCL deadlocks. So it is derived only from the DP-synced sync values and
+        prefers the largest captured row count -- that is what a graph replay
+        bakes, so eager and idle joins have to match it. Above that capacity no
+        rank can be on the graph path, and the raw DP max is agreed on by
+        everyone.
+
+        A static capacity short-circuits all of that: it is a constant, so it
+        needs no DP-synced values at all, which is what makes this path work
+        under SGLANG_SCHEDULER_SKIP_ALL_GATHER (where ``global_num_tokens`` holds
+        the LOCAL count and ``max(gnt)`` would differ per rank).
+        """
+        if not self._dp_vocab_sync:
+            return None
+        static_rows = vocab_dp_static_rows()
+        if static_rows:
+            return static_rows
+        if batch.global_num_tokens is None:
+            return None
+        gnt, _ = spec_scale_global_num_tokens(
+            self._draft_block_spec_info,
+            batch.global_num_tokens,
+            batch.global_num_tokens_for_logprob,
+        )
+        rows = max(gnt)
+        graph_rows = self._dp_graph_rows
+        if graph_rows is None:
+            graph_rows = getattr(self._draft_sampler, "dp_rows_capacity", None)
+        if graph_rows is not None and rows <= graph_rows:
+            return int(graph_rows)
+        return rows
+
+    def _run_weight_shard_idle_participation(self, batch: ScheduleBatch) -> None:
+        """Idle participation for a weight-sharded draft, shaped like a real
+        decode step so it takes the same graph-vs-eager branch as busy ranks.
+
+        Mirrors `TargetVerifyExecutor.run_idle_participation`, which sizes its
+        dummy verify batch to a captured tier for exactly this reason. A bs=0
+        IDLE batch cannot replay (`ForwardMode.IDLE.is_cuda_graph()` is False
+        and no bs=0 tier is captured), so it would be the only eager producer
+        of the shard-group AllGather while every busy rank replays a graph.
+        """
+        gamma = self.gamma
+        device = self.draft_model_runner.device
+        if not hasattr(self.draft_model, "forward_embed"):
+            # Without a draft-owned embedding we would need the target's embed
+            # module to build input_embeds, which this call site does not have.
+            raise RuntimeError(
+                "Weight-sharded draft idle participation requires a draft model "
+                "that owns its embedding (forward_embed)."
+            )
+        # bs=1 is the smallest captured draft decode tier; req/cache indices
+        # point at slot 0, the same dummy slot the target's idle verify uses.
+        bs = 1
+        num_tokens = bs * gamma
+        idle_forward_batch = self._build_draft_forward_batch(
+            batch=batch,
+            bs=bs,
+            device=device,
+            input_ids=torch.full(
+                (num_tokens,), int(self._mask_token_id), dtype=torch.long, device=device
+            ),
+            req_pool_indices=torch.zeros((bs,), dtype=torch.int64, device=device),
+            seq_lens=torch.ones((bs,), dtype=torch.int64, device=device),
+            out_cache_loc=torch.zeros((num_tokens,), dtype=torch.int64, device=device),
+            positions=torch.arange(1, num_tokens + 1, dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.full((bs,), 1 + gamma, dtype=torch.int64),
+            seq_lens_sum=bs * (1 + gamma),
+            input_embeds=None,
+        )
+        draft_out = self._forward_draft_model(idle_forward_batch)
+        self._log_idle_participation_mode(bool(draft_out.can_run_graph))
+
+    def _forward_draft_model(self, forward_batch: ForwardBatch):
+        """Run the draft forward, joining the prefetched AG 0.
+
+        AG 0 is launched by the worker on a dedicated stream late in the
+        previous step (`prefetch_weight_shard`, right before the ReplaySSM
+        commit fold), so here we only wait for it. Busy decode and idle
+        participation both go through this, which keeps the per-step AG
+        sequence identical on every rank of the shard group.
+        """
+        wait = getattr(self.draft_model, "wait_first_weight_shard", None)
+        if wait is not None:
+            wait()
+        with torch.inference_mode():
+            draft_out = self.draft_model_runner.forward(forward_batch)
+        return draft_out
+
+    def prefetch_weight_shard(self) -> None:
+        """Launch AG 0 for the next forward (called by the worker).
+
+        Kept on the proposer so the draft model stays the only owner of the
+        shard bookkeeping; the worker decides *when* in the step to call it.
+        """
+        prefetch = getattr(self.draft_model, "prefetch_first_weight_shard", None)
+        if prefetch is not None:
+            prefetch()
+
+    def _log_idle_participation_mode(self, can_run_graph: bool) -> None:
+        """Report the mode idle participation actually took, once per state.
+
+        The previous fix attempt inferred the mode instead of measuring it and
+        was wrong (the batch still replayed), so record the observed value.
+        """
+        if self._idle_participation_mode == can_run_graph:
+            return
+        self._idle_participation_mode = can_run_graph
+        logger.info(
+            "[K3WeightShard] draft idle participation can_run_graph=%s "
+            "(must match the busy ranks' draft forward)",
+            can_run_graph,
+        )
+
+    def _log_busy_forward_mode(self, can_run_graph: bool) -> None:
+        """Same for the busy path, so the two can be compared in one log."""
+        if self._busy_forward_mode == can_run_graph:
+            return
+        self._busy_forward_mode = can_run_graph
+        logger.info(
+            "[K3WeightShard] draft busy forward can_run_graph=%s "
+            "(must match idle participation)",
+            can_run_graph,
+        )
 
     def _run_forward(
         self,
@@ -617,20 +792,18 @@ class DraftBlockProposer:
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
-        draft_forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            batch_size=bs,
+        draft_forward_batch = self._build_draft_forward_batch(
+            batch=batch,
+            bs=bs,
+            device=device,
             input_ids=draft_block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=draft_seq_lens,
             out_cache_loc=draft_cache_loc,
-            seq_lens_sum=draft_seq_lens_sum,
-            seq_lens_cpu=draft_seq_lens_cpu,
             positions=draft_positions,
+            seq_lens_cpu=draft_seq_lens_cpu,
+            seq_lens_sum=draft_seq_lens_sum,
             input_embeds=draft_input_embeds,
-            spec_algorithm=SpeculativeAlgorithm.DSPARK,
-            spec_info=self._draft_block_spec_info,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         if (
@@ -645,6 +818,8 @@ class DraftBlockProposer:
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
         draft_hidden_3d = raw_hidden.view(bs, gamma, -1)
+        if getattr(self.draft_model, "_weight_shard_layers", None):
+            self._log_busy_forward_mode(bool(draft_out.can_run_graph))
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,
             raw_hidden=raw_hidden,
@@ -652,10 +827,74 @@ class DraftBlockProposer:
             can_run_graph=draft_out.can_run_graph,
         )
 
+    def _build_draft_forward_batch(
+        self,
+        *,
+        batch: ScheduleBatch,
+        bs: int,
+        device: str,
+        input_ids: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        seq_lens_sum: int,
+        input_embeds: Optional[torch.Tensor],
+    ) -> ForwardBatch:
+        """Build the draft ForwardBatch shared by the busy and idle paths.
+
+        Busy decode and idle participation MUST produce structurally identical
+        batches: the draft's per-layer flat AllGather is launched from inside
+        `DFlashDraftModel.forward`, so if one rank replays a cuda graph while
+        another runs eager, the two disagree on both the AG submission order
+        and on the ownership of `FlatAGScheduler._shared_event` (a graph event
+        node vs. an eager record on the same cudaEvent). That mismatch stalls
+        the shard group. Routing both paths through this builder keeps replay
+        admission (`can_run_graph`) reading the same fields on both sides.
+        """
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_lens_sum,
+            seq_lens_cpu=seq_lens_cpu,
+            positions=positions,
+            input_embeds=input_embeds,
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            spec_info=self._draft_block_spec_info,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            out_cache_loc_is_physical=self._compact,
+        )
+        self._fill_dp_moe_sync_metadata(forward_batch, batch)
+        self._publish_dp_embed_rows_capacity(batch)
+        if not self._dp_moe_sync:
+            # Dense (dp-local) draft: under --enable-dp-attention the draft's
+            # graph runner keeps require_mlp_sync, so replay admission reads
+            # can_run_dp_cuda_graph off this hand-built batch; without it the
+            # captured draft graphs never replay. The dense draft's only
+            # cross-DP collective is the DP-gathered lm head (dp_vocab_sync),
+            # which pads to the same captured bucket on every rank, so the
+            # scheduler's global decode-sync flag is a safe gate.
+            # num_token_non_padded mirrors ForwardBatch.init_new; the replay
+            # hook localizes it per attn-TP rank when the gathered-buffer path
+            # is active.
+            forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+            if enable_num_token_non_padded():
+                num_tokens = int(forward_batch.input_ids.numel())
+                forward_batch.num_token_non_padded = torch.tensor(
+                    num_tokens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+                forward_batch.num_token_non_padded_cpu = num_tokens
+        return forward_batch
+
     def _fill_dp_moe_sync_metadata(
         self, forward_batch: ForwardBatch, batch: ScheduleBatch
     ) -> None:
-        if not self._dp_moe_sync or batch.global_num_tokens is None:
+        if not self._dp_sync or batch.global_num_tokens is None:
             return
         gnt, gnt_logprob = spec_scale_global_num_tokens(
             self._draft_block_spec_info,

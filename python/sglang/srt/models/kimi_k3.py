@@ -81,6 +81,8 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    dp_sharded_embed,
+    embed_is_dp_sharded,
     get_embedding_tp_kwargs,
 )
 from sglang.srt.managers.mm_utils import (
@@ -2887,6 +2889,12 @@ class KimiK3LinearModel(nn.Module):
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
+            elif embed_is_dp_sharded(self.embed_tokens):
+                # Vocab shards span the whole TP group while DP attention gives
+                # this rank only its own tokens: gather the ids, embed, scatter.
+                hidden_states = dp_sharded_embed(
+                    self.embed_tokens, input_ids, forward_batch
+                )
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual = None

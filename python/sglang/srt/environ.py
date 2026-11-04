@@ -353,6 +353,14 @@ class Envs:
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
+    # Redistribute the DP-gathered base logits with a ring all-gather over the
+    # vocab dim instead of the all-to-all (see shared_lm_head_logits). Costs
+    # vocab_tp_size x the traffic and a vocab_tp_size-sized gather buffer, but
+    # avoids the send/recv P2P connections NCCL builds lazily against every peer
+    # the first time the all-to-all runs -- which lands inside the draft cuda
+    # graph capture and cost ~0.4 GB per peer (2.6 GB at SGLANG_VOCAB_TP_SIZE=8)
+    # in measurements. Must be set identically on every rank.
+    SGLANG_DSPARK_LM_HEAD_VOCAB_ALL_GATHER = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
@@ -1477,6 +1485,44 @@ class Envs:
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
     # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
+    # Under DP attention, shard the input embedding along the vocab dimension
+    # over the FULL TP group instead of the attention-TP group (the default,
+    # which replicates the whole table on every rank when dp_size == tp_size).
+    # Saves (N-1)/N of the embedding weights per rank; costs a DP row gather +
+    # an all-reduce + a scatter around every embed lookup, the same shape of
+    # traffic LogitsProcessor pays around a global-TP lm_head. Drives both the
+    # target and every draft that shares its embedding
+    # (get_embedding_tp_kwargs); they must stay in lock-step.
+    SGLANG_ENABLE_EMBED_DP_SHARD = EnvBool(False)
+    # Let DSpark run with a TP-sharded (non-dp) lm head under DP attention: the
+    # draft shares the target lm_head, whose vocab shards then span the whole TP
+    # group while each rank drafts its own tokens, so the draft's base logits
+    # need a DP row gather + all-to-all around the local shard matmul (see
+    # shared_lm_head_logits). Requires pure DP (--dp-size == --tp-size). Off by
+    # default: without it DSpark keeps requiring --enable-dp-lm-head.
+    SGLANG_ENABLE_DSPARK_LM_HEAD_DP_SHARD = EnvBool(False)
+    # Vocab-parallel shard width for the input embedding / lm_head whenever they
+    # shard over the global TP group (i.e. no --enable-dp-lm-head for the head,
+    # SGLANG_ENABLE_EMBED_DP_SHARD=1 for the embedding). 0 = the whole TP group
+    # (default). Set it to the per-node GPU count (e.g. 8 with tp_size=16 on two
+    # nodes) to keep every vocab collective inside a node: each node then holds
+    # one full vocab replica sharded across its own GPUs, so the logits
+    # all-gather / embed all-reduce never crosses the NIC, at the cost of one
+    # replica per node instead of one per job. Must divide tp_size.
+    SGLANG_VOCAB_TP_SIZE = EnvInt(0)
+    # Per-rank row capacity of the vocab DP gather/scatter that the sharded
+    # embedding and lm_head run (see vocab_dp_block_layout). 0 = derive the
+    # layout from the DP-synced per-rank token counts (default). Set it to a
+    # constant >= the largest row count any rank can bring, and every rank then
+    # claims an equally sized slot, so the offsets are rank * rows and the buffer
+    # is dp_per_block * rows -- derivable locally. That is what makes this path
+    # usable together with SGLANG_SCHEDULER_SKIP_ALL_GATHER, where the per-rank
+    # counts are no longer gathered and describe only the local rank. Same
+    # contract as DSpark's rows_capacity: must be identical on every rank, and
+    # every rank must be in the same forward mode on every step (the skipped
+    # all-gather no longer reconciles global_forward_mode). Rows are the
+    # post-spec-scaling token count, i.e. batch_size * num_tokens_per_req.
+    SGLANG_VOCAB_DP_STATIC_ROWS = EnvInt(0)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)

@@ -179,10 +179,108 @@ def get_embedding_tp_kwargs() -> dict:
         # Replicate the full table on every rank: skips the embed all-reduce
         # at the cost of duplicated embedding weights.
         return {"enable_tp": False}
+    if envs.SGLANG_ENABLE_EMBED_DP_SHARD.get() and is_dp_attention_enabled():
+        # Shard over the FULL TP group even under DP attention: the ranks of
+        # that group hold different tokens, so every caller must wrap the
+        # lookup in the DP row gather/scatter (see dp_sharded_embed).
+        # SGLANG_VOCAB_TP_SIZE can narrow that group to an intra-node block.
+        return {"enable_tp": True, "use_attn_tp_group": False}
     # Shard along the vocab dim. Under DP attention each rank owns only its
     # local tokens, so reduce within the attention-TP group, not the full TP
     # group.
     return {"enable_tp": True, "use_attn_tp_group": is_dp_attention_enabled()}
+
+
+def embed_is_dp_sharded(embed_tokens: torch.nn.Module) -> bool:
+    """True when the embedding's vocab shards span more than one attention-DP
+    group, i.e. the lookup needs the DP row gather/scatter to be correct.
+
+    Holds for both shard widths of the non-attn-TP scope: the whole TP group and
+    the narrower intra-node block picked by SGLANG_VOCAB_TP_SIZE (the block
+    still spans several DP ranks, each holding different tokens)."""
+    return (
+        int(getattr(embed_tokens, "tp_size", 1)) > 1
+        and not getattr(embed_tokens, "use_attn_tp_group", False)
+        and get_parallel().attn_tp_size < int(embed_tokens.tp_size)
+    )
+
+
+def dp_sharded_embed(
+    embed_tokens: torch.nn.Module,
+    input_ids: torch.Tensor,
+    forward_batch,
+) -> torch.Tensor:
+    """Embed with a vocab table sharded over the full TP group while DP
+    attention hands each rank only its own tokens.
+
+    The layer's reduce spans every TP rank, so all of them must look up the
+    SAME ids: gather the ids over the DP dim, embed (the layer's all-reduce
+    then sums the vocab shards), and keep this rank's rows. Same shape as what
+    LogitsProcessor does around a global-TP lm_head
+    (_gather_dp_attn_hidden_states / _scatter_dp_attn_logits).
+
+    Offsets are safe in both padding modes even though dp_scatter always derives
+    them as a cumsum of global_num_tokens_gpu: under MAX_LEN,
+    compute_dp_attention_metadata rewrites global_num_tokens to [max] * dp_size
+    (forward_batch_info.py), so the cumsum equals the all_gather layout
+    (rank * max_len); under SUM_LEN the all_reduce/all_gatherv layout is the
+    cumsum by construction.
+
+    When the vocab scope is narrowed (SGLANG_VOCAB_TP_SIZE) each block already
+    holds a full replica, so only the block's ids have to be shared and the
+    gather runs on the block's group. The same reasoning applies to the block
+    cumsum: MAX_LEN equalizes the per-rank counts, so slicing them per block
+    keeps gather and scatter offsets in agreement.
+    """
+    from sglang.srt.layers.dp_attention import (
+        dp_gather_replicate,
+        dp_scatter,
+        get_global_dp_buffer_len,
+        vocab_block_dp_gather_replicate,
+        vocab_block_dp_scatter,
+        vocab_dp_block_layout,
+        vocab_dp_static_rows,
+    )
+
+    block = vocab_dp_block_layout(
+        forward_batch.global_num_tokens_cpu, forward_batch.global_num_tokens_gpu
+    )
+    if block is not None:
+        block_ids = input_ids.new_zeros((block.buffer_len,))
+        vocab_block_dp_gather_replicate(block_ids, input_ids, block)
+        block_embeds = embed_tokens(block_ids)
+        local_embeds = block_embeds.new_empty(
+            (input_ids.shape[0], block_embeds.shape[-1])
+        )
+        vocab_block_dp_scatter(local_embeds, block_embeds, block)
+        return local_embeds
+
+    global_len = get_global_dp_buffer_len()
+    if global_len is None:
+        raise RuntimeError(
+            "dp_sharded_embed needs the DP buffer length for this forward; "
+            "the caller must run inside the mlp-sync (DP gather) path."
+        )
+    if vocab_dp_static_rows() or forward_batch.global_num_tokens_cpu is None:
+        # The global path derives both its buffer length and its offsets from
+        # DP-synced per-rank counts. A static row capacity is only wired into the
+        # block layout, and without the counts `get_global_dp_buffer_len()` is a
+        # leftover from an earlier forward: gathering into it would silently
+        # mis-place rows rather than fail.
+        raise RuntimeError(
+            "dp_sharded_embed fell back to the global DP gather, which needs "
+            "DP-synced per-rank token counts. Narrow the vocab scope with "
+            "SGLANG_VOCAB_TP_SIZE so the block layout applies, or drop "
+            "SGLANG_VOCAB_DP_STATIC_ROWS / SGLANG_SCHEDULER_SKIP_ALL_GATHER."
+        )
+    global_ids = input_ids.new_zeros((global_len,))
+    dp_gather_replicate(global_ids, input_ids, forward_batch)
+    global_embeds = embed_tokens(global_ids)
+    local_embeds = global_embeds.new_empty(
+        (input_ids.shape[0], global_embeds.shape[-1])
+    )
+    dp_scatter(local_embeds, global_embeds, forward_batch)
+    return local_embeds
 
 
 class VocabParallelEmbedding(torch.nn.Module):
@@ -247,13 +345,26 @@ class VocabParallelEmbedding(torch.nn.Module):
             if use_attn_tp_group:
                 tp_rank = get_parallel().attn_tp_rank
                 self.tp_size = get_parallel().attn_tp_size
+                self.vocab_shard_group = get_parallel().attn_tp_group
             else:
-                tp_rank = get_parallel().tp_rank
-                self.tp_size = get_parallel().tp_size
+                # The "global TP" scope goes through the vocab-TP group, which
+                # IS the TP group unless SGLANG_VOCAB_TP_SIZE narrows it to an
+                # intra-node block (one vocab replica per block).
+                tp_rank = get_parallel().vocab_tp_rank
+                self.tp_size = get_parallel().vocab_tp_size
+                self.vocab_shard_group = get_parallel().vocab_tp_group
         else:
             assert use_attn_tp_group is False
             tp_rank = 0
             self.tp_size = 1
+            self.vocab_shard_group = None
+        # True when the shards span a strict subgroup of TP: the reduce/gather
+        # must name that group instead of the ambient TP collectives.
+        self.vocab_tp_subgroup = (
+            self.enable_tp
+            and not use_attn_tp_group
+            and self.tp_size < get_parallel().tp_size
+        )
 
         self.num_embeddings = num_embeddings
         self.org_vocab_size = org_num_embeddings or num_embeddings
@@ -355,13 +466,15 @@ class VocabParallelEmbedding(torch.nn.Module):
         layout outlined in the class docstring, based on the given tp_rank and
         tp_size."""
         num_added_embeddings_padded = vocab_size_padded - org_vocab_size_padded
-        padded_org_vocab_start_index, padded_org_vocab_end_index = (
-            vocab_range_from_global_vocab_size(org_vocab_size_padded, tp_rank, tp_size)
-        )
-        padded_added_vocab_start_index, padded_added_vocab_end_index = (
-            vocab_range_from_global_vocab_size(
-                num_added_embeddings_padded, tp_rank, tp_size, offset=org_vocab_size
-            )
+        (
+            padded_org_vocab_start_index,
+            padded_org_vocab_end_index,
+        ) = vocab_range_from_global_vocab_size(org_vocab_size_padded, tp_rank, tp_size)
+        (
+            padded_added_vocab_start_index,
+            padded_added_vocab_end_index,
+        ) = vocab_range_from_global_vocab_size(
+            num_added_embeddings_padded, tp_rank, tp_size, offset=org_vocab_size
         )
         # remove padding
         org_vocab_start_index = min(padded_org_vocab_start_index, org_vocab_size)
@@ -529,7 +642,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         in-place fill deliberately stay outside the pool.
         """
         symm_alloc = use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_tp_group(),
+            disabled=not is_allocation_symmetric() or self.vocab_tp_subgroup,
         )
         if self.tp_size == 1:
             with symm_alloc:
@@ -559,6 +673,16 @@ class VocabParallelEmbedding(torch.nn.Module):
         output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         return output_parallel
 
+    def embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
+        """Vocab-shard lookup WITHOUT the cross-rank reduce, for callers that
+        own the reduce themselves -- e.g. a speculative draft that shares this
+        table while its ambient TP group is patched to the attention-TP group,
+        so it must name the shard group explicitly."""
+        maybe_detect_oob(
+            input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
+        )
+        return self._embed_local_shard(input_)
+
     def forward(self, input_):
         # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
         # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
@@ -569,6 +693,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
             if self.use_attn_tp_group:
                 output_parallel = attn_tp_all_reduce(output_parallel)
+            elif self.vocab_tp_subgroup:
+                # Vocab replicated per block: reduce inside the block only.
+                output_parallel = self.vocab_shard_group.all_reduce(output_parallel)
             else:
                 # Reduce across all the model parallel GPUs.
                 output_parallel = tensor_model_parallel_all_reduce(output_parallel)

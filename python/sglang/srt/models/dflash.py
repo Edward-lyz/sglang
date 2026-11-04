@@ -28,6 +28,15 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sharding import (
+    WeightShardForwardPlanner,
+    finalize_model_weight_shard,
+    get_weight_sharding_config,
+    get_weight_sharding_side_stream,
+    prepare_layer_weight_shard_forward,
+    resolve_weight_module,
+    setup_layer_weight_shard_flat,
+)
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
@@ -279,6 +288,13 @@ class DFlashDecoderLayer(nn.Module):
 
     def __init__(self, config, layer_id: int, quant_config=None) -> None:
         super().__init__()
+        # Weight sharding resolves the layer id off the module (`_layer_id`) to
+        # apply SGLANG_K3_WEIGHT_SHARD_LAYERS, so it must be recorded here.
+        self.layer_id = layer_id
+        # DFlash layers are draft (MTP) layers: weight sharding applies its
+        # draft-specific layer selection (default "all", i.e. every draft layer
+        # including layer 0) instead of the K3 target's 1-92 range.
+        self._weight_shard_is_draft = True
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
@@ -289,6 +305,70 @@ class DFlashDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = DFlashMLP(config=config, quant_config=quant_config)
 
+        # Must stay last in __init__: it shrinks `weight.data` to this rank's
+        # row slice and replaces the weight_loader, so every init-time shape
+        # decision above must have been made against the full weight.
+        self._setup_weight_shard()
+
+    def weight_shard_targets(self) -> list:
+        """Dotted paths of draft weights that runtime weight sharding may split.
+
+        The DSPARK dense draft is built under the attn-TP group (draft_tp_context,
+        attn_tp==1 under full DP attention), so every linear is fully replicated
+        across ranks and qualifies as a shard target. `fc` / `markov_w2` are plain
+        ``nn.Linear`` without ``quant_method`` and are deliberately excluded (the
+        sharding layer only supports SGLang linear modules).
+
+        `self_attn.qkv_proj` is also excluded on purpose: the context-KV
+        injection path (`DSparkDraftMixin.write_context_hidden_kv`) reads that
+        weight directly, outside this layer's AllGather window. Reconstructed
+        weights live in a 2-slot ping-pong staging pool, so by then the rows
+        would already have been overwritten by another layer's AllGather. QKV
+        is the smallest of the four linears, so keeping it replicated costs
+        little.
+        """
+        return [
+            "self_attn.o_proj",
+            "mlp.gate_up_proj",
+            "mlp.down_proj",
+        ]
+
+    def _setup_weight_shard(self) -> None:
+        """Host one flat AllGather covering this layer's replicated weights.
+
+        Mirrors KimiK3DecoderLayer._setup_weight_shard: the draft runs one
+        AllGather per layer, launched one layer ahead by WeightShardForwardPlanner
+        and consumed at the top of `forward`.
+        """
+        cfg = get_weight_sharding_config()
+        if not cfg.enabled:
+            return
+        targets: list = []
+        for target_path in self.weight_shard_targets():
+            target_mod = resolve_weight_module(self, target_path)
+            mod_tp = (
+                int(getattr(target_mod, "tp_size", 1))
+                if target_mod is not None
+                else None
+            )
+            # Only fully replicated weights may be sharded; a draft built under
+            # a real TP narrow must be left untouched.
+            if target_mod is not None and mod_tp == 1:
+                targets.append(target_path)
+        if not targets:
+            return
+        sched = setup_layer_weight_shard_flat(
+            self,
+            targets=[(p, p) for p in targets],
+            side_stream=get_weight_sharding_side_stream(),
+        )
+        logger.debug(
+            "[K3WeightShard draft-layer=%s] targets=%s sched=%s",
+            self.layer_id,
+            targets,
+            sched,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -296,6 +376,9 @@ class DFlashDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # First statement: attention reads sharded weights before the MLP, so
+        # the layer's AllGather must be joined and `weight.data` rebound here.
+        prepare_layer_weight_shard_forward(self)
         if hidden_states.numel() == 0:
             # Keep return types consistent for upstream callers.
             if residual is None:
@@ -370,6 +453,29 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(default=16)
+        # feature_indices tuple -> column index into fc.weight. The PP-local
+        # feature set is fixed at startup, so the index is built once (see
+        # `_partial_fc_column_index`).
+        self._partial_fc_index_cache: dict[Tuple[int, ...], torch.Tensor] = {}
+
+        # Runtime weight sharding (K3 DSPARK draft under full DP attention):
+        # every draft layer is fully replicated, so its four big linears are
+        # split 1/N and rebuilt per forward by one flat AllGather each.
+        self._weight_shard_layers = [
+            (i, self.layers[i])
+            for i in range(num_layers)
+            if getattr(self.layers[i], "_weight_shard_sched", None) is not None
+        ]
+        self._weight_shard_planner = WeightShardForwardPlanner(
+            self._weight_shard_layers
+        )
+        self._weight_shard_pool = None
+        self._weight_shard_finalized = False
+        logger.info(
+            "[K3WeightShard] %s: %d weight-sharded layers",
+            type(self).__name__,
+            len(self._weight_shard_layers),
+        )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -414,10 +520,14 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
-        for layer in self.layers:
+        self._weight_shard_planner.reset()
+        self._weight_shard_planner.pre_dispatch(0)
+        for i, layer in enumerate(self.layers):
+            self._weight_shard_planner.maybe_dispatch(i + 1)
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+            self._weight_shard_planner.update_done_event(i, layer)
 
         if hidden_states.numel() != 0:
             if residual is None:
@@ -429,6 +539,104 @@ class DFlashDraftModel(nn.Module):
             next_token_logits=None,
             hidden_states=hidden_states,
         )
+
+    def force_weight_shard_finalize(self) -> None:
+        """Finalize the draft's replicated weight shards before graph capture.
+
+        Invoked by ModelRunner.initialize() through the same hasattr hook as the
+        Kimi K3 target model; runs inside the draft worker after all weights are
+        loaded and before the draft decode graphs are captured.
+        """
+        if self._weight_shard_finalized:
+            return
+        modules = [module for _, module in self._weight_shard_layers]
+        self._weight_shard_pool = finalize_model_weight_shard(modules, mode="force")
+        self._weight_shard_finalized = True
+        if modules:
+            torch.cuda.empty_cache()
+        self._enable_first_weight_shard_prefetch()
+
+    def _num_external_weight_shards(self) -> int:
+        # Exactly AG 0 is hoisted (host-launched to overlap the ReplaySSM commit
+        # fold); AG 1..N-1 stay in-graph under the planner's depth-1 lookahead
+        # (layer i dispatches AG i+1), which keeps the in-model pipeline intact.
+        return min(1, len(self._weight_shard_layers))
+
+    def _enable_first_weight_shard_prefetch(self) -> None:
+        """Move ONLY layer 0's AllGather off the forward path.
+
+        Layers 1..N-1 keep their in-graph AGs dispatched one layer ahead, so the
+        draft forward itself carries no extra bubble beyond layer 0's slot. AG 0
+        has nothing inside the forward to overlap with: it is launched by the
+        host on a dedicated stream right where this step's ReplaySSM commit fold
+        begins, so it overlaps that ~4ms pure-compute window instead of sitting
+        exposed at the head of the next draft forward.
+
+        The dedicated stream matters: draft and target share one side stream,
+        and the target's own flat AGs queue ahead of an eager AG there, pushing
+        its start past the fold (v5 measured ~25us overlap). On its own stream
+        the AG's start time is determined solely by the gate event.
+        """
+        self._external_weight_shard_scheds = []
+        self._weight_shard_prefetched = False
+        self._weight_shard_gate = None
+        n_external = self._num_external_weight_shards()
+        if n_external <= 0:
+            return
+        sched = getattr(self._weight_shard_layers[0][1], "_weight_shard_sched", None)
+        if sched is None:
+            return
+        sched.set_external_prefetch(True)
+        # One dedicated prefetch stream shared by all hoisted layers; today that
+        # is exactly one (AG 0), so there is never concurrent eager traffic on it.
+        self._ag_prefetch_stream = torch.cuda.Stream()
+        sched.set_prefetch_stream(self._ag_prefetch_stream)
+        self._external_weight_shard_scheds.append(sched)
+        self._weight_shard_gate = torch.cuda.Event()
+        logger.info(
+            "[K3WeightShard] draft hoisted %d/%d layer AG(s) out of the graph "
+            "(dedicated prefetch stream)",
+            len(self._external_weight_shard_scheds),
+            len(self._weight_shard_layers),
+        )
+
+    def prefetch_first_weight_shard(self) -> None:
+        """Launch AG 0 for the *next* forward on its own stream.
+
+        Called by the worker immediately before the ReplaySSM commit fold. The
+        gate event is recorded here on the compute stream just before the fold
+        enters the stream, so on the device the AG starts together with the fold
+        and runs inside its ~4ms window.
+        """
+        scheds = getattr(self, "_external_weight_shard_scheds", None)
+        if not scheds or torch.cuda.is_current_stream_capturing():
+            return
+        if self._weight_shard_prefetched:
+            # One AG per step, no matter how many gate modes/call sites run:
+            # a duplicate submission would desynchronize the shard-group PG.
+            return
+        gate = self._weight_shard_gate
+        if gate is not None:
+            gate.record(torch.cuda.current_stream())
+        for sched in scheds:
+            sched.external_launch(gate_event=gate)
+        self._weight_shard_prefetched = True
+
+    def wait_first_weight_shard(self) -> None:
+        """Block the compute stream on the prefetched AG before the forward."""
+        scheds = getattr(self, "_external_weight_shard_scheds", None)
+        if not scheds or torch.cuda.is_current_stream_capturing():
+            return
+        if not self._weight_shard_prefetched:
+            # Cold start (and any step that skipped the prefetch): fall back to
+            # launching inline so the forward never reads a stale buffer.
+            for sched in scheds:
+                sched.external_launch()
+        for sched in scheds:
+            sched.external_wait()
+        # Later layers reuse the staging slots inside this same forward, so the
+        # prefetched contents do not survive it: every step must re-launch.
+        self._weight_shard_prefetched = False
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

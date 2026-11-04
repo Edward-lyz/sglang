@@ -8,6 +8,7 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import vocab_dp_static_rows
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -265,6 +266,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
         )
 
+        if self._is_pd_prefill and not self._draft_is_moe:
+            self.draft_model.prune_to_ctx_kv_injection()
+
+    @property
+    def _draft_weight_sharded(self) -> bool:
+        # Runtime weight sharding adds a node-local AllGather to the dense
+        # draft's forward. Idle DP ranks must still run that forward (empty
+        # batch) so all shard-group members enter the AG; probe live because
+        # prune_to_ctx_kv_injection() drops the shard bookkeeping.
+        return bool(getattr(self.draft_model, "_weight_shard_layers", None))
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -290,6 +302,25 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._draft_dp_context_enabled:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
+
+    def _vocab_graph_capture_context(self):
+        """Put the lm_head shard group's pynccl comm in graph mode for the draft
+        capture.
+
+        The draft graphs are captured with the ambient TP group patched to
+        attn-TP, so the module-level ``graph_capture()`` only switches THAT
+        group into graph mode (pynccl enabled). The DP-gathered lm-head
+        collectives run on the shard group (the global TP group), whose pynccl
+        comm would stay disabled and fall back to torch.distributed -- which is
+        not capturable and stalls the capture.
+        """
+        if not self._dp_vocab_sync:
+            return nullcontext()
+        group = getattr(self.draft_model, "lm_head_group", None)
+        pynccl_comm = getattr(group, "pynccl_comm", None)
+        if pynccl_comm is None:
+            return nullcontext()
+        return pynccl_comm.change_state(enable=True)
 
     def alloc_memory_pool(
         self,
@@ -324,7 +355,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
-        with self._draft_context():
+        with self._draft_context(), self._vocab_graph_capture_context():
             if capture_decode_cuda_graph:
                 self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
@@ -517,11 +548,23 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
             if self.server_args.enable_dp_attention:
-                if self._draft_is_moe:
-                    self._proposer.run_idle_participation(batch)
+                if (
+                    self._draft_is_moe
+                    or self._dp_vocab_sync
+                    or self._draft_weight_sharded
+                ):
+                    # Same TP context as the busy path's propose, so the draft
+                    # side of an idle rank issues its collectives on the same
+                    # groups.
+                    with self._draft_context():
+                        self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )
+                # Mirror the busy path: exactly one AG submission per step on
+                # every rank (the proposer's prefetch is idempotent).
+                if self._draft_weight_sharded:
+                    self._proposer.prefetch_weight_shard()
             return self._decode_idle_result(on_publish=on_publish)
 
         batch.seq_lens.record_stream(
@@ -661,6 +704,15 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+        # Fire AG 0 here, right where the accept-epilogue kernels
+        # (finalize_accept_lens / build_out_tokens / index ops) are about to be
+        # enqueued: the gate resolves at the epilogue start on the device, so
+        # the AG covers [accept epilogue + ReplaySSM commit fold]. The proposer's
+        # prefetch is idempotent per step, and the idle path mirrors this with
+        # exactly one submission per step (NCCL pairs the shard-group AGs by
+        # sequence number).
+        if self._draft_weight_sharded:
+            self._proposer.prefetch_weight_shard()
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,

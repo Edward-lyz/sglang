@@ -27,6 +27,7 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    VocabBlockDpLayout,
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -34,6 +35,9 @@ from sglang.srt.layers.dp_attention import (
     get_dp_device,
     get_dp_dtype,
     get_dp_hidden_size,
+    vocab_block_dp_gather_replicate,
+    vocab_block_dp_scatter,
+    vocab_dp_block_layout,
 )
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
@@ -278,6 +282,10 @@ class LogitsMetadata:
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # The gather mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
+    # Row layout of this rank's vocab block, set by compute_dp_attention_metadata
+    # when the vocab scope is narrower than TP (SGLANG_VOCAB_TP_SIZE): then the
+    # DP gather/scatter of the hidden states stays inside the block.
+    vocab_block_dp: Optional[VocabBlockDpLayout] = None
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
@@ -347,27 +355,39 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-        cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
-        dp_rank = get_parallel().attn_dp_rank
-        if dp_rank == 0:
-            dp_local_start_pos = torch.zeros_like(
-                self.global_num_tokens_for_logprob_gpu[0]
-            )
+        # With a narrowed vocab scope every rank of a block holds a full vocab
+        # replica, so the rows only have to be shared inside the block: gather
+        # (and size the buffer for) the block's DP ranks instead of all of them.
+        self.vocab_block_dp = vocab_dp_block_layout(
+            self.global_num_tokens_for_logprob_cpu,
+            self.global_num_tokens_for_logprob_gpu,
+        )
+        if self.vocab_block_dp is not None:
+            self.dp_local_start_pos = self.vocab_block_dp.local_start_pos
+            self.dp_local_num_tokens = self.vocab_block_dp.local_num_tokens
+            self.global_dp_buffer_len = self.vocab_block_dp.buffer_len
         else:
-            dp_local_start_pos = cumtokens[dp_rank - 1]
+            cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
+            dp_rank = get_parallel().attn_dp_rank
+            if dp_rank == 0:
+                dp_local_start_pos = torch.zeros_like(
+                    self.global_num_tokens_for_logprob_gpu[0]
+                )
+            else:
+                dp_local_start_pos = cumtokens[dp_rank - 1]
 
-        self.dp_local_start_pos = dp_local_start_pos
-        self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+            self.dp_local_start_pos = dp_local_start_pos
+            self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+
+            if self.global_num_tokens_for_logprob_cpu is not None:
+                # create a smaller buffer to reduce peak memory usage
+                self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
+            else:
+                self.global_dp_buffer_len = self.global_dp_buffer_len
 
         hidden_size = get_dp_hidden_size()
         dtype = get_dp_dtype()
         device = get_dp_device()
-
-        if self.global_num_tokens_for_logprob_cpu is not None:
-            # create a smaller buffer to reduce peak memory usage
-            self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
-        else:
-            self.global_dp_buffer_len = self.global_dp_buffer_len
 
         self.gathered_buffer = torch.empty(
             (
@@ -393,6 +413,13 @@ class LogitsProcessor(nn.Module):
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_server_args().enable_fp32_lm_head
+        # The lm_head's vocab shards live on the vocab-TP group, which equals the
+        # TP group unless SGLANG_VOCAB_TP_SIZE narrows it to an intra-node block
+        # (one vocab replica per block). Only the vocab gather changes: the DP
+        # row gather below still spans every DP rank, so after it every rank
+        # holds all rows and one replica's worth of shards is enough.
+        self.vocab_tp_size = get_parallel().vocab_tp_size
+        self.vocab_tp_subgroup = self.vocab_tp_size < get_parallel().tp_size
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -401,7 +428,7 @@ class LogitsProcessor(nn.Module):
             self.do_tensor_parallel_all_gather_dp_attn = False
         else:
             self.do_tensor_parallel_all_gather = (
-                not skip_all_gather and get_parallel().tp_size > 1
+                not skip_all_gather and self.vocab_tp_size > 1
             )
             self.do_tensor_parallel_all_gather_dp_attn = (
                 self.do_tensor_parallel_all_gather and get_parallel().attn_dp_size != 1
@@ -423,7 +450,9 @@ class LogitsProcessor(nn.Module):
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            enabled=self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.vocab_tp_subgroup,
             skip_entry_sync=True,
         )
 
@@ -752,6 +781,9 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
+            elif self.vocab_tp_subgroup:
+                # One vocab replica per block: gather inside the block only.
+                logits = get_parallel().vocab_tp_group.all_gather(logits, dim=-1)
             else:
                 logits = self._logits_gatherer(logits)
 
@@ -828,7 +860,12 @@ class LogitsProcessor(nn.Module):
             logits_metadata.compute_dp_attention_metadata()
             local_hidden_states = hidden_states
             hidden_states = logits_metadata.gathered_buffer
-            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            if logits_metadata.vocab_block_dp is not None:
+                vocab_block_dp_gather_replicate(
+                    hidden_states, local_hidden_states, logits_metadata.vocab_block_dp
+                )
+            else:
+                dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
 
@@ -873,7 +910,12 @@ class LogitsProcessor(nn.Module):
                 device=global_logits.device,
                 dtype=global_logits.dtype,
             )
-            dp_scatter(logits, global_logits, logits_metadata)
+            if logits_metadata.vocab_block_dp is not None:
+                vocab_block_dp_scatter(
+                    logits, global_logits, logits_metadata.vocab_block_dp
+                )
+            else:
+                dp_scatter(logits, global_logits, logits_metadata)
         return logits
 
     def _copy_logits_to_buffer(

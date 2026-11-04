@@ -102,6 +102,9 @@ _PARALLEL_FIELDS = frozenset(
         "attn_tp_group",
         "attn_cp_group",
         "dcp_group",
+        "vocab_tp_size",
+        "vocab_tp_rank",
+        "vocab_tp_group",
     }
 )
 
@@ -214,6 +217,27 @@ class ParallelContext:
         return self._v("attn_tp_rank", _ps().get_attn_tensor_model_parallel_rank)
 
     @property
+    def vocab_tp_size(self) -> int:
+        """vocab_tp_size"""
+        return self._v("vocab_tp_size", self._vocab_tp_size_default)
+
+    @property
+    def vocab_tp_rank(self) -> int:
+        """vocab_tp_rank"""
+        return self._v("vocab_tp_rank", self._vocab_tp_rank_default)
+
+    def _vocab_tp_size_default(self) -> int:
+        # Fall through to the TP values unless SGLANG_VOCAB_TP_SIZE actually
+        # narrowed the vocab scope, so the plain-TP case keeps honoring
+        # tp_size / tp_rank overrides (and works before the group exists).
+        group = _ps().get_narrowed_vocab_tp_group()
+        return self.tp_size if group is None else group.world_size
+
+    def _vocab_tp_rank_default(self) -> int:
+        group = _ps().get_narrowed_vocab_tp_group()
+        return self.tp_rank if group is None else group.rank_in_group
+
+    @property
     def attn_cp_size(self) -> int:
         return self._v("attn_cp_size", _ps().get_attn_context_model_parallel_world_size)
 
@@ -285,6 +309,15 @@ class ParallelContext:
     @property
     def attn_tp_group(self) -> Any:
         return self._v("attn_tp_group", _ps().get_attn_tp_group)
+
+    @property
+    def vocab_tp_group(self) -> Any:
+        """vocab_tp_group"""
+        return self._v("vocab_tp_group", self._vocab_tp_group_default)
+
+    def _vocab_tp_group_default(self) -> Any:
+        group = _ps().get_narrowed_vocab_tp_group()
+        return self.tp_group if group is None else group
 
     @property
     def attn_cp_group(self) -> Any:
