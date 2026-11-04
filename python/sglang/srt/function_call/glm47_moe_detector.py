@@ -3,9 +3,33 @@ import json
 import logging
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import (
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+)
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from xgrammar.structural_tag import (
+    ConstStringFormat,
+    JSONSchemaFormat,
+    RegexFormat,
+    SequenceFormat,
+    StructuralTag,
+    TagFormat,
+    TagsWithSeparatorFormat,
+    TriggeredTagsFormat,
+)
+
+from sglang.srt.entrypoints.openai.protocol import (
+    Tool,
+    ToolCallConstraint,
+    ToolChoice,
+)
+from sglang.srt.environ import ToolStrictLevel
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -149,8 +173,14 @@ class Glm47MoeDetector(BaseFormatDetector):
       <tool_call>get_weather<arg_key>city</arg_key><arg_value>北京</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>上海</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self,
+        tools: List[Tool],
+        tool_choice: Union[Literal["required", "auto", "none"], ToolChoice],
+        parallel_tool_calls: bool,
+    ):
+        super().__init__(tools, tool_choice, parallel_tool_calls)
+
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
         self.func_call_regex = r"<tool_call>.*?</tool_call>"
@@ -166,9 +196,10 @@ class Glm47MoeDetector(BaseFormatDetector):
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
         self._tool_call_completed = False  # Track if tool call has been completed
-        self._sent_empty_object = (
-            False  # Track if empty object has been sent for no-arg functions
-        )
+        # Track if empty object has been sent for no-arg functions
+        self._sent_empty_object = False
+        # Buffer for synthetic JSON chars (braces, commas, key prefixes, quotes)
+        self._pending_json_prefix = ""
         self._reset_streaming_state()
 
     def _reset_streaming_state(self) -> None:
@@ -184,6 +215,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         )
         self._tool_call_completed = False  # Reset tool call completion status
         self._sent_empty_object = False  # Reset empty object sent status
+        self._pending_json_prefix = ""  # Reset pending synthetic char buffer
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -351,7 +383,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._stream_state = StreamState.IN_KEY
                     self._current_key = ""
                     self._xml_tag_buffer = ""
-                    json_output += "{" if self._is_first_param else ", "
+                    self._pending_json_prefix += "{" if self._is_first_param else ", "
                     self._is_first_param = False
 
             elif self._stream_state == StreamState.IN_KEY:
@@ -359,7 +391,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._current_key = self._xml_tag_buffer[:-10].strip()
                     self._xml_tag_buffer = ""
                     self._stream_state = StreamState.WAITING_VALUE
-                    json_output += (
+                    self._pending_json_prefix += (
                         json.dumps(self._current_key, ensure_ascii=False) + ": "
                     )
 
@@ -385,17 +417,23 @@ class Glm47MoeDetector(BaseFormatDetector):
                     if self._value_started:
                         # Output any remaining content
                         if final_value:
+                            # Flush pending synthetic chars before actual content
+                            json_output += self._pending_json_prefix
+                            self._pending_json_prefix = ""
                             if value_type == "string":
                                 json_output += json.dumps(
                                     final_value, ensure_ascii=False
                                 )[1:-1]
                             else:
                                 json_output += final_value
-                        # Always output closing quote for string type when value was started
+                        # Closing quote for string type goes to pending (synthetic)
                         if value_type == "string":
-                            json_output += '"'
+                            self._pending_json_prefix += '"'
                     else:
                         # Value was never started (empty or complete in one chunk)
+                        # Flush pending synthetic chars before formatted value
+                        json_output += self._pending_json_prefix
+                        self._pending_json_prefix = ""
                         json_output += self._format_value_complete(
                             self._current_value, value_type
                         )
@@ -418,9 +456,13 @@ class Glm47MoeDetector(BaseFormatDetector):
 
                         if value_type == "string":
                             if not self._value_started:
-                                json_output += '"'
+                                self._pending_json_prefix += '"'
                                 self._value_started = True
                             if content:
+                                json_output += (
+                                    self._pending_json_prefix
+                                )  # flush pending
+                                self._pending_json_prefix = ""
                                 json_output += json.dumps(content, ensure_ascii=False)[
                                     1:-1
                                 ]
@@ -430,6 +472,10 @@ class Glm47MoeDetector(BaseFormatDetector):
                             if content:
                                 if not self._value_started:
                                     self._value_started = True
+                                json_output += (
+                                    self._pending_json_prefix
+                                )  # flush pending
+                                self._pending_json_prefix = ""
                                 json_output += content
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
@@ -438,6 +484,10 @@ class Glm47MoeDetector(BaseFormatDetector):
                             if content:
                                 if not self._value_started:
                                     self._value_started = True
+                                json_output += (
+                                    self._pending_json_prefix
+                                )  # flush pending
+                                self._pending_json_prefix = ""
                                 json_output += content
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
@@ -568,28 +618,34 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         # Handle no-arg function or need to close braces
         if self._is_first_param and not self._sent_empty_object:
-            # No-arg function
+            # No-arg function: flush any pending prefix + "{}"
+            final_params = self._pending_json_prefix + "{}"
+            self._pending_json_prefix = ""
             calls.append(
                 ToolCallItem(
                     tool_index=self.current_tool_id,
                     name=None,
-                    parameters="{}",
+                    parameters=final_params,
                 )
             )
-            self._last_arguments += "{}"
-            self.streamed_args_for_tool[self.current_tool_id] += "{}"
+            self._last_arguments += final_params
+            self.streamed_args_for_tool[self.current_tool_id] += final_params
             self._sent_empty_object = True
-        elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
-            # Need to close brace
+        elif not self._is_first_param and not self._sent_empty_object:
+            # Outer '{' was opened when the first <arg_key> was seen — close it now.
+            # Don't gate on _last_arguments.endswith("}"): an object/array value
+            # whose last char is '}' would otherwise be mistaken for the outer close.
+            final_params = self._pending_json_prefix + "}"
+            self._pending_json_prefix = ""
             calls.append(
                 ToolCallItem(
                     tool_index=self.current_tool_id,
                     name=None,
-                    parameters="}",
+                    parameters=final_params,
                 )
             )
-            self._last_arguments += "}"
-            self.streamed_args_for_tool[self.current_tool_id] += "}"
+            self._last_arguments += final_params
+            self.streamed_args_for_tool[self.current_tool_id] += final_params
             self._sent_empty_object = True
 
         # Parse final arguments
@@ -667,75 +723,99 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         calls: list[ToolCallItem] = []
         try:
-            # Try to match a partial or complete tool call
-            # Use a single flexible regex pattern that handles all cases
-            partial_match = re.search(
-                r"<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)",
-                current_text,
-                re.DOTALL,
-            )
+            while True:
+                # Re-read buffer each iteration (may have been trimmed by _finalize_tool_call)
+                current_text = self._buffer
 
-            if not partial_match:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
-
-            # Extract match groups using helper method
-            func_name, func_args_raw, is_tool_end = self._extract_match_groups(
-                partial_match
-            )
-
-            # Initialize tool call state if needed (keeping existing logic)
-            if self.current_tool_id == -1:
-                self.current_tool_id = 0
-                self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = [""]
-                self._streamed_raw_length = 0
-                self.current_tool_name_sent = False  # Reset for new tool call
-                self._reset_streaming_state()
-            # Check if this is a continuation of an existing tool call or a new one
-            elif not self.current_tool_name_sent:
-                # Only increment tool_id if we're truly starting a NEW tool call
-                # Don't increment if this is just the first time we're processing
-                # a tool call that was received in the buffer
-                # The key insight: only increment when we've COMPLETED a previous tool call
-                # and now see another bot_token in new_text
-                pass  # Remove the problematic auto-increment logic
-
-            # Ensure tracking arrays are large enough (keeping existing logic)
-            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                self.streamed_args_for_tool.append("")
-
-            # Determine if function name is complete by checking for <arg_key> in the full text
-            # This is important for streaming scenarios where args come in later chunks
-            has_arg_key = "<arg_key" in current_text
-
-            # Send tool name if needed
-            tool_name_item = self._send_tool_name_if_needed(
-                func_name, has_arg_key, is_tool_end
-            )
-            if tool_name_item:
-                calls.append(tool_name_item)
-
-            # Process streaming arguments if tool name has been sent
-            if self.current_tool_name_sent:
-                arg_item = self._process_arguments_streaming(
-                    func_name, func_args_raw, tools
+                # Try to match a partial or complete tool call
+                # Use a single flexible regex pattern that handles all cases
+                partial_match = re.search(
+                    r"<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)",
+                    current_text,
+                    re.DOTALL,
                 )
-                if arg_item:
-                    calls.append(arg_item)
 
-                # Finalize tool call if end token is encountered
-                if is_tool_end == self.eot_token and not self._tool_call_completed:
-                    finalize_calls = self._finalize_tool_call(
-                        func_name,
-                        func_args_raw,
-                        tools,
-                        partial_match.end(),
-                        current_text,
+                if not partial_match:
+                    break
+
+                # Extract match groups using helper method
+                func_name, func_args_raw, is_tool_end = self._extract_match_groups(
+                    partial_match
+                )
+
+                # Initialize tool call state if needed (keeping existing logic)
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                    self.prev_tool_call_arr = []
+                    self.streamed_args_for_tool = [""]
+                    self._streamed_raw_length = 0
+                    self.current_tool_name_sent = False  # Reset for new tool call
+                    self._reset_streaming_state()
+                # Check if this is a continuation of an existing tool call or a new one
+                elif not self.current_tool_name_sent:
+                    # Only increment tool_id if we're truly starting a NEW tool call
+                    # Don't increment if this is just the first time we're processing
+                    # a tool call that was received in the buffer
+                    # The key insight: only increment when we've COMPLETED a previous tool call
+                    # and now see another bot_token in new_text
+                    pass  # Remove the problematic auto-increment logic
+
+                # Ensure tracking arrays are large enough (keeping existing logic)
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+
+                # Determine if function name is complete by checking for <arg_key> in the full text
+                # This is important for streaming scenarios where args come in later chunks
+                has_arg_key = "<arg_key" in current_text
+
+                # Send tool name if needed
+                tool_name_item = self._send_tool_name_if_needed(
+                    func_name, has_arg_key, is_tool_end
+                )
+                if tool_name_item:
+                    calls.append(tool_name_item)
+
+                # Process streaming arguments if tool name has been sent
+                if self.current_tool_name_sent:
+                    arg_item = self._process_arguments_streaming(
+                        func_name, func_args_raw, tools
                     )
-                    calls.extend(finalize_calls)
-                    return StreamingParseResult(normal_text=normal_text, calls=calls)
+                    if arg_item:
+                        calls.append(arg_item)
+
+                    # Finalize tool call if end token is encountered
+                    if is_tool_end == self.eot_token and not self._tool_call_completed:
+                        finalize_calls = self._finalize_tool_call(
+                            func_name,
+                            func_args_raw,
+                            tools,
+                            partial_match.end(),
+                            current_text,
+                        )
+                        # Merge finalize's synthetic closing chars (e.g. "}) into the
+                        # previous argument item, so they share the same SSE chunk
+                        # with real tokens. This keeps output_token_ids non-empty and
+                        # lets continuation_token_ids track correctly.
+                        for fc in finalize_calls:
+                            if (
+                                calls
+                                and calls[-1].name
+                                is None  # previous is an argument-delta item
+                                and fc.name
+                                is None  # current is also argument-delta (synthetic close)
+                                and calls[-1].tool_index == fc.tool_index
+                            ):
+                                calls[-1].parameters += fc.parameters
+                            else:
+                                # No prior item to merge into (e.g. no-arg function "{}"), append independently
+                                calls.append(fc)
+                        continue  # Drain next tc from buffer instead of returning
+                    else:
+                        break  # Partial tc, wait for more data
+                else:
+                    break  # Tool name not yet complete, wait for more data
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
@@ -781,8 +861,77 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         return arguments
 
-    def supports_structural_tag(self) -> bool:
-        return False
-
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
+
+    def get_structure_constraint(self) -> Optional[ToolCallConstraint]:
+        """Get structure constraint for guided generation."""
+
+        # Only parsing for requests with "tool_choice=auto"
+        if self.tool_choice != "auto":
+            return None
+
+        if self.tool_strict_level == ToolStrictLevel.OFF:
+            return None
+
+        return ("structural_tag", self._get_structural_tag())
+
+    def _get_structural_tag(self) -> StructuralTag:
+        # <tool_call>get_weather
+        #   <arg_key>city</arg_key><arg_value>北京</arg_value>
+        #   <arg_key>date</arg_key><arg_value>2024-06-27</arg_value>
+        # </tool_call>
+        # <tool_call>get_weather
+        #   <arg_key>city</arg_key><arg_value>上海</arg_value>
+        #   <arg_key>date</arg_key><arg_value>2024-06-27</arg_value>
+        # </tool_call>
+        return StructuralTag(
+            format=TriggeredTagsFormat(
+                triggers=[self.bot_token],
+                tags=[
+                    TagFormat(
+                        begin=self.bot_token,
+                        end=self.eot_token,
+                        content=SequenceFormat(
+                            elements=[
+                                ConstStringFormat(
+                                    value=f"{tool.function.name}",
+                                ),
+                            ]
+                            + (
+                                [
+                                    JSONSchemaFormat(
+                                        json_schema=property,
+                                    )
+                                    for property in tool.function.parameters[
+                                        "properties"
+                                    ]
+                                ]
+                                if self.tool_strict_level == ToolStrictLevel.PARAMETER
+                                and tool.function.parameters is not None
+                                and tool.function.strict
+                                else [
+                                    TagsWithSeparatorFormat(
+                                        tags=[
+                                            TagFormat(
+                                                begin="<arg_key>",
+                                                end="</arg_value>",
+                                                content=RegexFormat(
+                                                    pattern=r"^.*</arg_key><arg_value>.*$",
+                                                ),
+                                            ),
+                                        ],
+                                        separator="",
+                                        at_least_one=False,
+                                        stop_after_first=False,
+                                    ),
+                                ]
+                            ),
+                        ),
+                    )
+                    for tool in self.tools
+                ],
+                at_least_one=False,
+                stop_after_first=(not self.parallel_tool_calls),
+            ),
+        )

@@ -1074,6 +1074,22 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
+            # In decode disaggregation mode, the previous batch's accepted grammar
+            # tokens must be applied before generating the current batch's mask.
+            # Reuse the same overlapped grammar handoff as the centralized path.
+            if (
+                batch
+                and batch.is_spec_v2
+                and batch.spec_algorithm.is_eagle()
+                and batch.has_grammar
+                and batch.forward_mode.is_decode()
+                and len(self.result_queue) > 0
+            ):
+                last_batch, last_result = self.result_queue[-1]
+                if last_batch.has_grammar:
+                    batch.pending_accept_info = (last_batch, last_result)
+                    last_result.grammar_accept_processed = True
+
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)

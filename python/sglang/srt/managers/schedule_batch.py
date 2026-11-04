@@ -91,6 +91,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
+    from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -598,6 +599,9 @@ class Req(ReqDllmMixin):
         self.return_hidden_states = return_hidden_states
         # The thinking-related fields are mutated in the scheduler event loop.
         # They are not designed for concurrent multi-thread mutation.
+        self.thinking_budget: Optional[int] = None
+        self.thinking_inject_index: int = 0
+        self.thinking_prompt_token_ids: Optional[List[int]] = None
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -756,6 +760,7 @@ class Req(ReqDllmMixin):
         self.grammar_key: Optional[str] = None
         self.grammar: Optional[BaseGrammarObject] = None
         self.grammar_wait_ct = 0
+        self.continuation_token_ids: Optional[List[int]] = None
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
@@ -838,9 +843,9 @@ class Req(ReqDllmMixin):
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-        assert (
-            not self.kv_committed_freed
-        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        assert not self.kv_committed_freed, (
+            f"Committed KV cache already freed ({self.kv_committed_len=})"
+        )
         self.kv_committed_freed = True
         return self.kv_committed_len
 
@@ -850,9 +855,9 @@ class Req(ReqDllmMixin):
         # NOTE: This function is called when there is over-allocation of KV cache.
         # Over-allocation: we allocate more KV cache than the committed length.
         # e.g., speculative decoding may allocate more KV cache than actually used.
-        assert (
-            not self.kv_overallocated_freed
-        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        assert not self.kv_overallocated_freed, (
+            f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        )
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 
@@ -895,7 +900,14 @@ class Req(ReqDllmMixin):
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                    req=self if tree_cache.supports_mamba() else None,
+                    req=(
+                        self
+                        if (
+                            tree_cache.supports_mamba()
+                            or tree_cache.needs_req_in_match()
+                        )
+                        else None
+                    ),
                     cow_mamba=tree_cache.supports_mamba(),
                 )
             )
@@ -995,52 +1007,68 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+    def find_stop_token_index(self, tokens: List[int]) -> int:
+        """
+        Find the first stop token / EOS in a list of token ids, else -1.
+        """
         if self.sampling_params.ignore_eos:
+            return -1
+        stop_ids = self.sampling_params.stop_token_ids
+        extra = self.tokenizer.additional_stop_token_ids if self.tokenizer else None
+        tk_eos = self.tokenizer.eos_token_id if self.tokenizer else None
+        for i, tid in enumerate(tokens):
+            if stop_ids and tid in stop_ids:
+                return i
+            if self.eos_token_ids and tid in self.eos_token_ids:
+                return i
+            if tk_eos is not None and tid == tk_eos:
+                return i
+            if extra and tid in extra:
+                return i
+        return -1
+
+    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+        idx = self.find_stop_token_index(new_accepted_tokens)
+        if idx == -1:
             return False
+        self.finished_reason = FINISH_MATCHED_TOKEN(matched=new_accepted_tokens[idx])
+        matched_pos = len(self.output_ids) - len(new_accepted_tokens) + idx
+        self.finished_len = matched_pos + 1
+        return True
 
-        # Check stop token ids
-        matched_eos = False
-
-        for i, token_id in enumerate(new_accepted_tokens):
-            if self.sampling_params.stop_token_ids:
-                matched_eos |= token_id in self.sampling_params.stop_token_ids
-            if self.eos_token_ids:
-                matched_eos |= token_id in self.eos_token_ids
-            if self.tokenizer is not None:
-                matched_eos |= token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
-            if matched_eos:
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
-                matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
-                self.finished_len = matched_pos + 1
-                return True
-
-        return False
-
-    def _check_str_based_finish(self):
+    def _check_str_based_finish(self, new_accepted_len: int = 1):
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
         ):
-            tail_str = self.tail_str()
+            first_new_token = len(self.output_ids) - new_accepted_len
+            for finished_len in range(first_new_token + 1, len(self.output_ids) + 1):
+                max_len_tail_str = max(
+                    self.sampling_params.stop_str_max_len + 1,
+                    self.sampling_params.stop_regex_max_len + 1,
+                )
+                tail_len = min(max_len_tail_str + 1, finished_len)
+                tail_str = self.tokenizer.decode(
+                    self.output_ids[finished_len - tail_len : finished_len]
+                )
 
-            # Check stop strings
-            if len(self.sampling_params.stop_strs) > 0:
-                for stop_str in self.sampling_params.stop_strs:
-                    if stop_str in tail_str or stop_str in self.decoded_text:
-                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        return True
+                # Check stop strings
+                if len(self.sampling_params.stop_strs) > 0:
+                    for stop_str in self.sampling_params.stop_strs:
+                        if stop_str in tail_str or stop_str in self.decoded_text:
+                            self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                            self.finished_len = finished_len
+                            return True
 
-            # Check stop regex
-            if len(self.sampling_params.stop_regex_strs) > 0:
-                for stop_regex_str in self.sampling_params.stop_regex_strs:
-                    if re.search(stop_regex_str, tail_str):
-                        self.finished_reason = FINISHED_MATCHED_REGEX(
-                            matched=stop_regex_str
-                        )
-                        return True
+                # Check stop regex
+                if len(self.sampling_params.stop_regex_strs) > 0:
+                    for stop_regex_str in self.sampling_params.stop_regex_strs:
+                        if re.search(stop_regex_str, tail_str):
+                            self.finished_reason = FINISHED_MATCHED_REGEX(
+                                matched=stop_regex_str
+                            )
+                            self.finished_len = finished_len
+                            return True
 
         return False
 
@@ -1083,14 +1111,121 @@ class Req(ReqDllmMixin):
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
+        if self._check_str_based_finish(new_accepted_len):
+            return
+
         if self._check_token_based_finish(new_accepted_tokens):
             return
 
         if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
 
-        if self._check_str_based_finish():
+    def init_thinking_budget(self):
+        """Initialize per-request thinking budget state.
+
+        This reads `thinking_budget` and `thinking_prompt_token_ids` from
+        `self.sampling_params` and prepares request-local mutable fields for decode.
+
+        Notes:
+        - `thinking_budget` is an int state machine: `>0` counts down, `==0` starts
+          injection, `-1` means thinking is finished/disabled.
+        - `thinking_prompt_token_ids` passed from the request must NOT include the
+          `</think>` token; the server appends `think_end_id` here to ensure the
+          injected sequence always terminates the thinking segment.
+        """
+        thinking_budget = getattr(self.sampling_params, "thinking_budget", None)
+        if thinking_budget is None:
             return
+        if self.tokenizer is None:
+            return
+
+        self.thinking_budget = int(thinking_budget)
+        self.thinking_inject_index = 0
+
+        prompt_token_ids = getattr(
+            self.sampling_params, "thinking_prompt_token_ids", None
+        )
+        self.thinking_prompt_token_ids = list(prompt_token_ids or [])
+
+        think_end_id = getattr(self.tokenizer, "think_end_id", None)
+        if think_end_id is None:
+            # Fallback for when the server is launched without --reasoning-parser:
+            # infer think_end_id from tokenizer vocab and cache it on the tokenizer.
+            # Only accept single-token encodings to match the current state machine.
+            ids = self.tokenizer.encode("</think>", add_special_tokens=False)
+            if len(ids) == 1:
+                think_end_id = int(ids[0])
+                self.tokenizer.think_end_id = think_end_id
+        if think_end_id is not None:
+            self.thinking_prompt_token_ids.append(int(think_end_id))
+
+    def inject_thinking_prompt_tokens(
+        self,
+        draft_tokens: torch.Tensor,
+        start_idx: int,
+        max_count: int,
+        advance: bool = True,
+    ) -> int:
+        """Inject thinking prompt token ids into a token tensor.
+
+        This is used to truncate the `<think>...</think>` segment by injecting a
+        predefined token sequence (e.g. "思考已达上限，请开始回答" + `</think>`).
+
+        Semantics:
+        - Only active when `self.thinking_budget == 0` (budget reached, start injecting).
+        - `advance=False` is for speculative draft stage (write tokens without consuming
+          the inject sequence).
+        - `advance=True` is for verify/sample stage (commit the injection and advance
+          `thinking_inject_index`; when finished, set `thinking_budget = -1`).
+
+        Args:
+            draft_tokens: The target tensor to be overwritten in-place.
+            start_idx: Start offset in `draft_tokens` to write.
+            max_count: Maximum number of tokens to inject.
+            advance: Whether to advance the injection cursor and update state.
+
+        Returns:
+            The number of injected tokens.
+        """
+        if self.thinking_budget != 0 or not self.thinking_prompt_token_ids:
+            return 0
+        inject_index = self.thinking_inject_index
+        remains = len(self.thinking_prompt_token_ids) - inject_index
+        if remains <= 0:
+            return 0
+        count = min(max_count, remains)
+        inject_ids = self.thinking_prompt_token_ids[inject_index : inject_index + count]
+        draft_tokens[start_idx : start_idx + count] = torch.tensor(
+            inject_ids, dtype=draft_tokens.dtype, device=draft_tokens.device
+        )
+        if advance:
+            self.thinking_inject_index += count
+            if self.thinking_inject_index >= len(self.thinking_prompt_token_ids):
+                self.thinking_budget = -1  # -1 means thinking is finished/disabled
+        return count
+
+    def update_thinking_state(self, new_token_ids: List[int]) -> None:
+        """Update thinking budget state given newly accepted token ids.
+
+        Behavior:
+        - If `think_end_id` is observed, set `thinking_budget = -1` to stop all future
+          thinking budget accounting/injection for this request.
+        - Otherwise, if `thinking_budget > 0`, decrement by 1 per token.
+
+        This function does not perform injection; it only maintains the state machine.
+        """
+        if self.thinking_budget is None or self.thinking_budget < 0:
+            return
+        if self.tokenizer is None:
+            return
+
+        think_end_id = getattr(self.tokenizer, "think_end_id", None)
+        for token_id in new_token_ids:
+            if think_end_id is not None and token_id == think_end_id:
+                self.thinking_budget = -1  # -1 means thinking is finished/disabled
+                continue
+            if self.thinking_budget > 0:
+                self.thinking_budget -= 1
 
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
@@ -1298,6 +1433,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+    # Pending grammar state update from the previous overlapped batch.
+    # Format: (last_batch, last_result)
+    pending_accept_info: Optional[Tuple[ScheduleBatch, GenerationBatchResult]] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1436,9 +1574,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert (
-            len(self.out_cache_loc) == self.extend_num_tokens
-        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        assert len(self.out_cache_loc) == self.extend_num_tokens, (
+            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        )
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
@@ -1902,9 +2040,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_estimate_ratio = (
             total_decoded_tokens
             + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(self.reqs)
-        ) / (
-            total_max_new_tokens + 1
-        )  # avoid zero division
+        ) / (total_max_new_tokens + 1)  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
@@ -2238,6 +2374,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
             reqs=self.reqs,
+            pending_accept_info=self.pending_accept_info,
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
@@ -2264,6 +2401,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2311,9 +2449,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         sliding_window_size = self.tree_cache.sliding_window_size
 
         # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-        assert (
-            req.cache_protected_len % self.tree_cache.page_size == 0
-        ), "cache_protected_len must be page aligned"
+        assert req.cache_protected_len % self.tree_cache.page_size == 0, (
+            "cache_protected_len must be page aligned"
+        )
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
         new_swa_evicted_seqlen = max(
@@ -2421,6 +2559,9 @@ class ModelWorkerBatch:
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
+    # Pending grammar state update from the previous overlapped batch.
+    # Format: (last_batch, last_result)
+    pending_accept_info: Optional[Tuple[ScheduleBatch, GenerationBatchResult]] = None
     has_grammar: bool = False
 
     # For hidden states before normal

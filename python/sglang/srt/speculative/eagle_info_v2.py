@@ -372,6 +372,22 @@ class EagleVerifyInputV2Mixin:
 
         # Include the bonus token
         accept_length.add_(1)
+
+        for i, req in enumerate(batch.reqs):
+            start = i * self.draft_token_num
+            count = req.inject_thinking_prompt_tokens(
+                predict,
+                start_idx=start,
+                max_count=self.draft_token_num,
+                advance=True,
+            )
+            if count <= 0:
+                continue
+            accept_index[i].fill_(-1)
+            accept_index[i, :count] = torch.arange(
+                start, start + count, dtype=accept_index.dtype, device=device
+            )
+            accept_length[i] = count
         return predict, accept_length, accept_index
 
 

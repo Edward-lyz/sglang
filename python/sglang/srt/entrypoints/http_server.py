@@ -29,6 +29,7 @@ import time
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
+    Annotated,
     Any,
     AsyncGenerator,
     AsyncIterator,
@@ -290,7 +291,9 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager,
+        fast_api_app.state.openai_serving_chat,
+        fast_api_app.state.openai_serving_completion,
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
@@ -469,6 +472,8 @@ def stopped_by_external():
         logger.info(f"Error reading stop signal file: {e}")
 
     return False
+
+
 @app.get("/ready")
 @app.get("/health")
 @app.get("/health_forward")
@@ -687,15 +692,19 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
-                    yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS
-                    ) + b"\n\n"
+                    yield (
+                        b"data: "
+                        + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS)
+                        + b"\n\n"
+                    )
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
                 logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS
-                ) + b"\n\n"
+                yield (
+                    b"data: "
+                    + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS)
+                    + b"\n\n"
+                )
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -1123,9 +1132,11 @@ async def dump_expert_distribution_record_async():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
-    success, message, num_paused_requests = (
-        await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
-    )
+    (
+        success,
+        message,
+        num_paused_requests,
+    ) = await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
 
     content = {
         "success": success,
@@ -1149,10 +1160,11 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
 async def init_weights_send_group_for_remote_instance(
     obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
 ):
-    success, message = (
-        await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -1166,10 +1178,11 @@ async def init_weights_send_group_for_remote_instance(
 async def send_weights_to_remote_instance(
     obj: SendWeightsToRemoteInstanceReqInput, request: Request
 ):
-    success, message = (
-        await _global_state.tokenizer_manager.send_weights_to_remote_instance(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -1225,9 +1238,10 @@ async def destroy_weights_update_group(
     obj: DestroyWeightsUpdateGroupReqInput, request: Request
 ):
     """Destroy the parameter update group."""
-    success, message = (
-        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
-    )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
@@ -1262,10 +1276,11 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
-    success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.update_weights_from_distributed(
+        obj, request
     )
 
     content = {"success": success, "message": message}
@@ -1593,6 +1608,34 @@ async def openai_v1_chat_completions(
 
 
 @app.post(
+    "/v1/chat/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_chat_tokenize(request: ChatCompletionRequest, raw_request: Request):
+    """OpenAI-compatible chat tokenization endpoint."""
+    return await raw_request.app.state.openai_serving_tokenize.handle_chat_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/completions/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_completions_tokenize(
+    request: CompletionRequest, raw_request: Request
+):
+    """OpenAI-compatible text completion tokenization endpoint."""
+    return (
+        await raw_request.app.state.openai_serving_tokenize.handle_completions_request(
+            request, raw_request
+        )
+    )
+
+
+@app.post(
     "/v1/embeddings",
     response_class=ORJSONResponse,
     dependencies=[Depends(validate_json_request)],
@@ -1627,7 +1670,9 @@ async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
     dependencies=[Depends(validate_json_request)],
     include_in_schema=False,
 )
-async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
+async def openai_v1_tokenize(
+    request: Annotated[Dict[str, Any], Body()], raw_request: Request
+):
     """OpenAI-compatible tokenization endpoint."""
     return await raw_request.app.state.openai_serving_tokenize.handle_request(
         request, raw_request

@@ -356,6 +356,15 @@ class EagleDraftWorker(BaseDraftWorker):
             position_buf,
         )
 
+        if model_worker_batch.reqs:
+            for i, req in enumerate(model_worker_batch.reqs):
+                start = i * self.speculative_num_draft_tokens
+                req.inject_thinking_prompt_tokens(
+                    draft_tokens,
+                    start_idx=start,
+                    max_count=self.speculative_num_draft_tokens,
+                    advance=False,
+                )
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
@@ -620,6 +629,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+        # Pinned CPU buffers for async grammar D2H copy on CUDA.
+        self._grammar_pinned_buffers_initialized = False
+        self._grammar_retrieve_next_token_cpu = None
+        self._grammar_retrieve_next_sibling_cpu = None
+        self._grammar_draft_tokens_cpu = None
+
     @property
     def target_worker(self):
         return self._target_worker
@@ -627,6 +642,56 @@ class EAGLEWorkerV2(BaseSpecWorker):
     @property
     def draft_worker(self):
         return self._draft_worker
+
+    def _init_grammar_pinned_buffers(self, num_draft_tokens: int):
+        """Lazily initialize pinned buffers for grammar D2H copy on CUDA."""
+        if self._grammar_pinned_buffers_initialized:
+            return
+        self._grammar_pinned_buffers_initialized = True
+        max_bs = self.server_args.max_running_requests
+        self._grammar_retrieve_next_token_cpu = torch.empty(
+            (max_bs, num_draft_tokens), dtype=torch.int64, pin_memory=True
+        )
+        self._grammar_retrieve_next_sibling_cpu = torch.empty(
+            (max_bs, num_draft_tokens), dtype=torch.int64, pin_memory=True
+        )
+        self._grammar_draft_tokens_cpu = torch.empty(
+            (max_bs, num_draft_tokens), dtype=torch.int64, pin_memory=True
+        )
+
+    def _async_copy_grammar_data(self, verify_input: EagleVerifyInput):
+        """
+        Async copy grammar data from device to pinned CPU buffers.
+
+        Returns:
+            (retrieve_next_token_cpu, retrieve_next_sibling_cpu, draft_tokens_cpu, copy_event)
+        """
+        bs, num_draft_tokens = verify_input.retrive_next_token.shape
+        self._init_grammar_pinned_buffers(num_draft_tokens)
+
+        retrieve_next_token_cpu = self._grammar_retrieve_next_token_cpu[:bs]
+        retrieve_next_sibling_cpu = self._grammar_retrieve_next_sibling_cpu[:bs]
+        draft_tokens_cpu = self._grammar_draft_tokens_cpu[:bs]
+
+        retrieve_next_token_cpu.copy_(
+            verify_input.retrive_next_token, non_blocking=True
+        )
+        retrieve_next_sibling_cpu.copy_(
+            verify_input.retrive_next_sibling, non_blocking=True
+        )
+        draft_tokens_cpu.copy_(
+            verify_input.draft_token.view(bs, num_draft_tokens), non_blocking=True
+        )
+
+        copy_event = torch.get_device_module(self.device).Event()
+        copy_event.record()
+
+        return (
+            retrieve_next_token_cpu,
+            retrieve_next_sibling_cpu,
+            draft_tokens_cpu,
+            copy_event,
+        )
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
@@ -724,13 +789,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
-        # Prepare grammar data on CPU if needed
+        # Prepare grammar data on CPU if needed (async copy to pinned buffer)
+        grammar_copy_event = None
         if batch.has_grammar:
-            retrieve_next_token_cpu = verify_input.retrive_next_token.cpu()
-            retrieve_next_sibling_cpu = verify_input.retrive_next_sibling.cpu()
-            draft_tokens_cpu = verify_input.draft_token.view(
-                verify_input.retrive_next_token.shape
-            ).cpu()
+            (
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                grammar_copy_event,
+            ) = self._async_copy_grammar_data(verify_input)
 
         # Run target verify batch in the main compute stream (GPU compute)
         forward_batch_output = self.target_worker.forward_batch_generation(
@@ -741,9 +808,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         logits_output = forward_batch_output.logits_output
 
+        # Process pending accept tokens from the previous overlapped batch.
+        if batch.pending_accept_info is not None:
+            self._process_pending_accept_tokens(batch.pending_accept_info)
+
         # Generate vocab mask for constrained decoding
         vocab_mask = None
         if batch.has_grammar:
+            # Wait for async D2H copy to complete before using CPU tensors
+            grammar_copy_event.synchronize()
             # Generate the logit mask for structured output.
             vocab_mask = generate_token_bitmask(
                 batch.reqs,
@@ -756,7 +829,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             if vocab_mask is not None:
                 assert verify_input.grammar is not None
-                vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
+                vocab_mask = vocab_mask.to(
+                    verify_input.retrive_next_token.device, non_blocking=True
+                )
                 # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
@@ -799,6 +874,56 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
         )
+
+    def _process_pending_accept_tokens(self, pending_accept_info):
+        """
+        Process pending grammar accept tokens from the previous batch.
+        This runs during current verify to overlap CPU grammar work with GPU compute.
+        """
+        last_batch, last_result = pending_accept_info
+
+        if last_result.copy_done is not None:
+            last_result.copy_done.synchronize()
+
+        next_token_ids = last_result.next_token_ids.tolist()
+
+        if last_batch.forward_mode.is_extend():
+            # Prefill/extend path: one accepted token per request.
+            for i, req in enumerate(last_batch.reqs):
+                if (
+                    req.grammar is not None
+                    and not req.finished()
+                    and not req.is_retracted
+                ):
+                    try:
+                        req.grammar.accept_token(next_token_ids[i])
+                    except ValueError as e:
+                        logger.error(
+                            f"Grammar accept_token failed for req {req.rid} "
+                            f"with token {next_token_ids[i]}: {e}"
+                        )
+        else:
+            # Decode/spec path: use accepted token lengths per request.
+            accept_lens = last_result.accept_lens.tolist()
+            stride = self.speculative_num_draft_tokens
+
+            for i, req in enumerate(last_batch.reqs):
+                if (
+                    req.grammar is not None
+                    and not req.finished()
+                    and not req.is_retracted
+                ):
+                    accepted_tokens = next_token_ids[
+                        i * stride : i * stride + accept_lens[i]
+                    ]
+                    try:
+                        for token_id in accepted_tokens:
+                            req.grammar.accept_token(token_id)
+                    except ValueError as e:
+                        logger.error(
+                            f"Grammar accept_token failed for req {req.rid} "
+                            f"with tokens {accepted_tokens}: {e}"
+                        )
 
     def move_accepted_tokens_to_target_kvcache(
         self,

@@ -1,13 +1,16 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
-
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import (
+    Tool,
+    ToolCallConstraint,
+    ToolChoice,
+)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -26,7 +29,12 @@ logger = logging.getLogger(__name__)
 class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        tools: List[Tool] = [],
+        tool_choice: Union[Literal["required", "auto", "none"], ToolChoice] = "auto",
+        parallel_tool_calls: bool = True,
+    ):
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
         self._buffer = ""
@@ -49,6 +57,14 @@ class BaseFormatDetector(ABC):
         self.bot_token = ""
         self.eot_token = ""
         self.tool_call_separator = ", "
+
+        self.tools: List[Tool] = tools
+        self.tool_choice: Union[Literal["required", "auto", "none"], ToolChoice] = (
+            tool_choice
+        )
+        self.parallel_tool_calls: bool = parallel_tool_calls
+
+        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL
 
     def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
         """
@@ -158,9 +174,9 @@ class BaseFormatDetector(ABC):
                 # Might be partial bot_token, keep buffering
                 return StreamingParseResult()
 
-        # Build tool indices if not already built
+        # Build tool indices once; reuse on subsequent streaming calls
         if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
+            self._tool_indices = self._get_tool_indices(tools) if tools else {}
 
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
@@ -205,9 +221,9 @@ class BaseFormatDetector(ABC):
                 # Handle parameters/arguments consistency
                 # NOTE: we assume here that the obj is always partial of a single tool call
                 if "parameters" in obj:
-                    assert (
-                        "arguments" not in obj
-                    ), "model generated both parameters and arguments"
+                    assert "arguments" not in obj, (
+                        "model generated both parameters and arguments"
+                    )
                     obj["arguments"] = obj["parameters"]
 
                 current_tool_call = obj
@@ -343,4 +359,9 @@ class BaseFormatDetector(ABC):
         Returns:
             A function that takes a tool name (str) and returns StructureInfo
         """
+        raise NotImplementedError()
+
+    def get_structure_constraint(self) -> Optional[ToolCallConstraint]:
+        """get structure constraint for constrained generation"""
+
         raise NotImplementedError()

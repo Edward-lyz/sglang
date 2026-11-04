@@ -102,6 +102,7 @@ class RequestTimingMetricsMixin:
     prefill_finished_ts: Optional[List[Optional[float]]]
 
 
+
 @dataclass
 class SpeculativeDecodingMetricsMixin:
     """
@@ -280,6 +281,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     as_max_hit_token_len: Optional[Union[List[List[int]], List[int]]] = None
 
     # Function call continuation: token IDs to replay for grammar state recovery
+    continuation_token_ids: Optional[List[int]] = None
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -704,6 +706,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             return_routed_experts=self.return_routed_experts,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
+            continuation_token_ids=self.continuation_token_ids,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             custom_logit_processor=(
@@ -747,6 +750,21 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             # AttentionStore parameters (normalized by _normalize_as_params)
+            as_kv_cache_params=(
+                self.as_kv_cache_params[i]
+                if self.as_kv_cache_params is not None
+                else None
+            ),
+            as_max_hit_host_ip=(
+                self.as_max_hit_host_ip[i]
+                if self.as_max_hit_host_ip is not None
+                else None
+            ),
+            as_max_hit_token_len=(
+                self.as_max_hit_token_len[i]
+                if self.as_max_hit_token_len is not None
+                else None
+            ),
             **{
                 field: getattr(self, field)
                 for field in _API_SERVING_TIMING_MIXIN_FIELDS
@@ -788,6 +806,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
+
+    # Timestamp when tokenizer dispatches the request to the scheduler
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
@@ -842,6 +862,10 @@ class TokenizedGenerateReqInput(BaseReq):
     as_max_hit_token_len: Optional[List[int]] = None  # From request
 
     # Function call continuation: token IDs to replay for grammar state recovery
+    continuation_token_ids: Optional[List[int]] = None
+
+    # Return the scheduler-finalized prompt token IDs without enqueueing generation.
+    return_prompt_token_ids_only: bool = False
 
 
 @dataclass
@@ -857,6 +881,16 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq):
 
     def __iter__(self):
         return iter(self.batch)
+
+
+@dataclass
+class TokenizeReqOutput(BaseReq):
+    """Scheduler-finalized prompt token IDs for a tokenize-only request."""
+
+    input_ids: List[int]
+    input_ids_unpadded: List[int]
+    error_message: Optional[str] = None
+    status_code: int = 200
 
 
 @dataclass
@@ -1033,6 +1067,7 @@ class TokenizedEmbeddingReqInput(BaseReq):
     dimensions: Optional[int] = None
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+    # Timestamp when tokenizer dispatches the request to the scheduler
 
 
 @dataclass
@@ -1156,6 +1191,7 @@ class BatchStrOutput(
     output_strs: List[str]
     # The token ids
     output_ids: Optional[List[int]]
+    generated_token_nums: Optional[List[int]]
 
     # Token counts
     prompt_tokens: List[int]

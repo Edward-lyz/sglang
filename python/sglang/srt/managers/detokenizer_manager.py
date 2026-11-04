@@ -95,6 +95,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Init dispatcher
         self.init_request_dispatcher()
 
+        # Init metrics
+
+
     @staticmethod
     def is_health_check_request(rid: Optional[str]) -> bool:
         return isinstance(rid, str) and rid.startswith("HEALTH_CHECK")
@@ -225,9 +228,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
+        generated_token_nums = []
 
         # Initialize decode status
         read_ids, surr_ids = [], []
+        token_num = 0
         for i in range(bs):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
@@ -243,6 +248,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             else:
                 s = self.decode_status[rid]
                 s.decode_ids.extend(recv_obj.decode_ids[i])
+
+            generated_token_nums.append(token_num)
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -342,7 +349,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
-        return output_strs
+        return output_strs, generated_token_nums
 
     def _extract_routed_experts(
         self, recv_obj: BatchTokenIDOutput
@@ -364,7 +371,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         output_strs = (
             self._decode_batch_token_id_output(recv_obj)
             if len(recv_obj.rids) > 0
-            else []
+            else ([], [])
         )
         routed_experts = self._extract_routed_experts(recv_obj)
 
@@ -374,6 +381,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
             output_ids=recv_obj.output_ids,
+            generated_token_nums=generated_token_nums,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,

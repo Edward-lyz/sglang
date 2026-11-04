@@ -262,13 +262,27 @@ def create_grammar_backend(
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
+    # TODO(liyaolang): Only support xgrammar backend for now and should support all others in the future.
+    if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id") and name == "xgrammar":
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )
 
+        # Collect special token ids in a tokenizer-agnostic way.
+        # tiktoken-style tokenizers expose `.special_tokens` (name->id);
+        # HuggingFace tokenizers expose `.all_special_ids`.
+        if hasattr(tokenizer, "special_tokens"):
+            special_token_ids = set(tokenizer.special_tokens.values())
+        else:
+            special_token_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+
         grammar_backend = ReasonerGrammarBackend(
-            grammar_backend, tokenizer.think_end_id
+            grammar_backend,
+            tokenizer.think_end_id,
+            special_token_ids,
+        )
+        logger.info(
+            f"create_grammar_backend(): reasoner special_token_ids={special_token_ids}"
         )
 
     return grammar_backend

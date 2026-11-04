@@ -71,15 +71,22 @@ class FunctionCallParser:
         "gigachat3": GigaChat3Detector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
+    def __init__(
+        self,
+        tool_call_parser: str,
+        tools: List[Tool],
+        tool_choice: Union[Literal["required", "auto", "none"], ToolChoice],
+        parallel_tool_calls: bool,
+    ):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
-            detector = detector_class()
+            detector = detector_class(tools, tool_choice, parallel_tool_calls)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 
         self.detector = detector
         self.tools = tools
+        self.tool_choice = tool_choice
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
 
     def has_tool_call(self, text: str) -> bool:
@@ -144,12 +151,60 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
-    def get_structure_tag(self) -> LegacyStructuralTagResponseFormat:
+    # Multi-char structural markers across all detectors. Must be fed atomically
+    # during replay; splitting them mid-marker triggers detector buffer-clear and
+    # drops state. New detectors with extra markers MUST extend this list.
+    _REPLAY_MARKER_ATTRS = (
+        "bot_token",
+        "eot_token",
+        "tool_call_separator",
+        "invoke_end_token",
+        "tool_call_begin",
+        "tool_call_end",
+        "tool_call_start_token",
+        "tool_call_end_token",
+    )
+
+    def replay_continuation(self, continuation_text: str):
+        """Replay continuation text to fully restore parser streaming state.
+
+        Char-by-char so partial-args state (prev_tool_call_arr,
+        streamed_args_for_tool) tracks live streaming. Multi-char structural
+        markers fed atomically — splitting them would let detector buffer-clear
+        drop the marker.
+        """
+        if not self.tools or not continuation_text:
+            return
+
+        markers = {
+            v
+            for a in self._REPLAY_MARKER_ATTRS
+            if isinstance(v := getattr(self.detector, a, None), str) and len(v) > 1
+        }
+        if not markers:
+            for ch in continuation_text:
+                self.parse_stream_chunk(ch)
+            return
+
+        import re
+
+        pattern = "|".join(re.escape(m) for m in sorted(markers, key=len, reverse=True))
+        for part in re.split(f"({pattern})", continuation_text):
+            if not part:
+                continue
+            if part in markers:
+                self.parse_stream_chunk(part)
+            else:
+                for ch in part:
+                    self.parse_stream_chunk(ch)
+
+    def _get_legacy_structural_tag(self) -> LegacyStructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.
 
         This creates the necessary structural tags that guide the model's output format.
         """
+
         tool_structures: List[StructuresResponseFormat] = list()
         tool_trigger_set: Set[str] = set()
 
@@ -183,9 +238,7 @@ class FunctionCallParser:
             triggers=list(tool_trigger_set),
         )
 
-    def get_structure_constraint(
-        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
-    ) -> Optional[ToolCallConstraint]:
+    def get_structure_constraint(self) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
         The constraint is used to guide the model's output format.
@@ -201,14 +254,15 @@ class FunctionCallParser:
         # It cannot parse or validate function call Pythonic or XML-ish syntax.
         if (
             self.detector.supports_structural_tag()
-            and tool_choice == "auto"
-            and (
-                any(tool.function.strict for tool in self.tools)
-                or self.tool_strict_level >= ToolStrictLevel.FUNCTION
-            )
+            and self.tool_choice == "auto"
+            and self.tool_strict_level >= ToolStrictLevel.FUNCTION
         ):
-            tag = self.get_structure_tag()
+            # Use new structural tag to support parallel tool callings
+            # TODO(liyaolang): Other models should also support in the future
+            if isinstance(self.detector, Glm47MoeDetector):
+                return self.detector.get_structure_constraint()
+            tag = self._get_legacy_structural_tag()
             return ("structural_tag", tag)
-        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-            json_schema = get_json_schema_constraint(self.tools, tool_choice)
+        elif self.tool_choice == "required" or isinstance(self.tool_choice, ToolChoice):
+            json_schema = get_json_schema_constraint(self.tools, self.tool_choice)
             return ("json_schema", json_schema)

@@ -25,7 +25,6 @@ from xgrammar import (
     GrammarMatcher,
     StructuralTagItem,
     TokenizerInfo,
-    allocate_token_bitmask,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -34,16 +33,12 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     GrammarStats,
 )
-from sglang.srt.constrained.utils import is_legacy_structural_tag
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
-if _is_hip:
-    from sgl_kernel import apply_token_bitmask_inplace_cuda
-else:
-    from sglang.srt.constrained.triton_ops.bitmask_ops import (
-        apply_token_bitmask_inplace_triton,
-    )
+from sglang.srt.constrained.utils import (
+    is_legacy_structural_tag,
+    allocate_vocab_bitmask,
+    apply_vocab_bitmask,
+    move_vocab_bitmask,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -94,29 +89,17 @@ class XGrammarGrammar(BaseGrammarObject):
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        return allocate_token_bitmask(batch_size, vocab_size)
+        return allocate_vocab_bitmask(batch_size, vocab_size, device)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
-        return vocab_mask.to(device, non_blocking=True)
+        return move_vocab_bitmask(vocab_mask, device)
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if (
-            logits.device.type == "cuda"
-            or logits.device.type == "npu"
-            or logits.device.type == "xpu"
-        ):
-            if _is_hip:
-                apply_token_bitmask_inplace_cuda(logits, vocab_mask)
-            else:
-                apply_token_bitmask_inplace_triton(logits, vocab_mask)
-        elif logits.device.type == "cpu" and self.apply_vocab_mask_cpu:
-            self.apply_vocab_mask_cpu(logits, vocab_mask)
-        else:
-            raise RuntimeError(f"Unsupported device: {logits.device.type}")
+        apply_vocab_bitmask(logits, vocab_mask)
 
     def copy(self):
         matcher = GrammarMatcher(
@@ -261,7 +244,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
                 ctx = self.grammar_compiler.compile_json_schema(
-                    schema=key_string, any_whitespace=self.any_whitespace
+                    schema=key_string, max_whitespace_cnt=1
                 )
 
         except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError) as e:

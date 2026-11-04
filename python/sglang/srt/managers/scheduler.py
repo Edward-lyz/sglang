@@ -121,6 +121,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    TokenizeReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
@@ -780,6 +781,7 @@ class Scheduler(
                 # DSA (NSA): MLA-based key + index_k_with_scale_buffer as V
                 attention_type = AttentionType.DSA
                 attention_type_str = "DSA"
+                indexer_layer_mapping = getattr(kv_cache, "indexer_layer_mapping", None)
                 if indexer_layer_mapping is not None:
                     target_indexer_layer_ids = [
                         layer_id
@@ -1336,6 +1338,24 @@ class Scheduler(
             if disable_overlap_for_batch:
                 pop_and_process()
 
+            # Prepare pending accept info for overlapped grammar processing.
+            # The accept tokens from the last batch will be processed during
+            # the current batch's verify forward to overlap CPU grammar work
+            # with GPU verify computation.
+            if (
+                batch
+                and batch.is_spec_v2
+                and batch.spec_algorithm.is_eagle()
+                and batch.has_grammar
+                and batch.forward_mode.is_decode()
+                and len(self.result_queue) > 0
+            ):
+                last_batch, last_result = self.result_queue[-1]
+                if last_batch.has_grammar:
+                    batch.pending_accept_info = (last_batch, last_result)
+                    # Skip grammar accept in output processor; it will be handled in verify.
+                    last_result.grammar_accept_processed = True
+
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
@@ -1372,18 +1392,7 @@ class Scheduler(
             and self.last_batch.forward_mode.is_extend()
         )
 
-        # We do not support overlap + spec + grammar yet,
-        # so we need to turn off overlap for this batch.
-        # TODO(lsyin): support overlap + spec + grammar
-        need_grammar_sync = (
-            batch
-            and batch.is_spec_v2
-            and batch.has_grammar
-            and batch.forward_mode.is_decode()
-            and len(self.result_queue) > 0
-        )
-
-        return disable_overlap_for_batch or need_grammar_sync
+        return disable_overlap_for_batch
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -1485,8 +1494,19 @@ class Scheduler(
                     if error_code == 400
                     else HTTPStatus.INTERNAL_SERVER_ERROR
                 )
-                prepare_abort(req, error_msg, status_code=status_code)
-                self.stream_output([req], req.return_logprob)
+                if getattr(req, "return_prompt_token_ids_only", False):
+                    self.send_to_tokenizer.send_output(
+                        self._build_tokenize_req_output(
+                            req,
+                            error_message=error_msg,
+                            status_code=status_code,
+                            finish_trace=False,
+                        ),
+                        req,
+                    )
+                else:
+                    prepare_abort(req, error_msg, status_code=status_code)
+                    self.stream_output([req], req.return_logprob)
 
         if self.enable_trace:
             for req in recv_reqs:
@@ -1650,10 +1670,26 @@ class Scheduler(
                 item.feature = None
             req.multimodal_inputs = None
 
+    def _build_tokenize_req_output(
+        self,
+        req: Req,
+        error_message: Optional[str] = None,
+        status_code: int = HTTPStatus.OK,
+        finish_trace: bool = True,
+    ) -> TokenizeReqOutput:
+        return TokenizeReqOutput(
+            input_ids=list(req.origin_input_ids),
+            input_ids_unpadded=list(req.origin_input_ids_unpadded),
+            error_message=error_message,
+            status_code=status_code,
+            rid=req.rid,
+        )
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        is_tokenize_only = recv_req.return_prompt_token_ids_only
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1702,6 +1738,8 @@ class Scheduler(
                 dllm_config=self.dllm_config,
             )
             req.tokenizer = self.tokenizer
+            req.continuation_token_ids = recv_req.continuation_token_ids
+            req.init_thinking_budget()
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1719,9 +1757,17 @@ class Scheduler(
                 recv_req.session_params is not None
                 and recv_req.session_params.id is not None
             ):
-                req.set_finish_with_abort(
-                    f"Invalid request: session id {recv_req.session_params.id} does not exist"
+                error_message = (
+                    f"Invalid request: session id {recv_req.session_params.id} "
+                    "does not exist"
                 )
+                if is_tokenize_only:
+                    return self._build_tokenize_req_output(
+                        req,
+                        error_message=error_message,
+                        status_code=HTTPStatus.BAD_REQUEST,
+                    )
+                req.set_finish_with_abort(error_message)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
@@ -1732,6 +1778,14 @@ class Scheduler(
                 recv_req, self.tokenizer, self.model_config.vocab_size
             )
             if isinstance(req.finished_reason, FINISH_ABORT):
+                if is_tokenize_only:
+                    return self._build_tokenize_req_output(
+                        req,
+                        error_message=req.finished_reason.message,
+                        status_code=(
+                            req.finished_reason.status_code or HTTPStatus.BAD_REQUEST
+                        ),
+                    )
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
@@ -1767,12 +1821,18 @@ class Scheduler(
             req.extend_image_inputs(image_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                    )
+                error_message = (
+                    "Multimodal prompt is too long after expanding multimodal tokens. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => "
+                    f"{len(req.origin_input_ids)} >= {self.max_req_input_len}."
                 )
+                if is_tokenize_only:
+                    return self._build_tokenize_req_output(
+                        req,
+                        error_message=error_message,
+                        status_code=HTTPStatus.BAD_REQUEST,
+                    )
+                req.set_finish_with_abort(error_msg=error_message)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
@@ -1787,9 +1847,18 @@ class Scheduler(
             self.server_args.allow_auto_truncate,
         )
         if error_msg:
+            if is_tokenize_only:
+                return self._build_tokenize_req_output(
+                    req,
+                    error_message=error_msg,
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        if is_tokenize_only:
+            return self._build_tokenize_req_output(req)
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored

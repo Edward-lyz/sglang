@@ -63,8 +63,8 @@ class SchedulerOutputProcessorMixin:
             - {"device": X, "host": Y} if HiCache enabled but L3 storage is not
             - {"device": X, "host": Y, "storage": Z, "storage_backend": "..."} if L3 enabled
         """
-        # Only show details if HiCache is enabled
-        if not getattr(self, "enable_hierarchical_cache", False):
+        # Only show details if HiCache or AsRadixCache is enabled
+        if not getattr(self, "enable_hierarchical_cache", False) and not getattr(self, "enable_asradix_cache", False):
             return None
 
         # Only show if there are any cached tokens
@@ -236,16 +236,17 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
-                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                        try:
-                            req.grammar.accept_token(next_token_id)
-                        except ValueError as e:
-                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                            # This can happen if the grammar is not set correctly or the token is invalid.
-                            logger.error(
-                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                            )
-                            self.abort_request(AbortReq(rid=req.rid))
+                        if not result.grammar_accept_processed:
+                            # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                            try:
+                                req.grammar.accept_token(next_token_id)
+                            except ValueError as e:
+                                # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                                # This can happen if the grammar is not set correctly or the token is invalid.
+                                logger.error(
+                                    f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                                )
+                                self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
                     trace_slice(
@@ -356,19 +357,26 @@ class SchedulerOutputProcessorMixin:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
-        result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
 
         for i, req in enumerate(batch.reqs):
+            accepted = next_token_ids[i * stride : i * stride + accept_lens[i]]
+            # Trim post-EOS draft/bonus tokens and shrink accept_len, so
+            # kv_committed_len/metrics stay consistent and dropped slots fall
+            # into the over-alloc free range.
+            stop_idx = req.find_stop_token_index(accepted)
+            if stop_idx != -1:
+                accepted = accepted[: stop_idx + 1]
+                accept_lens[i] = len(accepted)
             req.kv_committed_len += accept_lens[i]
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
+            predict_tokens.append(accepted)
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_lens[i] - 1
+
+        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
+        result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
         return predict_tokens
 
@@ -477,11 +485,33 @@ class SchedulerOutputProcessorMixin:
 
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
+                if (
+                    getattr(req, "thinking_budget", None) == 0
+                    and req.thinking_prompt_token_ids
+                    and req.thinking_inject_index < len(req.thinking_prompt_token_ids)
+                ):
+                    next_token_id = req.thinking_prompt_token_ids[
+                        req.thinking_inject_index
+                    ]
+                    req.thinking_inject_index += 1
+                    if req.thinking_inject_index >= len(req.thinking_prompt_token_ids):
+                        req.thinking_budget = (
+                            -1
+                        )  # -1 means thinking is finished/disabled
+                    if batch.enable_overlap:
+                        if batch.output_ids is not None:
+                            future_idx = -batch.output_ids[i]
+                            self.future_map.token_ids_buf[future_idx] = next_token_id
+                    else:
+                        if batch.output_ids is not None:
+                            batch.output_ids[i] = next_token_id
                 req.output_ids.append(next_token_id)
+                req.update_thinking_state([next_token_id])
             elif batch.is_spec_v2:
-                # Only spec v2's output_ids are updated here.
+                # output_ids already trimmed at EOS in _resolve_spec_overlap_token_ids.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+                req.update_thinking_state(next_token_id)
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
@@ -527,22 +557,23 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None:
-                # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                try:
-                    if batch.spec_algorithm.is_none():
-                        # Normal decode: single token
-                        req.grammar.accept_token(next_token_id)
-                    elif batch.is_spec_v2:
-                        # Speculative decode: next_token_id is a list of accepted tokens
-                        for token_id in next_token_id:
-                            req.grammar.accept_token(token_id)
-                except ValueError as e:
-                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                    # This can happen if the grammar is not set correctly or the token is invalid.
-                    logger.error(
-                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                    )
-                    self.abort_request(AbortReq(rid=req.rid))
+                if not result.grammar_accept_processed:
+                    # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                    try:
+                        if batch.spec_algorithm.is_none():
+                            # Normal decode: single token
+                            req.grammar.accept_token(next_token_id)
+                        elif batch.is_spec_v2:
+                            # Speculative decode: next_token_id is a list of accepted tokens
+                            for token_id in next_token_id:
+                                req.grammar.accept_token(token_id)
+                    except ValueError as e:
+                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                        # This can happen if the grammar is not set correctly or the token is invalid.
+                        logger.error(
+                            f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        )
+                        self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)

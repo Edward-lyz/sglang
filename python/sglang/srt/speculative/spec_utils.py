@@ -6,6 +6,7 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
+import math
 import torch
 import triton
 import triton.language as tl
@@ -37,6 +38,11 @@ elif _is_hip:
     from sgl_kernel import fast_topk
 else:
     from sglang.srt.utils.common import fast_topk
+
+try:
+    from xgrammar.testing import _traverse_draft_tree as _traverse_draft_tree_native
+except ImportError:
+    _traverse_draft_tree_native = None
 
 
 logger = logging.getLogger(__name__)
@@ -567,7 +573,7 @@ def generate_simulated_accept_index(
     return sim_accept_index
 
 
-def traverse_tree(
+def traverse_tree_fallback(
     retrieve_next_token: torch.Tensor,
     retrieve_next_sibling: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -577,10 +583,8 @@ def traverse_tree(
 ):
     """
     Traverse the tree constructed by the draft model to generate the logits mask.
+    Pure Python fallback implementation.
     """
-    assert (
-        retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
-    )
 
     def dfs(
         curr: int,
@@ -635,6 +639,41 @@ def traverse_tree(
     dfs(0, retrieve_next_token, retrieve_next_sibling, -1)
 
 
+def traverse_tree(
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    grammar: BaseGrammarObject,
+    allocate_token_bitmask: torch.Tensor,
+    vocab_size: Optional[int] = None,
+):
+    """
+    Traverse the draft tree to generate logits masks.
+    Prefer native xgrammar traversal when available; otherwise use Python fallback.
+    """
+    assert (
+        retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
+    )
+
+    if _traverse_draft_tree_native is not None and hasattr(grammar, "matcher"):
+        _traverse_draft_tree_native(
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+            grammar.matcher,
+            allocate_token_bitmask,
+        )
+        return
+
+    traverse_tree_fallback(
+        retrieve_next_token,
+        retrieve_next_sibling,
+        draft_tokens,
+        grammar,
+        allocate_token_bitmask,
+    )
+
+
 def generate_token_bitmask(
     reqs: List[Req],
     verify_input: EagleVerifyInput,
@@ -659,10 +698,12 @@ def generate_token_bitmask(
     for i, req in enumerate(reqs):
         if req.grammar is not None:
             if allocate_token_bitmask is None:
-                allocate_token_bitmask = req.grammar.allocate_vocab_mask(
-                    vocab_size=vocab_size,
-                    batch_size=draft_tokens_cpu.numel(),
+                allocate_token_bitmask = torch.full(
+                    (draft_tokens_cpu.numel(), math.ceil(vocab_size / 32)),
+                    -1,
+                    dtype=torch.int32,
                     device="cpu",
+                    pin_memory=True
                 )
             grammar = req.grammar
             s = time.perf_counter()

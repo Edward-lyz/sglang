@@ -176,6 +176,9 @@ class Envs:
     # Constrained Decoding (Grammar)
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+    # Maximum continuation tokens replayed to restore a grammar state.
+    # A negative value disables the limit.
+    SGLANG_MAX_GRAMMAR_REPLAY_TOKENS = EnvInt(8192)
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
     # CuTe DSL GDN Decode

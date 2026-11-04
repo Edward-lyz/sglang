@@ -205,6 +205,8 @@ class KVTransferParams(BaseModel):
     """
     Parameters for KV transfer.
     """
+
+    # AttentionStore 定位 Prefix Cache 使用的 Block Hash
     as_block_hashs: Optional[List[int]] = None
     as_kv_cache_params: Optional[dict] = None
     max_hit_host_ip: Optional[List[str]] = None
@@ -215,6 +217,7 @@ class KVCacheParams(BaseModel):
     """
     Parameters for KV cache.
     """
+
     need_caching: bool = False
     expire_at: int = 0
 
@@ -297,6 +300,10 @@ class CompletionRequest(BaseModel):
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
+    # Thinking budget (only limits <think>...</think>)
+    thinking_budget: Optional[int] = None
+    # Must NOT include </think>; server will append end token when injecting.
+    thinking_prompt_token_ids: Optional[List[int]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -388,6 +395,7 @@ class CompletionResponse(BaseModel):
 class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
+    tokens: int
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
@@ -575,6 +583,7 @@ class ChatCompletionRequest(BaseModel):
         "including visible output tokens and reasoning tokens. Input tokens are not included. ",
     )
     n: int = 1
+    parallel_tool_calls: bool = True
     presence_penalty: float = 0.0
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     seed: Optional[int] = None
@@ -591,12 +600,14 @@ class ChatCompletionRequest(BaseModel):
     return_hidden_states: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
-    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
-        default="medium",
+    reasoning_effort: Optional[
+        Literal["max", "xhigh", "high", "medium", "low", "minimal", "none"]
+    ] = Field(
+        default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "'low' is the least effort, 'high' is the most effort. Reducing reasoning effort can "
-        "result in faster responses and fewer tokens used on reasoning in a response. "
-        "Currently only supported for OpenAI models in the harmony path, i.e GPT-OSS models.",
+        "Supported values (most to least effort): max, xhigh, high, medium, low, "
+        "minimal, none. Only honored by models whose chat template consumes "
+        "reasoning_effort (e.g. GLM-5.2); other models fall back to their defaults.",
     )
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -611,6 +622,7 @@ class ChatCompletionRequest(BaseModel):
     no_stop_trim: bool = False
     ignore_eos: bool = False
     continue_final_message: bool = False
+    continuation_token_ids: Optional[List[int]] = None
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
@@ -625,6 +637,10 @@ class ChatCompletionRequest(BaseModel):
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
+    # Thinking budget (only limits <think>...</think>)
+    thinking_budget: Optional[int] = None
+    # Must NOT include </think>; server will append end token when injecting.
+    thinking_prompt_token_ids: Optional[List[int]] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -730,6 +746,18 @@ class ChatCompletionRequest(BaseModel):
 
         return values
 
+    @model_validator(mode="before")
+    @classmethod
+    def validate_continuation_exclusivity(cls, values):
+        """Validate that continuation_token_ids and continue_final_message are mutually exclusive."""
+        cont_ids = values.get("continuation_token_ids")
+        cont_final = values.get("continue_final_message", False)
+        if cont_ids and len(cont_ids) > 0 and cont_final:
+            raise ValueError(
+                "continuation_token_ids and continue_final_message cannot be used together"
+            )
+        return values
+
     def to_sampling_params(
         self,
         stop: List[str],
@@ -780,6 +808,12 @@ class ChatCompletionRequest(BaseModel):
             "sampling_seed": self.seed,
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }
+        if self.thinking_budget is not None:
+            sampling_params["thinking_budget"] = self.thinking_budget
+        if self.thinking_prompt_token_ids is not None:
+            sampling_params["thinking_prompt_token_ids"] = (
+                self.thinking_prompt_token_ids
+            )
 
         if self.response_format and self.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
@@ -836,12 +870,16 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    # incremental; excludes continuation_token_ids prefix
+    output_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.output_token_ids is None:
+            data.pop("output_token_ids", None)
         return data
 
 
@@ -869,6 +907,7 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
+    tokens: Optional[int] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -888,6 +927,15 @@ class ChatCompletionResponseStreamChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    # incremental; excludes continuation_token_ids prefix
+    output_token_ids: Optional[List[int]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.output_token_ids is None:
+            data.pop("output_token_ids", None)
+        return data
 
 
 class ChatCompletionStreamResponse(BaseModel):
@@ -1064,7 +1112,7 @@ class TokenizeRequest(BaseModel):
     """Request schema for the /tokenize endpoint."""
 
     model: str = DEFAULT_MODEL_NAME
-    prompt: Union[str, List[str]]
+    prompt: Union[List[int], List[List[int]], str, List[str]]
     add_special_tokens: bool = Field(
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",

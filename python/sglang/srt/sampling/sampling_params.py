@@ -62,7 +62,9 @@ class SamplingParams:
         no_stop_trim: bool = False,
         custom_params: Optional[Dict[str, Any]] = None,
         # Only limits tokens inside <think>...</think>
+        thinking_budget: Optional[int] = None,
         # Must NOT include </think>; server will append end token when injecting.
+        thinking_prompt_token_ids: Optional[List[int]] = None,
         stream_interval: Optional[int] = None,
         logit_bias: Optional[Dict[str, float]] = None,
         sampling_seed: Optional[int] = None,
@@ -92,6 +94,8 @@ class SamplingParams:
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self.no_stop_trim = no_stop_trim
         self.custom_params = custom_params
+        self.thinking_budget = thinking_budget
+        self.thinking_prompt_token_ids = thinking_prompt_token_ids
         self.stream_interval = stream_interval
         self.logit_bias = logit_bias
         self.sampling_seed = sampling_seed

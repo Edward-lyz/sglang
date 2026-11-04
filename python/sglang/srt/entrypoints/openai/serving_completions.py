@@ -173,6 +173,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
             "sampling_seed": request.seed,
+            "thinking_budget": request.thinking_budget,
+            "thinking_prompt_token_ids": request.thinking_prompt_token_ids,
         }
 
         # Handle response_format constraints
@@ -295,6 +297,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
                     text=delta,
+                    tokens=content.get("generated_token_num", 1),
                     logprobs=logprobs,
                     finish_reason=finish_reason["type"] if finish_reason else None,
                     matched_stop=(

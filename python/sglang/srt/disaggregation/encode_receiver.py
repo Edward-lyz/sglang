@@ -374,6 +374,9 @@ class MMReceiverHTTP(MMReceiverBase):
             dllm_config=self.scheduler.dllm_config,
         )
         req.tokenizer = self.scheduler.tokenizer
+        req.return_prompt_token_ids_only = getattr(
+            recv_req, "return_prompt_token_ids_only", False
+        )
         return req
 
     # For zmq_to_scheduler

@@ -2,6 +2,7 @@ import logging
 from copy import copy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+from http import HTTPStatus
 
 import torch
 import torch.nn.functional as F
@@ -12,7 +13,10 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    ScheduleBatch,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -385,6 +389,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 spec_steps=self.spec_steps,
             )
 
+        for i, req in enumerate(batch.reqs):
+            start = i * self.draft_token_num
+            count = req.inject_thinking_prompt_tokens(
+                predict,
+                start_idx=start,
+                max_count=self.draft_token_num,
+                advance=True,
+            )
+            if count <= 0:
+                continue
+            accept_index[i].fill_(-1)
+            accept_index[i, :count] = torch.arange(
+                start, start + count, dtype=accept_index.dtype, device=predict.device
+            )
+            accept_length[i] = count - 1
 
         unfinished_index = []
         unfinished_accept_index = []
@@ -402,6 +421,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 num_accepted += 1
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
+                req.update_thinking_state([id])
                 req.check_finished()
                 if req.finished():
                     has_finished = True
@@ -413,10 +433,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         try:
                             req.grammar.accept_token(id)
                         except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
+                            # Grammar reject: abort this request instead of crashing the scheduler
+                            error_message = (
+                                f"Grammar accept_token failed during EAGLE verify for req {req.rid} "
+                                f"with token {id}: {e}"
                             )
-                            raise e
+                            logger.warning(
+                                f"{error_message}\n"
+                                f"{i=}, rid={req.rid}\n"
+                                f"{accept_index=}\n"
+                                f"{predict=}\n"
+                            )
+                            req.finished_reason = FINISH_ABORT(
+                                error_message, HTTPStatus.INTERNAL_SERVER_ERROR
+                            )
+                            has_finished = True
+                            accept_index[i, j + 1 :] = -1
+                            break
             # Update KV cache tracking for the accepted tokens
             req.kv_committed_len += num_accepted
             req.kv_allocated_len = req.kv_committed_len

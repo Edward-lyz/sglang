@@ -592,6 +592,14 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_draft_tokens,
         )
 
+        for i, req in enumerate(batch.reqs):
+            start = i * self.server_args.speculative_num_draft_tokens
+            req.inject_thinking_prompt_tokens(
+                draft_tokens,
+                start_idx=start,
+                max_count=self.server_args.speculative_num_draft_tokens,
+                advance=False,
+            )
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
