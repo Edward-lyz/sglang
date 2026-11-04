@@ -94,7 +94,21 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                self.fire_pending_trace(req)
+                # A request that finishes here never ran a forward, so the
+                # decode-side release path below is the ONLY one it takes: the
+                # draft SWA pages `pop_preallocated` mapped for it must be
+                # returned here too, or every prebuilt-finished request (a
+                # health-check probe, max_new_tokens=1, a grammar abort) leaks
+                # one page until the draft pool exhausts.
+                draft_req_pool_idx = req.req_pool_idx
                 release_kv_cache(req, self.tree_cache)
+                if draft_req_pool_idx is not None and isinstance(
+                    self.draft_worker, BaseSpecWorker
+                ):
+                    self.draft_worker.release_draft_kv(
+                        req_pool_idx=int(draft_req_pool_idx)
+                    )
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -997,7 +1011,14 @@ class SchedulerBatchResultProcessor:
                     if get_server_args().enable_mamba_extra_buffer_lazy()
                     else True
                 )
+                draft_req_pool_idx = req.req_pool_idx
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                if draft_req_pool_idx is not None and isinstance(
+                    self.draft_worker, BaseSpecWorker
+                ):
+                    self.draft_worker.release_draft_kv(
+                        req_pool_idx=int(draft_req_pool_idx)
+                    )
 
             req.time_stats.set_completion_time()
 

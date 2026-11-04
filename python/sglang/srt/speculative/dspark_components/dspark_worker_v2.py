@@ -7,6 +7,7 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.layers.dp_attention import vocab_dp_static_rows
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -20,6 +21,13 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.draft_swa_pool import (
+    DraftWindowSlotMap,
+    compact_draft_pool_multiplier,
+    compute_compact_draft_pool_slots,
+    gather_token_ranges,
+    validate_token_ranges,
+)
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -86,6 +94,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
+        # Draft-side SWA: a private compact req_to_token over the target's global
+        # KV index space, so draft attention only sees the recent window. None =
+        # full context (no windowing). Normalized in speculative_hook.
+        self.draft_window_size: Optional[int] = (
+            server_args.speculative_draft_window_size
+        )
+        self.use_compact_draft_cache = self.draft_window_size is not None
+        # Window-bounded draft KV: assigned in alloc_memory_pool, once the pool
+        # geometry is known. Only meaningful with windowing enabled.
+        self._draft_slot_map: Optional[DraftWindowSlotMap] = None
         self._draft_dp_context_enabled = (
             server_args.enable_dp_attention and not self._draft_is_moe
         )
@@ -227,6 +245,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
+            # Resolved lazily: the slot map is built in alloc_memory_pool, after
+            # the injector. None until then, and None forever when windowing is
+            # off -- in which case writes stay in the global index space.
+            slot_translator=self._translate_draft_slots,
         )
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
@@ -235,6 +257,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+            dp_vocab_sync=self._dp_vocab_sync,
+            dp_graph_rows=self._dp_graph_rows,
+            dcp_enabled=server_args.dcp_size > 1,
+            draft_window_size=self.draft_window_size,
+            page_size=self.page_size,
+            resolve_target_req_to_token=lambda: (
+                self.model_runner.req_to_token_pool.req_to_token
+            ),
+            # Resolved per call: the slot map does not exist yet (it is built in
+            # alloc_memory_pool), so passing the value here would capture None.
+            resolve_slot_translator=lambda: self._translate_draft_slots_or_none,
         )
         self._verify_epilogue = None
         if (
@@ -442,9 +475,164 @@ class DSparkWorkerV2(BaseSpecWorker):
             token_to_kv_pool_allocator = None
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
-            req_to_token_pool=req_to_token_pool,
+            req_to_token_pool=(
+                None if self.use_compact_draft_cache else req_to_token_pool
+            ),
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        self._init_draft_slot_map()
+
+    def _shrink_memory_pool_config_to_window(
+        self, memory_pool_config: MemoryPoolConfig
+    ) -> MemoryPoolConfig:
+        """Resize the draft's KV pool from context-length down to window-length.
+
+        The draft only ever addresses the swa-id space (see draft_swa_pool.py):
+        ids fit in ``[1, num_swa_slots)`` and any id outside that range is a bug
+        the injector catches. Sizing the physical KV buffer to
+        ``num_swa_slots`` -- rather than the target's context-length pool --
+        turns the index compression into an actual memory saving.
+
+        Never grow the config. Two cases must survive:
+          * a config quirk (small target, tiny max_reqs) that recommends more
+            slots than the target has -- the window buys nothing;
+          * the PD-prefill branch above already shrunk to ``page_size`` -- that
+            branch minimises a mostly-unused pool, so growing it back to
+            ``swa_size`` here would undo the intent.
+        """
+        # In PD mode Prefill is a producer of full prompt KV. Its temporary
+        # source mappings live until RDMA completion and may overlap across
+        # transfer rooms, so sizing this pool by the Decode window is unsafe.
+        # Keep the original Prefill draft pool; Decode remains window-compact.
+        if self.__dict__.get("_is_pd_prefill", False):
+            return memory_pool_config
+
+        max_running_requests = memory_pool_config.max_running_requests or int(
+            self.model_runner.req_to_token_pool.req_to_token.shape[0]
+        )
+        page_size = int(self.page_size)
+        # The recommendation is already the physical pool size: it is a whole
+        # number of pages and includes the reserved page 0 (whose slot 0 is the
+        # unmapped sentinel). The KV pool must stay page-aligned so trtllm_mha's
+        # ``k_cache.view(-1, page_size, num_kv_heads, head_dim)`` reshape stays
+        # valid; a mid-page pool size makes that view raise a shape mismatch.
+        # compute_compact_draft_pool_slots is the single source of truth, shared
+        # with the target-side pool budget (pool_configurator) so the Decode pool
+        # and the reserved budget can never disagree. Its multiplier defaults to
+        # the shared env headroom (SGLANG_DSPARK_SWA_POOL_MULTIPLIER).
+        swa_pool_size = compute_compact_draft_pool_slots(
+            max_num_reqs=max_running_requests,
+            window_size=self.draft_window_size,
+            gamma=int(self.verify_num_draft_tokens),
+            page_size=page_size,
+        )
+        if swa_pool_size >= memory_pool_config.max_total_num_tokens:
+            return memory_pool_config
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DSpark draft KV pool: shrinking %d -> %d slots (%.1fx) "
+                "for window=%d, gamma=%d, max_reqs=%d.",
+                memory_pool_config.max_total_num_tokens,
+                swa_pool_size,
+                memory_pool_config.max_total_num_tokens / max(1, swa_pool_size),
+                self.draft_window_size,
+                int(self.verify_num_draft_tokens),
+                max_running_requests,
+            )
+        return MemoryPoolConfig(
+            max_total_num_tokens=swa_pool_size,
+            max_running_requests=memory_pool_config.max_running_requests,
+            full_max_total_num_tokens=memory_pool_config.full_max_total_num_tokens,
+            swa_max_total_num_tokens=memory_pool_config.swa_max_total_num_tokens,
+            mem_fraction_static=memory_pool_config.mem_fraction_static,
+        )
+
+    def _init_draft_slot_map(self) -> None:
+        """Build the window-bounded draft SWA slot map (windowed mode only).
+
+        Sized from the window, not the context length: that is what keeps the
+        draft KV footprint bounded as sequences grow.
+
+        The map's ``num_swa_slots`` MUST NOT exceed the draft pool's addressable
+        slot count (``draft.token_to_kv_pool_allocator.size + page_size``). If
+        the map hands out a slot id past the pool, ``store_kvcache`` asserts
+        ``index < size_limit`` on the device -- the assertion fires
+        asynchronously from a later Mamba free, making the true cause hard to
+        find. Bound the map to what the pool can actually hold.
+        """
+        if not self.use_compact_draft_cache:
+            return
+        assert self.draft_window_size is not None
+
+        target_req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        max_num_reqs = int(target_req_to_token.shape[0])
+        target_allocator = self.model_runner.token_to_kv_pool_allocator
+        # SWA allocators expose ``size`` as the compact physical pool size, but
+        # req_to_token stores ids from the complete target slot address space.
+        # DraftWindowSlotMap must therefore be indexed by size_full.
+        size_full = getattr(target_allocator, "size_full", None)
+        num_full_slots = int(
+            size_full if size_full is not None else target_allocator.size
+        )
+        # The draft worker rebuilt its allocator against the shrunk pool
+        # (`_shrink_memory_pool_config_to_window`); read its size, not the
+        # target's, so the map's id space stays within the actual buffer.
+        draft_allocator = self.draft_model_runner.token_to_kv_pool_allocator
+        draft_pool_size = int(draft_allocator.size)
+        page_size = int(self.page_size)
+        # The recommended size is already the physical pool size (a whole number
+        # of pages, including the reserved page 0). Bound it to the actual draft
+        # pool and floor-align to page_size so DraftWindowSlotMap's page-space
+        # invariant holds even if the allocator reports a mid-page size.
+        # The recommended size is already the physical pool size (a whole number
+        # of pages, including the reserved page 0). Scale it by the SAME pool
+        # multiplier as the physical buffer (_shrink_memory_pool_config_to_window)
+        # so the slot map is never the binding constraint, then bound it to the
+        # actual draft pool and floor-align to page_size so DraftWindowSlotMap's
+        # page-space invariant holds even if the allocator reports a mid-page size.
+        recommended_swa_slots = int(
+            DraftWindowSlotMap.recommended_num_swa_slots(
+                max_num_reqs=max_num_reqs,
+                window_size=self.draft_window_size,
+                gamma=int(self.verify_num_draft_tokens),
+                page_size=page_size,
+            )
+            * compact_draft_pool_multiplier()
+        )
+        num_swa_slots = (
+            min(recommended_swa_slots, draft_pool_size) // page_size
+        ) * page_size
+        # The map is gathered against ``cache_loc`` / ``req_to_token``, both of
+        # which live on the draft device; a CPU table would raise a device
+        # mismatch on the first inject.
+        self._draft_slot_map = DraftWindowSlotMap(
+            num_full_slots=num_full_slots,
+            num_swa_slots=num_swa_slots,
+            max_num_reqs=max_num_reqs,
+            window_size=self.draft_window_size,
+            page_size=int(self.page_size),
+            device=self.device,
+        )
+        draft_pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
+        if draft_pool is not None:
+            # PD queues receive the raw draft pool from kv_cache_builder. Expose
+            # the compact map on that pool so both prefill source translation
+            # and decode destination allocation use the same worker-owned map.
+            draft_pool.slot_map = self._draft_slot_map
+            draft_pool.full_to_swa_index_mapping = self._draft_slot_map.full_to_swa
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DSpark draft SWA slot map: window=%d, gamma=%d, swa_slots=%d "
+                "(%d per request) over %d global slots "
+                "(allocator.size=%d, allocator.size_full=%s).",
+                self.draft_window_size,
+                self.verify_num_draft_tokens,
+                num_swa_slots,
+                num_swa_slots // max(1, max_num_reqs),
+                num_full_slots,
+                int(target_allocator.size),
+                str(size_full),
+            )
 
     def init_attention_backends(self):
         with self._draft_context():
@@ -657,10 +845,65 @@ class DSparkWorkerV2(BaseSpecWorker):
         elif local_ctx is not None:
             ctx_acc = local_ctx
 
-        batch_output.next_draft_input = make_next_draft_input(
-            bonus_tokens=next_token_ids,
-            new_seq_lens=batch.seq_lens,
-        )
+        # Prefill writes draft KV at freshly-allocated slots, so they need a
+        # draft-SWA mapping before the write. Decode maps inside
+        # _maintain_draft_swa_window; prefill has no such pass. Only the
+        # trailing `window` tokens of each extend segment are kept: the draft's
+        # self-attention is window-truncated, so older extend tokens are never
+        # read and must not consume draft-SWA slots (the pool is sized by the
+        # window, not by the extend length).
+        slot_map = self._draft_slot_map
+        if slot_map is not None:
+            keep = torch.zeros(num_real_tokens, dtype=torch.bool, device=device)
+            off = 0
+            for ext_len in batch.extend_lens:
+                ext_len = int(ext_len)
+                keep_len = min(ext_len, int(self.draft_window_size))
+                if keep_len > 0:
+                    keep[off + ext_len - keep_len : off + ext_len] = True
+                off += ext_len
+            prefill_cache_loc = batch.out_cache_loc[keep]
+            prefill_positions = positions[keep]
+        else:
+            keep = None
+            prefill_cache_loc = batch.out_cache_loc
+            prefill_positions = positions
+
+        # Prefill draft KV is written locally before PD transfer, so its active
+        # tail must be mapped before injection. The per-request mapper records
+        # ownership; Mooncake recycles these source slots after RDMA completes.
+        self._map_prefill_draft_slots(batch=batch, cache_loc=prefill_cache_loc)
+
+        if output_pp_proxy_tensors is not None:
+            # Non-last PP ranks forward the FULL accumulated context to the next
+            # rank; only the rank that actually injects KV trims to the window.
+            if ctx_acc is not None:
+                output_pp_proxy_tensors.tensors["dspark_ctx_acc"] = ctx_acc
+        elif ctx_acc is not None:
+            if keep is not None:
+                ctx_acc = ctx_acc[keep]
+            self._kv_injector.inject_projected_context(
+                projected_context=ctx_acc,
+                cache_loc=prefill_cache_loc,
+                positions=prefill_positions,
+            )
+        elif has_local_target_hidden and not (self.ps.pp_size > 1 and not self._draft_is_moe):
+            if keep is not None and target_hidden.shape[0] == num_real_tokens:
+                target_hidden = target_hidden[keep]
+            self._kv_injector.inject_target_hidden(
+                target_hidden=target_hidden,
+                cache_loc=prefill_cache_loc,
+                positions=prefill_positions,
+            )
+        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+        if logits_output is not None:
+            logits_output.hidden_states = None
+
+        if next_token_ids is not None:
+            batch_output.next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
@@ -711,6 +954,175 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=next_draft_input.new_seq_lens,
         )
 
+    def _map_prefill_draft_slots(self, *, batch: ScheduleBatch, cache_loc) -> None:
+        """Map the slots prefill is about to write draft KV into.
+
+        ``cache_loc`` is the window-trimmed write list prepared by
+        ``_forward_prefill``: one tail window per extend segment, because the
+        draft's window-truncated attention never reads the rest. Mapping
+        ``batch.out_cache_loc`` instead would remap the whole prompt and exhaust
+        the compact pool under long-context PD traffic.
+        """
+        slot_map = self._draft_slot_map
+        if slot_map is None or batch.out_cache_loc is None:
+            return
+        # Map per request, carrying the owner id into the map.  A flattened
+        # batch mapping cannot be released safely because the allocator then
+        # has no request high-water mark to sweep on completion.
+        if batch.extend_lens is None or batch.prefix_lens is None:
+            slot_map.map_slots(cache_loc)
+            return
+        # Chunked prefill may call this repeatedly for the same request; evict
+        # the previous chunk before retaining the new tail.
+        compact_offset = 0
+        for req, prefix_len, extend_len in zip(
+            batch.reqs, batch.prefix_lens, batch.extend_lens
+        ):
+            ext_len = int(extend_len)
+            keep_len = min(ext_len, int(self.draft_window_size))
+            if keep_len > 0:
+                committed = int(prefix_len) + ext_len
+                slot_map.advance_window(
+                    req_pool_indices_cpu=[int(req.req_pool_idx)],
+                    committed_lens_cpu=[committed],
+                    target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    return_count=False,
+                )
+                req_loc = cache_loc[compact_offset : compact_offset + keep_len]
+                slot_map.map_slots(
+                    req_loc,
+                    req_pool_idx=int(req.req_pool_idx),
+                    end_pos=committed,
+                )
+            compact_offset += keep_len
+
+    def _translate_draft_slots(self, cache_loc):
+        """Target-global slot ids -> draft-SWA slot ids; identity when off."""
+        slot_map = self._draft_slot_map
+        if slot_map is None:
+            return cache_loc
+        return slot_map.translate(cache_loc)
+
+    @property
+    def _translate_draft_slots_or_none(self):
+        """The translator, or None when windowing is off.
+
+        The compact-row rebuild skips its translation pass entirely on None,
+        which keeps the non-windowed path free of an extra gather.
+        """
+        return None if self._draft_slot_map is None else self._translate_draft_slots
+
+    def _maintain_draft_swa_window(
+        self, *, batch: ScheduleBatch, draft_input: DFlashDraftInputV2
+    ) -> None:
+        """Advance the window, then map every slot the draft may touch this step.
+
+        Both halves run here, on the host, before the draft forward:
+
+        * Eviction uses ``req.kv_committed_len``, which the batch-result processor
+          settles on the host, so it lags this step's verify by one. That lag is
+          harmless -- the frontier is monotonic and the pool carries a block of
+          slack -- and it avoids a D2H sync on ``commit_lens``. It also means the
+          target's ``decode_batch_idx >= 1`` guard has no analogue here: the
+          length we evict against is one the draft has already read past.
+        * Mapping starts at the eviction frontier, never at 0: re-mapping an
+          evicted position would silently undo the eviction. It must reach the
+          RESERVED length, because ``prepare_for_decode`` over-allocates to
+          ``committed + 2 * block_size`` and the draft may gather any of it --
+          a reserved-but-unmapped slot would translate to 0 (the unmapped
+          sentinel) and read the wrong KV.
+        * ``reserved_seq_lens_cpu`` is computed one scheduling step ago (host
+          metadata intentionally lags, see ``prepare_for_decode``), off last
+          step's ``kv_committed_len``. When a step accepts an unusually long
+          draft block, this step's ``kv_committed_len`` can already exceed
+          that stale reserved bound. ``alloc_verify_window`` always gathers
+          this step's real ``[committed, committed + block)`` regardless, so
+          the map must cover at least that -- else the same reserved-but-
+          unmapped-slot failure hits on the *current* step's own verify
+          write, not just a future over-allocated one. ``committed[i] +
+          block`` reads only already-resident host ints, so folding it in
+          costs no extra D2H sync.
+        """
+        slot_map = self._draft_slot_map
+        if slot_map is None:
+            return
+        target_req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        reserved = draft_input.reserved_seq_lens_cpu
+        block = int(self.verify_num_draft_tokens)
+
+        req_pool_indices = [int(req.req_pool_idx) for req in batch.reqs]
+        committed = [int(req.kv_committed_len) for req in batch.reqs]
+        # 有效 end 超过真实行宽时必须报错，不能 min/clamp 成最后一列：
+        # 后续 verify 仍会按完整 block 读写，映射范围与写入范围必须一致。
+        mapping_ends = [
+            (
+                max(int(reserved[i]), length + block)
+                if reserved is not None
+                else length + block
+            )
+            for i, length in enumerate(committed)
+        ]
+        validate_token_ranges(
+            target_req_to_token, req_pool_indices, [0] * len(committed), mapping_ends
+        )
+        slot_map.advance_window(
+            req_pool_indices_cpu=req_pool_indices,
+            committed_lens_cpu=committed,
+            target_req_to_token=target_req_to_token,
+            # The freed count is unused here, and reading it back would wait
+            # out the previous forward.
+            return_count=False,
+        )
+
+        # Batched window-tail mapping: ONE map_slots call per step. The former
+        # per-request loop paid a full map_slots chain (~15 small CUDA ops plus
+        # torch.unique) per request per step, which alone cost ~0.4ms/request
+        # of pure CPU launch overhead -- the bulk of SWA's decode regression.
+        window_tail = int(self.draft_window_size) + 2 * block
+        starts = []
+        ends = []
+        active_reqs = []
+        for i, req_pool_idx in enumerate(req_pool_indices):
+            end = mapping_ends[i]
+            # Only the active SWA tail can be read by draft attention.  On the
+            # first decode step the eviction frontier is zero, but ``end`` may
+            # be the entire prefill context; mapping from zero would allocate
+            # one compact page per full-context page and defeat SWA entirely.
+            # Keep enough history for the configured window and the reserved
+            # verify block, while preserving the monotonic eviction frontier.
+            window_start = max(0, end - window_tail)
+            start = max(int(slot_map.evict_frontier[req_pool_idx]), window_start)
+            if end > start:
+                starts.append(start)
+                ends.append(end)
+                active_reqs.append(req_pool_idx)
+        if starts:
+            # 与淘汰端共用安全 gather：只给无效补齐列用安全下标，之后置 -1。
+            # 有效列越界在状态变更前报错，不再静默重复最后一列。
+            slot_map.map_slots(
+                gather_token_ranges(target_req_to_token, active_reqs, starts, ends),
+                assert_capacity=False,
+            )
+            slot_map.note_mapped_extents(active_reqs, ends)
+
+    def release_draft_kv(self, *, req_pool_idx: int) -> None:
+        """Return every draft-SWA slot this request still holds.
+
+        Called from the request-release path once the radix insert has happened
+        but before the slot id is recycled, so a reused prefix never inherits a
+        stale draft mapping.
+        """
+        slot_map = self._draft_slot_map
+        if slot_map is None:
+            return
+        slot_map.release_request(
+            req_pool_idx=req_pool_idx,
+            target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+            # Runs inside the scheduler's release path, on the same stream as the
+            # forward: the freed count is unused, so do not read it back.
+            return_count=False,
+        )
+
     def _forward_decode(
         self, batch: ScheduleBatch, on_publish, grammar_barrier=None
     ) -> GenerationBatchResult:
@@ -752,6 +1164,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         prefix_lens = batch.seq_lens
 
         self._observers.begin_step()
+
+        self._maintain_draft_swa_window(batch=batch, draft_input=draft_input)
 
         target_model = self.target_worker.model_runner.model
 

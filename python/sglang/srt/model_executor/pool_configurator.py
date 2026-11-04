@@ -185,6 +185,90 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 minimal_draft_budget = self._minimal_dspark_prefill_draft_budget_bytes(
                     kvc, int(draft_num_layers)
                 )
+                if minimal_draft_budget is not None:
+                    self._draft_fixed_budget_bytes = minimal_draft_budget
+                elif kvc.server_args.speculative_draft_window_size is not None:
+                    # Draft SWA compaction: the draft pool is a fixed byte budget
+                    # (window-bounded), not a per-target-token surcharge. Reserve
+                    # that budget out of available_bytes instead of inflating
+                    # cell_size, so the draft KV the window frees turns into
+                    # target capacity rather than idle memory.
+                    self._draft_fixed_budget_bytes = self._compact_draft_budget_bytes(
+                        kvc
+                    )
+                else:
+                    self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                        target_cell_size_per_token=self._cell_size,
+                        target_num_layers=int(num_layers),
+                        draft_num_layers=int(draft_num_layers)
+                        * kvc.server_args.dcp_size,
+                    )
+
+    def _minimal_dspark_prefill_draft_budget_bytes(
+        self, kvc: KVCacheConfigurator, draft_num_layers: int
+    ) -> Optional[int]:
+        """Budget the one-page draft pool used by context-only DSpark stages."""
+        if not (
+            kvc.spec_algorithm.is_dspark()
+            and kvc.server_args.disaggregation_mode == "prefill"
+            and kvc.ps.pp_rank < kvc.ps.pp_size - 1
+            and kvc.server_args.speculative_draft_window_size is None
+            and kvc.server_args.dcp_size == 1
+            and not is_float4_e2m1fn_x2(kvc.kv_cache_dtype)
+            and get_model().kv_cache_dtype != "mxfp8"
+        ):
+            return None
+        from sglang.srt.configs.model_config import ModelConfig
+
+        draft_config = ModelConfig.from_server_args(
+            kvc.server_args,
+            model_path=kvc.server_args.speculative_draft_model_path,
+            model_revision=kvc.server_args.speculative_draft_model_revision,
+            is_draft_model=True,
+        )
+        if draft_config.hf_config.architectures != ["Qwen3DSparkModel"]:
+            return None
+        draft_cell_size = (
+            draft_config.get_num_kv_heads(kvc.ps.attn_tp_size)
+            * (draft_config.head_dim + draft_config.v_head_dim)
+            * draft_num_layers
+            * torch._utils._element_size(kvc.kv_cache_dtype)
+        )
+        return 2 * kvc.server_args.page_size * draft_cell_size
+
+    def _compact_draft_budget_bytes(self, kvc: KVCacheConfigurator) -> int:
+        """Bytes to reserve for a window-bounded (SWA) draft KV pool.
+
+        Only meaningful when --speculative-draft-window-size is set and the draft
+        per-token cost is known via SGLANG_K3_DSPARK_MHA_CELL_SIZE (Kimi-K3's
+        DSpark draft). Returns 0 otherwise, which keeps the caller on the
+        per-token cell_size surcharge path unchanged.
+
+        The draft pool is sized by max_running_requests, not context length, so
+        this budget is fixed once the request cap is known. It uses the user's
+        --max-running-requests as the request-cap approximation: the final cap may
+        be clamped by token_capacity//2 later, but the budget is small enough that
+        the <1% discrepancy is immaterial.
+        """
+        draft_cell = envs.SGLANG_K3_DSPARK_MHA_CELL_SIZE.get()
+        window = kvc.server_args.speculative_draft_window_size
+        max_reqs = kvc.server_args.max_running_requests
+        gamma = kvc.server_args.speculative_num_draft_tokens
+        if draft_cell is None or window is None or max_reqs is None or gamma is None:
+            return 0
+        self._draft_cell_size = int(draft_cell)
+        from sglang.srt.speculative.draft_swa_pool import (
+            compute_compact_draft_pool_slots,
+        )
+
+        max_reqs_per_worker = int(max_reqs) // max(1, int(kvc.ps.attn_dp_size))
+        slots = compute_compact_draft_pool_slots(
+            max_num_reqs=max_reqs_per_worker,
+            window_size=int(window),
+            gamma=int(gamma),
+            page_size=int(kvc.server_args.page_size),
+        )
+        return slots * int(draft_cell)
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
