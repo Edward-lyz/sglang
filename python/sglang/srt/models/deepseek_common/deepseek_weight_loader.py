@@ -14,6 +14,7 @@
 
 import concurrent.futures
 import logging
+import os
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
@@ -104,6 +105,9 @@ class DeepseekV2WeightLoaderMixin:
             weights: Iterable of (weight_name, weight_tensor) pairs
             is_nextn: Whether loading NextN speculative decoding weights
         """
+        _role = "draft" if is_nextn else "target"
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights.do_load_weights start")
+
         nextn_conf = self._initialize_nextn_conf(is_nextn)
 
         weights = self._maybe_quant_weights_to_fp8_ue8m0(
@@ -142,6 +146,7 @@ class DeepseekV2WeightLoaderMixin:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights.scatter_params start")
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             params_dict = dict(self.named_parameters())
@@ -403,8 +408,10 @@ class DeepseekV2WeightLoaderMixin:
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights.scatter_params done")
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights.do_load_weights done")
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """
@@ -456,6 +463,8 @@ class DeepseekV2WeightLoaderMixin:
             is_nextn: Whether processing NextN weights
             weight_names: Optional list of loaded weight names to determine which layers to process
         """
+        _role = "draft" if is_nextn else "target"
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights.post_load_weights start")
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]
         else:
@@ -653,6 +662,7 @@ class DeepseekV2WeightLoaderMixin:
                 self_attn.use_deep_gemm_bmm = True
             if envs.SGLANG_DEL_MLA_DEAD_WEIGHT.get():
                 del self_attn.kv_b_proj.weight
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights.post_load_weights done")
 
     def _maybe_quant_weights_to_fp8_ue8m0(
         self,
@@ -671,6 +681,8 @@ class DeepseekV2WeightLoaderMixin:
             Original weights iterator if no quantization needed,
             otherwise list of (name, tensor) pairs with quantized weights
         """
+        _role = "draft" if isinstance(nextn_conf, NextNEnabledConfig) else "target"
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights._maybe_quant_weights_to_fp8_ue8m0 start")
         weight_block_size = [128, 128]
         partial_names = []
 
@@ -702,6 +714,7 @@ class DeepseekV2WeightLoaderMixin:
 
         # Early return if no quantization needed - avoid materializing all weights into memory
         if not partial_names:
+            logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights._maybe_quant_weights_to_fp8_ue8m0 done")
             return weights
 
         # Only materialize weights dict when quantization is actually needed
@@ -720,6 +733,7 @@ class DeepseekV2WeightLoaderMixin:
         ) and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             self._mark_nextn_moe_weights_as_ue8m0()
 
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights._maybe_quant_weights_to_fp8_ue8m0 done")
         return list(weights_dict.items())
 
     def _mark_nextn_moe_weights_as_ue8m0(self):

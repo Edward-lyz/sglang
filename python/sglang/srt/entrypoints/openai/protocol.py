@@ -333,6 +333,7 @@ class CompletionRequest(BaseModel):
     data_parallel_rank: Optional[int] = None
     peer_data_parallel_rank: Optional[int] = None
 
+    trace_config: Optional[Dict[str, Any]] = None
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -383,6 +384,7 @@ class CompletionResponse(BaseModel):
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -417,6 +419,7 @@ class CompletionStreamResponse(BaseModel):
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -664,6 +667,7 @@ class ChatCompletionRequest(BaseModel):
     data_parallel_rank: Optional[int] = None
     peer_data_parallel_rank: Optional[int] = None
 
+    trace_config: Optional[Dict[str, Any]] = None
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
@@ -892,6 +896,7 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -946,6 +951,7 @@ class ChatCompletionStreamResponse(BaseModel):
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):

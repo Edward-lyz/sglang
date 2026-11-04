@@ -137,7 +137,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
-from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.metrics.func_timer import enable_func_timer, time_func_latency
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
@@ -147,6 +147,7 @@ from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
+    configure_logger,
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
@@ -216,6 +217,13 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
+
+    # Configure logger to align with other sglang subprocess entry points;
+    # uvicorn spawns this worker via multiprocessing.get_context("spawn"),
+    # so without this call the worker inherits whatever (mis)configuration
+    # the parent left on the root logger after re-import.
+    configure_logger(server_args, f" Tokenizer {os.getpid()}")
+
     logger.info(
         f"Start multi-tokenizer worker process {os.getpid()}, "
         f"ipc_name={port_args.tokenizer_ipc_name}"
@@ -1605,22 +1613,26 @@ async def continue_generation(obj: ContinueGenerationReqInput, request: Request)
 
 
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
+@time_func_latency
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
     # Timestamp when the HTTP request is received and handed off to the tokenizer
+    tokenizer_rev_request_time = time.time()
     return await raw_request.app.state.openai_serving_completion.handle_request(
-        request, raw_request
+        request, raw_request, tokenizer_rev_request_time
     )
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
+@time_func_latency
 async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
     # Timestamp when the HTTP request is received and handed off to the tokenizer
+    tokenizer_rev_request_time = time.time()
     return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+        request, raw_request, tokenizer_rev_request_time
     )
 
 
@@ -2057,6 +2069,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                     for i in range(server_args.dp_size)
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
+                "log_metrics": False,
             }
             res = requests.post(
                 url + request_name,
@@ -2095,6 +2108,7 @@ def _wait_and_warmup(
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
 ):
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_and_warmup start")
     if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
 
@@ -2106,6 +2120,7 @@ def _wait_and_warmup(
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     # The server is ready for requests
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_and_warmup done")
     logger.info("The server is fired up and ready to roll!")
 
     if server_args.delete_ckpt_after_loading:
@@ -2163,6 +2178,8 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     # Launch subprocesses
+    configure_logger(server_args)
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] launch_server start")
     tokenizer_manager, template_manager, scheduler_infos, port_args = (
         _launch_subprocesses(
             server_args=server_args,

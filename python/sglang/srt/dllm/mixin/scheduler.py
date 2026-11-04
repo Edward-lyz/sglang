@@ -199,6 +199,7 @@ class SchedulerDllmMixin:
         new_batch.prefill_stats = PrefillStats(
             log_input_tokens=self.adder.log_input_tokens,
             log_hit_tokens=self.adder.log_hit_tokens,
+            log_host_hit_tokens=self.adder.log_host_hit_tokens,
             new_token_ratio=self.adder.new_token_ratio,
             running_bs=len(self.running_batch.reqs),
             num_new_seqs=len(can_run_list),

@@ -200,6 +200,29 @@ class SamplingParams:
 
             self.stop_regex_max_len = stop_regex_max_len
 
+    def __repr__(self):
+        """__repr__"""
+        return  f"max_new_tokens ={self.max_new_tokens}, " \
+                f"stop_strs = {self.stop_strs}, " \
+                f"stop_token_ids = {self.stop_token_ids}, " \
+                f"temperature = {self.temperature}, " \
+                f"thinking_budget = {self.thinking_budget}, " \
+                f"thinking_prompt_token_ids = {self.thinking_prompt_token_ids}, " \
+                f"top_p = {self.top_p}, " \
+                f"top_k = {self.top_k}, " \
+                f"min_p = {self.min_p}, " \
+                f"frequency_penalty = {self.frequency_penalty}, " \
+                f"presence_penalty = {self.presence_penalty}, " \
+                f"repetition_penalty = {self.repetition_penalty}, " \
+                f"min_new_tokens = {self.min_new_tokens}, " \
+                f"spaces_between_special_tokens = {self.spaces_between_special_tokens}, " \
+                f"n = {self.n}, " \
+                f"json_schema = {self.json_schema}, " \
+                f"regex = {self.regex}, " \
+                f"ebnf = {self.ebnf}, " \
+                f"no_stop_trim = {self.no_stop_trim}, " \
+                f"ignore_eos = {self.ignore_eos}, " \
+                f"skip_special_tokens = {self.skip_special_tokens}" 
 
 # This function gets a strict upperbound on the maximum number of tokens that would need
 # to be buffered to match the input regex string

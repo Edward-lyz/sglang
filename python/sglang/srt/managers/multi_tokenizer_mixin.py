@@ -139,6 +139,7 @@ def _handle_output_by_index(output, i):
             prefill_finished_ts=_extract_field_by_index(
                 output, "prefill_finished_ts", i
             ),
+            detokenize_completed_time=output.detokenize_completed_time,
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
             decode_ids=_extract_field_by_index(output, "decode_ids", i),
@@ -204,6 +205,9 @@ def _handle_output_by_index(output, i):
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
+            trace_infos=_extract_field_by_index(
+                output, "trace_infos", i, check_length=False
+            ),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
@@ -214,6 +218,7 @@ def _handle_output_by_index(output, i):
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            detokenize_completed_time=output.detokenize_completed_time,
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
@@ -233,6 +238,7 @@ def _handle_output_by_index(output, i):
             prefill_finished_ts=_extract_field_by_index(
                 output, "prefill_finished_ts", i
             ),
+            detokenize_completed_time=output.detokenize_completed_time,
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),
@@ -296,6 +302,9 @@ def _handle_output_by_index(output, i):
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
+            ),
+            trace_infos=_extract_field_by_index(
+                output, "trace_infos", i, check_length=False
             ),
         )
     elif isinstance(output, BatchMultimodalOutput):

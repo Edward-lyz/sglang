@@ -100,6 +100,7 @@ def init_tokenizer_manager(
     port_args: PortArgs,
     TokenizerManagerClass: Optional[TokenizerManager] = None,
 ) -> Tuple[TokenizerManager, TemplateManager]:
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_tokenizer_manager start")
     # Launch tokenizer process
     TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
     tokenizer_manager = TokenizerManagerClass(server_args, port_args)
@@ -112,6 +113,7 @@ def init_tokenizer_manager(
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_tokenizer_manager done")
 
     return tokenizer_manager, template_manager
 
@@ -887,6 +889,7 @@ def _wait_for_scheduler_ready(
     scheduler_procs: List,
 ) -> List[Dict]:
     """Wait for the model to finish loading and return scheduler infos."""
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_for_scheduler_ready start")
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
         try:
@@ -904,6 +907,7 @@ def _wait_for_scheduler_ready(
                 "Initialization failed. Please see the error messages above."
             )
         scheduler_infos.append(data)
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_for_scheduler_ready done")
     return scheduler_infos
 
 
@@ -912,6 +916,9 @@ def _launch_scheduler_processes(
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
 ):
+    logger.info(
+        f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _launch_scheduler_processes start"
+    )
     scheduler_procs = []
 
     if server_args.dp_size == 1:
@@ -982,6 +989,9 @@ def _launch_scheduler_processes(
         proc.start()
         scheduler_procs.append(proc)
 
+    logger.info(
+        f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _launch_scheduler_processes done"
+    )
     return scheduler_procs, scheduler_pipe_readers
 
 
@@ -995,6 +1005,7 @@ def _launch_subprocesses(
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _launch_subprocesses start")
     # Configure global environment
     configure_logger(server_args)
     _set_envs_and_config(server_args)
@@ -1063,5 +1074,7 @@ def _launch_subprocesses(
 
     # Get back some info from scheduler to tokenizer_manager
     tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
+
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _launch_subprocesses done")
 
     return tokenizer_manager, template_manager, scheduler_infos, port_args

@@ -25,6 +25,7 @@ import pybase64
 import setproctitle
 import zmq
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -96,11 +97,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.init_request_dispatcher()
 
         # Init metrics
+        self.init_metrics(server_args)
 
+        self.disaggregation_mode = DisaggregationMode(server_args.disaggregation_mode)
 
-    @staticmethod
-    def is_health_check_request(rid: Optional[str]) -> bool:
-        return isinstance(rid, str) and rid.startswith("HEALTH_CHECK")
+    def init_metrics(self, server_args: ServerArgs):
+        """Initialize metrics"""
+        from sglang.srt.metrics.collector import DetokenizerMetricsCollector
+
+        self.enable_metrics = server_args.enable_metrics
+        if self.enable_metrics:
+            self.metrics_collector = DetokenizerMetricsCollector(
+                labels={
+                    "model_name": server_args.served_model_name,
+                    "node_rank": server_args.node_rank,
+                    "dp_rank": 0,
+                    # TODO: Add lora name/path in the future,
+                },
+            )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
@@ -425,12 +439,28 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
-        output_strs = (
+        logfunc = (
+            logger.debug
+            if self.disaggregation_mode != DisaggregationMode.PREFILL
+            else logger.info
+        )
+        if recv_obj.rids:
+            logfunc("[trace] detokenizer received %s from scheduler", recv_obj.rids)
+
+        start = time.perf_counter()
+
+        output_strs, generated_token_nums = (
             self._decode_batch_token_id_output(recv_obj)
             if len(recv_obj.rids) > 0
             else ([], [])
         )
         routed_experts = self._extract_routed_experts(recv_obj)
+
+        if self.enable_metrics:
+            self.metrics_collector.observe_detokenizer_time(time.perf_counter() - start)
+
+        if recv_obj.rids:
+            logfunc("[trace] detokenizer sending %s to tokenizer", recv_obj.rids)
 
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -461,6 +491,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
             customized_info=recv_obj.customized_info,
+            trace_infos=recv_obj.trace_infos,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
@@ -471,6 +502,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
             prefill_finished_ts=recv_obj.prefill_finished_ts,
+            detokenize_completed_time=time.time(),
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
@@ -504,7 +536,7 @@ def run_detokenizer_process(
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
-    configure_logger(server_args)
+    configure_logger(server_args, " Detokenizer")
     parent_process = psutil.Process().parent()
 
     try:

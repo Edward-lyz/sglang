@@ -423,6 +423,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+        self.model_forward = self.model if envs.AIAK_ENABLE_MSIT_TRACE.get() else self.model.forward
 
     def init_mindspore_runner(self):
         # Init the mindspore runner
@@ -885,6 +886,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def load_model(self):
+        _role = "draft" if self.is_draft_worker else "target"
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model start")
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
@@ -956,6 +959,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights start")
         monkey_patch_vllm_parallel_state()
 
         enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
@@ -969,6 +973,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 load_config=self.load_config,
                 model_config=self.model_config,
             )
+            self.loader._role = _role  # 供 loader 里 load_model.weights.* 子埋点区分 target/draft
             self.model = self.loader.load_model(
                 model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
@@ -978,6 +983,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
         monkey_patch_vllm_parallel_state(reverse=True)
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.weights done")
 
         get_offloader().post_init()
 
@@ -1048,13 +1054,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         # Pre-expand RoPE cache before CUDA Graph capture
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.rope_cache start")
         reserve_rope_cache_for_long_sequences(
             self.model,
             self.server_args,
             self.model_config,
             logger,
         )
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.rope_cache done")
 
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.sync_barrier start")
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
             dist.barrier(group=get_tp_group().cpu_group)
@@ -1072,6 +1081,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.sync_barrier done")
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model done")
 
     def update_expert_location(
         self,
@@ -1701,6 +1712,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
+        _role = "draft" if self.is_draft_worker else "target"
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} init_attention_backend start"
+        )
         if self.server_args.enable_pdmux:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []
@@ -1711,6 +1726,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} init_attention_backend done"
+        )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
@@ -2266,7 +2284,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
+        return self.model_forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
@@ -2304,7 +2322,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.attn_backend.init_forward_metadata(forward_batch)
 
         return (
-            self.model.forward(
+            self.model_forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
@@ -2325,7 +2343,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
+        return self.model_forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,

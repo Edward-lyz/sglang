@@ -313,6 +313,7 @@ class CommonKVReceiver(BaseKVReceiver):
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
+        self.bootstrap_infos = None
         self.kv_mgr = mgr
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -111,6 +112,7 @@ def _update_gather_batch(
     if not require_mlp_tp_gather or skip_all_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
+        batch.dp_global_num_tokens_for_metric = [mlp_sync_info.num_tokens]
     else:
         batch.global_num_tokens = mlp_sync_info.global_num_tokens
         batch.global_num_tokens_for_logprob = (
@@ -126,7 +128,7 @@ def _update_gather_batch(
 
 
 def prepare_mlp_sync_batch_raw(
-    local_batch: ScheduleBatch,
+    local_batch: Optional[ScheduleBatch],
     dp_size: int,
     attn_tp_size: int,
     tp_group: GroupCoordinator,
@@ -180,6 +182,9 @@ def prepare_mlp_sync_batch_raw(
         group = tp_group.cpu_group
         device = "cpu"
 
+    # Start timing DP all_gather
+    start_time = time.perf_counter()
+
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
 
     mlp_sync_info = MLPSyncBatchInfo(
@@ -195,13 +200,16 @@ def prepare_mlp_sync_batch_raw(
 
     if not skip_all_gather:
         mlp_sync_info.all_gather(device=device, group=group)
-
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
                 mlp_sync_info.tp0_info[:, 4:6],
             )
         )
 
+    # DP all_gather latency (seconds)
+    all_gather_latency = time.perf_counter() - start_time
+    if local_batch is not None:
+        local_batch.all_gather_latency = all_gather_latency
     need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
     if need_idle_batch:
         batch_to_gather = local_batch
@@ -213,7 +221,7 @@ def prepare_mlp_sync_batch_raw(
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
-
+        batch_to_gather.all_gather_latency = all_gather_latency
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
 

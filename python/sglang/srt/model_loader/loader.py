@@ -685,8 +685,12 @@ class DefaultModelLoader(BaseModelLoader):
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
-    @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(self, model, weights, target_device):
+        """Load weights into the model and postprocess them if necessary."""
+        _role = getattr(self, "_role", "target")
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} "
+            "load_model.weights.load_weights_and_postprocess start")
         model.load_weights(weights)
 
         for name, module in model.named_modules():
@@ -703,6 +707,9 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
                 if _is_npu:
                     torch.npu.empty_cache()
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} "
+            "load_model.weights.load_weights_and_postprocess done")
 
 
 class LayeredModelLoader(DefaultModelLoader):

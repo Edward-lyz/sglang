@@ -625,6 +625,11 @@ class DecodePreallocQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        if preallocated_reqs:
+            logger.info(f"[trace] decode bootstrap completed: {[r.req.rid for r in preallocated_reqs]}")
+
+        if failed_reqs:
+            logger.info(f"[trace] reqs were aborted during bootstrap: {[r.req.rid for r in failed_reqs]}")
 
         return preallocated_reqs, failed_reqs
 
@@ -1003,6 +1008,10 @@ class DecodeTransferQueue:
                             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                     else:
                         transferred_reqs.append(decode_req.req)
+                        if self.scheduler.enable_metrics:
+                            self.scheduler.metrics_collector.observe_kvcache_transfer_time(
+                                time.perf_counter() - decode_req.req.time_stats.decode_transfer_queue_entry_time
+                            )
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -1027,6 +1036,11 @@ class DecodeTransferQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        if transferred_reqs:
+            logger.info(f"[trace] recv kvcache completed: {[r.rid for r in transferred_reqs]}")
+        if failed_reqs:
+            logger.info(f"[trace] recv kvcache failed: {[r.rid for r in failed_reqs]}")
+
         return transferred_reqs
 
 
@@ -1038,6 +1052,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
+            self.iter_start_time = time.perf_counter()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
@@ -1065,6 +1080,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
+            self.iter_start_time = time.perf_counter()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
@@ -1101,7 +1117,17 @@ class SchedulerDisaggregationDecodeMixin:
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
-            elif batch is None:
+
+            # Enter the idle self-check when neither the current nor the
+            # previous batch carries real work. `batch is None` alone is not a
+            # usable idle test here: with DP attention (require_mlp_sync) the
+            # scheduler replaces a None batch with a non-None *empty* idle
+            # batch, so the original `elif batch is None` branch never ran and
+            # the periodic gauge refresh inside self_check_during_idle never
+            # happened.
+            if (batch is None or batch.is_empty()) and (
+                self.last_batch is None or self.last_batch.is_empty()
+            ):
                 self.self_check_during_idle()
 
             # Run sample of the current batch
@@ -1186,6 +1212,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
+            if ret.reqs and self.forward_ct_decode % self.server_args.decode_log_interval == 0:
+                logger.info(f"[trace] run batch: {[r.rid for r in ret.reqs]}")
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
@@ -1224,6 +1252,10 @@ class SchedulerDisaggregationDecodeMixin:
 
         for req in can_run_list:
             req.time_stats.forward_entry_time = time.perf_counter()
+            if self.enable_metrics:
+                self.metrics_collector.observe_request_waiting_time(
+                    req.time_stats.get_request_waiting_time(),
+                )
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

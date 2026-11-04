@@ -102,6 +102,7 @@ class RequestTimingMetricsMixin:
     # This marks when the prefill computation finishes.
     prefill_finished_ts: Optional[List[Optional[float]]]
 
+    detokenize_completed_time: Optional[float]
 
 
 @dataclass
@@ -283,6 +284,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # Function call continuation: token IDs to replay for grammar state recovery
     continuation_token_ids: Optional[List[int]] = None
+    trace_config: Optional[Dict[str, Any]] = None
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -766,6 +768,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 if self.as_max_hit_token_len is not None
                 else None
             ),
+            trace_config=self.trace_config,
             **{
                 field: getattr(self, field)
                 for field in _API_SERVING_TIMING_MIXIN_FIELDS
@@ -809,6 +812,7 @@ class TokenizedGenerateReqInput(BaseReq):
     session_params: Optional[SessionParams] = None
 
     # Timestamp when tokenizer dispatches the request to the scheduler
+    dispatch_to_scheduler_time: Optional[float] = None
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
@@ -853,6 +857,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    trace_config: Optional[Dict[str, Any]] = None
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
 
@@ -1069,6 +1074,7 @@ class TokenizedEmbeddingReqInput(BaseReq):
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
     # Timestamp when tokenizer dispatches the request to the scheduler
+    dispatch_to_scheduler_time: Optional[float] = None
 
 
 @dataclass
@@ -1148,6 +1154,8 @@ class BatchTokenIDOutput(
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    # Trace info for each request (populated by TraceManager for online return)
+    trace_infos: Optional[List[Optional[Dict[str, Any]]]] = None
 
 
 @dataclass
@@ -1240,6 +1248,8 @@ class BatchStrOutput(
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    # Trace info for each request (populated by TraceManager for online return)
+    trace_infos: Optional[List[Optional[Dict[str, Any]]]] = None
 
 
 @dataclass
@@ -1672,6 +1682,45 @@ class AbortReq(BaseReq):
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
+        if self.rid is None:
+            self.rid = ""
+class TraceType:
+    """Trace action types.
+    """
+
+    KV = "kv"
+    METADATA = "metadata"
+    PROMPT = "prompt"
+    SAMPLE = "sample"
+    LOGPROBS = "logprobs"
+    ALL = "all"
+    AS_CACHE = "as_cache"
+class TraceTrigger:
+    """When to trigger a trace action."""
+
+    IMMEDIATE = "immediate"
+    ON_FINISH = "on_finish"
+@dataclass
+class TraceReq(BaseReq):
+    """Request to trigger KV cache or metadata tracing."""
+
+    # Directory to dump KV metadata to. If None, use default path.
+    dump_dir: Optional[str] = None
+    # Which trace mode to execute; see TraceType for valid values.
+    trace_type: str = TraceType.KV
+    # When to trigger the trace; see TraceTrigger for valid values.
+    trigger: str = TraceTrigger.IMMEDIATE
+    # Optional JSON-serializable payload for prompt/sample trace data.
+    payload: Optional[Dict[str, Any]] = None
+    # Whether to include logprobs data in the trace output.
+    return_logprob: bool = False
+    # Whether to return trace data online via the response
+    return_online: bool = False
+    # Deterministic request id shared by normal trace and AS trace. Minted at
+    # Req init (build_trace_req); downstream (TraceManager, ASCache) reads it here.
+    unique_trace_id: Optional[str] = None
+
+    def __post_init__(self):
         if self.rid is None:
             self.rid = ""
 

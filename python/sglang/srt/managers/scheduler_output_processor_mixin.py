@@ -22,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.managers.io_struct import TraceTrigger
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
@@ -45,6 +46,12 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _fire_pending_trace(self: Scheduler, req: Req) -> None:
+        if req.to_trace_req is None:
+            return
+        trace_req = req.to_trace_req
+        if trace_req.trigger == TraceTrigger.ON_FINISH:
+            self._run_trace(trace_req, req)
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
         storage_backend_type = "none"
@@ -97,6 +104,7 @@ class SchedulerOutputProcessorMixin:
                     req.rid,
                     thread_finish_flag=True,
                 )
+                self._fire_pending_trace(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -157,6 +165,12 @@ class SchedulerOutputProcessorMixin:
                         logits_output.input_token_logprobs.tolist()
                     )
 
+            if self.enable_metrics:
+                self.iter_forward_finish_time = time.time()
+                run_batch_time = (
+                    self.iter_forward_finish_time - self.iter_forward_start_time
+                )
+                self.stats.run_batch_time = run_batch_time
 
             hidden_state_offset = 0
 
@@ -190,8 +204,13 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
+                        self._fire_pending_trace(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
+                        if self.enable_metrics:
+                            self.metrics_collector.observe_request_first_token_forward_time(
+                                req.time_stats.get_request_first_token_forward_time()
+                            )
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -325,6 +344,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
+                        self._fire_pending_trace(req)
                         release_kv_cache(req, self.tree_cache)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
@@ -338,6 +358,9 @@ class SchedulerOutputProcessorMixin:
                     auto_next_anon=not req.finished(),
                     thread_finish_flag=req.finished(),
                 )
+        # Log DP-level prefill load-balancing metrics
+        if self.current_scheduler_metrics_enabled:
+            self.log_prefill_dp_balance_stats(batch)
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
@@ -415,6 +438,7 @@ class SchedulerOutputProcessorMixin:
                 req.output_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
+                    self._fire_pending_trace(req)
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.completion_time = time.perf_counter()
                     break
@@ -458,6 +482,7 @@ class SchedulerOutputProcessorMixin:
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 
+        self.iter_forward_finish_time = time.time()
         self.token_to_kv_pool_allocator.free_group_begin()
 
         # NOTE: in any case, we should check finish here
@@ -524,8 +549,10 @@ class SchedulerOutputProcessorMixin:
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
+                        self._fire_pending_trace(req)
                         release_kv_cache(req, self.tree_cache)
                 else:
+                    self._fire_pending_trace(req)
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
@@ -965,6 +992,7 @@ class SchedulerOutputProcessorMixin:
         load = self.get_load()
         routed_experts = None
         customized_info = {}
+        trace_infos = []
 
         queue_times = []
         forward_entry_times = []
@@ -1174,6 +1202,7 @@ class SchedulerOutputProcessorMixin:
                             customized_info[k] = []
                         customized_info[k].append(v)
 
+                trace_infos.append(req.trace_info)
             if (
                 req.finished()
                 and self.attn_tp_rank == 0
@@ -1187,6 +1216,12 @@ class SchedulerOutputProcessorMixin:
                 return
 
             # decode may too noisy
+            logfunc = (
+                logger.debug
+                if self.disaggregation_mode != DisaggregationMode.PREFILL
+                else logger.info
+            )
+            logfunc(f"[trace] scheduler sending {rids} to detokenizer")
 
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
@@ -1196,6 +1231,7 @@ class SchedulerOutputProcessorMixin:
                     spec_accepted_tokens=spec_accepted_tokens,
                     queue_time=queue_times,
                     forward_entry_time=forward_entry_times,
+                    detokenize_completed_time=None,
                     prefill_launch_delay=prefill_launch_delays,
                     prefill_launch_latency=prefill_launch_latencies,
                     prefill_finished_ts=prefill_finished_timestamps,
@@ -1227,6 +1263,7 @@ class SchedulerOutputProcessorMixin:
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
                     customized_info=customized_info,
+                    trace_infos=trace_infos,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
@@ -1281,6 +1318,7 @@ class SchedulerOutputProcessorMixin:
                 prefill_launch_delay=prefill_launch_delays,
                 prefill_launch_latency=prefill_launch_latencies,
                 prefill_finished_ts=prefill_finished_timestamps,
+                detokenize_completed_time=None,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,

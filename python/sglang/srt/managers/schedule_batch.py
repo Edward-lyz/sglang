@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.io_struct import TraceReq
     from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -534,6 +535,7 @@ class Req(ReqDllmMixin):
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        dispatch_to_scheduler_time: Optional[float] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
@@ -547,6 +549,7 @@ class Req(ReqDllmMixin):
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        trace_config=None,
     ):
         # Input and output info
         self.rid = rid
@@ -677,6 +680,24 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        self.trace_config: Optional[Dict[str, Any]] = trace_config
+        self.to_trace_req: Optional[TraceReq] = self.build_trace_req()
+        self.trace_info: Optional[Dict[str, Any]] = None
+        # AS trace: pure in-memory event collector owned by the request.
+        # unique_trace_id lives on to_trace_req so normal trace and AS trace
+        # share the same id; JSON writing and rank info are owned by TraceManager.
+        self.as_trace_context: Optional[Any] = None
+        if (
+            trace_config
+            and trace_config.get("enable_trace")
+            and trace_config.get("trace_type") in ("as_cache", "all")
+            and self.to_trace_req is not None
+        ):
+            from sglang.srt.mem_cache.as_trace import ASTraceContext
+
+            self.as_trace_context = ASTraceContext(
+                self, self.to_trace_req.unique_trace_id
+            )
         # AttentionStore (AS) parameters
         self.as_block_hashs = None
         self.as_kv_cache_params = None
@@ -796,6 +817,12 @@ class Req(ReqDllmMixin):
         self.has_log_time_stats: bool = False
         self.last_tic = time.monotonic()
 
+        # Timestamp when tokenizer dispatches the request to the scheduler
+        self.dispatch_to_scheduler_time = dispatch_to_scheduler_time
+        # TODO (suhang): Move the dispatch_to_scheduler_time synchronization into Req’s own initializer:
+        # Once dispatch_to_scheduler_time is passed into Req
+        # TimeStats can synchronize it automatically, so the scheduler no longer needs that extra getattr check.
+
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
@@ -824,6 +851,29 @@ class Req(ReqDllmMixin):
 
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
+    def build_trace_req(self):
+        """Build TraceReq from trace_config at init time.
+
+        Parses trace_config to create a TraceReq. Returns None if tracing is
+        not enabled or trace_type is missing.
+        """
+        from sglang.srt.managers.io_struct import TraceReq, TraceType, TraceTrigger
+        from sglang.srt.content_detection.config import DETECTION_CONFIG
+        from sglang.srt.mem_cache.as_trace import build_unique_trace_id
+
+        cfg = self.trace_config or {}
+        if not cfg.get("enable_trace") or not cfg.get("trace_type"):
+            return None
+        return TraceReq(
+            rid=self.rid,
+            trace_type=cfg.get("trace_type", TraceType.METADATA),
+            dump_dir=cfg.get("dump_dir") or DETECTION_CONFIG.trace_dump_dir,
+            trigger=cfg.get("trigger", TraceTrigger.ON_FINISH),
+            payload=cfg.get("payload"),
+            return_logprob=cfg.get("return_logprob", False),
+            return_online=cfg.get("online", True),
+            unique_trace_id=build_unique_trace_id(self),
+        )
 
     @property
     def seqlen(self) -> int:
@@ -1391,6 +1441,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_forward_mode: Optional[ForwardMode] = None
 
     # DP all_gather latency for this batch
+    all_gather_latency: float = 0.0
 
     # For processing logprobs
     return_logprob: bool = False
@@ -2403,6 +2454,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             dp_global_num_tokens_for_metric=self.dp_global_num_tokens_for_metric,
+            all_gather_latency=self.all_gather_latency,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,

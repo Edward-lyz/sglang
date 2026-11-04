@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+import os
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -308,6 +309,10 @@ class ModelRunnerKVCacheMixin:
         )
 
     def init_memory_pool(self: ModelRunner, total_gpu_memory: int):
+        _role = "draft" if self.is_draft_worker else "target"
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} init_memory_pool start"
+        )
         max_num_reqs = self.server_args.max_running_requests
         max_total_tokens = self.server_args.max_total_tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
@@ -774,4 +779,7 @@ class ModelRunnerKVCacheMixin:
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} init_memory_pool done"
         )

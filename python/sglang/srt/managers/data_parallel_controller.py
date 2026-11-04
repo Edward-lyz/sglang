@@ -202,7 +202,16 @@ class DataParallelController:
             trace_slice_start(RequestStage.DC_DISPATCH, req.rid)
             req.trace_context = trace_get_proc_propagate_context(req.rid)
 
-        self.dispatching(req)
+        if getattr(req, "return_prompt_token_ids_only", False):
+            # Tokenize-only requests do not participate in disaggregated generation,
+            # so they neither have a bootstrap room nor consume generation load.
+            self.round_robin_scheduler(req)
+        else:
+            self.dispatching(req)
+
+        logger.info(
+            f"[trace] DP-controller received req {req.rid} from tokenizer and routed it to scheduler"
+        )
 
         if self.server_args.enable_trace:
             trace_slice_end(RequestStage.DC_DISPATCH, req.rid, thread_finish_flag=True)
@@ -570,7 +579,7 @@ def run_data_parallel_controller_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
-    configure_logger(server_args)
+    configure_logger(server_args, " DPController")
     if server_args.enable_trace:
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
         thread_label = "DP Controller"

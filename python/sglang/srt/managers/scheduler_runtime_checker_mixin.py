@@ -231,11 +231,96 @@ class SchedulerRuntimeCheckerMixin:
                 msg,
             )
 
+    def _refresh_idle_metrics(self: Scheduler):
+        """Refresh the pool-level gauges while the engine is idle.
+
+        Split out of ``check_memory`` on purpose. This is a read-only snapshot
+        of the allocator, so it is safe to run under a *light* gate. The leak
+        checks in ``check_memory`` are not: they raise, so they need the full
+        ``_is_no_request()`` judgment. Keeping them together would freeze
+        ``num_used_tokens`` at a stale value whenever a request lingers in
+        ``running_batch`` or a health check sits in an input queue, which is
+        exactly the "metrics never fall back" symptom.
+        """
+        if not (
+            self.enable_metrics
+            and self.current_scheduler_metrics_enabled
+            and time.perf_counter() > self.metrics_collector.last_log_time + 30
+        ):
+            return
+        # During idle time, also collect metrics every 30 seconds.
+        if self.is_hybrid_swa:
+            (
+                full_num_used,
+                swa_num_used,
+                full_token_usage,
+                swa_token_usage,
+                _,
+                _,
+                _,
+                _,
+            ) = self._get_swa_token_info()
+            num_used = max(full_num_used, swa_num_used)
+            token_usage = max(full_token_usage, swa_token_usage)
+        elif self.is_hybrid_ssm:
+            (
+                num_used,
+                _,
+                token_usage,
+                _,
+                _,
+                _,
+                _,
+                _,
+            ) = self._get_mamba_token_info()
+        else:
+            num_used, token_usage, _, _ = self._get_token_info()
+        self.stats.num_running_reqs = len(self.running_batch.reqs)
+        self.stats.num_used_tokens = num_used
+        self.stats.token_usage = round(token_usage, 2)
+        self.stats.gen_throughput = 0
+        self.stats.num_queue_reqs = len(self.waiting_queue)
+        self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.stats.num_prefill_prealloc_queue_reqs = len(
+                self.disagg_prefill_bootstrap_queue.queue
+            )
+            self.stats.num_prefill_inflight_queue_reqs = len(
+                self.disagg_prefill_inflight_queue
+            )
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.stats.num_decode_prealloc_queue_reqs = len(
+                self.disagg_decode_prealloc_queue.queue
+            )
+            self.stats.num_decode_transfer_queue_reqs = len(
+                self.disagg_decode_transfer_queue.queue
+            )
+            self.stats.decode_sum_seq_lens = (
+                self.running_batch.seq_lens_cpu.sum().item()
+                if (
+                    self.running_batch is not None
+                    and not self.running_batch.is_empty()
+                    and self.running_batch.seq_lens_cpu is not None
+                )
+                else 0
+            )
+        self.metrics_collector.log_stats(self.stats)
+
     def check_memory(self: Scheduler):
         if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
         elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             memory_leak, token_msg = self._check_mamba_memory()
+        elif (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and getattr(self.tree_cache, "disable", False)
+        ):
+            # The decode engine disables radix cache, so the radix-based leak
+            # check does not apply to it: the pool always keeps a reserved
+            # padding page and health-check pages that the check would
+            # misreport as a leak. Only skip it for the decode engine; other
+            # radix-disabled deployments still go through the radix check.
+            memory_leak, token_msg = False, ""
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
 
@@ -250,60 +335,7 @@ class SchedulerRuntimeCheckerMixin:
 
         self._check_req_pool()
 
-        if (
-            self.enable_metrics
-            and self.current_scheduler_metrics_enabled
-            and time.perf_counter() > self.metrics_collector.last_log_time + 30
-        ):
-            # During idle time, also collect metrics every 30 seconds.
-            if self.is_hybrid_swa:
-                (
-                    full_num_used,
-                    swa_num_used,
-                    full_token_usage,
-                    swa_token_usage,
-                    _,
-                    _,
-                    _,
-                    _,
-                ) = self._get_swa_token_info()
-                num_used = max(full_num_used, swa_num_used)
-                token_usage = max(full_token_usage, swa_token_usage)
-            elif self.is_hybrid_ssm:
-                (
-                    num_used,
-                    _,
-                    token_usage,
-                    _,
-                    _,
-                    _,
-                    _,
-                    _,
-                ) = self._get_mamba_token_info()
-            else:
-                num_used, token_usage, _, _ = self._get_token_info()
-            num_running_reqs = len(self.running_batch.reqs)
-            self.stats.num_running_reqs = num_running_reqs
-            self.stats.num_used_tokens = num_used
-            self.stats.token_usage = round(token_usage, 2)
-            self.stats.gen_throughput = 0
-            self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_prealloc_queue_reqs = len(
-                    self.disagg_prefill_bootstrap_queue.queue
-                )
-                self.stats.num_prefill_inflight_queue_reqs = len(
-                    self.disagg_prefill_inflight_queue
-                )
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = len(
-                    self.disagg_decode_prealloc_queue.queue
-                )
-                self.stats.num_decode_transfer_queue_reqs = len(
-                    self.disagg_decode_transfer_queue.queue
-                )
-            self.metrics_collector.log_stats(self.stats)
+        self._refresh_idle_metrics()
         self._publish_kv_events()
 
     def check_tree_cache(self: Scheduler):
@@ -314,19 +346,64 @@ class SchedulerRuntimeCheckerMixin:
         ):
             self.tree_cache.sanity_check()
 
+
+    def _decode_idle_ready(self: Scheduler) -> bool:
+        """Complete idle judgment for the decode engine's leak checks.
+
+        ``_is_no_request()`` cannot be reused verbatim here. With overlap
+        scheduling the *idle* event loop still builds an idle batch every
+        iteration, runs it, and pushes it onto ``result_queue``; the previous
+        iteration's entry is popped right after. So ``len(result_queue) == 0``
+        never holds while the loop spins, and any check behind that condition
+        would be skipped forever. Treat a ``result_queue`` that only carries
+        empty batches as idle instead.
+        """
+        if not self.running_batch.is_empty():
+            return False
+        if self.last_batch is not None and not self.last_batch.is_empty():
+            return False
+        if self.cur_batch is not None and not self.cur_batch.is_empty():
+            return False
+        if any(b is not None and not b.is_empty() for b, _ in self.result_queue):
+            return False
+        if self.pp_size > 1 and any(
+            not x.is_empty() for x in getattr(self, "running_mbs", []) or []
+        ):
+            return False
+        if (
+            len(self.waiting_queue)
+            or len(self.disagg_decode_prealloc_queue.queue)
+            or len(self.disagg_decode_transfer_queue.queue)
+        ):
+            return False
+        # Quarantined requests have left the transfer queue but still hold
+        # their KV pages and req_to_token slot on purpose.
+        if self.disagg_decode_transfer_queue.num_quarantined() > 0:
+            return False
+        # Requests being offloaded still own their KV until the async
+        # Device->Host copy completes.
+        if (
+            self.server_args.disaggregation_decode_enable_offload_kvcache
+            and len(self.decode_offload_manager.ongoing_offload) > 0
+        ):
+            return False
+        return True
+
     def self_check_during_idle(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            queue_size = (
-                len(self.waiting_queue)
-                + len(self.disagg_decode_transfer_queue.queue)
-                + len(self.disagg_decode_prealloc_queue.queue)
-            )
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                queue_size += len(self.decode_offload_manager.ongoing_offload)
-            if queue_size:
+            # Refresh the gauges *before* the leak-check gate below.
+            # num_used_tokens / decode_sum_seq_lens are read-only allocator and
+            # batch snapshots, so publishing them is safe even with work still
+            # in flight. Keeping them behind the full idle gate is what made
+            # the pool look like it never fell back: the gauges froze at their
+            # last value from log_decode_stats — i.e. the last running
+            # request's size — long after the pages had actually been freed.
+            self._refresh_idle_metrics()
+
+            if not self._decode_idle_ready():
                 return
 
         self.check_memory()

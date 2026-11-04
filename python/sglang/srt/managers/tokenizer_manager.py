@@ -69,6 +69,7 @@ from sglang.srt.managers.io_struct import (
     TokenizeReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TraceReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
@@ -496,6 +497,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        tokenizer_rev_request_time: Optional[float] = None,
     ):
         created_time = obj.received_time if obj.received_time else time.time()
         self.auto_create_handle_loop()
@@ -521,7 +523,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
+                tokenized_obj = await self._tokenize_one_request(
+                    obj, tokenizer_rev_request_time
+                )
                 state = self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
@@ -541,6 +545,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.auto_create_handle_loop()
 
         obj.normalize_batch_and_arguments()
+        if self.enable_trace:
+            self._trace_request_start(obj, created_time, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
@@ -594,6 +600,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         future = asyncio.get_running_loop().create_future()
         self.tokenize_req_futures[rid] = future
         tokenized_obj.return_prompt_token_ids_only = True
+        tokenized_obj.dispatch_to_scheduler_time = time.perf_counter()
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(rid)
         tokenized_obj = wrap_shm_features(tokenized_obj)
@@ -610,6 +617,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             output: TokenizeReqOutput = await future
         finally:
             self.tokenize_req_futures.pop(rid, None)
+            if self.enable_trace:
+                trace_req_finish(rid, ts=int(time.time() * 1e9), attrs={})
 
         if output.error_message is not None:
             raise fastapi.HTTPException(
@@ -759,6 +768,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        tokenizer_rev_request_time: Optional[float] = None,
     ):
         """Tokenize one request."""
         # Validate dp_rank fields early so a bad client can't crash the DP controller.
@@ -829,6 +839,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
 
         # Record tokenize request ready time
+        tokenizer_ready_time = time.time()
+        if (
+            tokenizer_rev_request_time is not None
+            and tokenizer_rev_request_time > 0
+            and self.enable_metrics
+        ):
+            self.metrics_collector.observe_request_time_to_tokenizer_ready(
+                tokenizer_ready_time - tokenizer_rev_request_time
+            )
 
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
@@ -1112,6 +1131,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 as_max_hit_host_ip=obj.as_max_hit_host_ip,
                 as_max_hit_token_len=obj.as_max_hit_token_len,
                 continuation_token_ids=obj.continuation_token_ids,
+                trace_config=obj.trace_config
             )
 
             # Generate as_block_hashs from input_ids
@@ -1282,6 +1302,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         tokenized_obj = wrap_shm_features(tokenized_obj)
+        tokenized_obj.dispatch_to_scheduler_time = time.perf_counter()
+        logger.info(f"[trace] tokenizer sent {obj.rid} to scheduler")
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = self.req_state_class(
             [], False, asyncio.Event(), obj, created_time=created_time
@@ -1319,6 +1341,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
+        logger.info(f"[trace] tokenizer sent {batch_req.rids} to scheduler")
         self.send_to_scheduler.send_pyobj(batch_req)
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
@@ -1591,6 +1614,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self.metrics_collector.labels
             )
 
+    def trace_request(self, rid: str = ""):
+        """Send a trace request to scheduler. Scheduler will parse trace_config from Req."""
+        if not rid:
+            return
+        req = TraceReq(rid=rid)
+        self.send_to_scheduler.send_pyobj(req)
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
@@ -1743,8 +1772,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
+            self._result_dispatcher(recv_obj)
             self.soft_watchdog.feed()
 
     def _handle_batch_output(
@@ -1756,6 +1785,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             BatchTokenIDOutput,
         ],
     ):
+        logfunc = (
+            logger.debug
+            if self.disaggregation_mode != DisaggregationMode.PREFILL
+            else logger.info
+        )
+        if recv_obj.rids:
+            logfunc("[trace] tokenizer received %s from detokenizer", recv_obj.rids)
 
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
@@ -1816,6 +1852,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         i
                     ]
 
+            # Add trace_info from scheduler trace if available
+            if (
+                hasattr(recv_obj, "trace_infos")
+                and recv_obj.trace_infos
+                and i < len(recv_obj.trace_infos)
+                and recv_obj.trace_infos[i] is not None
+            ):
+                meta_info["trace_info"] = recv_obj.trace_infos[i]
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
@@ -1873,7 +1917,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
                 if self.server_args.speculative_algorithm:
-                    self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
+                    self._calculate_spec_decoding_metrics(meta_info, recv_obj, i, state)
                 if self.enable_metrics:
                     self._calculate_timing_metrics(meta_info, state, recv_obj, i)
 
@@ -1883,6 +1927,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     attrs=self.convert_to_span_attrs(state, recv_obj, i),
                 )
 
+                logger.info(
+                    f"[trace] req {rid} finished in {meta_info['e2e_latency']:.3f}s"
+                )
 
                 del self.rid_to_state[rid]
 
@@ -2078,7 +2125,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             ]
         else:
             assert self.tokenizer is not None
-            token_texts = self.tokenizer.batch_decode(token_logprobs_idx)
+            token_texts = self.tokenizer.batch_decode(
+                [[idx] for idx in token_logprobs_idx]
+            )
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
     def detokenize_top_logprobs_tokens(
@@ -2111,6 +2160,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             BatchTokenIDOutput,
         ],
         i: int,
+        state: ReqState,
     ) -> None:
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
         if (
@@ -2134,6 +2184,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["spec_accept_token_num"] = accepted_tokens
                 meta_info["spec_draft_token_num"] = total_draft_tokens
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+                logger.info(
+                    f"[MTP] rid={meta_info.get('id')} "
+                    f"bootstrap_host={getattr(state.obj, 'bootstrap_host', None)} "
+                    f"accept_len={meta_info['spec_accept_length']:.3f} "
+                    f"accept_rate={meta_info['spec_accept_rate']:.3f} "
+                    f"accepted={meta_info['spec_accept_token_num']} "
+                    f"drafted={meta_info['spec_draft_token_num']} "
+                    f"verify_ct={meta_info['spec_verify_ct']}"
+                )
 
     def _calculate_timing_metrics(
         self,
@@ -2271,6 +2330,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 cached_tokens_details,
             )
 
+        if recv_obj.detokenize_completed_time is not None:
+            zmq_cost = self.last_receive_tstamp - recv_obj.detokenize_completed_time
+            self.metrics_collector.observe_detokenizer_to_tokenizer_time(zmq_cost)
 
     def dump_requests(self, state: ReqState, out_dict: dict):
         self.dump_request_list.append(
@@ -2420,6 +2482,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         pass
 
     def _handle_abort_req(self, recv_obj: AbortReq):
+        logger.info(
+            f"[trace] tokenizer received aborted {recv_obj.rid} from detokenizer"
+        )
         if is_health_check_generate_req(recv_obj):
             return
         state = self.rid_to_state.get(recv_obj.rid, None)

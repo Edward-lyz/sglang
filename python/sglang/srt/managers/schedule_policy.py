@@ -407,6 +407,7 @@ class PrefillAdder:
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
+        self.log_host_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
 
@@ -508,7 +509,11 @@ class PrefillAdder:
         return AddReqResult.CONTINUE
 
     def _update_prefill_budget(
-        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+        self,
+        prefix_len: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        host_hit_len: int,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -523,6 +528,7 @@ class PrefillAdder:
             self.rem_chunk_tokens -= extend_input_len
 
         self.log_hit_tokens += prefix_len
+        self.log_host_hit_tokens += host_hit_len
         self.log_input_tokens += extend_input_len
 
     def _get_dllm_remain_tokens(self) -> int:
@@ -551,7 +557,9 @@ class PrefillAdder:
 
         self.can_run_list.append(req)
 
-        self._update_prefill_budget(prefix_len, trunc_len, 0)
+        self._update_prefill_budget(
+            prefix_len, trunc_len, 0, host_hit_len=req.host_hit_length
+        )
 
     def _req_inc_lock_ref(self, req: Req):
         if self.is_hybrid_swa:
@@ -579,7 +587,9 @@ class PrefillAdder:
             if not truncated
             else 0
         )
-        self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
+        self._update_prefill_budget(
+            0, req.extend_input_len, max_new_tokens, host_hit_len=req.host_hit_length
+        )
 
         # Return based on remaining token availability
         return (
@@ -610,6 +620,7 @@ class PrefillAdder:
                 if not truncated
                 else 0
             ),
+            host_hit_len=0,
         )
 
         # Return if chunked prefill not finished
@@ -700,6 +711,7 @@ class PrefillAdder:
                 0,
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                host_hit_len=0,
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -712,7 +724,7 @@ class PrefillAdder:
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._update_prefill_budget(0, trunc_len, 0)
+            self._update_prefill_budget(0, trunc_len, 0, host_hit_len=0)
 
         return self.budget_state()
 
@@ -747,7 +759,30 @@ class PrefillAdder:
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
+        logger.info(
+            f"before lock, for req {req.rid} current rem_total_tokens: "
+            f"{self.rem_total_tokens}, "
+            f"local rem total: "
+            f"{self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}, "
+            f"avaliable: {self.token_to_kv_pool_allocator.available_size()}, "
+            f"evictable: {self.tree_cache.evictable_size()}, "
+            f"extend_input_len: {req.extend_input_len}, "
+            f"prefix len {prefix_len}, "
+            f"host_hit_length {req.host_hit_length}"
+        )
+
         with self._lock_node(req.last_node):
+            logger.info(
+                f"after lock, for req {req.rid} current rem_total_tokens: "
+                f"{self.rem_total_tokens}, "
+                f"local rem total: "
+                f"{self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}, "
+                f"avaliable: {self.token_to_kv_pool_allocator.available_size()}, "
+                f"evictable: {self.tree_cache.evictable_size()}, "
+                f"extend_input_len: {req.extend_input_len}, "
+                f"prefix len {prefix_len}, "
+                f"host_hit_length {req.host_hit_length}"
+            )
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
@@ -801,6 +836,7 @@ class PrefillAdder:
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),
+                    req.host_hit_length,
                 )
             else:
                 # Make sure at least one page is available
@@ -828,7 +864,9 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
+                self._update_prefill_budget(
+                    prefix_len, trunc_len, 0, req.host_hit_length
+                )
 
         return self.budget_state()
 

@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.managers.io_struct import TraceTrigger
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     Req,
@@ -331,6 +332,11 @@ class PrefillBootstrapQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        if bootstrapped_reqs:
+            logger.info(f"[trace] prefill bootstrap completed: {[r.rid for r in bootstrapped_reqs]}")
+        if failed_reqs:
+            logger.info(f"[trace] prefill bootstrap failed: {[r.rid for r in failed_reqs]}")
+
         if return_failed_reqs is False:
             return bootstrapped_reqs
         else:
@@ -466,6 +472,12 @@ class SchedulerDisaggregationPrefillMixin:
                     logits_output.input_token_logprobs.tolist()
                 )
 
+        if self.enable_metrics:
+            self.iter_forward_finish_time = time.time()
+            run_batch_time = (
+                self.iter_forward_finish_time - self.iter_forward_start_time
+            )
+            self.stats.run_batch_time = run_batch_time
 
         completed_req_ids: List[str] = []
         for i, (req, next_token_id) in enumerate(
@@ -507,6 +519,10 @@ class SchedulerDisaggregationPrefillMixin:
                     logprob_pt += num_input_logprobs
                 self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
+                if self.enable_metrics:
+                    self.metrics_collector.observe_prompt_calculation_time(
+                        req.time_stats.prefill_transfer_queue_entry_time - req.time_stats.forward_entry_time
+                    )
 
                 if req.grammar is not None:
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -549,6 +565,8 @@ class SchedulerDisaggregationPrefillMixin:
                     RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
                 )
 
+        if completed_req_ids:
+            logger.info(f"[trace] KV caches for all chunks computed. Starting transmission for: {completed_req_ids}")
 
         # Stream output immediately after KV transfer initiated (don't wait for poll).
         # This allows P instance's HTTP response to complete early, so the Router
@@ -562,11 +580,27 @@ class SchedulerDisaggregationPrefillMixin:
         ]
         for req in stream_reqs:
             req.finished_reason = FINISH_LENGTH(length=0)
+            trace_req = req.to_trace_req
+            if (
+                trace_req is not None
+                and trace_req.trigger == TraceTrigger.ON_FINISH
+                and trace_req.return_online
+            ):
+                self._run_trace(trace_req, req)
+                req.to_trace_req = None
         if stream_reqs:
             self.stream_output(
                 stream_reqs,
                 any(req.return_logprob for req in stream_reqs),
                 None,
+            )
+
+        # Log DP-level prefill load-balancing metrics
+        if self.current_scheduler_metrics_enabled and batch.prefill_stats is not None:
+            self.log_prefill_dp_balance_stats(batch)
+            self.log_prefill_stats(
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=getattr(result, "can_run_cuda_graph", False)
             )
         self.maybe_send_health_check_signal()
 
@@ -601,6 +635,7 @@ class SchedulerDisaggregationPrefillMixin:
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                self._fire_pending_trace(req)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 # finished_reason and stream_output already handled in
                 # process_batch_result_disagg_prefill() right after send_kv_chunk.
@@ -629,14 +664,34 @@ class SchedulerDisaggregationPrefillMixin:
         finish_times = self.disagg_prefill_bootstrap_queue.kv_manager.transfer_finish_times
         now = time.perf_counter()
         for req in done_reqs:
-            req.time_stats.completion_time = time.perf_counter()
+            req.time_stats.completion_time = now
+            bootstrap_room = req.bootstrap_room
+            if bootstrap_room is not None and bootstrap_room in finish_times:
+                # TODO move pop to `req.disagg_kv_sender.clear()`
+                finish_time = finish_times.pop(bootstrap_room)
+            else:
+                logger.warning(f"req {req.rid} kv transfer finished, but no finish time recorded")
+                finish_time = now
 
-        # Stream requests which have finished transfer
-        self.stream_output(
-            done_reqs,
-            any(req.return_logprob for req in done_reqs),
-            None,
-        )
+            if self.enable_metrics:
+                self.metrics_collector.observe_kvcache_transfer_time(
+                    finish_time - req.time_stats.prefill_transfer_queue_entry_time
+                )
+                self.metrics_collector.observe_request_first_token_forward_time(
+                    req.time_stats.get_request_first_token_forward_time()
+                )
+        if done_reqs:
+            succeeded, failed = [], []
+            for r in done_reqs:
+                (failed if r.finished_reason and r.finished_reason.is_error else succeeded).append(r.rid)
+            logger.info(
+                f"[trace] prefill sent kv cache done, "
+                f"succeeded({len(succeeded)}): {succeeded}"
+                + (f", failed({len(failed)}): {failed}" if failed else "")
+            )
+
+        # stream_output already done in process_batch_result_disagg_prefill().
+        # Here we only do resource cleanup for transferred requests.
         for req in done_reqs:
             req: Req
             req.add_latency(RequestStage.PREFILL_TRANSFER_KV_CACHE)
