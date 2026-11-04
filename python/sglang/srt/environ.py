@@ -154,6 +154,8 @@ class Envs:
     # fmt: off
     #GLM5.2 memory opt
     SGLANG_MTP_OPT_LOAD = EnvBool(False)
+    SGLANG_DEL_MLA_DEAD_WEIGHT = EnvBool(False)
+    SGLANG_ENABLE_MOE_UE8M0_CHUNKED_REQUANT = EnvBool(False)
     SGLANG_INDEXER_CACHE_OPT = EnvBool(False)
 
     # Model & File Download

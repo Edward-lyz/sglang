@@ -608,6 +608,8 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+            if envs.SGLANG_DEL_MLA_DEAD_WEIGHT.get():
+                del self_attn.kv_b_proj.weight
 
     def _maybe_quant_weights_to_fp8_ue8m0(
         self,

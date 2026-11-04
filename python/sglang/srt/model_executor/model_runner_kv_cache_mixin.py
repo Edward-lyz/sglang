@@ -381,7 +381,8 @@ class ModelRunnerKVCacheMixin:
         if not self.spec_algorithm.is_none() and not self.is_draft_worker:
             # Draft worker should use SWA adjusted max_total_num_tokens for cache size, otherwise it may cause oob in kv cache store
             self.server_args.draft_runner_cache_size = self.max_total_num_tokens
-            self.server_args.max_num_reqs = max_num_reqs
+            self.server_args.max_num_reqs = max_num_reqs // self.server_args.dp_size
+            max_num_reqs = self.server_args.max_num_reqs
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
