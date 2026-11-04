@@ -449,15 +449,28 @@ def traverse_tree(
 ):
     """
     Traverse the tree constructed by the draft model to generate the logits mask.
+
+    The tree may come in as tensors or as python lists. All per-node reads go
+    through python lists and a numpy view of the (host) bitmask: per-element
+    torch indexing costs microseconds each, which at decode batch sizes made
+    this host loop longer than the target forward it is meant to hide under.
     """
-    assert (
-        retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
-    )
+    if isinstance(retrieve_next_token, torch.Tensor):
+        assert (
+            retrieve_next_token.shape
+            == retrieve_next_sibling.shape
+            == draft_tokens.shape
+        )
+        retrieve_next_token = retrieve_next_token.tolist()
+        retrieve_next_sibling = retrieve_next_sibling.tolist()
+        draft_tokens = draft_tokens.tolist()
+    # Shares memory with allocate_token_bitmask, so it sees every fill below.
+    bitmask_view = allocate_token_bitmask.numpy()
 
     def dfs(
         curr: int,
-        retrieve_next_token: torch.Tensor,
-        retrieve_next_sibling: torch.Tensor,
+        retrieve_next_token: List[int],
+        retrieve_next_sibling: List[int],
         parent_pos: int,
     ):
         if curr == 0:
@@ -465,20 +478,23 @@ def traverse_tree(
             # accepted from the previous iteration
             is_accepted = True
         else:
-            parent_bitmask = allocate_token_bitmask[parent_pos]
             current_token = draft_tokens[curr]
             if vocab_size and current_token >= vocab_size:
                 is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers
                 is_accepted = (
-                    parent_bitmask[current_token // 32] & (1 << (current_token % 32))
+                    (
+                        int(bitmask_view[parent_pos, current_token >> 5])
+                        >> (current_token & 31)
+                    )
+                    & 1
                 ) != 0
 
         if is_accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(int(draft_tokens[curr]))
+                grammar.accept_token(draft_tokens[curr])
             if not grammar.is_terminated():
                 # Generate the bitmask for the current token
                 grammar.fill_vocab_mask(allocate_token_bitmask, curr)
@@ -526,6 +542,16 @@ def generate_token_bitmask(
 
     allocate_token_bitmask = None
     assert len(reqs) == retrieve_next_token_cpu.shape[0]
+    assert (
+        retrieve_next_token_cpu.shape
+        == retrieve_next_sibling_cpu.shape
+        == draft_tokens_cpu.shape
+    )
+    # One bulk host conversion for the whole batch; traverse_tree then works on
+    # plain lists (see its docstring).
+    next_token_rows = retrieve_next_token_cpu.tolist()
+    next_sibling_rows = retrieve_next_sibling_cpu.tolist()
+    draft_token_rows = draft_tokens_cpu.tolist()
     grammar = None
     for i, req in enumerate(reqs):
         if req.grammar is not None:
@@ -538,9 +564,9 @@ def generate_token_bitmask(
             grammar = req.grammar
             s = time.perf_counter()
             traverse_tree(
-                retrieve_next_token_cpu[i],
-                retrieve_next_sibling_cpu[i],
-                draft_tokens_cpu[i],
+                next_token_rows[i],
+                next_sibling_rows[i],
+                draft_token_rows[i],
                 req.grammar,
                 allocate_token_bitmask[
                     i * num_draft_tokens : (i + 1) * num_draft_tokens

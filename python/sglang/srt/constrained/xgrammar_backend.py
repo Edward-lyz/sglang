@@ -57,6 +57,8 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
+
+
 def _xgrammar_cache_limit_bytes() -> int:
     limit_gb = envs.SGLANG_XGRAMMAR_CACHE_LIMIT_GB.get()
     return -1 if limit_gb < 0 else int(limit_gb * 1024**3)
@@ -109,7 +111,11 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def rollback(self, k: int):
         self.matcher.rollback(k)
-        self.accepted_tokens = self.accepted_tokens[:-k]
+        # In place, O(k): slicing a fresh copy is O(len) per call, and spec
+        # verify rolls back every draft node of every request each step, so a
+        # long generation made this the hottest line in the decode loop.
+        if k > 0:
+            del self.accepted_tokens[-k:]
 
     def is_terminated(self):
         return self.matcher.is_terminated()
@@ -255,6 +261,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
+        logger.info(
+            "XGrammar backend: spec-verify bitmask uses the host-list tree "
+            "traversal and O(k) rollback"
+        )
 
     @property
     def is_support_token_filter(self):
