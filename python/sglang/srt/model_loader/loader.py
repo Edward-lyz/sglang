@@ -27,6 +27,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -100,10 +101,12 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_safetensors_files_by_name,
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
     initialize_dummy_weights,
+    make_pp_layer_name_filter,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
@@ -355,6 +358,40 @@ class BaseModelLoader(ABC):
         raise NotImplementedError
 
 
+def _resolve_pp_layer_range(model) -> Optional[Tuple[int, int]]:
+    """Return the decoder layer range owned by this PP rank, or None.
+
+    None means "do not filter": the env flag is off, or the model does not
+    expose a PP layer range (no pipeline sharding).
+    """
+    if not envs.SGLANG_ENABLE_PP_WEIGHT_FILTER.get():
+        return None
+
+    for obj in (model, getattr(model, "model", None)):
+        if obj is None:
+            continue
+        try:
+            start = getattr(obj, "start_layer", None)
+            end = getattr(obj, "end_layer", None)
+        except Exception:
+            continue
+        if isinstance(start, int) and isinstance(end, int) and end > start:
+            return start, end
+    return None
+
+
+def _resolve_pp_extra_weight_suffixes(model) -> Tuple[str, ...]:
+    """Out-of-range weight-name suffixes the model still loads under PP.
+
+    Optional model hook ``pp_extra_weight_suffixes()``; only consulted when the
+    PP weight filter is on.
+    """
+    if model is None or not envs.SGLANG_ENABLE_PP_WEIGHT_FILTER.get():
+        return ()
+    hook = getattr(model, "pp_extra_weight_suffixes", None)
+    return tuple(hook()) if hook is not None else ()
+
+
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
@@ -382,6 +419,13 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        pp_layer_range: Optional[Tuple[int, int]] = None
+        """[start_layer, end_layer) owned by this pipeline-parallel rank, if the
+        decoder stack is PP-sharded. Used to skip reading unowned weights."""
+
+        pp_extra_weight_suffixes: Tuple[str, ...] = ()
+        """Weights outside pp_layer_range that this rank still loads."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -390,6 +434,8 @@ class DefaultModelLoader(BaseModelLoader):
                 prefix="",
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
                 model_config=model_config,
+                pp_layer_range=_resolve_pp_layer_range(model),
+                pp_extra_weight_suffixes=_resolve_pp_extra_weight_suffixes(model),
             )
 
     counter_before_loading_weights: float = 0.0
@@ -544,6 +590,48 @@ class DefaultModelLoader(BaseModelLoader):
 
         return hf_folder, hf_weights_files, use_safetensors
 
+    def _maybe_build_pp_name_filter(
+        self, source: DefaultModelLoader.Source
+    ) -> Optional[Callable[[str], bool]]:
+        """Build a weight-name predicate keeping only this PP rank's layers.
+
+        Returns None when filtering must not happen: no PP sharding, unknown
+        layer count, this rank owns the whole stack, or the source is a draft
+        model (its layer indices live in the MTP namespace and are remapped by
+        _filter_mtp_weights).
+        """
+        # Duck-typed sources (tests, other loaders) may not carry the field.
+        pp_layer_range = getattr(source, "pp_layer_range", None)
+        if pp_layer_range is None or source.model_config is None:
+            return None
+        if self.load_config.draft_model_idx is not None:
+            return None
+
+        num_hidden_layers = getattr(
+            source.model_config.hf_text_config, "num_hidden_layers", None
+        )
+        if not isinstance(num_hidden_layers, int):
+            return None
+
+        start_layer, end_layer = pp_layer_range
+        if not 0 <= start_layer < end_layer <= num_hidden_layers:
+            # An out-of-range span would otherwise be wide enough to look like
+            # "this rank owns everything" and silently disable the filter,
+            # hiding the upstream bug that produced the range.
+            raise ValueError(
+                f"Invalid pipeline-parallel layer range [{start_layer}, "
+                f"{end_layer}) for a model with {num_hidden_layers} layers."
+            )
+        if end_layer - start_layer >= num_hidden_layers:
+            return None
+
+        return make_pp_layer_name_filter(
+            start_layer,
+            end_layer,
+            num_hidden_layers,
+            extra_suffixes=getattr(source, "pp_extra_weight_suffixes", ()),
+        )
+
     def _get_weights_iterator(
         self, source: Source
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -561,6 +649,32 @@ class DefaultModelLoader(BaseModelLoader):
                 "model.safetensors.index.json",
                 source.model_config.hf_config,
             )
+
+        name_filter = self._maybe_build_pp_name_filter(source)
+        if name_filter is not None and use_safetensors:
+            filtered_files = filter_safetensors_files_by_name(
+                hf_weights_files,
+                hf_folder,
+                SAFE_WEIGHTS_INDEX_NAME,
+                name_filter,
+            )
+            logger.info(
+                "PP weight filter: loading %d/%d checkpoint shards for layers "
+                "[%d, %d).",
+                len(filtered_files),
+                len(hf_weights_files),
+                *source.pp_layer_range,
+            )
+            hf_weights_files = filtered_files
+            if not hf_weights_files:
+                raise RuntimeError(
+                    "PP weight filter removed every checkpoint shard; this "
+                    "indicates a stale safetensors index. layers="
+                    f"[{source.pp_layer_range[0]}, {source.pp_layer_range[1]}), "
+                    f"num_hidden_layers="
+                    f"{source.model_config.hf_text_config.num_hidden_layers}, "
+                    f"folder={hf_folder}"
+                )
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
@@ -609,6 +723,12 @@ class DefaultModelLoader(BaseModelLoader):
                 use_multithread = False
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+                if name_filter is not None:
+                    logger.warning(
+                        "FASTSAFETENSORS does not support per-tensor filtering; "
+                        "the PP weight filter only skips whole shards here, so "
+                        "unowned tensors in the kept shards are still read."
+                    )
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                 )
@@ -622,6 +742,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    name_filter=name_filter,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -630,6 +751,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    name_filter=name_filter,
                 )
 
         else:

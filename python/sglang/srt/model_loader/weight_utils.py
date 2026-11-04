@@ -701,6 +701,82 @@ def filter_duplicate_safetensors_files(
     return hf_weights_files
 
 
+# Only the main decoder stack is layer-partitioned by pipeline parallelism.
+# Matching on `model.layers.<n>.` keeps vision towers (`vision_tower.layers.N.`)
+# and MTP/NextN stacks (`model.mtp.layers.N.`) out of the filter: their layer
+# indices live in a separate namespace and are owned by every PP rank.
+_PP_DECODER_LAYER_PATTERN = re.compile(r"(?:^|\.)model\.layers\.(\d+)\.")
+
+
+def make_pp_layer_name_filter(
+    start_layer: int,
+    end_layer: int,
+    num_hidden_layers: int,
+    extra_suffixes: Tuple[str, ...] = (),
+) -> Callable[[str], bool]:
+    """Build a predicate selecting the checkpoint weights this PP rank owns.
+
+    Mirrors the layer-range skip that PP-capable models already do inside
+    load_weights(), so it can be applied before the tensor is read from disk.
+    Anything that is not a main decoder layer weight (embeddings, final norm,
+    lm_head, vision tower, MTP) is kept and left to the model to handle.
+    ``extra_suffixes`` keeps out-of-range weights the model still reads, e.g.
+    the next stage's first-layer tensors needed at a stage boundary.
+    """
+
+    def keep(name: str) -> bool:
+        match = _PP_DECODER_LAYER_PATTERN.search(name)
+        if match is None:
+            return True
+        layer_id = int(match.group(1))
+        if layer_id >= num_hidden_layers:
+            return True
+        if name.endswith(extra_suffixes):
+            return True
+        return start_layer <= layer_id < end_layer
+
+    return keep
+
+
+def filter_safetensors_files_by_name(
+    hf_weights_files: List[str],
+    hf_folder: str,
+    index_file: str,
+    name_filter: Callable[[str], bool],
+) -> List[str]:
+    """Drop shards in which every tensor is rejected by ``name_filter``.
+
+    Uses the safetensors index (``weight_map``) so a shard holding no weight
+    needed by this rank is never opened. Returns the input unchanged when the
+    index is missing or empty. Shards absent from the index are always kept:
+    dropping them could silently leave parameters uninitialized.
+    """
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return hf_weights_files
+
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    if not weight_map:
+        logger.warning(
+            "Safetensors index %s has an empty weight_map; keeping every shard "
+            "so the shard-level filter has no effect.",
+            index_file_name,
+        )
+        return hf_weights_files
+
+    needed_files = set()
+    indexed_files = set()
+    for weight_name, shard in weight_map.items():
+        shard_path = os.path.join(hf_folder, shard)
+        indexed_files.add(shard_path)
+        if name_filter(weight_name):
+            needed_files.add(shard_path)
+
+    return [f for f in hf_weights_files if f in needed_files or f not in indexed_files]
+
+
 def maybe_add_mtp_safetensors(
     hf_weights_files: List[str], hf_folder: str, index_file: str, hf_config
 ) -> List[str]:
@@ -966,6 +1042,7 @@ def safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -988,10 +1065,14 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
+                    if name_filter is not None and not name_filter(name):
+                        continue
                     yield name, result[name]
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
+                    if name_filter is not None and not name_filter(name):
+                        continue
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
@@ -1052,11 +1133,37 @@ def fastsafetensors_weights_iterator(
             loader.close()
 
 
+def _load_safetensors_shard_dict(
+    st_file: str,
+    disable_mmap: bool,
+    name_filter: Optional[Callable[[str], bool]],
+) -> Dict[str, torch.Tensor]:
+    """Load one safetensors shard into a name->tensor dict.
+
+    Applies the optional PP name filter while reading so unowned tensors are
+    never materialized. Shared by the multi-threaded loaders.
+    """
+    if disable_mmap:
+        with open(st_file, "rb") as f:
+            result = safetensors.torch.load(f.read())
+        if name_filter is not None:
+            result = {k: v for k, v in result.items() if name_filter(k)}
+    else:
+        with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+            result = {
+                k: f.get_tensor(k)
+                for k in f.keys()
+                if name_filter is None or name_filter(k)
+            }
+    return result
+
+
 def multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
     disable_mmap: bool = False,
     drop_cache_after_load: bool = False,
+    name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1064,14 +1171,7 @@ def multi_thread_safetensors_weights_iterator(
     )
 
     def _load_file(st_file: str):
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
-
-        return st_file, result
+        return st_file, _load_safetensors_shard_dict(st_file, disable_mmap, name_filter)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
@@ -1103,6 +1203,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1119,13 +1220,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     )
 
     def _load_file(st_file: str):
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
-        return result
+        return _load_safetensors_shard_dict(st_file, disable_mmap, name_filter)
 
     # Sliding window: max_workers loading + 1 prefetched.
     buffer_size = max_workers + 1
