@@ -11,13 +11,12 @@ export MODEL_PATH="/Kimi-K3-ATTN-MOE-DENSE-FP8"
 export DRAFT_MODEL_PATH="/Kimi-K3-DSpark"
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-NUM_NODES=2
-export NUM_NODES
-GPUS_PER_NODE=8
+export NUM_NODES=2
+export GPUS_PER_NODE=8
 export TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
-PP_SIZE=$((NUM_NODES * 1))
-export PP_SIZE
+export PP_SIZE=$((NUM_NODES * 8))
+export TP_SIZE=1
 
 TP_SIZE=$((NUM_NODES * 4))
 export TP_SIZE
@@ -62,7 +61,8 @@ export SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096
 export SGLANG_WARMUP_PREFILL_LENS="512,2048,8192,32768,65536"
 export SGLANG_WARMUP_BATCH_SIZE=1
 export SGLANG_WARMUP_TIMEOUT=600
-export SGLANG_HEALTH_CHECK_TIMEOUT=20
+export SGLANG_PP_PD_PREFILL_EARLY_STREAM_OUTPUT=1
+export SGLANG_IDLE_METRIC_HEARTBEAT=1
 
 export HTTP_PORT=8000
 export PD_SEPARATE_STAGE=prefill
@@ -92,7 +92,7 @@ PARALLEL_ARGS=(
 MTP=(
     --speculative-algorithm DSPARK
     --speculative-draft-model-path "$DRAFT_MODEL_PATH"
-    --speculative-dspark-block-size 3
+    --speculative-dspark-block-size 4
 )
 
 MM_ARG=(
@@ -119,47 +119,54 @@ else
     NSYS_PREFIX=""
 fi
 
-sglang serve \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --trust-remote-code \
-    --model-path "$MODEL_PATH" \
-    --served-model-name "$MODEL_ID" \
-    --tokenizer-worker-num 8 \
-    --reasoning-parser kimi_k3 \
-    --tool-call-parser kimi_k3 \
-    --enable-strict-thinking \
-    --allow-auto-truncate \
-    "${PARALLEL_ARGS[@]}" \
-    --nnodes "$NUM_NODES" \
-    --node-rank "$FED_POD_INDEX" \
-    --dist-init-addr "$MASTER_IP:6676" \
-    --dist-timeout 3600 \
-    --disaggregation-mode prefill \
-    --disaggregation-transfer-backend mooncake \
-    --disaggregation-ib-device mlx5_bond_0 \
-    --disaggregation-bootstrap-port 8200 \
-    --disaggregation-zmq-ports 7000-7007 \
-    "${MM_ARG[@]}" \
-    --moe-a2a-backend megamoe \
-    --moe-runner-backend deep_gemm \
-    --deepep-config "$DEEPEP_CONFIG_JSON" \
-    --attention-backend trtllm_mla \
-    --linear-attn-prefill-backend flashkda \
-    --mamba-full-memory-ratio 0.25 \
-    --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' \
-    --disable-flashinfer-autotune \
-    --chunked-prefill-size $((32 * 1024)) \
-    --max-prefill-tokens $((512 * 1024)) \
-    --max-total-tokens 1050000 \
-    --max-running-requests 64 \
-    --pp-async-batch-depth 2 \
-    --page-size 64 \
-    --mem-fraction-static 0.8 \
-    "${MTP[@]}" \
-    "${CACHE_OPT[@]}" \
-    --kv-cache-dtype fp8_e4m3 \
-    --watchdog-timeout 3600 \
-    --enable-metrics \
-    --enable-cache-report \
-    --collect-tokens-histogram
+(
+    if [[ "$LOG_TO_FILE" == "1" ]]; then
+        exec >"$LOG_FILE" 2>&1
+    fi
+
+    $NSYS_PREFIX sglang serve \
+        --host 0.0.0.0 \
+        --port 8000 \
+        --trust-remote-code \
+        --model-path "$MODEL_PATH" \
+        --served-model-name "$MODEL_ID" \
+        --tokenizer-worker-num 8 \
+        --reasoning-parser kimi_k3 \
+        --tool-call-parser kimi_k3 \
+        --grammar-backend llguidance \
+        --allow-auto-truncate \
+        "${PARALLEL_ARGS[@]}" \
+        --nnodes "$NUM_NODES" \
+        --node-rank "$FED_POD_INDEX" \
+        --dist-init-addr "$MASTER_IP:6676" \
+        --dist-timeout 3600 \
+        --disaggregation-mode prefill \
+        --disaggregation-transfer-backend mooncake \
+        --disaggregation-ib-device mlx5_bond_0 \
+        --disaggregation-bootstrap-port 8200 \
+        --disaggregation-zmq-ports 7000-7007 \
+        --disaggregation-zmq-max-sockets 3000 \
+        "${MM_ARG[@]}" \
+        --attention-backend trtllm_mla \
+        --moe-runner-backend flashinfer_mxfp4 \
+        --linear-attn-prefill-backend flashkda \
+        --mamba-full-memory-ratio 0.25 \
+        --max-mamba-cache-size 512 \
+        --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' \
+        --disable-flashinfer-autotune \
+        --chunked-prefill-size $((16 * 1024)) \
+        --max-prefill-tokens $((512 * 1024)) \
+        --max-total-tokens $((4 * 1024 * 1024)) \
+        --max-running-requests 128 \
+        --pp-async-batch-depth 2 \
+        --page-size 64 \
+        --mem-fraction-static 0.8 \
+        "${MTP[@]}" \
+        "${CACHE_OPT[@]}" \
+        --kv-cache-dtype fp8_e4m3 \
+        --watchdog-timeout 3600 \
+        --enable-metrics \
+        --enable-cache-report \
+        --collect-tokens-histogram
+    # --ep-dispatch-algorithm fake
+) &

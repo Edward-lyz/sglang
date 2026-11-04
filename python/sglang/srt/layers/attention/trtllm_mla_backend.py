@@ -925,7 +925,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
-        return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
             value=v,
@@ -945,6 +945,109 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             o_sf_scale=o_sf_scale,
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+        )
+        if return_lse:
+            output, lse = result
+            # TRTLLM-GEN returns log2(sum(exp(scores))), whereas the shared
+            # prefix-state merger uses exp()/log() and expects natural logs.
+            # Normalize each partial before any zero-KV fixup or merge.
+            lse.mul_(math.log(2.0))
+            return output, lse
+        return result
+
+    def _set_kv_and_concat_q_fused(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Decode: scatter the KV row at ``loc`` (already physical — the
+        dense-loc buffer on the unified pool, or out_cache_loc on the static
+        pool where ``_full_translate`` is identity) and build the
+        [q_nope | q_rope] fmha query in one kernel launch (saves one launch
+        per MLA layer and keeps the PDL chain intact).
+
+        Returns the concatenated query, or None when the fused kernel does
+        not cover the inputs (caller falls back to the two-kernel path).
+        """
+        k_nope_2d = k.view(k.shape[0], -1)
+        k_rope_2d = k_rope.view(k_rope.shape[0], -1)
+        q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        q_rope_3d = q_rope.view(
+            -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+        )
+        # Same raw per-layer buffer the decode kernel reads below (bf16-only
+        # gate means store_dtype == dtype, so no view); get_key_buffer applies
+        # the hybrid pool's full-attention layer-id mapping.
+        kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
+        if not set_mla_kv_concat_q_covered(
+            kv_buffer=kv_2d,
+            loc=loc,
+            k_nope=k_nope_2d,
+            k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+        ):
+            return None
+        return set_mla_kv_concat_q(
+            kv_buffer=kv_2d,
+            loc=loc,
+            cache_k_nope=k_nope_2d,
+            cache_k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+        )
+
+    def _set_kv_and_concat_q_fp8_fused(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """fp8-KV decode: quantize + scatter the KV row at ``loc`` (already
+        physical) and build the fp8 [q_nope | q_rope] query in one launch.
+
+        Returns the fp8 query, or None when the fused kernel does not cover
+        the inputs (caller falls back to the aten quantize chain).
+        """
+        k_nope_2d = k.view(k.shape[0], -1)
+        k_rope_2d = k_rope.view(k_rope.shape[0], -1)
+        q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        q_rope_3d = q_rope.view(
+            -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+        )
+        # fp8 view of the pool's uint8 store; same buffer the decode kernel
+        # reads below.
+        kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
+        if not set_mla_kv_concat_q_fp8_covered(
+            kv_buffer=kv_2d,
+            loc=loc,
+            k_nope=k_nope_2d,
+            k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+        ):
+            return None
+        parallel = get_parallel()
+        return set_mla_kv_concat_q_fp8(
+            kv_buffer=kv_2d,
+            loc=loc,
+            cache_k_nope=k_nope_2d,
+            cache_k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+            # DCP cyclic KV sharding: virtual loc -> owner mask + loc//world
+            # (identity when attn_dcp_size == 1).
+            dcp_world_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
         )
 
     def forward_decode(
