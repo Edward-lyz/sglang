@@ -31,8 +31,11 @@ struct MegaMoEPreDispatchParams {
   int32_t* __restrict__ buf_x_sf;        // row-major int32 [P, G/4]
   int64_t* __restrict__ buf_topk_idx;    // [padded_max, top_k]
   float* __restrict__ buf_topk_weights;  // [padded_max, top_k]
+  int32_t* __restrict__ shared_x_sf;     // column-major, BLOCK_M-paged scales
 
   uint64_t buf_x_sf_stride_bytes;
+  uint64_t shared_x_sf_col_stride;
+  uint32_t shared_block_m;
   uint32_t num_tokens;
   uint32_t padded_max;
   uint32_t hidden;
@@ -66,6 +69,12 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     const uint32_t token_id = bid;
     const auto token_in = params.x + static_cast<uint64_t>(token_id) * params.hidden;
     const auto token_out = params.buf_x + static_cast<uint64_t>(token_id) * params.hidden;
+    uint32_t shared_row = 0;
+    if constexpr (kWriteSharedSF) {
+      const uint32_t m = token_id % params.shared_block_m;
+      shared_row = token_id / params.shared_block_m * ((params.shared_block_m + 127u) / 128u * 128u) + m / 128u * 128u +
+                   m % 32u * 4u + m % 128u / 32u;
+    }
 
     const auto quantize_chunk = [&](uint32_t chunk) {
       InputVec in_vec;
@@ -104,6 +113,11 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
       if (within_group_id == 0 && group_id < params.num_groups) {
         const uint64_t byte_off = static_cast<uint64_t>(token_id) * params.buf_x_sf_stride_bytes + group_id;
         reinterpret_cast<uint8_t*>(params.buf_x_sf)[byte_off] = static_cast<uint8_t>(ue8m0_exp);
+        if constexpr (kWriteSharedSF) {
+          const uint64_t off = shared_row + static_cast<uint64_t>(group_id / 4u) * params.shared_x_sf_col_stride;
+          reinterpret_cast<uint8_t*>(params.shared_x_sf)[off * sizeof(int32_t) + group_id % 4u] =
+              static_cast<uint8_t>(ue8m0_exp);
+        }
       }
     };
 
@@ -244,7 +258,10 @@ struct MegaMoEPreDispatchKernel {
         .buf_x_sf = static_cast<int32_t*>(buf_x_sf.data_ptr()),
         .buf_topk_idx = static_cast<int64_t*>(buf_topk_idx.data_ptr()),
         .buf_topk_weights = static_cast<float*>(buf_topk_weights.data_ptr()),
+        .shared_x_sf = shared_sf_ptr,
         .buf_x_sf_stride_bytes = buf_x_sf_stride_bytes,
+        .shared_x_sf_col_stride = shared_sf_stride,
+        .shared_block_m = static_cast<uint32_t>(shared_block_m),
         .num_tokens = num_tokens,
         .padded_max = padded_max,
         .hidden = hidden,

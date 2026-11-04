@@ -574,6 +574,12 @@ class Envs:
     SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # MegaMoE gate path: merge the topk_idx int64->int32 cast and the padded-row
+    # mask into one Triton launch (integer-only, bit-identical).
+    SGLANG_OPT_MEGA_GATE_CAST_MASK_FUSE = EnvBool(True)
+    # MegaMoE gate: image-token mask (input_ids == image_token_id) once per forward
+    # instead of per MoE layer (exact).
+    SGLANG_OPT_MEGA_GATE_IMAGE_MASK_ONCE = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -1267,6 +1273,7 @@ class Envs:
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
 
+
     # ===================================================================
     # DeepGEMM Mega MoE
     # ===================================================================
@@ -1274,6 +1281,21 @@ class Envs:
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+    # Community #39313: run the shared expert inside DeepGEMM's MegaMoE kernel
+    # (locally extended to 32x32 ue8m0 block-FP8 shared weights).
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
+    # Verification only: on the first eager fused call per process, also run the
+    # unfused path and log the difference.
+    SGLANG_COMMUNITY_SELFCHECK_MEGA_SHARED = EnvBool(False)
+    # Fuse the MegaMoE shared-expert residual combine
+    #   hidden = shared_output + routed_scaling_factor * routed_y
+    # from the two elementwise kernels the path issues today (y.mul_(scale) in
+    # _run_mega_routed + y.add_(shared_output) in forward_mega_moe) into one
+    # torch.add(shared_output, y, alpha=scale). Memory-bound; ~1.75x on the
+    # combine at the traced decode shape, single graph-safe elementwise kernel.
+    # Default OFF; falls back to the two-op path when the routed scaling is
+    # already folded into topk, or shapes/dtypes/contiguity do not match.
+    SGLANG_FUSE_SHARED_SCALE_ADD = EnvBool(False)
 
     # ===================================================================
     # MHC (mixed hidden-state compute) layernorm kernel

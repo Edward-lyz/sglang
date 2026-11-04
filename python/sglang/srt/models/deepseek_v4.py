@@ -4549,6 +4549,31 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
+    def precompile_kernels_after_loading(self) -> None:
+        """Community #39313: build the in-kernel MegaMoE shared-expert weights."""
+        from sglang.srt.layers.moe.mega_moe import (
+            build_mega_moe_shared_weights,
+            should_fuse_mega_moe_shared_experts,
+        )
+
+        num_built = 0
+        for module in self.modules():
+            if isinstance(
+                module, deepseek_v2.DeepseekV2MoE
+            ) and should_fuse_mega_moe_shared_experts(module):
+                module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
+                    build_mega_moe_shared_weights(module.shared_experts)
+                )
+                num_built += 1
+        if num_built:
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "#39313 mega_moe_fused_shared_build",
+                "built in-kernel shared-expert weights for %d MegaMoE layers (%s)",
+                num_built,
+                type(self).__name__,
+            )
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.encoder_only:
             return
