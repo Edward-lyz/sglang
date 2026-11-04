@@ -506,6 +506,11 @@ class Envs:
     # transform_index_ragged_stable) 3 elementwise launches into one. Opt-in;
     # CUDA int32 topk_indices path only.
     SGLANG_OPT_USE_FUSED_RAGGED_INDEX_TRANSFORM = EnvBool(False)
+    # Fuse rebuild_cp_kv_cache's pack step (2 elementwise slice-assigns into a
+    # strided view + 1 `.contiguous()` copy) into a single CUDA launch that
+    # writes k_nope/k_pe directly into a fresh contiguous AllGather-input
+    # buffer. Opt-in; CUDA only. See project/op/glm52_kv_latent_pack/readme.md.
+    SGLANG_OPT_USE_FUSED_KV_LATENT_PACK = EnvBool(False)
     # fmt: on
 
     # EPD

@@ -1602,10 +1602,16 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange
-        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
-        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
+        if k_nope.is_cuda and envs.SGLANG_OPT_USE_FUSED_KV_LATENT_PACK.get():
+            from sglang.jit_kernel.kv_latent_pack import pack_kv_latent_for_allgather
+
+            packed = pack_kv_latent_for_allgather(k_nope, k_pe)
+        else:
+            latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
+            latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
+            packed = latent_cache.contiguous()
         latent_cache_output = cp_all_gather_rerange_output(
-            latent_cache.contiguous(),
+            packed,
             self.cp_size,
             forward_batch,
             torch.cuda.current_stream(),
