@@ -37,6 +37,41 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+def warmup_alloc_extend_kernel(device, page_size: int, max_batch_size: int) -> None:
+    """Warm the extend-allocation kernel for the supported batch geometries.
+
+    Args:
+        device: Device used for allocation or kernel warmup.
+        page_size: Number of tokens represented by one physical page.
+        max_batch_size: Largest request batch geometry to warm.
+
+    Returns:
+        None.
+
+    Raises:
+        Exception: Allocation or kernel warmup failed on the selected device.
+    """
+    upper = next_power_of_2(max_batch_size)
+    prefix_lens = torch.zeros(upper, dtype=torch.int64, device=device)
+    seq_lens = torch.zeros_like(prefix_lens)
+    last_loc = torch.full_like(prefix_lens, -1)
+    free_pages = torch.zeros(1, dtype=torch.int64, device=device)
+    out_indices = torch.empty_like(free_pages)
+    batch_upper = 1
+    while batch_upper <= upper:
+        alloc_extend_kernel[(1,)](
+            prefix_lens,
+            seq_lens,
+            last_loc,
+            free_pages,
+            out_indices,
+            batch_upper,
+            page_size,
+        )
+        batch_upper *= 2
+    torch.cuda.current_stream(device).synchronize()
+
+
 def alloc_extend_naive(
     prefix_lens,
     seq_lens,

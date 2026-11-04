@@ -127,6 +127,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.python-version
 
 # Spyder project settings
 .spyderproject
@@ -283,3 +284,6 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Local native component build outputs
+/build-native*/

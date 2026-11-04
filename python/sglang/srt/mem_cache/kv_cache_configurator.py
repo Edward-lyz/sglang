@@ -153,10 +153,19 @@ def mm_runtime_reservation_gb(
     reserved_mb = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     if mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
         reserved_mb += envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+    disagg = get_disagg()
+    if disagg.language_only and (
+        disagg.encoder_transfer_backend == "mooncake"
+        or (
+            disagg.encoder_transfer_backend == "zmq_to_scheduler"
+            and envs.SGLANG_EMBEDDING_POOL_SIZE_MB.is_set()
+        )
+    ):
+        reserved_mb += max(0, envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get())
     if reserved_mb > 0:
         logger.info(
             "Reserving %.2f GB of the KV budget for post-sizing multimodal "
-            "allocations (feature-transport pools + embedding cache).",
+            "allocations (feature-transport pools + embedding cache + EPD pool).",
             reserved_mb / 1024,
         )
     return reserved_mb / 1024
@@ -1362,7 +1371,11 @@ class KVCacheConfigurator:
             # decode kernel (SGLANG_DSV4_KV_LAYOUT / SGLANG_DSV4_COMPRESSED_KV_LAYOUT).
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
             kv_layout_kwargs = dict(
-                kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
+                kv_layout=kv_layout,
+                compressed_kv_layout=compressed_kv_layout,
+                # Fallback for sizing the chunk-tail SWA staging pool when chunked
+                # prefill is off; the pool is not sized per request.
+                max_context_length=self.model_config.context_len,
             )
 
         token_to_kv_pool = pool_cls(
@@ -2220,7 +2233,8 @@ class KVCacheConfigurator:
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
             minimum_mem_fraction_static = (
-                1 - available_gpu_memory / pre_model_load_memory
+                1
+                - (available_gpu_memory - mm_reservation_gb) / pre_model_load_memory
             )
             suggested_mem_fraction_static = (
                 math.ceil(minimum_mem_fraction_static * 1000) / 1000
@@ -2230,7 +2244,7 @@ class KVCacheConfigurator:
                 f"--mem-fraction-static={get_schedule().mem_fraction_static}. "
                 f"Raise --mem-fraction-static above "
                 f"{suggested_mem_fraction_static:.3f} "
-                f"(minimum viable = 1 - available/pre = "
+                f"(minimum viable including multimodal reservation = "
                 f"{minimum_mem_fraction_static:.4f}). If using speculative "
                 f"decoding, draft weights are now counted."
             )

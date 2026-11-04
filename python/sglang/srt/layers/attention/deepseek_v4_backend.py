@@ -384,6 +384,8 @@ def _copy_or_replace(dst, src):
     return src
 
 
+
+
 @dataclass
 class DSV4AttnMetadata:
     page_size: int
@@ -1597,6 +1599,7 @@ class DeepseekV4AttnBackend(
                 pos_global=metadata.low_ratio_pos_i64,
             )
         return metadata
+
 
     def _late_layer_tail_cp_layout(
         self,
@@ -3957,6 +3960,7 @@ class DeepseekV4AttnBackend(
             topk_length=combined_lens,
         )
         return o
+
 
     def _prepare_q8kv8_q_and_sink(
         self,

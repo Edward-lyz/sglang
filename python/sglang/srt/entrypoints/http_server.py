@@ -740,6 +740,8 @@ async def health_generate(request: Request) -> Response:
     return Response(status_code=503)
 
 
+
+
 @app.get("/get_model_info")
 async def get_model_info():
     """Get the model information (deprecated - use /model_info instead)."""
@@ -996,6 +998,8 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
         content=content,
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
+
+
 
 
 @app.post("/add_external_corpus")
@@ -2734,7 +2738,14 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
             else:
-                uvicorn.run(
+                run_http = uvicorn.run
+                if envs.SGLANG_HTTP_REUSE_PORT.get():
+                    from sglang.srt.entrypoints.http_server_reuseport import (
+                        run_uvicorn_reuseport,
+                    )
+
+                    run_http = run_uvicorn_reuseport
+                run_http(
                     "sglang.srt.entrypoints.http_server:app",
                     host=get_serving().host,
                     port=get_serving().port,

@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
@@ -34,6 +34,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.utils.common import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 _is_hip = is_hip()
 
@@ -287,15 +288,25 @@ class RadixAttention(nn.Module):
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
         else:
-            return get_attn_backend().forward(
-                q,
-                k,
-                v,
-                self,
-                forward_batch,
-                save_kv_cache,
-                **kwargs,
+            # Eager backend dispatch (this config: tc-piecewise context is None,
+            # so extend attention lands here). Bracket the extend attention with
+            # an nvtx range so an nsys timeline can isolate attention-over-cached-
+            # -prefix cost from the surrounding MoE/gemm/collective work.
+            span = (
+                operations_nvtx_range("attn.extend")
+                if forward_batch.forward_mode.is_extend()
+                else nullcontext()
             )
+            with span:
+                return get_attn_backend().forward(
+                    q,
+                    k,
+                    v,
+                    self,
+                    forward_batch,
+                    save_kv_cache,
+                    **kwargs,
+                )
 
 
 def _unified_attention_with_output_impl(

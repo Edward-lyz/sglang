@@ -1470,6 +1470,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 encoder_urls=obj.encoder_urls,
             )
+
+            # AttentionStore: generate block hashes from input_ids so the
+            # scheduler can match/write against the asradix cache. Lazy import;
+            # a missing SDK just skips AS matching for this request.
+            if getattr(self.server_args, "enable_asradix_cache", False):
+                tokenized_obj.as_kv_cache_params = getattr(
+                    obj, "as_kv_cache_params", None
+                )
+                try:
+                    from attentionstore_sdk.sdk import Tokens
+
+                    from sglang.srt.mem_cache.storage.asradix.types import (
+                        AS_BLOCK_SIZE,
+                    )
+
+                    tokenized_obj.as_block_hashs = Tokens(input_ids_arr, AS_BLOCK_SIZE)
+                except ImportError:
+                    logger.warning(
+                        "[AS] attentionstore_sdk unavailable; skip as_block_hashs"
+                    )
+                except Exception as e:
+                    logger.warning("[AS] failed to build as_block_hashs: %s", e)
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
             positional_embed_overrides = obj.positional_embed_overrides

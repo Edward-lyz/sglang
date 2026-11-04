@@ -119,6 +119,8 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub key: &'k K,
     /// Namespace of the insert; picks the matching subtree root.
     pub namespace: KeyNamespaceRef<'k>,
+    /// Logical-page sharding run; None preserves non-sharded insertion.
+    pub rotation_base: Option<i64>,
     /// Device KV indices covering the key, one row per atom.
     pub value: Tensor,
     /// Tokens of this request already cached before the insert (the duplicate
@@ -141,6 +143,8 @@ pub struct InsertParams<'k, K: ChildKeyType> {
 /// Result of an insert.
 #[derive(Default)]
 pub struct InsertResult {
+    /// An incompatible rotation run was declined before any KV ownership change.
+    pub rotation_tail_declined: bool,
     /// Tokens of the insert key that overlapped existing nodes.
     pub prefix_len: usize,
     /// The inserted key's full (page-aligned) length.
@@ -211,6 +215,7 @@ pub struct InsertWalkState<K: ChildKeyType> {
     aligned_key_len: usize,
     value: Tensor,
     namespace: KeyNamespace,
+    rotation_base: Option<i64>,
     prev_prefix_len: usize,
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
@@ -334,6 +339,12 @@ pub enum PoolName {
     Mamba,
     Swa,
     Indexer,
+    DeepseekV4C1,
+    DeepseekV4C1Indexer,
+    DeepseekV4C1IndexerScale,
+    DeepseekV4C2,
+    DeepseekV4C2Indexer,
+    DeepseekV4C2IndexerScale,
     DeepseekV4C4,
     DeepseekV4C4Indexer,
     DeepseekV4C4IndexerScale,
@@ -1396,6 +1407,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return Ok(InsertStepResult {
                 actions: Vec::new(),
                 result: Some(InsertResult {
+            rotation_tail_declined: false,
                     prefix_len: 0,
                     total_len: 0,
                     last_device_node_id: Some(self.arena.node(root_id).id),
@@ -1414,6 +1426,24 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let node = self.arena.node_mut(root_id);
             node.priority = node.priority.max(params.priority);
         }
+        if let Some(rotation_base) = params.rotation_base {
+            let (matched_node, matched_len) =
+                self.peek_insert_walk(params.key, params.namespace);
+            if matched_node != root_id
+                && self.arena.node(matched_node).rotation_base != Some(rotation_base)
+            {
+                return Ok(InsertStepResult {
+                    actions: Vec::new(),
+                    result: Some(InsertResult {
+                        prefix_len: matched_len,
+                        last_device_node_id: Some(self.arena.node(matched_node).id),
+                        rotation_tail_declined: true,
+                        adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
+                        ..InsertResult::default()
+                    }),
+                });
+            }
+        }
         // The walk reads only [0, aligned_key_len); the ragged tail never enters.
         self.ongoing_insert_walk_state = Some(InsertWalkState {
             phase: InsertPhase::Walk,
@@ -1422,6 +1452,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             aligned_key_len,
             value: params.value.narrow(0, 0, aligned_key_len as i64),
             namespace: params.namespace.to_owned(),
+            rotation_base: params.rotation_base,
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
@@ -1439,6 +1470,40 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             pending_actions: Vec::new(),
         });
         Ok(self.advance_insert_())
+    }
+
+    /// Read-only insertion overlap, including device-evicted nodes. No split,
+    /// LRU update, duplicate free or component callback can precede the guard.
+    fn peek_insert_walk(
+        &self,
+        key: &K,
+        namespace: KeyNamespaceRef<'_>,
+    ) -> (NodeIdx_, usize) {
+        let mut node_id = self.arena.root();
+        let mut cursor = 0;
+        let aligned = key.atom_len() / self.page_size * self.page_size;
+        while cursor < aligned {
+            let child_id = self.arena.child_on_page_in_namespace(
+                node_id, namespace, key.page_at(cursor, self.page_size),
+            );
+            let Some(child_id) = child_id else { break };
+            let child = self.arena.node(child_id);
+            let matched = key.match_len(cursor, &child.key, self.page_size);
+            node_id = child_id;
+            cursor += matched;
+            if matched < child.key.atom_len() {
+                break;
+            }
+        }
+        (node_id, cursor)
+    }
+
+    pub fn peek_insert_overlap_len(&self, key: &K, namespace: KeyNamespaceRef<'_>) -> usize {
+        self.peek_insert_walk(key, namespace).1
+    }
+
+    pub fn rotation_base_of(&self, node_id: NodeId) -> Result<Option<i64>, NodeAccessError> {
+        Ok(self.arena.node(self.arena.resolve(node_id)?).rotation_base)
     }
 
     /// Continue the suspended insert after its step actions were executed.
@@ -1545,6 +1610,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         let params = InsertParams {
+            rotation_base: state.rotation_base,
             key: &state.key,
             namespace: state.namespace.as_ref(),
             value: state.value.shallow_clone(),
@@ -1683,6 +1749,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         } else {
             state.node_id
         };
+        if state.is_new_leaf {
+            self.arena.node_mut(target_node_id).rotation_base = state.rotation_base;
+        }
         state.target_node_id = Some(target_node_id);
 
         // Finalize: let each component attach its data to the target node.
@@ -1696,6 +1765,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         result.prefix_len = state.total_prefix_length;
         result.last_device_node_id = Some(self.arena.node(target_node_id).id);
         let params = InsertParams {
+            rotation_base: state.rotation_base,
             key: &state.key,
             namespace: state.namespace.as_ref(),
             value: state.value.shallow_clone(),
@@ -1791,6 +1861,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let child = self.arena.node(child_id);
         let parent_id = child.parent();
         let child_namespace = child.namespace.clone();
+        let child_rotation_base = child.rotation_base;
         let child_external_cache_stored = child.external_cache_stored;
         let (key_head, key_tail) = child.key.split_at(split_len);
         // key_head keeps the original key's first page, which keys the parent's child map.
@@ -1808,6 +1879,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             child_id,
         );
         self.arena.node_mut(new_node_id).external_cache_stored = child_external_cache_stored;
+        self.arena.node_mut(new_node_id).rotation_base = child_rotation_base;
 
         let child = self.arena.node_mut(child_id);
         child.parent = Some(new_node_id);
@@ -3002,6 +3074,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.touch_node_(node_id);
         if total_len == 0 {
             return Ok(InsertResult {
+            rotation_tail_declined: false,
                 prefix_len: 0,
                 total_len: 0,
                 last_device_node_id: None,
@@ -3042,6 +3115,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         let mut result = InsertResult {
+            rotation_tail_declined: false,
             prefix_len: matched_length,
             total_len,
             last_device_node_id: None,

@@ -169,6 +169,36 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "and cannot be used at the same time. Please use only one of them."
         )
 
+    if cfg.enable_asradix_cache:
+        if cfg.disable_radix_cache:
+            raise ValueError(
+                "AttentionStore (asradix_cache) requires radix cache to be enabled. "
+                "Please do not use --disable-radix-cache together with --enable-asradix-cache."
+            )
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "HiCache and AttentionStore cannot be enabled simultaneously. "
+                "Please use only one of them."
+            )
+        if cfg.disaggregation_mode == "decode":
+            raise ValueError(
+                "AttentionStore (asradix_cache) is not supported on disaggregation decode instances. "
+                "Please disable --enable-asradix-cache for decode (D) instances."
+            )
+        if cfg.page_size <= 1:
+            raise ValueError(
+                "AttentionStore KV R/W requires page_size > 1. "
+                f"Current page_size is {cfg.page_size}."
+            )
+
+    # The chunk-tail SWA staging pool only exists to feed AttentionStore writes,
+    # so it follows --enable-asradix-cache rather than being an operator knob.
+    declare_resolution(
+        server_args,
+        "handle_cache_compatibility",
+        enable_as_swa_pool=bool(cfg.enable_asradix_cache),
+    )
+
     if cfg.disaggregation_decode_enable_offload_kvcache:
         if cfg.disaggregation_mode != "decode":
             raise ValueError(

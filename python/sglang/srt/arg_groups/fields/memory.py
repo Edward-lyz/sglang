@@ -95,6 +95,49 @@ class Memory(msgspec.Struct):
     ] = None
 
     # -------------------------------------------------------------------------
+    # AttentionStore (asradix) secondary KV cache
+    # -------------------------------------------------------------------------
+    enable_asradix_cache: A[
+        bool,
+        "Enable the AttentionStore (asradix) secondary KV cache.",
+    ] = False
+    per_node_gpu_num: A[
+        int,
+        "Number of GPUs per node for AttentionStore Agent resource allocation.",
+    ] = 8
+    # SWA checkpoint placement for AttentionStore (DeepSeek-V4/V4.1 SPA path).
+    swa_step: A[
+        int,
+        "AttentionStore SWA checkpoint spacing in tokens (>= page_size). "
+        "0 means 'use page_size'. Each swa_step boundary crossed during prefill "
+        "backs up the tail SWA window for async write to AttentionStore.",
+    ] = 0
+    enable_dynamic_swa_step: A[
+        bool,
+        "Use a tiered (position-dependent) swa_step from --swa-step-tiers instead "
+        "of a single fixed swa_step: fine-grained near the start of a request and "
+        "coarser further out.",
+    ] = False
+    swa_step_tiers: A[
+        str,
+        "Tiered swa_step spec 'bound:step,...' ending with a '0:<step>' (inf) tier, "
+        "e.g. '1024:256,4096:1024,0:4096'. Only used when --enable-dynamic-swa-step.",
+    ] = "1024:256,4096:1024,0:4096"
+    as_swa_buffer_coef: A[
+        float,
+        "Capacity multiplier for the AttentionStore SWA staging pool: how many "
+        "concurrent per-chunk SWA checkpoints to reserve before the async write "
+        "drains and recycles them.",
+    ] = 3.0
+    enable_as_swa_pool: A[
+        bool,
+        "Allocate the chunk-tail SWA staging pool (ChunkTailSWAPool) so that the "
+        "SWA window at every swa_step checkpoint is rescued before eviction and "
+        "can be written to AttentionStore. Derived from --enable-asradix-cache; "
+        "not intended to be set directly.",
+    ] = False
+
+    # -------------------------------------------------------------------------
     # Hierarchical cache
     # -------------------------------------------------------------------------
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False

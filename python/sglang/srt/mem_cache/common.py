@@ -42,6 +42,29 @@ class RetractionBackup(NamedTuple):
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
     return (kv_indices[::page_size] // page_size).cpu().numpy()
+def kv_to_page_indices_pinned(
+    kv_indices: torch.Tensor,
+    page_size: int,
+    *,
+    stream: torch.cuda.Stream,
+    host_buf: torch.Tensor,
+) -> np.ndarray:
+    """kv_to_page_indices without a host-blocking D2H on the caller's stream.
+
+    The strided-slice gather and the D2H are enqueued on ``stream`` (the caller
+    runs inside its context); completion is the caller's job -- record an event
+    on ``stream`` after this returns and ``synchronize()`` it before reading.
+    The caller-owned pinned ``host_buf`` must be at least
+    ``kv_indices.numel() // page_size`` elements; the returned view is only
+    valid until the buffer is reused, and the consuming sender must snapshot
+    it (np.copy / torch tensor) before the next call reuses the buffer.
+    """
+    num_pages = kv_indices.numel() // page_size
+    dev_pages = (kv_indices[::page_size] // page_size).to(host_buf.dtype)
+    host_buf[:num_pages].copy_(dev_pages, non_blocking=True)
+    kv_indices.record_stream(stream)
+    dev_pages.record_stream(stream)
+    return host_buf[:num_pages].numpy()
 
 
 def kv_to_page_num(num_kv_indices: int, page_size: int):
@@ -280,6 +303,32 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
     req.kv.retraction_backup = None
 
 
+def _release_uncommitted_chunk_tail_swa_slots(
+    req: Req, tree_cache: BasePrefixCache
+) -> None:
+    """Free the chunk-tail SWA slots this request still owns.
+
+    Ownership is split at ``as_written_count``:
+
+      ``[0, as_written_count)``   already handed to an AS write task. The task
+                                  holds them until it retires, so freeing them
+                                  here would be a double-free. ``retire_ascache_writes()``
+                                  releases them — it is called from every event
+                                  loop except ``event_loop_pp_disagg_prefill``
+                                  (see the note there; pp=1 never reaches it).
+      ``[as_written_count, ...)`` allocated but never submitted (copied-not-
+                                  written, pool-full skips, or the request ended
+                                  first). Nothing else will free these.
+    """
+    if not req.as_swa_kv_slots:
+        return
+    from sglang.srt.mem_cache.chunk_tail_swa_pool import free_chunk_tail_swa_slots
+
+    kvcache = tree_cache.token_to_kv_pool_allocator.get_kvcache()
+    free_chunk_tail_swa_slots(kvcache, req.as_swa_kv_slots[req.as_written_count :])
+    req.as_swa_kv_slots = []
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
@@ -301,6 +350,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
         kv_len_to_handle=effective_kv_committed_len,
     )
+    # After cache_finished_req, so a write submitted there has already advanced
+    # as_written_count and keeps ownership of its slots.
+    _release_uncommitted_chunk_tail_swa_slots(req, tree_cache)
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # internally, then sets req_pool_idx = None.

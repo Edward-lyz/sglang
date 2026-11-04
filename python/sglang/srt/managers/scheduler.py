@@ -279,6 +279,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.chunk_tail_swa_pool import free_chunk_tail_swa_slots
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -347,6 +348,13 @@ from sglang.srt.utils.hf_transformers_utils import (
     resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_OPERATIONS_ENABLED,
+    NVTX_SCHEDULER_ENABLED,
+    profile_range,
+    operations_nvtx_range,
+    profile_method,
+)
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import (
@@ -366,6 +374,27 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_DEFAULT_PYTHON_SWITCH_INTERVAL = sys.getswitchinterval()
+
+
+def _configure_python_switch_interval():
+    value = envs.SGLANG_PYTHON_SWITCH_INTERVAL.get()
+    if value is None:
+        return
+    error = (
+        "SGLANG_PYTHON_SWITCH_INTERVAL requires seconds in [0.00001, 0.05], "
+        f"got {value!r}."
+    )
+    try:
+        interval = float(value)
+    except ValueError:
+        raise ValueError(error) from None
+    if not 0.00001 <= interval <= 0.05:
+        raise ValueError(error)
+    sys.setswitchinterval(interval)
+    logger.info(
+        "Python switch interval configured at startup: %.9f", sys.getswitchinterval()
+    )
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -492,6 +521,7 @@ class Scheduler(
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
+        self.enable_asradix_cache = get_memory().enable_asradix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
@@ -610,6 +640,9 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.ascli = None
+        if self.enable_asradix_cache:
+            self._init_attention_store(server_args)
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
@@ -1590,6 +1623,18 @@ class Scheduler(
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            # Benchmark-only fake-transfer shortcut (see
+            # disaggregation/prefill.py: _sendkv_fake_transfer). Never on for
+            # real PD: requires the env gate AND fake bootstrap hosts.
+            self._fake_transfer_bypass = (
+                os.environ.get("SGLANG_PREFILL_FAKE_FREE_KV", "0") == "1"
+            )
+
+            # Side-stream page-index staging for send_kv (see
+            # disaggregation/prefill.py: _sendkv_pinned_pages).
+            self._sendkv_pinned: Optional[torch.Tensor] = None
+            self._sendkv_gather_done: Optional[torch.cuda.Event] = None
+            self._sendkv_gather_live = False
 
         if (
             self.enable_unified_memory
@@ -1664,6 +1709,13 @@ class Scheduler(
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
         )
+        # Barrier-free lane for swa_stage's probe D2H
+        # (detect_and_may_copy_as_swa): unlike schedule_stream, nothing chains
+        # this stream behind forward_stream, so a host sync here returns once
+        # its own gather completes instead of draining the in-flight forward
+        # (the coarse WAR barrier stall, measured 55ms per call).
+        self.swa_copy_stream: CudaStream = self.device_module.Stream()
+        self.prep_done_event = self.device_module.Event()
 
         if not self.enable_overlap:
             return
@@ -1896,6 +1948,312 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def _init_attention_store(self, server_args):
+        """Attach the AttentionStore (asradix) binding for the single-node
+        (DP1/TP8, no-PP) DeepSeek-V4/V4.1 case.
+
+        Builds one InitContext, creates the SPA/SPAG binding via the tree cache,
+        refs it, and injects the model forward_stream into the write coordinator
+        so its producer fence targets the stream the KV writes actually run on.
+        On any failure it disables AS rather than crashing the scheduler.
+        """
+        import os
+
+        try:
+            from sglang.srt.mem_cache.storage.asradix.types import (
+                AS_BLOCK_SIZE,
+                AttentionStoreInitContext,
+            )
+
+            pod_name = os.getenv("POD_NAME")
+            model_id = os.getenv("MODEL_ID")
+            if pod_name is None or model_id is None:
+                raise ValueError(
+                    "enable_asradix_cache but POD_NAME / MODEL_ID env not set"
+                )
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+            cache_plan = self.tree_cache.attention_store_plan
+            layer_info = self.tp_worker.model_runner.layer_info
+            target_layer_ids = tuple(
+                range(int(layer_info.start_layer), int(layer_info.end_layer))
+            )
+            page_shard_id = int(self.ps.attn_tp_rank)
+            page_shard_num = int(self.ps.attn_tp_size)
+            # fake_dp: N independent dp1 replicas share ONE node. Register them
+            # exactly like real DP: same namespace / pod_name as the single
+            # instance (the AS Agent keys the pod on MODEL_ID / POD_NAME, so no
+            # per-replica suffix), with the replica distinguished only by dp_id.
+            # Each replica is dp1 internally (attn_dp_rank==0), so dp_id must come
+            # from the controller-assigned replica id.
+            draft_kv_cache, draft_layer_ids = self._as_draft_swa_layers(
+                cache_plan.name, len(target_layer_ids)
+            )
+            logger.info(
+                "[AS] init: plan=%s pod=%s shard=%d/%d layers=%d draft_layers=%d "
+                "page_size=%d gpu_count=%d",
+                cache_plan.name,
+                pod_name,
+                page_shard_id,
+                page_shard_num,
+                len(target_layer_ids),
+                len(draft_layer_ids),
+                self.page_size,
+                server_args.per_node_gpu_num,
+            )
+            ctx = AttentionStoreInitContext(
+                kv_cache=kv_cache,
+                req_to_token_pool=self.req_to_token_pool,
+                namespace_base=model_id,
+                pod_name=pod_name,
+                model_version="v1",
+                page_size=self.page_size,
+                block_size=AS_BLOCK_SIZE,
+                tp_rank=self.ps.attn_tp_rank,
+                tp_size=self.ps.attn_tp_size,
+                pp_rank=0,
+                pp_size=1,
+                node_pp_start=0,
+                node_pp_end=1,
+                dp_rank=self.ps.attn_dp_rank,
+                device_id=self.ps.gpu_id,
+                gpu_count=server_args.per_node_gpu_num,
+                target_layer_ids=target_layer_ids,
+                page_layer_ids=target_layer_ids,
+                draft_kv_cache=draft_kv_cache,
+                draft_layer_ids=draft_layer_ids,
+                page_shard_id=page_shard_id,
+                page_shard_num=page_shard_num,
+                page_layer_num=len(target_layer_ids),
+                endpoint_schema=dict(cache_plan.schema_factory(kv_cache)),
+            )
+            binding = self.tree_cache.create_attention_store_binding(ctx)
+            self.tree_cache.ref_as_binding(binding)
+            self.ascli = binding.cache_store
+            _as_coord = getattr(self.tree_cache, "_as_coordinator", None)
+            if _as_coord is not None:
+                _as_coord.forward_stream = getattr(
+                    getattr(self.tp_worker, "model_runner", None),
+                    "forward_stream",
+                    None,
+                )
+            logger.info(
+                "[AS] initialized: plan=%s namespace=%s forward_stream=%s",
+                cache_plan.name,
+                model_id,
+                getattr(_as_coord, "forward_stream", None),
+            )
+        except Exception as exc:
+            logger.error(
+                "[AS] AttentionStore init failed; disabling AS: %s",
+                exc,
+                exc_info=True,
+            )
+            self.enable_asradix_cache = False
+            self.ascli = None
+
+    def _as_draft_swa_layers(
+        self, plan_name: str, target_layer_count: int
+    ) -> Tuple[Any, Tuple[int, ...]]:
+        """Resolve the draft SWA layers the AttentionStore binding must cover.
+
+        Returns ``(draft_kv_cache, draft_layer_ids)``, both empty when there is
+        nothing to fan out to. Only SPAG consumes them: it folds the draft's SWA
+        layers into the same block segment as the target's, so a restored
+        checkpoint brings back both. The other plans pair ``draft_layer_ids`` with
+        ``page_layer_ids`` instead, and this branch never populates those.
+        """
+        if plan_name != "SPAG":
+            return None, ()
+        draft_pool = (
+            self.draft_worker.primary_draft_kv_pool if self.draft_worker else None
+        )
+        if draft_pool is None:
+            if self.draft_worker is not None:
+                # ngram and frozen-KV MTP have no draft KV pool at all, so there
+                # is no draft SWA state to persist. Correct, but say so: the
+                # alternative is wondering later why draft_layers=0.
+                logger.info(
+                    "[AS] draft SWA fan-out disabled: %s exposes no draft KV pool",
+                    type(self.draft_worker).__name__,
+                )
+            return None, ()
+        draft_swa = getattr(draft_pool, "swa_kv_pool", None)
+        # The layer count MUST come from the draft SWA pool itself. Under DSpark
+        # the pool holds one layer per stage while num_nextn_predict_layers stays
+        # 1, so deriving it from the server arg would register a single layer and
+        # leave the rest of the segment addressing the target's buffers.
+        draft_swa_layers = int(getattr(draft_swa, "layer_num", 0) or 0)
+        if draft_swa_layers <= 0:
+            logger.warning(
+                "[AS] draft SWA fan-out disabled: draft KV pool has no SWA layers"
+            )
+            return None, ()
+        self._assert_draft_swa_geometry(draft_pool)
+        return draft_pool, tuple(
+            range(target_layer_count, target_layer_count + draft_swa_layers)
+        )
+
+    def _assert_draft_swa_geometry(self, draft_pool) -> None:
+        """Fail AS init unless the draft SWA pool is slot-compatible with target.
+
+        ``detect_and_may_copy_as_swa`` stages each checkpoint's window into both
+        pools using the *target's* staging slot id and the *target's* SWA page
+        index. That is only meaningful while the two pools share one slot-id space
+        and one ``full_to_swa_index_mapping``; they do today (the draft is
+        allocated with one slot per target token, in the same process), but
+        nothing in the type system says so, and a divergence would stage the wrong
+        page instead of failing.
+        """
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        target = self.token_to_kv_pool_allocator.get_kvcache()
+        if not isinstance(target, DeepSeekV4TokenToKVPool) or not isinstance(
+            draft_pool, DeepSeekV4TokenToKVPool
+        ):
+            raise RuntimeError(
+                "AS draft SWA fan-out requires DeepSeekV4TokenToKVPool on both "
+                "the target and the draft worker"
+            )
+        if not draft_pool.compression_ratios or not all(
+            ratio == 0 for ratio in draft_pool.compression_ratios
+        ):
+            raise RuntimeError("AS draft SWA fan-out expects SWA-only NextN layers")
+        if target._unified_kv != draft_pool._unified_kv:
+            raise RuntimeError(
+                "AS draft SWA fan-out requires the same unified-KV mode on the "
+                "target and the draft worker"
+            )
+        if target._unified_kv:
+            raise RuntimeError(
+                "AS draft SWA fan-out requires the paged SWA pool: the unified-KV "
+                "ring has no page halves to stage a window from"
+            )
+        if (
+            target.full_to_swa_index_mapping
+            is not draft_pool.full_to_swa_index_mapping
+        ):
+            raise RuntimeError(
+                "AS draft SWA fan-out requires the target and draft pools to "
+                "share one full->swa index mapping object"
+            )
+        target_geometry = (target.page_size, target.sliding_window)
+        draft_geometry = (draft_pool.page_size, draft_pool.sliding_window)
+        if target_geometry != draft_geometry:
+            raise RuntimeError(
+                "AS draft SWA fan-out requires identical paged SWA geometry: "
+                f"target={target_geometry}, draft={draft_geometry}"
+            )
+        target_tail = getattr(target, "chunk_tail_swa_pool", None)
+        draft_tail = getattr(draft_pool, "chunk_tail_swa_pool", None)
+        if target_tail is None or draft_tail is None:
+            raise RuntimeError(
+                "AS draft SWA fan-out requires a chunk-tail staging pool on both "
+                "workers (target=%s, draft=%s)"
+                % (target_tail is not None, draft_tail is not None)
+            )
+        if target_tail.num_pages != draft_tail.num_pages:
+            raise RuntimeError(
+                "AS draft SWA staging pools must be the same size, because a slot "
+                "id allocated on the target is used verbatim on the draft: "
+                f"target={target_tail.num_pages}, draft={draft_tail.num_pages}"
+            )
+
+    def detect_and_may_copy_as_swa(self, req: Req) -> None:
+        """Rescue the tail SWA window at every swa_step checkpoint this request
+        has now committed.
+
+        Must run right after a chunk's forward completes: ``UnifiedRadixCache``
+        evicts everything older than ``max(sliding_window, page_size)``, so a
+        checkpoint's window is only still in HBM during the chunk that produced
+        it. A loop (not an ``if``) because one forward can cross several
+        checkpoints.
+        """
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        pool = getattr(kvcache, "chunk_tail_swa_pool", None)
+        if pool is None:
+            return
+        policy = kvcache.swa_policy
+        swa_win = pool.swa_win
+        # This branch has no ``Req.fill_ids`` attribute (that is master-v4's name):
+        # the token array lives in ``full_untruncated_fill_ids`` and
+        # ``get_fill_ids()`` slices it at ``extend_range.end``, i.e. exactly the
+        # prefix that this forward has just filled. Using the untruncated array
+        # here would count tokens of later chunks as committed and stage a window
+        # whose KV has not been written yet.
+        committed_len = len(req.get_fill_ids())
+        req_to_token = self.req_to_token_pool.req_to_token
+        draft_pool = (
+            self.draft_worker.primary_draft_kv_pool if self.draft_worker else None
+        )
+        draft_tail = getattr(draft_pool, "chunk_tail_swa_pool", None)
+
+        while req.as_swa_copy_count < len(req.as_swa_kv_slots):
+            checkpoint_no = req.as_swa_copy_count
+            checkpoint_pos = policy.checkpoint_pos(checkpoint_no)
+            if checkpoint_pos > committed_len:
+                # Not committed yet; a later chunk will pick it up.
+                break
+            slot_id = req.as_swa_kv_slots[checkpoint_no]
+            if slot_id == -1:
+                req.as_swa_copy_count += 1
+                continue
+            # The last swa_win tokens before checkpoint_pos live in the UPPER half
+            # (half=1) of their SWA page — guaranteed by the
+            # swa_step % swa_page_size == 0 assert in init_as_swa_pool. Resolve the
+            # physical page through req_to_token -> full_to_swa rather than
+            # tail_start_pos // swa_page_size, which would be wrong whenever this
+            # request's SWA pages do not start at physical page 0.
+            tail_start_pos = checkpoint_pos - swa_win
+            full_slot = int(req_to_token[req.kv.req_pool_idx, tail_start_pos].item())
+            swa_slot = int(kvcache.full_to_swa_index_mapping[full_slot].item())
+            if swa_slot == 0:
+                # Slot 0 is the reserved SWA padding sink and is never handed out
+                # (see allocator/swa.py:25-27), so reading it back means
+                # clear_full_to_swa_mapping already dropped this token's mapping:
+                # the window has been evicted. Copying anyway would silently stage
+                # the padding page's garbage and AS would serve it as valid KV.
+                # Degrade to the -1 sentinel and recycle the staging slot.
+                logger.warning(
+                    "chunk_tail_swa: rid=%s checkpoint#%d pos=%d tail_start=%d "
+                    "full_slot=%d has no live full->swa mapping (window already "
+                    "evicted); skipping this checkpoint",
+                    req.rid,
+                    checkpoint_no,
+                    checkpoint_pos,
+                    tail_start_pos,
+                    full_slot,
+                )
+                req.as_swa_kv_slots[checkpoint_no] = -1
+                free_chunk_tail_swa_slots(kvcache, [slot_id])
+                req.as_swa_copy_count += 1
+                continue
+            swa_page_idx = swa_slot // kvcache.swa_page_size
+            pool.copy_swa_page_half(slot_id, kvcache.swa_kv_pool, swa_page_idx, half=1)
+            if draft_tail is not None:
+                # Same slot_id and same swa_page_idx: the draft shares the target's
+                # slot-id space and the very same full_to_swa_index_mapping object
+                # (asserted in _assert_draft_swa_geometry).
+                draft_tail.copy_swa_page_half(
+                    slot_id, draft_pool.swa_kv_pool, swa_page_idx, half=1
+                )
+            req.as_swa_copy_count += 1
+
+    def retire_ascache_writes(self) -> None:
+        """Retire completed AttentionStore async writes in submission order.
+
+        Every scheduler loop that can produce AttentionStore writes must call
+        this once per round: retirement is the only place a write's retained
+        tree lock is given back, so skipping it pins the written prefix (FULL
+        path-to-root plus one SWA window) for the process lifetime.
+        """
+        if self.enable_asradix_cache and hasattr(
+            self.tree_cache, "check_ascache_events"
+        ):
+            self.tree_cache.check_ascache_events()
+            self.tree_cache.commit_ascache_load_backs()
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1903,6 +2261,7 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            self.retire_ascache_writes()
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -1947,6 +2306,7 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            self.retire_ascache_writes()
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -2634,6 +2994,59 @@ class Scheduler(
             return self._process_and_broadcast_mm_inputs(mm_inputs)
         return MultimodalInputs.from_processor_output(mm_inputs)
 
+    def _refresh_as_block_hashs(self, req: Req) -> None:
+        """Refresh AttentionStore hashes after scheduler-side token rewrites.
+
+        TokenizerManager computes hashes before prefill-side multimodal expansion.
+        If the scheduler later rebinds origin_input_ids (MM padding, automatic
+        truncation, etc.), the old hashes describe a different token sequence.
+        Recompute once from the final scheduler-visible input so AS match and write
+        use the same key space.
+        """
+        if (
+            not self.enable_asradix_cache
+            or req.origin_input_ids is req.origin_input_ids_unpadded
+        ):
+            return
+
+        old_count = (
+            len(req.as_block_hashs.hash_ids)
+            if req.as_block_hashs is not None
+            and hasattr(req.as_block_hashs, "hash_ids")
+            else 0
+        )
+        try:
+            from attentionstore_sdk.sdk import Tokens
+
+            from sglang.srt.mem_cache.storage.asradix.types import AS_BLOCK_SIZE
+
+            req.as_block_hashs = Tokens(req.origin_input_ids, AS_BLOCK_SIZE)
+        except ImportError:
+            logger.warning(
+                "attentionstore_sdk not available while refreshing AS block hashes "
+                "for rid=%s; disabling AS matching for this request",
+                req.rid,
+            )
+            req.as_block_hashs = None
+            return
+        except Exception as exc:
+            logger.warning(
+                "failed to refresh AS block hashes after input rewrite for rid=%s: %s",
+                req.rid,
+                exc,
+            )
+            req.as_block_hashs = None
+            return
+
+        logger.debug(
+            "Refreshed AS block hashes after input rewrite: rid=%s old_blocks=%d "
+            "new_blocks=%d input_tokens=%d",
+            req.rid,
+            old_count,
+            len(req.as_block_hashs.hash_ids),
+            len(req.origin_input_ids),
+        )
+
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
         """setup origin_input_ids with trying to reuse existing MultimodalInputs.padded_input_ids first,
@@ -2782,6 +3195,17 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+            # AttentionStore: carry the tokenizer-computed block hashes / cache
+            # params / prior-hit hints onto the request for AS match & write.
+            if self.enable_asradix_cache:
+                req.as_block_hashs = getattr(recv_req, "as_block_hashs", None)
+                req.as_kv_cache_params = getattr(recv_req, "as_kv_cache_params", None)
+                req.as_max_hit_host_ip = (
+                    getattr(recv_req, "as_max_hit_host_ip", None) or []
+                )
+                req.as_max_hit_token_len = (
+                    getattr(recv_req, "as_max_hit_token_len", None) or []
+                )
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -3052,6 +3476,8 @@ class Scheduler(
                 req.set_finish_with_abort(error_msg)
                 self._add_request_to_queue(req)
                 return
+
+        self._refresh_as_block_hashs(req)
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
@@ -3698,6 +4124,64 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _ascache_ready_refill_candidates(
+        self, adder, running_batch, refill_passes=0
+    ):
+        """Finish a deferred read group before launching an underfilled batch.
+
+        The caller makes one more pass through the ordinary admission loop,
+        so every existing request, token, SWA, LoRA and preemption gate still
+        applies. The opt-in bounded refill also scans queued requests not yet
+        submitted for load-back. Never choose collectives from local done().
+        """
+        max_passes = max(
+            1, min(8, envs.SGLANG_AS_LOAD_BACK_REFILL_PASSES.get())
+        )
+        rescan = max_passes > 1
+        if (
+            refill_passes >= max_passes
+            or not envs.SGLANG_AS_LOAD_BACK_COALESCE_READY.get()
+            or not envs.SGLANG_ENABLE_AS_LOAD_BACK_ASYNC.get()
+            or not self.enable_asradix_cache
+            or running_batch.batch_is_full
+            or (not adder.can_run_list and not rescan)
+            or adder.rem_chunk_tokens is None
+            or adder.rem_chunk_tokens <= 0
+            or adder.rem_input_tokens <= 0
+            or self.chunked_req is not None
+            or adder.new_chunked_req is not None
+            or adder.preempt_list
+            or getattr(self.req_to_token_pool, "mamba_allocator", None) is not None
+        ):
+            return ()
+        pending = self.tree_cache.pending_ascache_load_back_requests()
+        if not pending:
+            return ()
+        wanted = set(pending) - set(adder.can_run_list)
+        self.tree_cache.commit_ascache_load_backs()
+        wait_us = max(0, min(5000, envs.SGLANG_AS_LOAD_BACK_COALESCE_WAIT_US.get()))
+        if wait_us and self.tree_cache.pending_ascache_load_back_requests():
+            # Only the scheduler changes this queue; the first commit removes
+            # the same globally confirmed prefix on every CP rank. No local
+            # Future.done() or local clock chooses a collective here. Give the
+            # remaining reads a bounded opportunity to refill the ordinary
+            # admission loop before launching a small forward.
+            time.sleep(wait_us / 1_000_000)
+            self.tree_cache.commit_ascache_load_backs()
+        if rescan:
+            admitted = set(adder.can_run_list)
+            return [
+                req for req in self.waiting_queue
+                if req not in admitted and req._as_pending_load_back is None
+                and (req not in wanted or req.as_read_pending_lock)
+            ]
+        return [
+            req for req in self.waiting_queue
+            if req in wanted
+            and req._as_pending_load_back is None
+            and req.as_read_pending_lock
+        ]
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4212,6 +4696,24 @@ class Scheduler(
         """Run a batch."""
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
+        # Encode this forward's new-token count into the run_batch NVTX name so
+        # equal-token batches can be matched across captures (e.g. a 0%-hit and
+        # an 80%-hit run both have full prefill chunks of the same size).
+        _rb_label = f"sched.run_batch.nt{batch.extend_num_tokens or 0}"
+        if batch.admission_attempt_id is not None:
+            _rb_label += f" aid={batch.admission_attempt_id}"
+        if (NVTX_OPERATIONS_ENABLED or NVTX_SCHEDULER_ENABLED) and batch.prefill_stats is not None:
+            prefill_stats = batch.prefill_stats
+            _rb_label += (
+                f" it={self.forward_ct}"
+                f" new={prefill_stats.log_input_tokens}"
+                f" hit={prefill_stats.log_hit_tokens}"
+                f" device_hit={prefill_stats.log_device_hit_tokens}"
+                f" host_hit={prefill_stats.log_host_hit_tokens}"
+                f" storage_hit={prefill_stats.log_storage_hit_tokens}"
+                f" replay={prefill_stats.log_replay_tokens}"
+                f" reqs={len(batch.reqs)}"
+            )
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
@@ -4277,9 +4779,13 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
+                        with profile_range(
+                            _rb_label,
+                            nvtx_enabled=NVTX_OPERATIONS_ENABLED or NVTX_SCHEDULER_ENABLED,
+                        ):
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
+                            )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4349,9 +4855,13 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch, pp_proxy_tensors=pp_proxy_tensors
-                    )
+                    with profile_range(
+                        _rb_label,
+                        nvtx_enabled=NVTX_OPERATIONS_ENABLED or NVTX_SCHEDULER_ENABLED,
+                    ):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -4377,9 +4887,13 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
+                with profile_range(
+                    _rb_label,
+                    nvtx_enabled=NVTX_OPERATIONS_ENABLED or NVTX_SCHEDULER_ENABLED,
+                ):
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
@@ -4436,6 +4950,11 @@ class Scheduler(
 
         self._maybe_report_active_ranks()
 
+        # Fence point for the side-stream probe in detect_and_may_copy_as_swa:
+        # ordering against schedule_stream as a whole would transitively wait
+        # the in-flight forward (the WAR barrier chains schedule_stream behind
+        # it), so the probe instead waits on this event, which is recorded
+        # after this batch's prep writes but before _apply_war_barrier runs.
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
@@ -4553,6 +5072,7 @@ class Scheduler(
             batch_result.logits_output.next_token_logits = None
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
+    @profile_method("sched.proc_result", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def process_batch_result(
         self,
         batch: ScheduleBatch,
@@ -4945,6 +5465,12 @@ class Scheduler(
         if self.is_fully_idle():
             self.cur_batch_for_debug = None
             self.last_batch = None
+            # Drain in-flight AttentionStore async writes before resetting the
+            # tree cache so pending SPA/SPAG writes are not dropped mid-flight.
+            if self.enable_asradix_cache and hasattr(
+                self.tree_cache, "drain_attention_store_writes"
+            ):
+                self.tree_cache.drain_attention_store_writes()
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -5041,6 +5567,13 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "as_cache_digest",
+                "as_barrier_debug",
+                "python_switch_interval",
+                "as_load_back_coalesce_wait_us",
+                "scheduler_max_recv_per_poll",
+                "prefill_war_read_done",
+                "dsv4_batch_prefill_indexer",
             ]
         )
 
@@ -5082,6 +5615,54 @@ class Scheduler(
                     )
                     if_success = False
                     break
+            elif k in (
+                "as_cache_digest",
+                "as_barrier_debug",
+                "prefill_war_read_done",
+                "dsv4_batch_prefill_indexer",
+            ):
+                if v is not None and not isinstance(v, bool):
+                    logging.warning(f"{k} requires a boolean or null, got {v}.")
+                    if_success = False
+                    break
+                if (
+                    k in ("prefill_war_read_done", "dsv4_batch_prefill_indexer")
+                    and v is None
+                ):
+                    logging.warning(f"{k} requires an explicit boolean.")
+                    if_success = False
+                    break
+            elif k == "scheduler_max_recv_per_poll":
+                if (
+                    isinstance(v, bool)
+                    or not isinstance(v, int)
+                    or (v != -1 and not 1 <= v <= 256)
+                ):
+                    logging.warning(
+                        "scheduler_max_recv_per_poll requires -1 or an integer "
+                        "in [1, 256], got %s.", v,
+                    )
+                    if_success = False
+                    break
+            elif k == "as_load_back_coalesce_wait_us":
+                if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 5000:
+                    logging.warning(
+                        "as_load_back_coalesce_wait_us requires an integer in [0, 5000], got %s.", v
+                    )
+                    if_success = False
+                    break
+            elif k == "python_switch_interval":
+                if v is not None and (
+                    isinstance(v, bool)
+                    or not isinstance(v, (int, float))
+                    or not 0.00001 <= v <= 0.05
+                ):
+                    logging.warning(
+                        "python_switch_interval requires seconds in [0.00001, 0.05] "
+                        "or null, got %s.", v,
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -5099,6 +5680,44 @@ class Scheduler(
             # DSpark control keys are worker commands, not server args; route
             # them to the draft worker and keep them out of the override.
             remaining = dict(server_args_dict)
+            if "scheduler_max_recv_per_poll" in remaining:
+                limit = remaining.pop("scheduler_max_recv_per_poll")
+                self.request_receiver = dataclasses.replace(
+                    self.request_receiver, max_recv_per_poll=limit
+                )
+                self.max_recv_per_poll = limit
+                logger.info("Scheduler receive limit updated: %d", limit)
+            for command, field in (
+                ("prefill_war_read_done", envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE),
+                ("dsv4_batch_prefill_indexer", envs.SGLANG_DSV4_BATCH_PREFILL_INDEXER),
+            ):
+                if command in remaining:
+                    field.set(remaining.pop(command))
+                    logger.info(
+                        "Runtime experiment %s updated: %s", command, field.get()
+                    )
+            if "as_load_back_coalesce_wait_us" in remaining:
+                wait_us = remaining.pop("as_load_back_coalesce_wait_us")
+                envs.SGLANG_AS_LOAD_BACK_COALESCE_WAIT_US.set(wait_us)
+                logger.info("AS load-back coalesce wait updated: %d", wait_us)
+            if "python_switch_interval" in remaining:
+                interval = remaining.pop("python_switch_interval")
+                sys.setswitchinterval(
+                    _DEFAULT_PYTHON_SWITCH_INTERVAL if interval is None else interval
+                )
+                logger.info(
+                    "Python switch interval updated: %.9f", sys.getswitchinterval()
+                )
+            if "as_cache_digest" in remaining or "as_barrier_debug" in remaining:
+                from sglang.srt.mem_cache.storage.asradix.transport import (
+                    set_barrier_debug_enabled,
+                    set_cache_digest_enabled,
+                )
+
+                if "as_cache_digest" in remaining:
+                    set_cache_digest_enabled(remaining.pop("as_cache_digest"))
+                if "as_barrier_debug" in remaining:
+                    set_barrier_debug_enabled(remaining.pop("as_barrier_debug"))
             frac = remaining.pop("dspark_force_budget_frac", None)
             if "dspark_force_budget_frac" in server_args_dict:
                 self.draft_worker.set_dspark_forced_budget_frac(
@@ -5732,6 +6351,7 @@ def configure_scheduler_process(
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+    _configure_python_switch_interval()
 
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():

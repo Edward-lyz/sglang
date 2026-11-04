@@ -284,6 +284,9 @@ class Envs:
     SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
     IS_H200 = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
+    # Optional scheduler Python thread switch interval in seconds.
+    # Unset preserves the interpreter default; valid range is [0.00001, 0.05].
+    SGLANG_PYTHON_SWITCH_INTERVAL = EnvStr(None)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
@@ -675,6 +678,28 @@ class Envs:
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
+    # AttentionStore (asradix) diagnostics: content digest (D2H + hash per page)
+    # and producer-event barrier diagnostic. Off by default; each can be flipped
+    # at runtime via /set_internal_state (log_as_cache_digest/log_as_barrier_debug).
+    SGLANG_LOG_AS_CACHE_DIGEST = EnvBool(False)
+    SGLANG_LOG_AS_BARRIER_DEBUG = EnvBool(False)
+    # AttentionStore (asradix) read-diffuse: shard the L2 read across the
+    # attention CP ranks (each reads 1/N of the replicated blocks) then diffuse
+    # the shards over NVLink with a raw-IPC SM scatter kernel, cutting the
+    # redundant H2D to ~1/N. Off by default. BLOCKS bounds the diffuse kernel's
+    # SM footprint so it does not starve forward's latency-bound collectives.
+    SGLANG_ENABLE_AS_READ_DIFFUSE = EnvBool(False)
+    SGLANG_AS_READ_DIFFUSE_BLOCKS = EnvInt(32)
+    # Run AttentionStore load_back on a background executor instead of blocking
+    # scheduler admission. Admission only allocates and submits (no IO); the
+    # next loop top drains the finished read and inserts the prefix. The
+    # background thread runs the SDK read with NO torch.distributed calls:
+    # concurrent collectives on the same gloo group from two threads have no
+    # cross-rank pairing guarantee. For the same reason the async path always
+    # takes the plain full read (the sharded read + NVLink diffuse path issues
+    # CP-group barriers around the read and cannot move off the scheduler
+    # thread); each CP rank reads the full block set.
+    SGLANG_ENABLE_AS_LOAD_BACK_ASYNC = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime
@@ -1785,6 +1810,24 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
+    # Optional AttentionStore host scheduling and native transport features.
+    # Deferred allocation preserves the all-rank publication gates.
+    SGLANG_AS_DEFER_ALLOCATION_GATE = EnvBool(False)
+    SGLANG_HTTP_REUSE_PORT = EnvBool(False)
+    SGLANG_ADMISSION_DIAG_DIR = EnvStr("")
+    SGLANG_ENABLE_REQUEST_OOB_BROADCAST = EnvBool(False)
+    SGLANG_LOG_AS_CACHE_OPERATIONS = EnvBool(True)
+    SGLANG_AS_READ_DIFFUSE_BATCHED = EnvBool(False)
+    SGLANG_AS_READ_DIFFUSE_GROUP_COMMIT = EnvBool(False)
+    SGLANG_AS_LOAD_BACK_COALESCE_READY = EnvBool(False)
+    SGLANG_AS_LOAD_BACK_REFILL_PASSES = EnvInt(2)
+    SGLANG_AS_LOAD_BACK_COALESCE_WAIT_US = EnvInt(0)
+    SGLANG_AS_LOAD_BACK_READ_WORKERS = EnvInt(1)
+    SGLANG_AS_LOAD_BACK_MAX_PENDING = EnvInt(32)
+    SGLANG_AS_SPAG_REUSE_FINISHED_WRITE = EnvBool(False)
+    SGLANG_AS_SPAG_BATCH_WRITE_FENCE = EnvBool(False)
+    SGLANG_DSV4_BATCH_PREFILL_INDEXER = EnvBool(False)
+    SGLANG_FUSE_CP_CANDIDATE_MASK = EnvBool(False)
 
 
 envs = Envs()

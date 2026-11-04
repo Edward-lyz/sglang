@@ -237,6 +237,12 @@ fn pool_name_str(name: PoolName) -> &'static str {
         PoolName::Mamba => "mamba",
         PoolName::Swa => "swa",
         PoolName::Indexer => "indexer",
+        PoolName::DeepseekV4C1 => "deepseek_v4_c1",
+        PoolName::DeepseekV4C1Indexer => "deepseek_v4_c1_indexer",
+        PoolName::DeepseekV4C1IndexerScale => "deepseek_v4_c1_indexer_scale",
+        PoolName::DeepseekV4C2 => "deepseek_v4_c2",
+        PoolName::DeepseekV4C2Indexer => "deepseek_v4_c2_indexer",
+        PoolName::DeepseekV4C2IndexerScale => "deepseek_v4_c2_indexer_scale",
         PoolName::DeepseekV4C4 => "deepseek_v4_c4",
         PoolName::DeepseekV4C4Indexer => "deepseek_v4_c4_indexer",
         PoolName::DeepseekV4C4IndexerScale => "deepseek_v4_c4_indexer_scale",
@@ -257,6 +263,12 @@ fn parse_pool_name(name: &str) -> PyResult<PoolName> {
         "mamba" => Ok(PoolName::Mamba),
         "swa" => Ok(PoolName::Swa),
         "indexer" => Ok(PoolName::Indexer),
+        "deepseek_v4_c1" => Ok(PoolName::DeepseekV4C1),
+        "deepseek_v4_c1_indexer" => Ok(PoolName::DeepseekV4C1Indexer),
+        "deepseek_v4_c1_indexer_scale" => Ok(PoolName::DeepseekV4C1IndexerScale),
+        "deepseek_v4_c2" => Ok(PoolName::DeepseekV4C2),
+        "deepseek_v4_c2_indexer" => Ok(PoolName::DeepseekV4C2Indexer),
+        "deepseek_v4_c2_indexer_scale" => Ok(PoolName::DeepseekV4C2IndexerScale),
         "deepseek_v4_c4" => Ok(PoolName::DeepseekV4C4),
         "deepseek_v4_c4_indexer" => Ok(PoolName::DeepseekV4C4Indexer),
         "deepseek_v4_c4_indexer_scale" => Ok(PoolName::DeepseekV4C4IndexerScale),
@@ -521,12 +533,13 @@ pub struct InsertParamsBinding {
     pub chunked: bool,
     pub priority: i64,
     pub track_adopted_ranges: bool,
+    pub rotation_base: Option<i64>,
 }
 
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -540,6 +553,7 @@ impl InsertParamsBinding {
         priority: i64,
         mamba_value: Option<Py<PyAny>>,
         track_adopted_ranges: bool,
+        rotation_base: Option<i64>,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
             key: py_array_to_vec_i64(py, key)?,
@@ -553,6 +567,7 @@ impl InsertParamsBinding {
             chunked,
             priority,
             track_adopted_ranges,
+            rotation_base,
         })
     }
 }
@@ -600,6 +615,7 @@ pub struct InsertResultBinding {
     last_device_node: Option<NodeId>,
     inserted_host_node: Option<NodeId>,
     host_insert_dropped: bool,
+    rotation_tail_declined: bool,
     mamba_exist: bool,
     swa_branch_inserted: bool,
     adopted_ranges: Option<HashMap<u8, Vec<(usize, usize)>>>,
@@ -640,6 +656,7 @@ impl InsertResultBinding {
             last_device_node: result.last_device_node_id,
             inserted_host_node: result.inserted_host_node,
             host_insert_dropped: result.host_insert_dropped,
+            rotation_tail_declined: result.rotation_tail_declined,
             mamba_exist: result.mamba_exist,
             swa_branch_inserted: result.swa_branch_inserted,
             adopted_ranges: result.adopted_ranges.map(|ranges| {
@@ -1018,6 +1035,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             None => None,
         };
         let params = InsertParams {
+            rotation_base: params.rotation_base,
             key,
             namespace: KeyNamespaceRef::new(
                 params.extra_key.as_deref(),
@@ -1054,6 +1072,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             None => None,
         };
         let params = InsertParams {
+            rotation_base: params.rotation_base,
             key,
             namespace: KeyNamespaceRef::new(
                 params.extra_key.as_deref(),
@@ -1529,6 +1548,24 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
         py.allow_threads(|| self.core().is_root(node_id))
             .map_err(node_access_error)
+    }
+
+    fn rotation_base_of(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<i64>> {
+        py.allow_threads(|| self.core().rotation_base_of(node_id))
+            .map_err(node_access_error)
+    }
+
+    fn peek_insert_overlap_len(
+        &self,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+        extra_key: Option<String>,
+        cache_salt: Option<String>,
+    ) -> PyResult<usize> {
+        let raw = py_array_to_vec_i64(py, key)?;
+        let key = K::key_from(Cow::Borrowed(&raw));
+        let namespace = KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref());
+        Ok(py.allow_threads(|| self.core().peek_insert_overlap_len(key.as_ref(), namespace)))
     }
 
     /// The node's last page hash, or None when it was never hashed.
@@ -2804,6 +2841,21 @@ macro_rules! tree_core_binding {
             #[pyo3(signature = (extra_key = None))]
             fn root_node_handle(&self, py: Python<'_>, extra_key: Option<String>) -> NodeId {
                 self.inner.root_node_handle(py, extra_key)
+            }
+
+            fn rotation_base_of(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<i64>> {
+                self.inner.rotation_base_of(py, node_id)
+            }
+
+            #[pyo3(signature = (key, extra_key = None, cache_salt = None))]
+            fn peek_insert_overlap_len(
+                &self,
+                py: Python<'_>,
+                key: &Bound<'_, PyAny>,
+                extra_key: Option<String>,
+                cache_salt: Option<String>,
+            ) -> PyResult<usize> {
+                self.inner.peek_insert_overlap_len(py, key, extra_key, cache_salt)
             }
 
             fn dfs_weight_order(

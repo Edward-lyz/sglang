@@ -104,11 +104,31 @@ class TestPrefillAdder(CustomTestCase):
         req.storage_hit_start = None
         req.host_hit_is_storage = False
         req.host_loaded_length = 0
+        req.as_read_pending_lock = False
+        req._as_pending_load_back = None
+        req.ever_read_as = False
         req.materialized_host_hit_len.return_value = 0
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
+    def test_async_load_limit_leaves_request_queued_without_reprefill(self):
+        from sglang.srt.environ import envs
+
+        adder = self._create_delayer_adder(
+            available_tokens=100_000, delayer=_RecordingDelayer(allow=True)
+        )
+        req = self._create_delayer_req(50)
+        req.host_hit_length = 25
+        req.needs_host_load_back.return_value = True
+        self.mock_tree_cache.attention_store_load_back_batch_is_full.return_value = True
+        with envs.SGLANG_ENABLE_AS_LOAD_BACK_ASYNC.override(True):
+            result = adder.add_one_req(
+                req, has_chunked_req=False, truncation_align_size=None
+            )
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [])
+        self.mock_tree_cache.init_load_back.assert_not_called()
 
     def create_adder(self, running_batch, **kwargs):
         defaults = dict(

@@ -543,6 +543,7 @@ fn insert_params_swa<'k>(
     swa_evicted_seqlen: usize,
 ) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
+            rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(value),

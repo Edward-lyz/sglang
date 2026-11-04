@@ -336,11 +336,23 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return alloc_full_indices
 
         device = self.device
-        swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
-        swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
-        swa_seq_lens = torch.tensor([swa_tail_len], dtype=torch.int64, device=device)
-        swa_seq_lens_cpu = torch.tensor([swa_tail_len], dtype=torch.int64)
-        swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+        if torch.device(device).type == "cuda" and torch.version.hip is None:
+            # Immutable pageable source: one same-stream H2D copy for all scalars.
+            swa_metadata_cpu = torch.tensor(
+                [0, swa_tail_len, -1], dtype=torch.int64, device="cpu"
+            )
+            swa_metadata = swa_metadata_cpu.to(device, non_blocking=True)
+            swa_prefix_lens = swa_metadata[:1]
+            swa_seq_lens = swa_metadata[1:2]
+            swa_last_loc = swa_metadata[2:3]
+            swa_prefix_lens_cpu = swa_metadata_cpu[:1]
+            swa_seq_lens_cpu = swa_metadata_cpu[1:2]
+        else:
+            swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
+            swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
+            swa_seq_lens = torch.tensor([swa_tail_len], dtype=torch.int64, device=device)
+            swa_seq_lens_cpu = torch.tensor([swa_tail_len], dtype=torch.int64)
+            swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
 
         alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
             swa_prefix_lens,

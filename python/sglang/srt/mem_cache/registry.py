@@ -108,6 +108,25 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
+    # AttentionStore uses the unified cache adapter (SPA for V4, SPAG for V4.1).
+    if get_memory().enable_asradix_cache:
+        from sglang.srt.mem_cache.storage.asradix.cache import (
+            create_attention_store_cache,
+        )
+        from sglang.srt.mem_cache.storage.asradix.plans import (
+            resolve_attention_store_plan,
+        )
+
+        plan = resolve_attention_store_plan(
+            ctx.model_config,
+            params.token_to_kv_pool_allocator.get_kvcache(),
+        )
+        return create_attention_store_cache(
+            plan,
+            params=params,
+            server_args=server_args,
+        )
+
     if get_memory().enable_unified_cache_external_linker:
         return _create_unified_radix_cache(ctx, server_args, params)
 

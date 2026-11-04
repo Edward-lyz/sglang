@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.fake.conn import FakeKVSender
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -67,6 +68,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
+    kv_to_page_indices_pinned,
     kv_to_page_num,
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -85,6 +87,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -605,6 +608,7 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            self.retire_ascache_writes()
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -644,6 +648,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
+            self.retire_ascache_writes()
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -1251,6 +1256,30 @@ class SchedulerDisaggregationPrefillMixin:
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
+    def _sendkv_pinned_pages(
+        self: Scheduler, num_pages: int, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Pinned staging buffer for one segment's page indices, reused across
+        calls. Only safe while ``self._sendkv_gather_live`` is False (the
+        previous send already drained its D2H); the segment loop enforces that
+        by syncing before the buffer can be handed to the next send."""
+        buf = self._sendkv_pinned
+        if buf is None or buf.numel() < num_pages:
+            buf = torch.empty(num_pages, dtype=torch.int32, pin_memory=True)
+            self._sendkv_pinned = buf
+        return buf
+
+    def _sendkv_fake_transfer(self: Scheduler, req: Req) -> bool:
+        """Fake-backend benchmark shortcut: the sender discards indices, so the
+        payload builders and per-segment page-index D2H (the dominant
+        scheduler-thread cost, measurable even in the nocache baseline) can be
+        skipped entirely. Gated with _prefill_fake_free_kv so real PD keeps the
+        full path; the sender's page counter still advances via token math."""
+        return (
+            self._fake_transfer_bypass
+            and isinstance(req.disagg_kv_sender, FakeKVSender)
+        )
+
     def send_kv_chunk(
         self: Scheduler,
         req: Req,
@@ -1289,6 +1318,28 @@ class SchedulerDisaggregationPrefillMixin:
                 start_idx,
                 end_idx,
             )
+        if self._sendkv_fake_transfer(req):
+            # FakeKVSender.send only counts pages; drive the same accounting
+            # from token math instead of gathering req_to_token rows to host.
+            # curr_idx must reach num_pages for poll() to conclude, and the
+            # last chunk must land exactly at num_pages (it is the equality
+            # poll checks), so the final call closes any residual gap.
+            total_pages = kv_to_page_num(
+                transfer_input_len - req.disagg_decode_prefix_len, page_size
+            )
+            new_idx = min(
+                req.disagg_kv_sender.curr_idx
+                + (end_idx - start_idx) // page_size,
+                total_pages,
+            )
+            if last_chunk and new_idx < total_pages:
+                new_idx = total_pages
+            req.disagg_kv_sender.curr_idx = new_idx
+            req.start_send_idx = end_idx
+            if last_chunk:
+                self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+            else:
+                self.disagg_prefill_pending_chunk_rids.add(req.rid)
             return
 
         state_indices: Optional[List] = None
@@ -1415,6 +1466,23 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
+        # The page-index D2H runs on a side stream, not the schedule stream:
+        # send_kv runs in process_batch_result behind the WAR barrier, so a
+        # pageable .cpu() there blocks until the in-flight forward drains
+        # (measured up to 61.8ms per call). This lane only waits on
+        # prep_done_event (recorded after this batch's prep writes, before the
+        # barrier), so the sync below ends once its own gather completes.
+        gather_stream = None
+        if (
+            self.enable_overlap
+            and self.swa_copy_stream is not None
+            and not self._sendkv_gather_live
+        ):
+            gather_stream = self.swa_copy_stream
+            gather_stream.wait_event(self.prep_done_event)
+            self._sendkv_gather_done = self.device_module.Event()
+            self._sendkv_gather_live = True
+
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -1427,12 +1495,34 @@ class SchedulerDisaggregationPrefillMixin:
                     kv_indices
                 )
             )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+            if gather_stream is not None:
+                num_pages = kv_to_page_num(kv_indices.numel(), page_size)
+                host_buf = self._sendkv_pinned_pages(num_pages, kv_indices)
+                with self.device_module.stream(gather_stream):
+                    page_indices = kv_to_page_indices_pinned(
+                        kv_indices,
+                        page_size,
+                        stream=gather_stream,
+                        host_buf=host_buf,
+                    )
+            else:
+                page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
                 len(page_indices), segment_is_last
             ):
                 continue
+            if gather_stream is not None:
+                # The pinned view is only valid once the side-stream D2H
+                # completes; the record+sync below fences every segment's copy.
+                with self.device_module.stream(gather_stream):
+                    self._sendkv_gather_done.record()
+                self._sendkv_gather_done.synchronize()
+                gather_stream = None
+                self._sendkv_gather_live = False
+                # Snapshot before send(): the transfer queue keeps the ndarray
+                # beyond this call, but the pinned buffer is reused next call.
+                page_indices = page_indices.copy()
             req.disagg_kv_sender.send(
                 page_indices,
                 state_indices if segment_is_last else None,
