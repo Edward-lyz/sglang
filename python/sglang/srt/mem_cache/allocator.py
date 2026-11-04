@@ -738,13 +738,31 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
+            free_page_indices = free_index[:: self.page_size] // self.page_size
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
         else:
             self.free_group.append(free_index)
+
+        if self.debug_mode:
+            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+
+    def free_group_end(self):
+        self.is_not_in_free_group = True
+        if not self.free_group:
+            return
+
+        free_index = torch.cat(self.free_group)
+        self.free_group = []
+        # Concatenated segments may end with partial pages, so the result is no
+        # longer page-aligned and strided slicing in free() would skip pages.
+        free_page_indices = torch.unique(free_index // self.page_size)
+        if self.need_sort:
+            self.release_pages = torch.cat((free_page_indices, self.release_pages))
+        else:
+            self.free_pages = torch.cat((free_page_indices, self.free_pages))
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)

@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     alloc_extend_naive,
 )
@@ -149,3 +150,6 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+
+    # NPU free() already uses torch.unique, so grouped frees can go through it.
+    free_group_end = BaseTokenToKVPoolAllocator.free_group_end
