@@ -663,6 +663,8 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    disaggregation_zmq_ports: Optional[List[int]] = None
+    disaggregation_zmq_max_sockets: int = 3000
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -2487,6 +2489,45 @@ class ServerArgs:
             )
 
     def _handle_pd_disaggregation(self):
+        # Parse disaggregation_zmq_ports from string to List[int]
+        if self.disaggregation_zmq_ports is not None:
+            raw = self.disaggregation_zmq_ports
+            if isinstance(raw, str):
+                ports = []
+                for token in raw.split(","):
+                    token = token.strip()
+                    if "-" in token:
+                        parts = token.split("-")
+                        if len(parts) != 2:
+                            raise ValueError(
+                                f"Invalid port range format: '{token}'. Expected 'start-end'."
+                            )
+                        start, end = int(parts[0]), int(parts[1])
+                        if start > end:
+                            raise ValueError(
+                                f"Invalid port range: start ({start}) > end ({end}). "
+                                f"Expected 'start-end' where start <= end."
+                            )
+                        ports.extend(range(start, end + 1))
+                    else:
+                        ports.append(int(token))
+                self.disaggregation_zmq_ports = ports
+
+            if len(self.disaggregation_zmq_ports) == 0:
+                raise ValueError(
+                    "--disaggregation-zmq-ports resulted in an empty port list."
+                )
+
+            if self.disaggregation_mode not in ("prefill", "decode"):
+                raise ValueError(
+                    "--disaggregation-zmq-ports can only be used with --disaggregation-mode prefill or decode"
+                )
+
+            if len(self.disaggregation_zmq_ports) != len(
+                set(self.disaggregation_zmq_ports)
+            ):
+                raise ValueError("Duplicate ports in --disaggregation-zmq-ports.")
+
         if self.disaggregation_mode == "decode":
             assert (
                 self.disaggregation_decode_tp is None
@@ -2649,6 +2690,7 @@ class ServerArgs:
                 "Please disable --enable-asradix-cache for decode (D) instances."
             )
 
+        if self.enable_asradix_cache:
             if self.page_size <= 1:
                 raise ValueError(
                     "AS KV R/W requires page_size > 1. "
@@ -4864,6 +4906,20 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--disaggregation-zmq-ports",
+            type=str,
+            default=None,
+            help="Fixed ZMQ port list for KV Manager ranks on this node (Prefill and Decode). "
+            "Supports range format '30001-30008' or comma-separated '30001,30002,30003'. "
+            "Port at index i is assigned to the rank running on GPU i.",
+        )
+        parser.add_argument(
+            "--disaggregation-zmq-max-sockets",
+            type=int,
+            default=ServerArgs.disaggregation_zmq_max_sockets,
+            help="Max number of ZMQ sockets per context for KV transfer. Default is 3000.",
         )
 
         # Encode prefill disaggregation

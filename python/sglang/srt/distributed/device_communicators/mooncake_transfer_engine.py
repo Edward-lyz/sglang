@@ -233,6 +233,7 @@ class MooncakeTransferEngine:
                 session_id, buffers, peer_buffer_addresses, lengths
             )
         except Exception:
+            logger.exception("Failed to batch transfer sync write data.")
             ret = -1
             if not hasattr(self.engine, "batch_transfer_sync_write"):
                 raise RuntimeError(

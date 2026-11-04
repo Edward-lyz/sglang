@@ -1474,23 +1474,39 @@ def get_zmq_socket_on_host(
     context: zmq.Context,
     socket_type: zmq.SocketType,
     host: Optional[str] = None,
+    port: Union[int, Tuple[int, int], None] = None,
 ) -> Tuple[int, zmq.Socket]:
     """Create and configure a ZeroMQ socket.
 
     Args:
         context: ZeroMQ context to create the socket from.
         socket_type: Type of ZeroMQ socket to create.
-        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
+        host: Optional host to bind/connect to, without "tcp://" prefix.
+              If None, binds to "tcp://*".
+        port: Port configuration:
+              - int: bind to this fixed port
+              - (min, max): bind to a random port in [min, max)
+              - None: bind to any random port
 
     Returns:
-        Tuple of (port, socket) where port is the randomly assigned TCP port.
+        Tuple of (port, socket) where port is the assigned TCP port.
     """
     socket = context.socket(socket_type)
     # Bind to random TCP port
     config_socket(socket, socket_type)
     bind_host = f"tcp://{host}" if host else "tcp://*"
-    port = socket.bind_to_random_port(bind_host)
-    return port, socket
+
+    if isinstance(port, int):
+        socket.bind(f"{bind_host}:{port}")
+        assigned_port = port
+    elif isinstance(port, tuple):
+        assigned_port = socket.bind_to_random_port(
+            bind_host, min_port=port[0], max_port=port[1]
+        )
+    else:
+        assigned_port = socket.bind_to_random_port(bind_host)
+
+    return assigned_port, socket
 
 
 def config_socket(socket, socket_type: zmq.SocketType):

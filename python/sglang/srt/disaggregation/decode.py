@@ -71,6 +71,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
+# export SGLANG_ENABLE_OPT_PREBUILT_BATCH=1
+OPT_PREBUILT_BATCH = get_int_env_var("SGLANG_ENABLE_OPT_PREBUILT_BATCH", False)
 
 
 class DecodeReqToTokenPool:
@@ -96,7 +98,6 @@ class DecodeReqToTokenPool:
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
-
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
@@ -330,6 +331,13 @@ class DecodePreallocQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+
+        # Configure receiver ZMQ MAX_SOCKETS from server_args
+        receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
+        max_sockets = self.scheduler.server_args.disaggregation_zmq_max_sockets
+        if hasattr(receiver_class, "configure_max_sockets"):
+            receiver_class.configure_max_sockets(max_sockets)
+
         return kv_manager
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
@@ -468,7 +476,7 @@ class DecodePreallocQueue:
         self._update_handshake_waiters(rids_to_check)
 
         failed_reqs = []
-        preallocated_reqs = []
+        preallocated_reqs: List[DecodeRequest] = []
         indices_to_remove = set()
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
@@ -604,6 +612,7 @@ class DecodePreallocQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+
         return preallocated_reqs, failed_reqs
 
     @property
@@ -700,6 +709,24 @@ class DecodePreallocQueue:
         return kv_loc
 
 
+@dataclass
+class QuarantinedKV:
+    """KV pages of an aborted room a prefill rank may still be writing into.
+
+    Holding them is the actual safety mechanism: the
+    pages stay out of the free list until every notified prefill rank has acked,
+    so a late one-sided RDMA write cannot land on memory that has meanwhile been
+    reallocated to an innocent request. The deadline is the fallback for a
+    prefill instance that dies before acking.
+    """
+
+    req: Req
+    metadata_buffer_index: int
+    kv_receiver: BaseKVReceiver
+    quarantined_at: float
+    deadline: float
+
+
 class DecodeTransferQueue:
     """
     Store the requests that is polling kv
@@ -722,6 +749,71 @@ class DecodeTransferQueue:
         self.scheduler = scheduler
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
+        self.quarantine: List[QuarantinedKV] = []
+
+    def _quarantine_timeout(self, kv_receiver: BaseKVReceiver) -> float:
+        kv_mgr = getattr(kv_receiver, "kv_mgr", None)
+        return float(getattr(kv_mgr, "abort_quarantine_timeout", 60.0))
+
+    def _release_quarantined(self, entry: QuarantinedKV) -> None:
+        release_kv_cache(entry.req, self.tree_cache, is_insert=False)
+        self.req_to_metadata_buffer_idx_allocator.free(entry.metadata_buffer_index)
+        discard = getattr(entry.kv_receiver, "discard_abort_ack_state", None)
+        if discard is not None:
+            discard()
+
+    def drain_quarantine(self) -> None:
+        """Release quarantined KV pages that are provably or presumably safe.
+
+        Two triggers: every notified prefill
+        rank acked (the closed loop), or the deadline passed (the fallback, which
+        is what covers a dead or hung prefill instance). The deadline is the
+        residual risk window and the reason this is a probability reduction
+        rather than a proof.
+        """
+        if not self.quarantine:
+            return
+
+        now = time.perf_counter()
+        still_held: List[QuarantinedKV] = []
+        for entry in self.quarantine:
+            safe = getattr(entry.kv_receiver, "is_kv_safe_to_release", None)
+            if safe is not None and safe():
+                self._release_quarantined(entry)
+                continue
+            if now >= entry.deadline:
+                logger.warning(
+                    "Releasing quarantined KV cache of request %s "
+                    "(bootstrap_room=%s) without a full ABORT_ACK quorum after "
+                    "%.1fs. The prefill side is either dead or lost the "
+                    "notification; a late RDMA write could still corrupt these "
+                    "pages.",
+                    entry.req.rid,
+                    entry.req.bootstrap_room,
+                    now - entry.quarantined_at,
+                )
+                self._release_quarantined(entry)
+                continue
+            still_held.append(entry)
+
+        self.quarantine = still_held
+
+    def quarantine_kv(self, decode_req: DecodeRequest) -> None:
+        """Hold an aborted request's KV pages instead of freeing them now."""
+        now = time.perf_counter()
+        self.quarantine.append(
+            QuarantinedKV(
+                req=decode_req.req,
+                metadata_buffer_index=decode_req.metadata_buffer_index,
+                kv_receiver=decode_req.kv_receiver,
+                quarantined_at=now,
+                deadline=now + self._quarantine_timeout(decode_req.kv_receiver),
+            )
+        )
+
+    def num_quarantined(self) -> int:
+        """Return the number of quarantined requests."""
+        return len(self.quarantine)
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -781,7 +873,7 @@ class DecodeTransferQueue:
             prepare_abort(
                 decode_req.req,
                 "Metadata corruption detected - bootstrap_room mismatch",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                status_code=HTTPStatus.REQUEST_TIMEOUT,
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
@@ -820,19 +912,36 @@ class DecodeTransferQueue:
         return True
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+        self.drain_quarantine()
         if not self.queue:
             return []
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
 
-        transferred_reqs = []
+        transferred_reqs: List[Req] = []
+        failed_reqs: List[Req] = []
         indices_to_remove = set()
+        quarantined_indices = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                refresh_registration = getattr(
+                    decode_req.kv_receiver, "refresh_registration", None
+                )
+                if refresh_registration is not None:
+                    try:
+                        refresh_registration()
+                    except Exception:
+                        logger.exception(
+                            "Mooncake registration refresh failed after decode transfer failure: "
+                            "rank=%s rid=%s bootstrap_room=%s",
+                            self.tp_rank,
+                            decode_req.req.rid,
+                            decode_req.req.bootstrap_room,
+                        )
                 try:
                     decode_req.kv_receiver.failure_exception()
                 except Exception as e:
@@ -841,14 +950,27 @@ class DecodeTransferQueue:
                 prepare_abort(
                     decode_req.req,
                     error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status_code=HTTPStatus.REQUEST_TIMEOUT,
                 )
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                # The client gets its 408 now either way; only the memory may be
+                # held back. If we told a prefill rank to abort and it has not
+                # confirmed quiescence yet, freeing the pages here would let a
+                # late one-sided RDMA write corrupt whichever request picks them
+                # up next.
+                safe_to_release = getattr(
+                    decode_req.kv_receiver, "is_kv_safe_to_release", None
+                )
+                if safe_to_release is not None and not safe_to_release():
+                    self.quarantine_kv(decode_req)
+                    quarantined_indices.add(i)
+                else:
+                    # release pre-allocated kv cache, but don't insert into the tree since it's failed
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
+                failed_reqs.append(decode_req.req)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
@@ -881,6 +1003,11 @@ class DecodeTransferQueue:
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
             self.queue[i].req.add_latency(RequestStage.DECODE_TRANSFERRED)
+            if i in quarantined_indices:
+                # The slot travels with the quarantined entry and is freed by
+                # drain_quarantine; freeing it here would hand it to another
+                # request while a prefill rank may still write the aux buffer.
+                continue
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -970,31 +1097,57 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
         """Create fake completed prefill if possible and merge with running batch"""
-        # Merge the prefill batch into the running batch
-        last_batch = self.last_batch
-        if last_batch and last_batch.forward_mode.is_prebuilt():
-            # chunked prefill doesn't happen in decode instance.
-            assert self.chunked_req is None
-            # Filter finished batches.
-            last_batch.filter_batch()
-            if not last_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = last_batch
-                else:
-                    # merge running_batch with prefill batch
-                    self.running_batch.merge_batch(last_batch)
+        if OPT_PREBUILT_BATCH:
+            # Optimized the decode processing and prebuilt processing flow.
+            # The decode stage is significantly affected by prebuilt processing under large batch sizes.
+            # The specific optimization logic is as follows:
+            # when encountering prebuilt data, perform output processing first,
+            # and then add it to the running_batch,
+            # eliminating the idle processing logic caused by prebuilt data.
+            new_prebuilt_batch = self.get_new_prebuilt_batch()
+            if new_prebuilt_batch:
+                assert self.chunked_req is None
+                self.process_batch_result_prebuilt(new_prebuilt_batch)
+                # Filter finished batches.
+                new_prebuilt_batch.filter_batch()
+                if not new_prebuilt_batch.is_empty():
+                    if self.running_batch.is_empty():
+                        self.running_batch = new_prebuilt_batch
+                    else:
+                        # merge running_batch with prefill batch
+                        self.running_batch.merge_batch(new_prebuilt_batch)
 
-        new_prebuilt_batch = self.get_new_prebuilt_batch()
-
-        ret: Optional[ScheduleBatch] = None
-        if new_prebuilt_batch:
-            ret = new_prebuilt_batch
-        else:
+            ret: Optional[ScheduleBatch] = None
             if self.running_batch.is_empty():
                 ret = None
             else:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
+        else:
+            # Merge the prefill batch into the running batch
+            last_batch = self.last_batch
+            if last_batch and last_batch.forward_mode.is_prebuilt():
+                # chunked prefill doesn't happen in decode instance.
+                assert self.chunked_req is None
+                # Filter finished batches.
+                last_batch.filter_batch()
+                if not last_batch.is_empty():
+                    if self.running_batch.is_empty():
+                        self.running_batch = last_batch
+                    else:
+                        # merge running_batch with prefill batch
+                        self.running_batch.merge_batch(last_batch)
+
+            new_prebuilt_batch = self.get_new_prebuilt_batch()
+            ret: Optional[ScheduleBatch] = None
+            if new_prebuilt_batch:
+                ret = new_prebuilt_batch
+            else:
+                if self.running_batch.is_empty():
+                    ret = None
+                else:
+                    self.running_batch = self.update_running_batch(self.running_batch)
+                    ret = self.running_batch if not self.running_batch.is_empty() else None
 
         # 1. decode + None -> decode + idle
         # 2. decode + prebuilt -> decode + idle (idle forward, prebuilt returns)

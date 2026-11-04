@@ -27,7 +27,8 @@ from typing import TYPE_CHECKING, List, Optional, Type
 
 import torch
 
-from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
+from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -134,7 +135,7 @@ class PrefillBootstrapQueue:
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
 
-    def _init_kv_manager(self) -> BaseKVManager:
+    def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
@@ -197,10 +198,10 @@ class PrefillBootstrapQueue:
             kv_args.state_item_lens = []
             kv_args.state_type = "none"
 
-        kv_manager_class: Type[BaseKVManager] = get_kv_class(
+        kv_manager_class: Type[CommonKVManager] = get_kv_class(
             self.transfer_backend, KVClassType.MANAGER
         )
-        kv_manager: BaseKVManager = kv_manager_class(
+        kv_manager: CommonKVManager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
@@ -262,8 +263,8 @@ class PrefillBootstrapQueue:
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
 
-        bootstrapped_reqs = []
-        failed_reqs = []
+        bootstrapped_reqs: List[Req] = []
+        failed_reqs: List[Req] = []
         indices_to_remove = set()
 
         if len(self.queue) == 0:
@@ -292,7 +293,7 @@ class PrefillBootstrapQueue:
                     error_message += f" with exception {e}"
                 logger.error(error_message)
                 prepare_abort(
-                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                    req, error_message, status_code=HTTPStatus.REQUEST_TIMEOUT
                 )
                 self.scheduler.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
@@ -465,10 +466,13 @@ class SchedulerDisaggregationPrefillMixin:
                     logits_output.input_token_logprobs.tolist()
                 )
 
+
+        completed_req_ids: List[str] = []
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
             if req.is_chunked <= 0:
+                completed_req_ids.append(req.rid)
                 if req.time_stats.prefill_finished_ts == 0.0:
                     req.time_stats.prefill_finished_ts = time.time()
 
@@ -516,7 +520,7 @@ class SchedulerDisaggregationPrefillMixin:
                         prepare_abort(
                             req,
                             error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                            status_code=HTTPStatus.REQUEST_TIMEOUT,
                         )
                     req.grammar.finished = req.finished()
             else:
@@ -545,6 +549,25 @@ class SchedulerDisaggregationPrefillMixin:
                     RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
                 )
 
+
+        # Stream output immediately after KV transfer initiated (don't wait for poll).
+        # This allows P instance's HTTP response to complete early, so the Router
+        # can start forwarding D's stream to the user sooner.
+        # KV cache is protected by radix cache lock (cache_unfinished_req ref count)
+        # and will be released later in process_disagg_prefill_inflight_queue().
+        stream_reqs = [
+            req
+            for req in batch.reqs
+            if req.is_chunked <= 0 and req.finished_reason is None
+        ]
+        for req in stream_reqs:
+            req.finished_reason = FINISH_LENGTH(length=0)
+        if stream_reqs:
+            self.stream_output(
+                stream_reqs,
+                any(req.return_logprob for req in stream_reqs),
+                None,
+            )
         self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
@@ -557,7 +580,7 @@ class SchedulerDisaggregationPrefillMixin:
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
-        done_reqs = []
+        done_reqs: List[Req] = []
 
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
@@ -579,7 +602,8 @@ class SchedulerDisaggregationPrefillMixin:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
-                req.finished_reason = FINISH_LENGTH(length=0)
+                # finished_reason and stream_output already handled in
+                # process_batch_result_disagg_prefill() right after send_kv_chunk.
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
                     req.disagg_kv_sender.clear()
@@ -593,7 +617,7 @@ class SchedulerDisaggregationPrefillMixin:
                 logger.warning(error_message)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 prepare_abort(
-                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                    req, error_message, status_code=HTTPStatus.REQUEST_TIMEOUT
                 )
                 done_reqs.append(req)
                 if self.enable_metrics:
@@ -601,6 +625,9 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 assert False, f"Unexpected polling state {poll=}"
 
+        
+        finish_times = self.disagg_prefill_bootstrap_queue.kv_manager.transfer_finish_times
+        now = time.perf_counter()
         for req in done_reqs:
             req.time_stats.completion_time = time.perf_counter()
 

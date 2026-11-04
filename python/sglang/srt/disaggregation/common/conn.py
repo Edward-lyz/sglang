@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import socket
 import threading
 from functools import cache
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, TypeAlias, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -39,6 +40,38 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+BootstrapRoomType: TypeAlias = int
+
+# A ZMQ PUSH socket blocks in send() whenever it has no usable peer pipe: the
+# peer died, never came back, or its queue hit the send high-water mark. These
+# bootstrap/notification sends run on the decode scheduler event loop and on
+# prefill transfer_worker threads, so an unbounded send lets a single broken peer
+# freeze an entire instance with no error and no watchdog trip. Bound them and
+# let each caller fail only the affected request.
+DISAGG_SEND_TIMEOUT_MS = int(os.getenv("SGLANG_DISAGGREGATION_SEND_TIMEOUT_MS", "2000"))
+DISAGG_SEND_HWM = int(os.getenv("SGLANG_DISAGGREGATION_SEND_HWM", "1024"))
+
+# How long to stop sending to a set of peer ranks after a send to them timed out.
+# Bounding the send is not enough on its own: both registration paths run on the
+# decode scheduler loop and are driven per request, so a dead prefill would cost
+# one SNDTIMEO per request and quietly throttle the engine to a crawl instead of
+# freezing it outright -- harder to spot, because health checks still pass.
+DISAGG_SEND_COOLDOWN_S = float(
+    os.getenv(
+        "SGLANG_DISAGGREGATION_SEND_COOLDOWN_S",
+        str(max(5.0, 2 * DISAGG_SEND_TIMEOUT_MS / 1000)),
+    )
+)
+
+
+def configure_bounded_push_socket(sock: zmq.Socket) -> zmq.Socket:
+    """Apply the bounded-send options every disaggregation PUSH socket needs."""
+    sock.setsockopt(zmq.SNDTIMEO, DISAGG_SEND_TIMEOUT_MS)
+    sock.setsockopt(zmq.SNDHWM, DISAGG_SEND_HWM)
+    # Never let an undeliverable queued message hold up process teardown.
+    sock.setsockopt(zmq.LINGER, 0)
+    return sock
 
 
 class CommonKVManager(BaseKVManager):
@@ -76,12 +109,33 @@ class CommonKVManager(BaseKVManager):
         # bind zmq socket
         context = zmq.Context()
         zmq_bind_host = maybe_wrap_ipv6_address(self.local_ip)
-        self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            context, zmq.PULL, host=zmq_bind_host
-        )
-        logger.debug(f"kv manager bind to {zmq_bind_host}:{self.rank_port}")
 
-        self.request_status: Dict[int, KVPoll] = {}
+        zmq_port = None
+        if server_args.disaggregation_zmq_ports is not None:
+            port_index = self.kv_args.gpu_id
+            ports = server_args.disaggregation_zmq_ports
+            if port_index >= len(ports):
+                raise ValueError(
+                    f"gpu_id {port_index} exceeds the number of specified ports ({len(ports)}). "
+                    f"Provide at least {port_index + 1} ports via --disaggregation-zmq-ports."
+                )
+            zmq_port = ports[port_index]
+        else:
+            zmq_port = (30000, 32768)
+
+        self.rank_port, self.server_socket = get_zmq_socket_on_host(
+            context,
+            zmq.PULL,
+            host=zmq_bind_host,
+            port=zmq_port,
+        )
+        port_type = "fixed" if isinstance(zmq_port, int) else "random"
+        logger.info(
+            f"kv manager bind to {zmq_bind_host}:{self.rank_port} ({port_type} port)"
+        )
+
+        self.request_status: Dict[BootstrapRoomType, KVPoll] = {}
+        self.transfer_finish_times: Dict[BootstrapRoomType, float] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._register_to_bootstrap()
@@ -135,7 +189,7 @@ class CommonKVManager(BaseKVManager):
         }
 
         try:
-            response = requests.put(url, json=payload, timeout=5)
+            response = requests.put(url, json=payload, timeout=(2, 3))
             if response.status_code == 200:
                 logger.debug("Prefill successfully registered to bootstrap server.")
             else:
@@ -152,6 +206,7 @@ class CommonKVManager(BaseKVManager):
         socket = zmq.Context().socket(zmq.PUSH)
         if is_ipv6:
             socket.setsockopt(zmq.IPV6, 1)
+        configure_bounded_push_socket(socket)
         socket.connect(endpoint)
         return socket
 
@@ -205,7 +260,7 @@ class CommonKVManager(BaseKVManager):
 class CommonKVSender(BaseKVSender):
     def __init__(
         self,
-        mgr: BaseKVManager,
+        mgr: CommonKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
         dest_tp_ranks: List[int],
@@ -242,6 +297,12 @@ class CommonKVReceiver(BaseKVReceiver):
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()
+
+    @classmethod
+    def configure_max_sockets(cls, max_sockets: int):
+        """Configure the ZMQ context MAX_SOCKETS for this receiver class."""
+        cls._ctx.set(zmq.MAX_SOCKETS, max_sockets)
+        logger.info(f"{cls.__name__} ZMQ Context MAX_SOCKETS set to {max_sockets}")
 
     def __init__(
         self,
@@ -428,10 +489,12 @@ class CommonKVReceiver(BaseKVReceiver):
                         return
 
             self.bootstrap_infos = bootstrap_infos
-            self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
 
             # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
             self._register_kv_args()
+
+            # Only cache after successful registration to avoid poisoned entries
+            self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
         else:
             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
@@ -443,7 +506,7 @@ class CommonKVReceiver(BaseKVReceiver):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}"
-            response = requests.get(url, timeout=5)
+            response = requests.get(url, timeout=(2, 3))
             if response.status_code == 200:
                 bootstrap_info = response.json()
                 return bootstrap_info
@@ -462,7 +525,7 @@ class CommonKVReceiver(BaseKVReceiver):
         """Fetch the prefill parallel info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
-            response = requests.get(url)
+            response = requests.get(url, timeout=(2, 3))
             if response.status_code == 200:
                 prefill_parallel_info = response.json()
                 return (
@@ -484,9 +547,15 @@ class CommonKVReceiver(BaseKVReceiver):
     def _connect(cls, endpoint: str, is_ipv6: bool = False):
         with cls._global_lock:
             if endpoint not in cls._socket_cache:
+                logger.info(
+                    f"Creating new ZMQ PUSH socket for endpoint {endpoint}, "
+                    f"current _socket_cache size: {len(cls._socket_cache)}, "
+                    f"ZMQ MAX_SOCKETS: {cls._ctx.get(zmq.MAX_SOCKETS)}"
+                )
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
+                configure_bounded_push_socket(sock)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()

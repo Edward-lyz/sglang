@@ -1,23 +1,24 @@
 import threading
 from collections import deque
-from typing import List, Tuple
+from typing import List, Tuple, TypeVar, Generic
 
 import numpy as np
 import numpy.typing as npt
 
+_T = TypeVar("_T")
 
-class FastQueue:
+class FastQueue(Generic[_T]):
     def __init__(self):
-        self._buf = deque()
+        self._buf: deque[_T] = deque()
         self._cond = threading.Condition()
 
-    def put(self, item):
+    def put(self, item: _T):
         with self._cond:
             self._buf.append(item)
             # wake up a thread of wait()
             self._cond.notify()
 
-    def get(self):
+    def get(self) -> _T:
         with self._cond:
             # if queue is empty  ,block until is notified()
             while not self._buf:
