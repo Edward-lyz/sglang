@@ -19,14 +19,16 @@ Life cycle of a request in the prefill server
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 from array import array
 from collections import deque
 from contextlib import contextmanager
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
+import msgspec
 import numpy as np
 import torch
 
@@ -88,6 +90,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import Range
 from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 if TYPE_CHECKING:
@@ -99,6 +102,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+class _DeferredChunkFinalize(msgspec.Struct, frozen=True):
+    """A chunked req's chunk whose finalize the threaded AHEAD loop deferred
+    (see SchedulerDisaggregationPrefillMixin.process_prefill_chunk)."""
+
+    req: Req
+    chunk_range: Range
+
+
+# Deferred work queued by AHEAD admission: chunk finalizes, plus plain
+# callables (a chunked abort's KV release) that always run in the serial window.
+DeferredFinalize = List[Union[_DeferredChunkFinalize, Callable[[], None]]]
 
 
 def should_force_retry(req: Req) -> bool:
@@ -606,8 +620,11 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
+        *,
+        deferred_finalize: Optional[DeferredFinalize] = None,
     ) -> NextBatchPlan:
-        self.process_pending_chunked_abort()
+        """``deferred_finalize``: see process_prefill_chunk (threaded AHEAD loop)."""
+        self.process_pending_chunked_abort(deferred_release=deferred_finalize)
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
@@ -615,7 +632,11 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.resolve_waiting_queue_bootstrap()
 
-        self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
+        self.process_prefill_chunk(
+            last_batch=last_batch,
+            running_batch=running_batch,
+            deferred_finalize=deferred_finalize,
+        )
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
@@ -722,8 +743,292 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+    def _ensure_prefill_fwd_thread(self: Scheduler) -> None:
+        """Lazily start the forward worker thread (never created when the
+        SGLANG_ENABLE_PREFILL_FWD_THREAD gate is off, so the base loop is
+        untouched)."""
+        if getattr(self, "_fwd_thread", None) is not None:
+            return
+        if (
+            torch.device(self.device).type == "cuda"
+            and self.token_to_kv_pool_allocator.page_size > 1
+        ):
+            from sglang.srt.mem_cache.allocator.paged import warmup_alloc_extend_kernel
+
+            warmup_alloc_extend_kernel(
+                self.device,
+                self.token_to_kv_pool_allocator.page_size,
+                self.max_running_requests,
+            )
+            logger.info(
+                "Prefill allocator kernels warmed: page_size=%d max_batch_size=%d",
+                self.token_to_kv_pool_allocator.page_size,
+                self.max_running_requests,
+            )
+        import queue as _queue
+        import threading as _threading
+
+        self._fwd_in_q: _queue.Queue = _queue.Queue(maxsize=1)
+        self._fwd_out_q: _queue.Queue = _queue.Queue(maxsize=1)
+        self._fwd_thread = _threading.Thread(
+            target=self._prefill_fwd_thread_main, name="prefill_fwd", daemon=True
+        )
+        self._fwd_thread.start()
+
     # Grad mode is thread-local: the worker does not inherit the scheduler's
     # no_grad, and the CP extend path calls model.model() past its no_grad.
+    @torch.no_grad()
+    def _prefill_fwd_thread_main(self: Scheduler) -> None:
+        """Worker thread: bind the CUDA device, then run each submitted forward.
+
+        Safe to run off the scheduler thread because a prefill forward is
+        read-only w.r.t. the KV allocator / radix tree / req_to_token (those
+        mutate only on the scheduler thread), and the forward's NCCL
+        device_group is a distinct communicator from the gloo cpu_group every
+        scheduler-thread collective uses -- so the two threads never share a
+        communicator. The WAR barrier is recorded here, right after the
+        forward's shared reads, so it captures them before any slot reuse.
+        """
+        self.device_module.set_device(self.ps.gpu_id)
+        batch_write_fence = envs.SGLANG_AS_SPAG_BATCH_WRITE_FENCE.get()
+        while True:
+            item = self._fwd_in_q.get()
+            if item is None:  # shutdown sentinel
+                return
+            batch, early_send_prefix, extend_input_len_per_req = item
+            events = None
+            if self._fwd_record_events:
+                events = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                events[0].record(self.forward_stream)
+            try:
+                # inference_mode skips autograd version/view bookkeeping per op; the
+                # eager prefill body is host launch bound at small chunks.
+                with torch.inference_mode(
+                    envs.SGLANG_OPT_PREFILL_FWD_INFERENCE_MODE.get()
+                ):
+                    result = self.run_batch(
+                        batch,
+                        early_send_prefix=early_send_prefix,
+                        extend_input_len_per_req=extend_input_len_per_req,
+                    )
+                if events is not None:
+                    events[1].record(self.forward_stream)
+                    self._fwd_events.append(events)
+                if batch_write_fence:
+                    batch.as_kv_ready_event = self.device_module.Event()
+                    batch.as_kv_ready_event.record(stream=self.forward_stream)
+                self._apply_war_barrier()
+                # Snapshot on the worker, after the forward's in-place SB edits
+                # and while only this thread owns the batch (the scheduler has
+                # moved on to the next admission), so the copy is race-free.
+                batch_copy = batch.copy()
+                self._fwd_out_q.put((result, batch_copy, None))
+            except BaseException as exc:  # relay to the scheduler thread
+                self._fwd_out_q.put((None, None, exc))
+
+    def _fwd_submit(
+        self: Scheduler,
+        batch,
+        *,
+        early_send_prefix: bool = True,
+        extend_input_len_per_req: Optional[List[int]] = None,
+    ) -> None:
+        """Hand a batch to the forward thread (non-blocking)."""
+        self._ensure_prefill_fwd_thread()
+        self._fwd_in_q.put((batch, early_send_prefix, extend_input_len_per_req))
+
+    def _fwd_collect(self: Scheduler):
+        """Block for the oldest submitted forward; return (result, batch_copy)
+        or re-raise its error."""
+        result, batch_copy, exc = self._fwd_out_q.get()
+        if exc is not None:
+            raise exc
+        if batch_copy.as_kv_ready_event is not None:
+            for req in batch_copy.reqs:
+                req.as_kv_ready_event = batch_copy.as_kv_ready_event
+        return result, batch_copy
+
+    def _run_batch_on_fwd_thread(self: Scheduler, batch):
+        """Zero-overlap (Step 1): submit then block immediately, so the worker
+        and scheduler never run concurrently -- proves the forward is correct
+        off-thread with no perf change. Returns (result, batch_copy)."""
+        self._fwd_submit(batch)
+        return self._fwd_collect()
+
+    def _snapshot_batch_for_forward(self: Scheduler, batch):
+        """Independent-enough snapshot so the forward thread can read it while
+        the scheduler admits the next batch (Step 2).
+
+        A shallow ScheduleBatch copy already isolates every field admission
+        rebinds out of place: get_next / filter_batch rebind the LIVE batch's
+        attrs (reqs, seq_lens, req_pool_indices, sampling_info, ...), and this
+        copy is a distinct object that keeps the old refs. Only the in-place
+        mutations the forward actually reads need explicit isolation:
+
+        - sampling_info: filter_batch mutates it in place. The forward-only copy
+          drops the penalizer orchestrator (overlap-mode sampling reads the acc_*
+          buffers), leaving the live sampling_info's orchestrator intact for
+          admission's filter.
+        - spec_info: filter_batch mutates it in place when present.
+
+        The reqs list itself is NOT copied per-element: the forward reads only
+        batch-level tensors (input_ids / seq_lens / out_cache_loc / ...), never a
+        req's fill_ids, so admission's in-place edits to a chunked req don't race
+        it. Crucially, process_batch_result must see the LIVE req objects here so
+        its inflight_middle_chunks decrement lands on the same req the admission
+        increment did -- isolating the chunked req into a throwaway copy leaked
+        that decrement and left the live req wedged as a middle chunk forever
+        (orphaned req_to_token slot + KV, and 1-token admission thereafter).
+        """
+        snap = copy.copy(batch)
+        if batch.sampling_info is not None:
+            snap.sampling_info = batch.sampling_info.copy_for_forward()
+        if batch.spec_info is not None:
+            snap.spec_info = copy.copy(batch.spec_info)
+        return snap
+
+    @torch.no_grad()
+    def event_loop_overlap_disagg_prefill_threaded(self: Scheduler) -> None:
+        """SGLANG_ENABLE_PREFILL_FWD_THREAD: run the forward on a worker thread.
+
+        AHEAD off (Step 1): zero-overlap validation -- submit and block.
+        AHEAD on (Step 2): admit the NEXT batch while the current forward is in
+        flight, so the loop-top retire/ingest/admission overlap the previous
+        forward. Safe on a prefill P instance (forward read-only w.r.t.
+        allocator/tree/req_to_token; NCCL group disjoint from the scheduler
+        thread's gloo collectives; read slots stay tree-locked until their
+        pipelined process_batch_result).
+        """
+        ahead = envs.SGLANG_PREFILL_FWD_THREAD_AHEAD.get()
+        self.result_queue = deque()
+        inflight = None  # live prev batch whose forward is on the worker (ahead)
+
+        while True:
+            self.retire_ascache_writes()
+            self.ingest_requests()
+            if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
+                continue
+            self.waiting_queue.extend(
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            )
+
+            # AHEAD: admission below runs while the previous forward may still be
+            # launching on the worker (no WAR barrier on schedule_stream yet), so
+            # the work that reads / frees that forward's in-flight KV (the
+            # chunked req's chunk finalize, a chunked abort's KV release) is
+            # queued here and run once the forward is collected.
+            deferred_finalize: Optional[DeferredFinalize] = (
+                [] if ahead else None
+            )
+            plan = self.get_next_disagg_prefill_batch_to_run(
+                running_batch=self.running_batch,
+                last_batch=self.last_batch,
+                deferred_finalize=deferred_finalize,
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
+            self.cur_batch_for_debug = batch
+
+            if not ahead:
+                if batch:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(batch)
+                    batch_result, batch_copy = self._run_batch_on_fwd_thread(batch)
+                    self.result_queue.append((batch_copy, batch_result))
+                else:
+                    batch_result = None
+                if self.last_batch:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
+                elif batch is None:
+                    self.on_idle()
+                self.process_disagg_prefill_inflight_queue()
+                self.launch_batch_sample_if_needed(batch_result, batch)
+                self.last_batch = batch
+                continue
+
+            # Step 2: admit-ahead. This iteration's retire / ingest / get_next
+            # above already ran WHILE the previous batch's forward was in flight;
+            # what of it touches that forward's in-flight KV was deferred (see
+            # deferred_finalize) and runs right after the collect below.
+            # Only sampling must run with the worker idle: it uses forward_stream
+            # and future_map, which run_batch (worker) uses too. So: collect the
+            # previous forward, sample it, launch this batch's forward, and only
+            # THEN process the previous result, which overlaps the new forward
+            # (the base loop orders run_batch(N) before process(N-1) the same
+            # way). process touches neither forward_stream nor future_map; its
+            # radix inserts, SWA staging (side stream) and KV sends hit the
+            # previous batch's reqs, never what the new forward reads. Admission
+            # touches neither structure either (the future_map.stash paths are
+            # gated to non-overlap / mixed-decode, which never fire here).
+            prev_result = None
+            if inflight is not None:
+                prev_snap = inflight
+                prev_result, prev_result_copy = self._fwd_collect()
+                # prev_snap carries an independent sampling_info, so sampling the
+                # previous batch is correct even though get_next above already
+                # filtered its live batch.
+                self.launch_batch_sample_if_needed(prev_result, prev_snap)
+
+            # The previous forward is now fully enqueued and its WAR barrier is
+            # on schedule_stream (the worker applies it before handing back the
+            # result), and the worker is idle until the submit below. Work run
+            # here is ordered after the previous forward on the GPU and lands
+            # before the next forward reads req_to_token -- what the base loop
+            # gets from running admission after run_batch + barrier. Only a
+            # chunk finalize that would dedup-repoint the chunked req's row needs
+            # that last property; the rest overlaps the next forward's launch.
+            overlap_finalize = self._run_serial_deferred_finalize(deferred_finalize)
+
+            if batch:
+                if self.enable_staging:
+                    self.maybe_prefetch_staging_for_batch(batch)
+                snap = self._snapshot_batch_for_forward(batch)
+                # Early-send the cached prefix here rather than inside run_batch,
+                # so the forward thread never races the send_kv_chunk that
+                # process_batch_result below issues for a continuing chunked req.
+                for req in snap.reqs:
+                    self.maybe_send_cached_prefix_chunk(req)
+                self._fwd_submit(
+                    snap,
+                    early_send_prefix=False,
+                    # Read on this thread: the next admission may advance a
+                    # chunked req's extend_range while the worker is mid-run_batch.
+                    extend_input_len_per_req=self._snapshot_extend_input_lens(snap),
+                )
+                new_inflight = snap
+            else:
+                new_inflight = None
+
+            # Overlaps the forward just submitted; before process(prev) as in the
+            # base loop, whose admission finalizes the chunk first.
+            for item in overlap_finalize:
+                self._finalize_prefill_chunk(item.req, chunk_range=item.chunk_range)
+
+            if prev_result is not None:
+                # Worker's post-forward copy of the snapshot; finished reqs are
+                # the same objects, so KV-send / cache writes land on the real reqs.
+                self.process_batch_result(prev_result_copy, prev_result)
+            elif new_inflight is None:
+                self.on_idle()
+
+            # Drain KV transfers every iter (as the base loop does); pending
+            # sends must complete even when the pipeline momentarily has nothing
+            # in flight, or their requests never finish.
+            self.process_disagg_prefill_inflight_queue()
+
+            inflight = new_inflight
+            # Admission state only (no forward result); the next iter's
+            # get_next_batch must see this batch as last_batch.
+            self.last_batch = batch
+
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -1246,11 +1551,31 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         last_batch: Optional[ScheduleBatch],
         running_batch: ScheduleBatch,
+        *,
+        deferred_finalize: Optional[DeferredFinalize] = None,
     ) -> None:
+        """``deferred_finalize`` (threaded AHEAD loop only): instead of
+        finalizing the chunk the previous forward computed (SWA checkpoint
+        staging + tree insert / AttentionStore write / dedup / out-of-window SWA
+        free), queue it there. That forward may still be launching on the worker
+        with no WAR barrier yet, so those reads and frees of its in-flight KV
+        must wait until the caller has collected it."""
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
-            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            if deferred_finalize is not None:
+                deferred_finalize.append(
+                    _DeferredChunkFinalize(req=req, chunk_range=req.extend_range)
+                )
+                # The next chunk's admission needs the full computed prefix;
+                # take it from the req's own row (the tree insert that would
+                # normally provide it is deferred). The deferred finalize then
+                # repoints it exactly as cache_unfinished_req does in-line.
+                req.prefix_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, : req.extend_range.end
+                ].to(dtype=torch.int64, copy=True)
+            else:
+                self._finalize_prefill_chunk(req, chunk_range=req.extend_range)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
@@ -1284,6 +1609,88 @@ class SchedulerDisaggregationPrefillMixin:
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
+    def _run_serial_deferred_finalize(
+        self: Scheduler, deferred_finalize: DeferredFinalize
+    ) -> List[_DeferredChunkFinalize]:
+        """Run the deferred work that must land before the next forward is
+        submitted; return the chunk finalizes that may instead overlap it."""
+        overlap_finalize: List[_DeferredChunkFinalize] = []
+        for item in deferred_finalize:
+            if not isinstance(item, _DeferredChunkFinalize):
+                item()
+            elif self._chunk_finalize_keeps_row(
+                item.req, chunk_range=item.chunk_range
+            ):
+                overlap_finalize.append(item)
+            else:
+                self._finalize_prefill_chunk(item.req, chunk_range=item.chunk_range)
+        return overlap_finalize
+
+    def _chunk_finalize_keeps_row(self: Scheduler, req: Req, *, chunk_range) -> bool:
+        """Whether finalizing this chunk provably leaves the req's req_to_token
+        row and every slot in it in place, so it may run after the next forward
+        (which reads that row as its prefix) is submitted.
+
+        The only part of a chunk finalize that touches what the next forward
+        reads is the tree insert's dedup: where the inserted key overlaps
+        existing nodes past ``cache_protected_len``, the insert frees the req's
+        duplicate slots and the caller repoints its row at the tree's. So: walk
+        the tree read-only and require no overlap past ``cache_protected_len``
+        (an evicted node counts as overlap -- conservative). The rest of the
+        finalize is safe to overlap: SWA staging and the AttentionStore write
+        only read this chunk; the out-of-window SWA free stops a page below the
+        sliding window the next chunk attends. Nothing else mutates the tree
+        between this check and the finalize (scheduler thread only).
+
+        The unfiltered chunk key is a superset of what the insert uses (an SWA
+        branch insert only shortens it), so the check stays conservative.
+        """
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if req.skip_radix_cache_insert:
+            return True  # maybe_cache_unfinished_req inserts nothing
+        tree = self.tree_cache
+        if not isinstance(tree, UnifiedRadixCache):
+            return False
+        if tree.disable:
+            return True  # cache_unfinished_req only snapshots prefix_indices
+        if tree.tree_core.is_eagle or req.session is not None:
+            # Bigram keys / streaming-session commits: not mirrored here.
+            return False
+        key = RadixKey(
+            req.full_untruncated_fill_ids,
+            req.extra_key,
+            limit=chunk_range.end,
+            cache_salt=req.cache_salt,
+        ).page_aligned(tree.page_size)
+        overlap_len = tree.tree_core.peek_insert_overlap_len(key)
+        return overlap_len <= req.kv.cache_protected_len
+
+    def _finalize_prefill_chunk(self: Scheduler, req: Req, *, chunk_range) -> None:
+        """Commit the chunk of ``req`` ending at ``chunk_range.end``: stage its
+        SWA checkpoints, then insert it into the tree (which also submits the
+        AttentionStore write and frees out-of-window SWA).
+
+        Deferred (threaded AHEAD loop), this runs after the next chunk was
+        already admitted, so ``req.extend_range`` points one chunk ahead; both
+        callees size the committed prefix by ``get_fill_ids()``, so rewind the
+        range to the computed chunk for the duration. Safe even while the next
+        forward runs on the worker: the forward path reads no req's
+        extend_range (its per-req lengths are batch-level, and
+        extend_input_len_per_req is precomputed before submit).
+        """
+        live_range = req.extend_range
+        req.extend_range = chunk_range
+        try:
+            # Strictly before maybe_cache_unfinished_req: that call evicts SWA
+            # beyond pre_len - max(sliding_window, page_size), which is exactly the
+            # window these checkpoints need. The commit that follows submits them,
+            # because cache_unfinished_req runs the AttentionStore write path.
+            self.detect_and_may_copy_as_swa(req)
+            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+        finally:
+            req.extend_range = live_range
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():

@@ -1077,6 +1077,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         whole insert — which also keeps the walk's duplicate frees from running,
         as the declined request stays on its own pages.
         """
+        node, total_prefix_length = self._peek_insert_walk(key)
+        if node is self.root_node or node.rotation_base == rotation_base:
+            return None
+        return total_prefix_length, node
+
+    def peek_insert_overlap_len(self, key: RadixKey) -> int:
+        """Read-only: how many leading tokens of ``key`` an insert would walk
+        over existing nodes (evicted ones included). Mutates nothing -- no LRU
+        touch, no split -- so a caller can predict whether the insert would
+        dedup-free any of its value past ``prev_prefix_len``."""
+        _, total_prefix_length = self._peek_insert_walk(key)
+        return total_prefix_length
+
+    def _peek_insert_walk(self, key: RadixKey) -> tuple[UnifiedTreeNode, int]:
+        """Read-only mirror of ``_insert_walk_step``'s matching; returns the
+        deepest matched node and the matched length."""
         node = self.root_node
         total_prefix_length = 0
         while len(key) > 0:
@@ -1091,9 +1107,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if prefix_len < len(child.key):
                 # The walk would split here; the fragment inherits this base.
                 break
-        if node is self.root_node or node.rotation_base == rotation_base:
-            return None
-        return total_prefix_length, node
+        return node, total_prefix_length
 
     def resume_insert(self) -> InsertStepResult:
         """Continue the suspended insert after its step actions were executed."""

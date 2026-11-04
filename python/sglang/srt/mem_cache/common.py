@@ -55,11 +55,13 @@ def kv_to_page_indices_pinned(
     runs inside its context); completion is the caller's job -- record an event
     on ``stream`` after this returns and ``synchronize()`` it before reading.
     The caller-owned pinned ``host_buf`` must be at least
-    ``kv_indices.numel() // page_size`` elements; the returned view is only
+    ``ceil(kv_indices.numel() / page_size)`` elements; the returned view is only
     valid until the buffer is reused, and the consuming sender must snapshot
     it (np.copy / torch tensor) before the next call reuses the buffer.
     """
-    num_pages = kv_indices.numel() // page_size
+    # ceil: the strided slice below yields ceil(numel/page_size) rows for a
+    # ragged tail, so a floored num_pages would size-mismatch the copy_.
+    num_pages = (kv_indices.numel() + page_size - 1) // page_size
     dev_pages = (kv_indices[::page_size] // page_size).to(host_buf.dtype)
     host_buf[:num_pages].copy_(dev_pages, non_blocking=True)
     kv_indices.record_stream(stream)

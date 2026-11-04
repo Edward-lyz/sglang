@@ -507,6 +507,11 @@ class SamplingBatchInfo:
 
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
+        if self.penalizer_orchestrator is None:
+            # Already forward-copied: the penalties are in the acc_* buffers and
+            # the orchestrator was dropped. Idempotent so the prefill forward
+            # thread can re-isolate a sampling_info the scheduler already copied.
+            return dataclasses.replace(self)
         self.update_penalties()
         return dataclasses.replace(self, penalizer_orchestrator=None)
 
