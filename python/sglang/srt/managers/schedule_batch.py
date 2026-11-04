@@ -680,6 +680,7 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+
         self.trace_config: Optional[Dict[str, Any]] = trace_config
         self.to_trace_req: Optional[TraceReq] = self.build_trace_req()
         self.trace_info: Optional[Dict[str, Any]] = None
@@ -851,6 +852,7 @@ class Req(ReqDllmMixin):
 
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
+
     def build_trace_req(self):
         """Build TraceReq from trace_config at init time.
 

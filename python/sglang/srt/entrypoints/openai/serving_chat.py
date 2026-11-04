@@ -12,8 +12,9 @@ import jinja2
 import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from jsonschema import Draft202012Validator, SchemaError
-
+from sglang.srt.content_detection.config import DETECTION_CONFIG
+from sglang.srt.content_detection.pipeline import build_detection_pipeline
+from sglang.srt.content_detection.recorder import RequestContext, ChunkInfo
 from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -35,6 +36,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
+from sglang.srt.environ import envs
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -127,6 +129,10 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+
+        # Content detection pipeline
+        if DETECTION_CONFIG.enable_detection:
+            self.detection_pipeline = build_detection_pipeline(self.tokenizer_manager.server_args)
 
     def _handle_last_assistant_message(
         self,
@@ -691,6 +697,8 @@ class OpenAIServingChat(OpenAIServingBase):
         pending_output_token_ids = {}  # Accumulate token IDs, flush on SSE chunk emit
 
         #content detection
+        if DETECTION_CONFIG.enable_detection:
+            req_ctx = self._process_content_detection(request, adapted_request)
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -765,6 +773,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 stream_buffer = stream_buffers.get(index, "")
                 delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
+
+                if DETECTION_CONFIG.enable_detection:
+                    chunk_info = ChunkInfo(delta, pending_output_token_ids.get(index))
+                    await self.detection_pipeline.process(req_ctx, chunk_info)
 
                 # Handle reasoning content
                 # TODO(liyaolang): Reasoning content is parsed by upstream currently,
@@ -1245,6 +1257,25 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             return tool_call_id
 
+    def _process_content_detection(
+        self,
+        request: ChatCompletionRequest,
+        adapted_request: GenerateReqInput,
+    ) -> RequestContext:
+        custom_params = request.custom_params or {}
+        request_trace_config = getattr(request, "trace_config", None) or \
+            custom_params.get("trace_config", None) or {}
+        trace_config = DETECTION_CONFIG.build_trace_config()
+        trace_config.update(request_trace_config)
+        adapted_request.trace_config
+
+        req_ctx = RequestContext(
+            rid=request.rid,
+            tokenizer_manager=self.tokenizer_manager,
+            trace_config=trace_config,
+        )
+        return req_ctx
+
     def _process_tool_calls(
         self,
         text: str,
@@ -1382,7 +1413,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
-
+    
     def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
         """Counts the number of tool calls in the request's message history.
 

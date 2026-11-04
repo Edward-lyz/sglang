@@ -52,6 +52,7 @@ class SchedulerOutputProcessorMixin:
         trace_req = req.to_trace_req
         if trace_req.trigger == TraceTrigger.ON_FINISH:
             self._run_trace(trace_req, req)
+
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
         storage_backend_type = "none"
@@ -1203,6 +1204,7 @@ class SchedulerOutputProcessorMixin:
                         customized_info[k].append(v)
 
                 trace_infos.append(req.trace_info)
+
             if (
                 req.finished()
                 and self.attn_tp_rank == 0

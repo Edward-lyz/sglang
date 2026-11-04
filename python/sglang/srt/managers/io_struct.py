@@ -1684,6 +1684,8 @@ class AbortReq(BaseReq):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+
 class TraceType:
     """Trace action types.
     """
@@ -1695,11 +1697,15 @@ class TraceType:
     LOGPROBS = "logprobs"
     ALL = "all"
     AS_CACHE = "as_cache"
+
+
 class TraceTrigger:
     """When to trigger a trace action."""
 
     IMMEDIATE = "immediate"
     ON_FINISH = "on_finish"
+
+
 @dataclass
 class TraceReq(BaseReq):
     """Request to trigger KV cache or metadata tracing."""

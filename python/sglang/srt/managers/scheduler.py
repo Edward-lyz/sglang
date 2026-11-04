@@ -422,6 +422,7 @@ class Scheduler(
             tokenizer=self.tokenizer,
             disaggregation_mode=self.server_args.disaggregation_mode,
         )
+
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
 
@@ -645,6 +646,7 @@ class Scheduler(
         if envs.AIAK_ENABLE_MSIT_TRACE.get():
             from msit_llm.sglang import MsitLLMTracer
             self.msit_tracer = MsitLLMTracer(self.tp_worker.model_runner, envs, self.server_args)
+
         logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_model_worker done")
 
     def init_cache_with_memory_pool(self):
@@ -1768,6 +1770,7 @@ class Scheduler(
                 self.msit_tracer.configure_new_request(recv_req)
             else:
                 self.msit_tracer.disable_trace()
+
         # Create a new request
         if (
             recv_req.session_params is None
@@ -3333,6 +3336,7 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+
     def trace_request(self, recv_req: TraceReq):
         """Handle a trace request from the frontend.
 
@@ -3358,6 +3362,7 @@ class Scheduler(
             # Already stored in req.to_trace_req; _fire_pending_trace will pick it up
             return
         self._run_trace(trace_req, req)
+
     def _find_req_by_rid(self, rid: str) -> Optional[Req]:
         """Find a request by its rid across all queues."""
         reqs = list(self.running_batch.reqs) if self.running_batch else []
@@ -3368,6 +3373,7 @@ class Scheduler(
             if req.rid == rid:
                 return req
         return None
+
     def _run_trace(self, trace_req: TraceReq, req: Req):
         self.trace_manager.run_trace(trace_req, req)
 

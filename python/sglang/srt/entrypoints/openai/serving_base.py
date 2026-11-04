@@ -136,6 +136,7 @@ class OpenAIServingBase(ABC):
                 adapted_request.validation_time = validation_time
                 adapted_request.received_time = received_time
                 adapted_request.received_time_perf = received_time_perf
+            
             self._process_trace_config(request, adapted_request)
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
@@ -320,6 +321,7 @@ class OpenAIServingBase(ABC):
         if raw_request is None:
             return None
         return raw_request.headers.get("x-smg-routing-key")
+    
     @staticmethod
     def _serialize_trace_value(value: Any) -> Any:
         if hasattr(value, "model_dump"):
@@ -329,6 +331,7 @@ class OpenAIServingBase(ABC):
         if isinstance(value, dict):
             return {key: OpenAIServingBase._serialize_trace_value(item) for key, item in value.items()}
         return value
+
     def _build_trace_info(
         self,
         request: OpenAIServingRequest,
@@ -347,6 +350,7 @@ class OpenAIServingBase(ABC):
             trace_info = dict(meta_info["trace_info"])
 
         return trace_info
+
     def _process_trace_config(self, request, adapted_request):
         trace_config = request.trace_config
         if not trace_config:

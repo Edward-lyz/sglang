@@ -1620,6 +1620,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             return
         req = TraceReq(rid=rid)
         self.send_to_scheduler.send_pyobj(req)
+
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
@@ -1860,6 +1861,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 and recv_obj.trace_infos[i] is not None
             ):
                 meta_info["trace_info"] = recv_obj.trace_infos[i]
+
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
