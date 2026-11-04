@@ -474,6 +474,11 @@ class Envs:
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+    # GLM 5.2 / DeepSeek NSA fused ops
+    # Fuse the stable-TopK ragged index transform (topk_stable.py::
+    # transform_index_ragged_stable) 3 elementwise launches into one. Opt-in;
+    # CUDA int32 topk_indices path only.
+    SGLANG_OPT_USE_FUSED_RAGGED_INDEX_TRANSFORM = EnvBool(False)
     # fmt: on
 
     # EPD
