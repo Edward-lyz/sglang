@@ -1213,6 +1213,38 @@ class MQALayer(MqaAttentionBase):
             q, _ = self.wq_a(x)
         return self.q_norm(q)
 
+    def _mla_qnorm_mxfp8_enabled(self) -> bool:
+        # Gate for the fused q_a RMSNorm + wq_b-input MXFP8 swizzled quant (ops 56+58).
+        # Default OFF; only fires on CUDA when wq_b actually consumes a flashinfer
+        # cute-dsl 128x4 MXFP8 swizzled input (so a prequantized Mxfp8SwizzledInput
+        # is accepted and the in-wq_b quant is skipped). Otherwise stays inert.
+        return (
+            _is_cuda
+            and envs.SGLANG_FUSE_MLA_QNORM_MXFP8.get()
+            and getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
+            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+            and (
+                getattr(self.wq_b.quant_method, "use_mxfp8", False)
+                or getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
+            )
+        )
+    def _compute_q_a_maybe_fused(self, x, qkv_a=None):
+        # Returns (q_lora_normed_bf16, q_for_wqb). When the fusion is enabled and the
+        # shape is supported, q_for_wqb is a prequantized Mxfp8SwizzledInput and the
+        # normed bf16 is still returned for the indexer / other consumers; otherwise
+        # both are the same normed tensor (the exact unfused path).
+        if self._mla_qnorm_mxfp8_enabled():
+            q_raw = qkv_a[..., : self.q_lora_rank] if qkv_a is not None else self.wq_a(x)[0]
+            from sglang.kernels.ops.layernorm.mla_qnorm_mxfp8_fuse import (
+                fused_qnorm_mxfp8_swizzled_input,
+            )
+            fused = fused_qnorm_mxfp8_swizzled_input(
+                q_raw, self.q_norm.weight, self.q_norm.variance_epsilon
+            )
+            if fused is not None:
+                return fused  # (q_normed_bf16, Mxfp8SwizzledInput)
+        q_lora = self._compute_q_a(x, qkv_a=qkv_a)
+        return q_lora, q_lora
     def _compute_q_b(
         self,
         q: torch.Tensor,
@@ -1340,7 +1372,7 @@ class MQALayer(MqaAttentionBase):
             qkv_a, _ = self.wqkv_a(x_linear)
             qkv_a_ready = current_stream.record_event()
 
-        q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        q_lora, q_for_wqb = self._compute_q_a_maybe_fused(x_linear, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
 
         if self.indexer is not None:
@@ -1368,7 +1400,7 @@ class MQALayer(MqaAttentionBase):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_lora, positions, q_out)
+        q = self._compute_q_b(q_for_wqb, positions, q_out)
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
@@ -1416,12 +1448,12 @@ class MQALayer(MqaAttentionBase):
                 )
 
         stream_kv.wait_stream(current_stream)
-        q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        q_lora, q_for_wqb = self._compute_q_a_maybe_fused(x_linear, qkv_a=qkv_a)
         # NOTE: wait for the q_lora ready
         if self.indexer is not None:
             stream_sources.wait_stream(current_stream)
 
-        q = self._compute_q_b(q_lora, positions, q_out)
+        q = self._compute_q_b(q_for_wqb, positions, q_out)
         if self.indexer is not None:
             # Forked above, right after q_lora; recorded here, after the Q chain.
             with torch.cuda.stream(stream_sources):

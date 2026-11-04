@@ -1663,6 +1663,13 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    # Fuse the MLA q-path RMSNorm (op56 q_a_rmsnorm, q_lora_rank) + the wq_b input
+    # MXFP8 128x4-swizzled ue8m0 quantize (op58 q_proj_quant) into ONE Triton launch
+    # that emits the normed bf16 (for the indexer) plus Mxfp8SwizzledInput for the
+    # UNCHANGED flashinfer blockscaled wq_b GEMM. OFF by default: enable only after the
+    # fused path passes the live decode CUDA-graph boot gate on the target build
+    # (see record_kernel_opt/deepseekv4.1_flash_decode_kernel_norm_0923).
+    SGLANG_FUSE_MLA_QNORM_MXFP8 = EnvBool(False)
     # Tuned launch for the candidate-block visibility mask (_candidate_mask_kernel),
     # bit-exact, ~1.1x at bs256. OFF by default (must pass the live decode boot gate).
     SGLANG_FUSE_CANDIDATE_MASK_OPT = EnvBool(False)
