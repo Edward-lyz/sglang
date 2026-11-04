@@ -459,6 +459,26 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # PP: forward the *inherited* attn-res bank rows (residual [T, NB, H]) to the
+    # next stage before launching the local forward, so the cross-stage transfer
+    # overlaps the previous micro-batch instead of stalling in front of the next
+    # one. Bit-exact - the same bytes cross the wire, only earlier.
+    # PP0's value is broadcast over the pp group at scheduler start, so a pod
+    # that forgets to export this follows rank 0 instead of deadlocking on the
+    # resulting send/recv asymmetry; the disagreement is logged as a warning.
+    SGLANG_PP_EAGER_BANK_FORWARD = EnvBool(False)
+    # Receive the bank one loop iteration ahead on a dedicated stream, so the
+    # scheduler thread waits for it while the previous micro-batch's forward is
+    # still on the GPU rather than in front of the next one. The recv itself is
+    # blocking (its metadata goes over the gloo CPU group), so this trades
+    # scheduler-thread responsiveness and one message of deadlock margin for the
+    # removed stall, and keeps one extra bank buffer alive.
+    SGLANG_PP_EAGER_BANK_PREFETCH = EnvBool(True)
+    # Restrict the rewrite to these *sending* pp ranks (empty = every non-last).
+    SGLANG_PP_EAGER_BANK_RANKS = EnvStr("")
+    # Log a bit-sensitive digest of the proxy payload every N micro-batches.
+    # Debug only: the digest calls .item(), which synchronizes the device.
+    SGLANG_PP_EAGER_BANK_VERIFY = EnvInt(0)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)

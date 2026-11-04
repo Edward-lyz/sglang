@@ -38,7 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import get_device_module, is_xpu, print_warning_once
 
 logger = logging.getLogger(__name__)
 
@@ -578,6 +578,15 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        # SGLANG_PP_EAGER_BANK_FORWARD state
+        self._pp_bank_prefetch: deque = deque()
+        self._pp_bank_send_work: List[P2PWork] = []
+        self._pp_bank_rows_sent: Dict[int, Tuple[int, int]] = {}
+        self._pp_bank_recv_stream = None
+        # (mb_id, bank) taken ahead of this iteration's proxy recv
+        self._pp_bank_taken: Optional[Tuple[int, Any]] = None
+        self._pp_eager_bank_cfg_cache = None
+        self._pp_resolve_eager_bank_cfg()
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -1070,6 +1079,340 @@ class SchedulerPPMixin:
                     f"PP recv: expected {expected_kind}, got {received_kind}, stashing"
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
+
+    _PP_BANK_KIND = "pp_bank"
+
+    def _pp_eager_bank_cfg(self: Scheduler):
+        """(send_on, recv_on, prefetch), resolved once in init_pp_loop_state.
+
+        Never resolves lazily here: the resolution is collective, and an event
+        loop that reaches this without having gone through init_pp_loop_state
+        must not drag the group into an unmatched collective.
+        """
+        return getattr(self, "_pp_eager_bank_cfg_cache", None) or (False, False, False)
+
+    def _pp_resolve_eager_bank_cfg(self: Scheduler):
+        """Agree on the eager-bank config across the PP group, from PP0's env.
+
+        The rewrite is a two-sided protocol: `recv_on` says whether the
+        *previous* rank sends. Answering that from the local env is only correct
+        when every container exports the same values, and the hop where it
+        matters most -- the cross-node one, ~80% of the bank traffic -- is
+        exactly the hop whose two halves live in different pods. A pod whose
+        launch config disagrees would leave a send with no matching recv and
+        hang its peer inside _pp_commit_comm_work with no diagnostic, so take
+        the config from PP0 and log any disagreement instead.
+        """
+        local = (
+            bool(envs.SGLANG_PP_EAGER_BANK_FORWARD.get()),
+            envs.SGLANG_PP_EAGER_BANK_RANKS.get().strip(),
+            bool(envs.SGLANG_PP_EAGER_BANK_PREFETCH.get()),
+        )
+        agreed = local
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            gathered = [None] * torch.distributed.get_world_size(
+                self.pp_group.cpu_group
+            )
+            torch.distributed.all_gather_object(
+                gathered, local, group=self.pp_group.cpu_group
+            )
+            agreed = gathered[0]
+            if any(g != agreed for g in gathered):
+                logger.warning(
+                    "[PPEagerBank] launch config disagrees across PP ranks: "
+                    "(forward, ranks, prefetch) = %s; following PP0 %s. Fix the "
+                    "launch config so every pod exports the same "
+                    "SGLANG_PP_EAGER_BANK_* values.",
+                    gathered,
+                    agreed,
+                )
+        on, spec, prefetch = agreed
+        allowed = {int(x) for x in spec.replace(",", " ").split()} if spec else None
+        rank = self.ps.pp_rank
+
+        def _sender(r: int) -> bool:
+            # the last rank sends no proxy at all
+            if not on or r < 0 or r >= self.ps.pp_size - 1:
+                return False
+            return allowed is None or r in allowed
+
+        cfg = (_sender(rank), _sender(rank - 1), prefetch)
+        self._pp_eager_bank_cfg_cache = cfg
+        if cfg[0] or cfg[1]:
+            logger.info(
+                "[PPEagerBank] rank=%d send=%s recv=%s prefetch=%s ranks=%s",
+                rank,
+                cfg[0],
+                cfg[1],
+                prefetch,
+                allowed,
+            )
+
+    def _pp_bank_take(self: Scheduler, all_gather_group):
+        """This iteration's inherited bank rows and the micro-batch they were
+        sent for; prefetched when available."""
+        q = self._pp_bank_prefetch
+        if q:
+            bank, sent_mb_id, ready = q.popleft()
+            if ready is not None:
+                # the bytes landed on the side stream during the previous
+                # micro-batch's forward; just order the compute behind them
+                self.device_module.current_stream().wait_event(ready)
+            return bank, sent_mb_id
+        d = self._pp_recv_typed_dict(
+            expected_kind=self._PP_BANK_KIND, all_gather_group=all_gather_group
+        )
+        return d.get("residual"), d.get("__bank_mb_id__")
+
+    def _pp_bank_prefetch_one(self: Scheduler, all_gather_group):
+        """Receive the next iteration's bank ahead of time, on a side stream.
+
+        NOT an asynchronous post: _pp_recv_typed_dict goes through
+        recv_tensor_dict, whose first step is a blocking recv_object of the
+        metadata on the CPU group, and a device-stream context does not make
+        that non-blocking. What this buys is *where* the wait happens -- the
+        scheduler thread blocks here while the previous micro-batch's forward
+        runs on the GPU, so the bytes have landed by the time the next forward
+        is launched, instead of stalling in front of it. The recorded event is
+        therefore already satisfied on return; it is kept so the ordering is
+        explicit and stays correct if this ever becomes a real irecv.
+
+        Cost of that trade: the scheduler thread is unavailable for the length
+        of the wait (bootstrap / KV-transfer polling in the disagg loop included),
+        and the pipeline's deadlock margin shrinks by one message.
+        """
+        if self._pp_bank_prefetch:
+            return
+        stream = self._pp_bank_recv_stream
+        if stream is None:
+            stream = self.device_module.Stream()
+            # CUDA streams come from a fixed round-robin pool; an alias of
+            # forward_stream/schedule_stream would put the recv right back on
+            # the critical path (see Scheduler.event_loop dispatch).
+            for _ in range(64):
+                h = getattr(stream, "cuda_stream", None)
+                if h is None or h not in (
+                    getattr(self.forward_stream, "cuda_stream", None),
+                    getattr(self.schedule_stream, "cuda_stream", None),
+                ):
+                    break
+                stream = self.device_module.Stream()
+            self._pp_bank_recv_stream = stream
+        with self.device_module.stream(stream):
+            d = self._pp_recv_typed_dict(
+                expected_kind=self._PP_BANK_KIND, all_gather_group=all_gather_group
+            )
+            ready = self.device_module.Event()
+            ready.record(stream)
+        bank = d.get("residual")
+        if isinstance(bank, torch.Tensor) and bank.is_cuda:
+            # allocated in the side stream's context, read by the forward
+            bank.record_stream(self.device_module.current_stream())
+            bank.record_stream(self.forward_stream)
+        self._pp_bank_prefetch.append((bank, d.get("__bank_mb_id__"), ready))
+
+    def _pp_bank_send(self: Scheduler, mb_id: int, pp_proxy_tensors):
+        """Put this stage's inherited bank rows on the wire before its forward.
+
+        Sent unconditionally once per loop iteration (empty payload when there
+        is nothing to forward) so the two peers' message counts can never
+        diverge and strand a posted recv.  The micro-batch id travels with the
+        payload so the receiver can assert it is concatenating the rows that
+        belong to the batch it is about to run.
+        """
+        # a full pipeline period has passed since the previous eager send
+        self._pp_commit_comm_work(self._pp_bank_send_work)
+        self._pp_bank_rows_sent.pop(mb_id, None)
+        bank = None
+        if pp_proxy_tensors is not None:
+            bank = pp_proxy_tensors.tensors.get("residual")
+        payload = {"__bank_mb_id__": mb_id}
+        if isinstance(bank, torch.Tensor) and bank.dim() == 3 and bank.numel():
+            payload["residual"] = bank
+            self._pp_bank_rows_sent[mb_id] = (int(bank.size(0)), int(bank.size(1)))
+        elif isinstance(bank, torch.Tensor) and bank.dim() != 3:
+            # a model whose residual is not [T, NB, H] cannot be split this way;
+            # the whole bank keeps riding the tail message. Do NOT turn the
+            # feature off here -- that would desync this rank's message count
+            # from its peer's.
+            print_warning_once(
+                f"[PPEagerBank] rank={self.ps.pp_rank}: residual has "
+                f"{bank.dim()} dims, not the expected 3; nothing to forward "
+                f"eagerly"
+            )
+        self._pp_bank_send_work = self._pp_send_dict_to_next_stage(
+            payload, async_send=True, msg_type=self._PP_BANK_KIND
+        )
+
+    def _pp_eager_bank_take(self: Scheduler, mb_id: int) -> None:
+        """Consume this iteration's bank message, before any proxy recv.
+
+        Ordering is load-bearing.  The sender puts the bank on the wire *before*
+        its forward, and therefore before its proxy send; a receiver that waits
+        for the proxy first closes a cycle -- the sender blocks in a bank send
+        nobody is receiving and never reaches the proxy send the receiver is
+        waiting for.  Taking the bank first makes the receive order match the
+        send order on both halves of the hop.
+
+        SGLANG_PP_EAGER_BANK_PREFETCH used to hide this by consuming the message
+        one iteration early.  Prefetch is a throughput option, not the thing
+        that keeps the ring live, so the order has to be correct without it.
+        """
+        _, recv_on, _ = self._pp_eager_bank_cfg()
+        if not recv_on:
+            return
+        ag = self.attn_tp_group if self.require_attn_tp_allgather else None
+        bank, sent_mb_id = self._pp_bank_take(ag)
+        if sent_mb_id is not None and sent_mb_id != mb_id:
+            raise RuntimeError(
+                f"[PPEagerBank] rank={self.ps.pp_rank}: bank message was "
+                f"sent for mb={sent_mb_id} but is being consumed by "
+                f"mb={mb_id}; the eager-bank stream is out of step with "
+                f"the proxy stream"
+            )
+        self._pp_bank_taken = (mb_id, bank)
+
+    def _pp_eager_bank_recv(self: Scheduler, mb_id: int, pp_proxy_tensors):
+        """Rebuild `residual` from the rows `_pp_eager_bank_take` already took.
+
+        Must run before `_pp_prepare_received_proxy`: that filter drops token
+        rows (dim 0) for cache-read aborts, and the rows it drops have to be
+        dropped from the reassembled residual too.  Filtering first would either
+        raise in the `torch.cat` below on the dim-0 mismatch or -- when the
+        filter keeps no rows at all and `new_rows.numel()` is 0 -- silently
+        replace the filtered residual with the unfiltered bank and feed the
+        model a residual whose row count disagrees with `hidden_states`.
+        """
+        _, recv_on, _ = self._pp_eager_bank_cfg()
+        if not recv_on:
+            return pp_proxy_tensors
+        taken = self._pp_bank_taken
+        if taken is None or taken[0] != mb_id:
+            raise RuntimeError(
+                f"[PPEagerBank] rank={self.ps.pp_rank} mb={mb_id}: no bank "
+                f"message was taken for this micro-batch (have "
+                f"{None if taken is None else taken[0]}); _pp_eager_bank_take "
+                f"must run once per loop iteration, before the proxy recv"
+            )
+        self._pp_bank_taken = None
+        bank = taken[1]
+        rows = None
+        if pp_proxy_tensors is not None:
+            rows = pp_proxy_tensors.tensors.pop("__eager_bank_rows__", None)
+        if rows:
+            if not isinstance(bank, torch.Tensor):
+                raise RuntimeError(
+                    f"[PPEagerBank] rank={self.ps.pp_rank} mb={mb_id}: proxy "
+                    f"declares {rows} eagerly forwarded bank rows but no "
+                    f"bank message arrived"
+                )
+            new_rows = pp_proxy_tensors.tensors.get("residual")
+            if isinstance(new_rows, torch.Tensor) and new_rows.numel():
+                bank = torch.cat([bank, new_rows], dim=1)
+            pp_proxy_tensors.tensors["residual"] = bank
+        return pp_proxy_tensors
+
+    def _pp_eager_bank_forward(self: Scheduler, mb_id: int, pp_proxy_tensors):
+        """Forward this stage's inherited rows and prefetch the next bank.
+
+        Must run after `_pp_prepare_received_proxy`, so the rows put on the wire
+        have the same dim-0 extent as the batch this rank is about to run; still
+        before the forward, so the transfer overlaps the previous micro-batch.
+        """
+        send_on, recv_on, prefetch = self._pp_eager_bank_cfg()
+        if not (send_on or recv_on):
+            return
+        if send_on:
+            self._pp_bank_send(mb_id, pp_proxy_tensors)
+        if recv_on and prefetch and not self.gracefully_exit:
+            # skipped on the last iteration: nobody would consume the extra
+            # message, and this is a receiver-local decision, so it cannot
+            # desync the peers' message counts.
+            ag = self.attn_tp_group if self.require_attn_tp_allgather else None
+            self._pp_bank_prefetch_one(ag)
+
+    def _pp_eager_bank_strip(self: Scheduler, mb_id: int, proxy_tensors):
+        """Remove the eagerly forwarded rows from the tail proxy message."""
+        sent = self._pp_bank_rows_sent.pop(mb_id, None)
+        if sent is None:
+            return proxy_tensors
+        num_tokens, rows = sent
+        bank = proxy_tensors.get("residual")
+        if (
+            not isinstance(bank, torch.Tensor)
+            or bank.dim() != 3
+            or bank.size(0) != num_tokens
+            or bank.size(1) < rows
+        ):
+            logger.error(
+                "[PPEagerBank] rank=%d mb=%d: local residual %s is not an "
+                "extension of the %d eagerly forwarded rows over %d tokens; "
+                "sending it whole instead",
+                self.ps.pp_rank,
+                mb_id,
+                None if not isinstance(bank, torch.Tensor) else tuple(bank.shape),
+                rows,
+                num_tokens,
+            )
+            rows = 0
+        proxy_tensors = dict(proxy_tensors)
+        proxy_tensors["__eager_bank_rows__"] = rows
+        if rows:
+            proxy_tensors["residual"] = bank[:, rows:, :].contiguous()
+        return proxy_tensors
+
+    def _pp_bank_digest(self: Scheduler, tag: str, mb_id: int, tensors):
+        """Bit-sensitive digest of the proxy payload.
+
+        SGLANG_PP_EAGER_BANK_VERIFY=N digests one in N micro-batches.  The
+        sender digests the whole `residual` it would have shipped in one piece;
+        the receiver digests the `residual` it hands to the model after
+        reassembly.  Identical shape + raw-bit sum + fp32 sum + raw min/max is
+        the same-bytes evidence for the split.
+        """
+        every = getattr(self, "_pp_digest_every", None)
+        if every is None:
+            every = envs.SGLANG_PP_EAGER_BANK_VERIFY.get()
+            self._pp_digest_every = every
+            self._pp_digest_seq = {}
+        if not every or tensors is None:
+            return
+        seq = self._pp_digest_seq.get(tag, 0) + 1
+        self._pp_digest_seq[tag] = seq
+        if seq % every != 0:
+            return
+        d = tensors.tensors if hasattr(tensors, "tensors") else tensors
+        parts = []
+        for k in ("hidden_states", "residual", "dspark_ctx_acc"):
+            v = d.get(k)
+            if not isinstance(v, torch.Tensor) or not v.numel():
+                parts.append(f"{k}=-")
+                continue
+            shape = "x".join(str(s) for s in v.shape)
+            f32 = float(torch.sum(v, dtype=torch.float32).item())
+            if v.element_size() == 2:
+                raw = v.reshape(-1).view(torch.int16)
+                parts.append(
+                    "%s=%s/bits:%d/f32:%.9e/min:%d/max:%d"
+                    % (
+                        k,
+                        shape,
+                        int(torch.sum(raw, dtype=torch.int64).item()),
+                        f32,
+                        int(raw.min().item()),
+                        int(raw.max().item()),
+                    )
+                )
+            else:
+                parts.append("%s=%s/f32:%.9e" % (k, shape, f32))
+        logger.info(
+            "[PPDigest] rank=%d %s seq=%d mb=%d %s",
+            self.ps.pp_rank,
+            tag,
+            seq,
+            mb_id,
+            " ".join(parts),
+        )
 
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
