@@ -225,9 +225,18 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         "validate_deepseek_v4_cp",
         attn_cp_size=cfg.tp_size // cfg.dp_size,
     )
-    assert cfg.dp_size == 1, (
-        "For round-robin split mode, dp attention is not supported."
+    assert cfg.tp_size % cfg.dp_size == 0 and cfg.tp_size // cfg.dp_size >= 1, (
+        f"CP requires tp_size ({cfg.tp_size}) to be divisible by dp_size "
+        f"({cfg.dp_size})."
     )
+    if cfg.dp_size > 1:
+        logger.warning(
+            "DeepSeekV4 CP with dp_size=%d (attn_cp_size=%d): combining the "
+            "round-robin CP token split with DP attention is experimental; "
+            "each DP group runs its own CP token partition.",
+            cfg.dp_size,
+            cfg.tp_size // cfg.dp_size,
+        )
     assert cfg.tp_size <= 8, (
         "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
     )

@@ -165,6 +165,28 @@ def prepare_cp_forward(forward_batch) -> None:
             extend_seqs_len=extend_lens_cpu,
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
+        # CP together with DP>1: every DP group must pad each rank to the SAME
+        # physical length so full-TP-group all-gathers (MoE / engram / input-id
+        # gather) see rank-invariant sizes. The per-DP-group physical length is
+        # DP-local, so lift it to the DP-global maximum (the MAX_LEN-synced
+        # global token count, which is aligned to attn_cp_size).
+        from sglang.srt.runtime_context import get_parallel
+
+        gnt = getattr(forward_batch, "global_num_tokens_cpu", None)
+        if get_parallel().attn_dp_size > 1 and gnt is not None:
+            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+            cp_size = get_parallel().attn_cp_size
+            align = get_cp_padding_align_size()
+            global_total = max(gnt)
+            base = (global_total + cp_size - 1) // cp_size
+            physical = (base + align - 1) // align * align
+            meta = forward_batch.attn_cp_metadata
+            if meta.per_rank_logical_token is None:
+                meta.per_rank_logical_token = list(meta.per_rank_actual_token)
+            n = len(meta.per_rank_actual_token)
+            meta.per_rank_actual_token = [physical] * n
+            meta.max_rank_len = [physical] * n
 
     if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len

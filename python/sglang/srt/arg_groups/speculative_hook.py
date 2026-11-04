@@ -547,10 +547,21 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.attn_cp_size > 1:
-            raise ValueError(
-                "DSpark with dp attention does not support context parallel "
-                f"(attn_cp_size={cfg.attn_cp_size})."
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
             )
+
+            # Prefill CP + DSpark is supported under static ragged verify: the
+            # draft head runs on the (non-CP) decode side, and the prefill CP
+            # aux-hidden capture is gathered at the model boundary. Only the
+            # COMPACT ragged-verify path is incompatible with CP.
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "DSpark with dp attention + context parallel "
+                    f"(attn_cp_size={cfg.attn_cp_size}) requires "
+                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                )
         if (
             not _is_npu
             and cfg.speculative_moe_a2a_backend is not None

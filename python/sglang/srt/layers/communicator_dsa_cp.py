@@ -34,8 +34,10 @@ from sglang.srt.layers.cp.utils import is_mla_cp_active
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
+    get_global_dp_buffer,
     get_local_dp_buffer,
 )
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_parallel
@@ -63,7 +65,19 @@ def maybe_prefetch_next_full_attention_kv(
 def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
-    assert attn_dp_size == 1 and attn_tp_size == 1
+    assert attn_tp_size == 1
+    if attn_dp_size > 1:
+        # Prefill CP together with DP>1: the attn_cp group is scoped per DP
+        # group, but with moe_a2a_backend="none" the experts are sharded across
+        # the FULL TP group, so every rank must see every token (from all DP
+        # groups) before the per-rank expert all-reduce. Gather each rank's CP
+        # shard over the full TP group into the DP-global buffer.
+        hidden_states, local_hidden_states = (
+            get_global_dp_buffer(get_tp_group()),
+            hidden_states,
+        )
+        get_tp_group().all_gather_into_tensor(hidden_states, local_hidden_states)
+        return hidden_states
     hidden_states, local_hidden_states = (
         get_local_dp_buffer(get_parallel().attn_cp_group),
         hidden_states,
@@ -75,7 +89,20 @@ def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
 def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
-    assert attn_dp_size == 1 and attn_tp_size == 1
+    assert attn_tp_size == 1
+    if attn_dp_size > 1:
+        # Symmetric inverse of the full-TP-group gather above: SUM the per-rank
+        # expert partials across the full TP group and scatter each rank its own
+        # CP shard back. reduce_scatter_tensor splits the global buffer into
+        # tp_size equal chunks (chunk r -> rank r), matching the all_gather order.
+        tp_group = get_tp_group()
+        tp_size = get_parallel().tp_size
+        input_hidden_states = hidden_states
+        hidden_states = hidden_states.tensor_split(tp_size)[get_parallel().tp_rank]
+        tp_group.reduce_scatter_tensor(
+            hidden_states.contiguous(), input_hidden_states
+        )
+        return hidden_states
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank
     input_hidden_states = hidden_states
@@ -105,10 +132,13 @@ class DSACPLayerCommunicator(LayerCommunicator):
         )
 
     def _post_init_communicate(self):
-        # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
+        # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1.
+        # With CP the MLP gather/scatter (dsa_cp_gather/reduce_scatter) spans the
+        # full TP group when attn_dp_size > 1, so DP>1 is supported here; only the
+        # attn-tp dimension must be collapsed (attn_tp_size == 1 under CP).
         if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
-            assert self._context.attn_dp_size == 1, (
-                f"dp_size should be 1 when moe_runner_backend is none"
+            assert self._context.attn_tp_size == 1, (
+                "attn_tp_size should be 1 under CP when moe_runner_backend is none"
             )
         self._communicate_simple_fn = DSACPCommunicateSimpleFn.get_fn(
             input_mode=ScatterMode.SCATTERED,

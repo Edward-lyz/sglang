@@ -779,6 +779,43 @@ class EngramEmbedding(nn.Module):
                 FP8_BLOCK_SIZE,
             )
             return out
+        parallel = get_parallel()
+        if (
+            self.tp_size > 1
+            and parallel.attn_cp_size > 1
+            and get_attention_dp_size() > 1
+        ):
+            # Prefill CP together with DP>1: the hash table is sharded across the
+            # full TP group, but each rank only holds its (dp, cp) token shard.
+            # The attn_cp group is scoped per DP group, so a CP-only gather would
+            # miss the peer DP group's table rows. Gather every rank's indices
+            # over the FULL TP group so the sharded lookup + TP all-reduce in
+            # _lookup reassembles all tokens, then slice back this rank's rows.
+            # Equal-pad to a rank-invariant size so the all-gather is static and
+            # every (real or idle) rank participates in lockstep.
+            tp_group = get_tp_group()
+            local_rows = indices.shape[0]
+            max_rows_t = torch.tensor(
+                [local_rows], dtype=torch.int64, device=indices.device
+            )
+            torch.distributed.all_reduce(
+                max_rows_t,
+                op=torch.distributed.ReduceOp.MAX,
+                group=tp_group.device_group,
+            )
+            max_rows = int(max_rows_t.item())
+            if max_rows == 0:
+                return self._empty(indices)
+            padded = indices.new_zeros((max_rows, *indices.shape[1:]))
+            if local_rows > 0:
+                padded[:local_rows] = indices
+            all_indices = indices.new_empty(
+                (self.tp_size * max_rows, *indices.shape[1:])
+            )
+            tp_group.all_gather_into_tensor(all_indices, padded.contiguous())
+            values = self._lookup(all_indices)
+            start = parallel.tp_rank * max_rows
+            return values[start : start + local_rows]
         if cp_all_tokens and self.tp_size > 1:
             # Prefill CP: gather the hash ids over the CP group first so every
             # TP rank looks up the same indices, then keep this rank's slice.
