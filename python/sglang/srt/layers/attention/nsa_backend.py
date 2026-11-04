@@ -15,10 +15,19 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     PrecomputedMetadata,
     compute_cu_seqlens,
 )
-from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.nsa.nsa_indexer import (
+    BaseIndexerMetadata,
+    PagedMQASchedule,
+    build_paged_mqa_schedule_metadata,
+    copy_paged_mqa_schedule_metadata_,
+)
+from sglang.srt.layers.attention.nsa.page_table import (
+    gather_block_table_into,
+    gather_page_table_into,
+)
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.transform_index import (
-    transform_index_page_table_decode,
+    transform_index_page_table_decode_fast,
     transform_index_page_table_prefill,
 )
 from sglang.srt.layers.attention.nsa.utils import (
@@ -99,9 +108,9 @@ class NSAMetadata:
     cu_seqlens_q: torch.Tensor
     # Cumulative sequence lengths for key
     cu_seqlens_k: torch.Tensor
-    # Page table, the index of KV Cache Tables/Blocks
-    # this table is always with page_size = 1
-    page_table_1: torch.Tensor
+    # Token-granularity page table. Decode/speculative CUDA paths use only
+    # real_page_table and leave this unset to avoid O(batch * max_seq) memory.
+    page_table_1: Optional[torch.Tensor]
 
     # NOTE(dark): This will property be used in:
     # 1. dense decode/prefill, we use paged flash attention, need real_page_table
@@ -117,9 +126,9 @@ class NSAMetadata:
     nsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
 
     flashmla_metadata: Optional[NSAFlashMLAMetadata] = None
-    # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
-    # Precomputed once per forward batch and reused across layers.
-    paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    # DeepGEMM schedule metadata for paged MQA logits. Large query batches use
+    # one capture-stable schedule per logits chunk.
+    paged_mqa_schedule_metadata: Optional[PagedMQASchedule] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -167,6 +176,8 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class NSAIndexerMetadata(BaseIndexerMetadata):
+    """Indexer metadata adapter that exposes ``NSAMetadata`` fields for the NSA indexer."""
+
     attn_metadata: NSAMetadata
     topk_transform_method: TopkTransformMethod
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
@@ -177,7 +188,8 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     def get_page_table_64(self) -> torch.Tensor:
         return self.attn_metadata.real_page_table
 
-    def get_page_table_1(self) -> torch.Tensor:
+    def get_page_table_1(self) -> Optional[torch.Tensor]:
+        """Return the page table with page size 1, if available."""
         return self.attn_metadata.page_table_1
 
     def get_seqlens_expanded(self) -> torch.Tensor:
@@ -207,6 +219,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         ke_offset: torch.Tensor = None,
         batch_idx_list: List[int] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
+        cu_seqlens_q_override: Optional[torch.Tensor] = None,
+        page_table_size_1_override: Optional[torch.Tensor] = None,
+        page_table_size_64_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel import (
             fast_topk_transform_fused,
@@ -217,6 +232,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         if topk_indices_offset_override is not None:
             cu_topk_indices_offset = topk_indices_offset_override
             cu_seqlens_q_topk = None
+        elif cu_seqlens_q_override is not None:
+            cu_seqlens_q_topk = cu_seqlens_q_override
+            cu_topk_indices_offset = cu_seqlens_q_override[:-1]
         elif cu_seqlens_q is not None:
             cu_seqlens_q = cu_seqlens_q.to(torch.int32)
             cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
@@ -231,19 +249,38 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             seq_lens_topk = ke_offset
         else:
             seq_lens_topk = self.get_seqlens_expanded()
-        if batch_idx_list is not None:
-            page_table_size_1 = self.attn_metadata.page_table_1[batch_idx_list]
+        if page_table_size_1_override is not None:
+            assert page_table_size_64_override is None
+            page_table = page_table_size_1_override
+            page_size = 1
+        elif page_table_size_64_override is not None:
+            page_table = page_table_size_64_override
+            page_size = self.attn_metadata.page_size
+        elif self.attn_metadata.page_table_1 is not None:
+            page_table = self.attn_metadata.page_table_1
+            page_size = 1
+            if batch_idx_list is not None:
+                page_table = page_table[batch_idx_list]
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
 
         if not envs.SGLANG_NSA_FUSE_TOPK.get():
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
+            if page_size > 1:
+                topk_indices = fast_topk_v2(
+                    logits, seq_lens_topk, topk, row_starts=ks
+                )
+                return transform_index_page_table_decode_fast(
+                    page_table,
+                    topk_indices,
+                    page_size=page_size,
+                )
             # NOTE(dark): if fused, we return a transformed page table directly
             return fast_topk_transform_fused(
                 score=logits,
                 lengths=seq_lens_topk,
-                page_table_size_1=page_table_size_1,
+                page_table_size_1=page_table,
                 cu_seqlens_q=cu_seqlens_q_topk,
                 topk=topk,
                 row_starts=ks,
@@ -376,10 +413,44 @@ class NativeSparseAttnBackend(
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         assert forward_batch.seq_lens_cpu is not None
         max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
-        # [b, max_seqlen_k]
-        page_table = forward_batch.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices, :max_seqlen_k
-        ]
+        max_seqlen_k = min(max_seqlen_k, self.max_context_len)
+        if forward_batch.forward_mode.is_target_verify():
+            fixed_page_table_repeats = self.speculative_num_draft_tokens
+        elif forward_batch.forward_mode.is_draft_extend_v2():
+            assert forward_batch.extend_seq_lens_cpu is not None
+            fixed_page_table_repeats = int(forward_batch.extend_seq_lens_cpu[0])
+            assert all(
+                int(length) == fixed_page_table_repeats
+                for length in forward_batch.extend_seq_lens_cpu
+            ), "DRAFT_EXTEND_V2 requires a uniform batch shape"
+        else:
+            fixed_page_table_repeats = 1
+        block_table_only = self.real_page_size > 1 and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
+        if block_table_only:
+            page_table = None
+        elif fixed_page_table_repeats > 1:
+            page_table = torch.empty(
+                batch_size * fixed_page_table_repeats,
+                max_seqlen_k,
+                dtype=self.req_to_token.dtype,
+                device=device,
+            )
+            gather_page_table_into(
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                page_table,
+                max_seqlen_k,
+                repeats=fixed_page_table_repeats,
+            )
+        else:
+            # [b, max_seqlen_k]
+            page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, :max_seqlen_k
+            ]
 
         page_table_1_flattened = None
         topk_indices_offset = None
@@ -447,6 +518,7 @@ class NativeSparseAttnBackend(
                 # DRAFT_EXTEND (v1): V1 worker extends by (accept_length + 1) per request
                 # after verification. Lengths vary per request based on how many tokens
                 # were accepted.
+                assert page_table is not None
                 page_table = torch.repeat_interleave(
                     page_table, repeats=forward_batch.extend_seq_lens, dim=0
                 )
@@ -491,6 +563,7 @@ class NativeSparseAttnBackend(
                     if len(indexer_seq_lens_cpu) != 0
                     else 0
                 )
+                assert page_table is not None
                 page_table = page_table[bs_idx, :max_seqlen_k]
 
             if (
@@ -565,6 +638,25 @@ class NativeSparseAttnBackend(
         )
         nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
+        if block_table_only:
+            real_page_table = torch.empty(
+                batch_size * fixed_page_table_repeats,
+                (max_seqlen_k + self.real_page_size - 1)
+                // self.real_page_size,
+                dtype=self.req_to_token.dtype,
+                device=device,
+            )
+            gather_block_table_into(
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                real_page_table,
+                max_seqlen_k,
+                self.real_page_size,
+                repeats=fixed_page_table_repeats,
+            )
+        else:
+            assert page_table is not None
+            real_page_table = self._transform_table_1_to_real(page_table)
 
         paged_mqa_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
@@ -572,7 +664,7 @@ class NativeSparseAttnBackend(
         if is_cuda() and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
@@ -582,12 +674,17 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend()
+                        or forward_batch.forward_mode.is_draft_extend(
+                            include_v2=True
+                        )
                     )
                     else cache_seqlens_int32
                 )
-                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                paged_mqa_schedule_metadata = build_paged_mqa_schedule_metadata(
+                    seqlens_32,
+                    64,
+                    deep_gemm.get_num_sms(),
+                    real_page_table.shape[1] * self.real_page_size,
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -616,7 +713,7 @@ class NativeSparseAttnBackend(
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
             nsa_seqlens_expanded=seqlens_expanded,
             nsa_extend_seq_lens_list=extend_seq_lens_cpu,
-            real_page_table=self._transform_table_1_to_real(page_table),
+            real_page_table=real_page_table,
             nsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,
@@ -720,10 +817,12 @@ class NativeSparseAttnBackend(
             "cu_seqlens_k": torch.zeros(
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
-            # fake page_table for sparse_prefill
-            "page_table": torch.zeros(
+            # CUDA paged NSA consumes page-size-native block tables. Keeping a
+            # token-granularity table here scales as max_tokens * context_len.
+            "block_table": torch.zeros(
                 max_num_tokens,
-                self.max_context_len,
+                (self.max_context_len + self.real_page_size - 1)
+                // self.real_page_size,
                 dtype=torch.int32,
                 device=self.device,
             ),
@@ -759,9 +858,10 @@ class NativeSparseAttnBackend(
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
 
             # Use max context length for seq_len_k
-            page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
+            real_page_table = self.decode_cuda_graph_metadata["block_table"][:bs, :]
+            page_table_1 = real_page_table if self.real_page_size == 1 else None
             max_seqlen_q = 1
-            max_seqlen_k = page_table_1.shape[1]
+            max_seqlen_k = self.max_context_len
 
             # Precompute page table
             # Precompute cumulative sequence lengths
@@ -789,28 +889,36 @@ class NativeSparseAttnBackend(
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend(
             include_v2=True
         ):
-            cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
-                torch.int32
+            assert bs > 0 and num_tokens % bs == 0
+            num_tokens_per_req = num_tokens // bs
+            capture_draft_tokens = (
+                self.speculative_num_draft_tokens
+                if forward_mode.is_target_verify()
+                else num_tokens_per_req
             )
+            cache_seqlens_int32 = (seq_lens + capture_draft_tokens).to(torch.int32)
+            # Clamp to context_len to prevent overflow at context boundary
+            cache_seqlens_int32.clamp_(max=self.max_context_len)
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
             max_seqlen_q = 1
-            page_table_1 = self.decode_cuda_graph_metadata["page_table"][
-                : bs * self.speculative_num_draft_tokens, :
+            real_page_table = self.decode_cuda_graph_metadata["block_table"][
+                :num_tokens, :
             ]
-            max_seqlen_k = page_table_1.shape[1]
+            page_table_1 = real_page_table if self.real_page_size == 1 else None
+            max_seqlen_k = self.max_context_len
 
             cu_seqlens_q = torch.arange(
                 0,
-                bs * self.speculative_num_draft_tokens + 1,
+                num_tokens + 1,
                 1,
                 dtype=torch.int32,
                 device=self.device,
             )
 
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
+            extend_seq_lens_cpu = [num_tokens_per_req] * bs
 
             seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
+                capture_draft_tokens + kv_len
                 for kv_len in seq_lens.tolist()
             ]
             seqlens_expanded = torch.cat(
@@ -831,12 +939,12 @@ class NativeSparseAttnBackend(
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
             )
-            nsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
+            nsa_extend_seq_lens_list = [1] * num_tokens
 
             if self.nsa_decode_impl == "flashmla_kv":
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
-                ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
+                ].slice(slice(0, num_tokens + 1))
 
                 flashmla_metadata.copy_(
                     self._compute_flashmla_metadata(
@@ -849,13 +957,11 @@ class NativeSparseAttnBackend(
 
         nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
-        real_page_table = self._transform_table_1_to_real(page_table_1)
-
         paged_mqa_schedule_metadata = None
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
+            or forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
@@ -864,12 +970,15 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend()
+                        or forward_mode.is_draft_extend(include_v2=True)
                     )
                     else cache_seqlens_int32
                 )
-                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                paged_mqa_schedule_metadata = build_paged_mqa_schedule_metadata(
+                    seqlens_32,
+                    64,
+                    deep_gemm.get_num_sms(),
+                    real_page_table.shape[1] * self.real_page_size,
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -926,8 +1035,7 @@ class NativeSparseAttnBackend(
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
-            page_indices = self.req_to_token[req_pool_indices, :max_len]
-            metadata.page_table_1[:, :max_len].copy_(page_indices)
+            page_indices = None
             nsa_cache_seqlens = compute_nsa_seqlens(
                 cache_seqlens, nsa_index_topk=self.nsa_index_topk
             )
@@ -945,11 +1053,7 @@ class NativeSparseAttnBackend(
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
-            page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-            page_indices = torch.repeat_interleave(
-                page_indices, repeats=self.speculative_num_draft_tokens, dim=0
-            )
-            metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
+            page_indices = None
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
             seqlens_expanded = seqlens_expand_triton(
@@ -973,16 +1077,45 @@ class NativeSparseAttnBackend(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
 
-            extend_seq_lens = spec_info.accept_length[:bs]
-            extend_seq_lens_cpu = extend_seq_lens.tolist()
+            assert spec_info is not None
+            extend_seq_lens, extend_seq_lens_cpu = self._get_draft_extend_lens(
+                bs,
+                spec_info,
+                forward_mode,
+            )
+            uniform_repeats = None
+            if forward_mode.is_draft_extend_v2():
+                uniform_repeats = extend_seq_lens_cpu[0]
+                assert all(
+                    length == uniform_repeats for length in extend_seq_lens_cpu
+                ), "DRAFT_EXTEND_V2 requires a uniform graph shape"
 
-            page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-            page_indices = torch.repeat_interleave(
-                page_indices, repeats=extend_seq_lens, dim=0
-            )
-            metadata.page_table_1[: page_indices.shape[0], :max_seqlen_k].copy_(
-                page_indices
-            )
+            if forward_mode.is_draft_extend_v2():
+                assert uniform_repeats is not None
+                if self.real_page_size > 1:
+                    gather_block_table_into(
+                        self.req_to_token,
+                        req_pool_indices,
+                        metadata.real_page_table,
+                        max_seqlen_k,
+                        self.real_page_size,
+                        repeats=uniform_repeats,
+                    )
+                else:
+                    assert metadata.page_table_1 is not None
+                    gather_page_table_into(
+                        self.req_to_token,
+                        req_pool_indices,
+                        metadata.page_table_1,
+                        max_seqlen_k,
+                        repeats=uniform_repeats,
+                    )
+                page_indices = None
+            else:
+                page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+                page_indices = torch.repeat_interleave(
+                    page_indices, repeats=extend_seq_lens, dim=0
+                )
 
             seqlens_expanded = seqlens_expand_triton(
                 extend_seq_lens,
@@ -1004,28 +1137,35 @@ class NativeSparseAttnBackend(
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
+            or forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
 
                 seqlens_32 = (
-                    seqlens_expanded
+                    metadata.nsa_seqlens_expanded
                     if (
                         forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend()
+                        or forward_mode.is_draft_extend(include_v2=True)
                     )
                     else metadata.cache_seqlens_int32
                 )
-                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                new_schedule = build_paged_mqa_schedule_metadata(
+                    seqlens_32,
+                    64,
+                    deep_gemm.get_num_sms(),
+                    metadata.real_page_table.shape[1] * metadata.page_size,
                 )
-                if metadata.paged_mqa_schedule_metadata is None:
-                    metadata.paged_mqa_schedule_metadata = new_schedule
-                else:
-                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+                if (
+                    metadata.paged_mqa_schedule_metadata is not None
+                    and new_schedule is not None
+                ):
+                    copy_paged_mqa_schedule_metadata_(
+                        metadata.paged_mqa_schedule_metadata,
+                        new_schedule,
+                    )
             except (ImportError, ModuleNotFoundError):
-                metadata.paged_mqa_schedule_metadata = None
+                pass
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
@@ -1040,12 +1180,46 @@ class NativeSparseAttnBackend(
 
         assert self.real_page_size == metadata.page_size
         if self.real_page_size > 1:
-            real_table = self._transform_table_1_to_real(page_indices)
-            new_rows = real_table.shape[0]
-            new_cols = real_table.shape[1]
-            metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
+            repeat_count = (
+                self.speculative_num_draft_tokens
+                if forward_mode.is_target_verify()
+                else 1
+            )
+            if forward_mode.is_draft_extend() and not forward_mode.is_draft_extend_v2():
+                assert page_indices is not None
+                real_table = self._transform_table_1_to_real(page_indices)
+            elif not forward_mode.is_draft_extend_v2():
+                real_table = gather_block_table_into(
+                    self.req_to_token,
+                    req_pool_indices,
+                    metadata.real_page_table,
+                    max_len if forward_mode.is_decode_or_idle() else max_seqlen_k,
+                    self.real_page_size,
+                    repeats=repeat_count,
+                )
+            else:
+                real_table = metadata.real_page_table
+            if real_table.data_ptr() != metadata.real_page_table.data_ptr():
+                new_rows, new_cols = real_table.shape
+                metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
         else:
             assert metadata.real_page_table is metadata.page_table_1
+            assert metadata.page_table_1 is not None
+            if page_indices is not None:
+                rows, cols = page_indices.shape
+                metadata.page_table_1[:rows, :cols].copy_(page_indices)
+            elif not forward_mode.is_draft_extend_v2():
+                gather_page_table_into(
+                    self.req_to_token,
+                    req_pool_indices,
+                    metadata.page_table_1,
+                    max_len if forward_mode.is_decode_or_idle() else max_seqlen_k,
+                    repeats=(
+                        self.speculative_num_draft_tokens
+                        if forward_mode.is_target_verify()
+                        else 1
+                    ),
+                )
 
         if self.nsa_decode_impl == "flashmla_kv":
             flashmla_metadata = metadata.flashmla_metadata.slice(
@@ -1086,25 +1260,37 @@ class NativeSparseAttnBackend(
         # Mode-specific copy logic
         if forward_mode.is_decode_or_idle():
             # Decode mode
-            metadata.page_table_1[:, : precomputed.max_len].copy_(
-                precomputed.page_indices
-            )
+            if precomputed.page_indices is not None:
+                assert metadata.page_table_1 is not None
+                page_table_dst = metadata.page_table_1[:, : precomputed.max_len]
+                if page_table_dst.data_ptr() != precomputed.page_indices.data_ptr():
+                    page_table_dst.copy_(precomputed.page_indices)
             metadata.nsa_cache_seqlens_int32.copy_(precomputed.nsa_cache_seqlens)
             # seqlens_expanded is same as cache_seqlens (already copied)
 
         elif forward_mode.is_target_verify():
             # Target verify mode
-            metadata.page_table_1[:, : precomputed.max_seqlen_k].copy_(
-                precomputed.page_indices
-            )
+            if precomputed.page_indices is not None:
+                assert metadata.page_table_1 is not None
+                page_table_dst = metadata.page_table_1[
+                    :, : precomputed.max_seqlen_k
+                ]
+                if page_table_dst.data_ptr() != precomputed.page_indices.data_ptr():
+                    page_table_dst.copy_(precomputed.page_indices)
             metadata.nsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
             metadata.nsa_cache_seqlens_int32.copy_(precomputed.nsa_cache_seqlens)
 
         elif forward_mode.is_draft_extend():
             # Draft extend mode
-            rows = precomputed.page_indices.shape[0]
-            cols = precomputed.max_seqlen_k
-            metadata.page_table_1[:rows, :cols].copy_(precomputed.page_indices)
+            if (
+                precomputed.page_indices is not None
+                and metadata.page_table_1 is not None
+            ):
+                rows = precomputed.page_indices.shape[0]
+                cols = precomputed.max_seqlen_k
+                metadata.page_table_1[:rows, :cols].copy_(
+                    precomputed.page_indices
+                )
 
             size = precomputed.seqlens_expanded_size
             metadata.nsa_seqlens_expanded[:size].copy_(precomputed.seqlens_expanded)
@@ -1119,7 +1305,12 @@ class NativeSparseAttnBackend(
         # Copy real page table
         if precomputed.real_page_table is not None:
             rows, cols = precomputed.real_page_table.shape
-            metadata.real_page_table[:rows, :cols].copy_(precomputed.real_page_table)
+            real_page_table_dst = metadata.real_page_table[:rows, :cols]
+            if (
+                real_page_table_dst.data_ptr()
+                != precomputed.real_page_table.data_ptr()
+            ):
+                real_page_table_dst.copy_(precomputed.real_page_table)
         else:
             # real_page_table is same as page_table_1 (already copied)
             pass
@@ -1128,6 +1319,15 @@ class NativeSparseAttnBackend(
         if precomputed.flashmla_metadata is not None:
             flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
             flashmla_metadata.copy_(precomputed.flashmla_metadata)
+
+        if (
+            metadata.paged_mqa_schedule_metadata is not None
+            and precomputed.paged_mqa_schedule_metadata is not None
+        ):
+            copy_paged_mqa_schedule_metadata_(
+                metadata.paged_mqa_schedule_metadata,
+                precomputed.paged_mqa_schedule_metadata,
+            )
 
         self.forward_metadata = metadata
 
@@ -1217,13 +1417,20 @@ class NativeSparseAttnBackend(
                     mask, topk_indices + topk_indices_offset, topk_indices
                 )
             elif topk_transform_method == TopkTransformMethod.PAGED:
-                assert metadata.nsa_extend_seq_lens_list is not None
-                page_table_1 = transform_index_page_table_prefill(
-                    page_table=metadata.page_table_1,
-                    topk_indices=topk_indices,
-                    extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
-                    page_size=1,
-                )
+                if metadata.page_table_1 is None:
+                    page_table_1 = transform_index_page_table_decode_fast(
+                        page_table=metadata.real_page_table,
+                        topk_indices=topk_indices,
+                        page_size=metadata.page_size,
+                    )
+                else:
+                    assert metadata.nsa_extend_seq_lens_list is not None
+                    page_table_1 = transform_index_page_table_prefill(
+                        page_table=metadata.page_table_1,
+                        topk_indices=topk_indices,
+                        extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
+                        page_size=1,
+                    )
 
         nsa_impl = (
             self.nsa_decode_impl
@@ -1365,10 +1572,19 @@ class NativeSparseAttnBackend(
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
-            page_table_1 = transform_index_page_table_decode(
-                page_table=metadata.page_table_1,
+            source_page_table = (
+                metadata.page_table_1
+                if metadata.page_table_1 is not None
+                else metadata.real_page_table
+            )
+            page_table_1 = transform_index_page_table_decode_fast(
+                page_table=source_page_table,
                 topk_indices=topk_indices,
-                page_size=1,
+                page_size=(
+                    1
+                    if metadata.page_table_1 is not None
+                    else metadata.page_size
+                ),
             )
 
         if self.nsa_decode_impl == "flashmla_sparse":
@@ -1905,6 +2121,7 @@ class NativeSparseAttnMultiStepBackend:
         self, forward_batch: ForwardBatch, bs: int
     ):
         if envs.SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
+            primary_metadata = self.attn_backends[0].decode_cuda_graph_metadata[bs]
             # Precompute metadata once (shared across all backends)
             precomputed = self.attn_backends[0]._precompute_replay_metadata(
                 bs=bs,
@@ -1913,6 +2130,8 @@ class NativeSparseAttnMultiStepBackend:
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
+                page_table_dst=primary_metadata.page_table_1,
+                real_page_table_dst=primary_metadata.real_page_table,
             )
 
             # Fast copy to each backend (1-2x faster than computing N times)

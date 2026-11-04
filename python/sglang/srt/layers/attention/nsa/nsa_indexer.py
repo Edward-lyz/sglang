@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import contextlib
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from einops import rearrange
@@ -18,6 +19,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
+deep_gemm = None
 if _is_cuda:
     try:
         import deep_gemm
@@ -48,6 +50,101 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+PAGED_MQA_LOGITS_BYTES_PER_ELEM = 4
+
+
+@dataclass(frozen=True)
+class PagedMQAScheduleMetadata:
+    """DeepGEMM schedules for a statically query-row-chunked paged MQA call."""
+
+    max_rows: int
+    num_rows: int
+    schedules: Tuple[torch.Tensor, ...]
+    cu_seqlens_q: Tuple[torch.Tensor, ...]
+
+    def copy_(self, other: "PagedMQAScheduleMetadata") -> None:
+        assert self.max_rows == other.max_rows
+        assert self.num_rows == other.num_rows
+        assert len(self.schedules) == len(other.schedules)
+        assert len(self.cu_seqlens_q) == len(other.cu_seqlens_q)
+        for dst, src in zip(self.schedules, other.schedules, strict=True):
+            dst.copy_(src)
+
+
+PagedMQASchedule = Union[torch.Tensor, PagedMQAScheduleMetadata]
+
+
+def get_paged_mqa_logits_max_rows(max_seq_len: int) -> int:
+    """Return the static row cap that keeps one FP32 logits chunk bounded."""
+    max_chunk_mb = envs.SGLANG_NSA_PAGED_MQA_LOGITS_MAX_CHUNK_MB.get()
+    if max_chunk_mb <= 0:
+        raise ValueError(
+            "SGLANG_NSA_PAGED_MQA_LOGITS_MAX_CHUNK_MB must be greater than 0"
+        )
+    if max_seq_len <= 0:
+        raise ValueError("max_seq_len must be greater than 0")
+
+    max_chunk_bytes = max_chunk_mb * 1024 * 1024
+    bytes_per_row = max_seq_len * PAGED_MQA_LOGITS_BYTES_PER_ELEM
+    return max(1, max_chunk_bytes // bytes_per_row)
+
+
+def build_paged_mqa_schedule_metadata(
+    context_lens: torch.Tensor,
+    block_kv: int,
+    num_sms: int,
+    max_seq_len: int,
+) -> Optional[PagedMQASchedule]:
+    """Build one schedule per static query-row chunk for reuse across layers."""
+    if context_lens.shape[0] == 0:
+        return None
+    if deep_gemm is None:
+        raise ImportError("deep_gemm is unavailable on this platform")
+    if isinstance(deep_gemm, ImportError):
+        raise deep_gemm
+
+    max_rows = get_paged_mqa_logits_max_rows(max_seq_len)
+
+    def get_schedule(rows: torch.Tensor) -> torch.Tensor:
+        if rows.dim() == 1:
+            rows = rows.unsqueeze(-1)
+        return deep_gemm.get_paged_mqa_logits_metadata(rows, block_kv, num_sms)
+
+    num_rows = context_lens.shape[0]
+    if num_rows <= max_rows:
+        return get_schedule(context_lens)
+
+    schedules = []
+    cu_seqlens_q = []
+    for start in range(0, num_rows, max_rows):
+        chunk_rows = min(max_rows, num_rows - start)
+        schedules.append(get_schedule(context_lens[start : start + chunk_rows]))
+        cu_seqlens_q.append(
+            torch.arange(
+                chunk_rows + 1,
+                dtype=torch.int32,
+                device=context_lens.device,
+            )
+        )
+    return PagedMQAScheduleMetadata(
+        max_rows=max_rows,
+        num_rows=num_rows,
+        schedules=tuple(schedules),
+        cu_seqlens_q=tuple(cu_seqlens_q),
+    )
+
+
+def copy_paged_mqa_schedule_metadata_(
+    dst: PagedMQASchedule,
+    src: PagedMQASchedule,
+) -> None:
+    """Update capture-owned schedule buffers without changing their addresses."""
+    if isinstance(dst, PagedMQAScheduleMetadata):
+        assert isinstance(src, PagedMQAScheduleMetadata)
+        dst.copy_(src)
+    else:
+        assert isinstance(src, torch.Tensor)
+        dst.copy_(src)
 
 
 class BaseIndexerMetadata(ABC):
@@ -65,7 +162,7 @@ class BaseIndexerMetadata(ABC):
         """
 
     @abstractmethod
-    def get_page_table_1(self) -> torch.Tensor:
+    def get_page_table_1(self) -> Optional[torch.Tensor]:
         """
         Return: (batch_size, num_blocks) int32, page table.
                 The page size of the table is 1.
@@ -102,6 +199,9 @@ class BaseIndexerMetadata(ABC):
         self,
         logits: torch.Tensor,
         topk: int,
+        cu_seqlens_q_override: Optional[torch.Tensor] = None,
+        page_table_size_1_override: Optional[torch.Tensor] = None,
+        page_table_size_64_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform topk selection on the logits and possibly transform the result.
@@ -118,7 +218,6 @@ class BaseIndexerMetadata(ABC):
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
-    # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     else:
@@ -372,6 +471,7 @@ class Indexer(MultiPlatformOp):
         if _is_hip:
             assert page_size == 1, "only support page size 1"
             block_tables = metadata.get_page_table_1()
+            assert block_tables is not None
         else:
             assert page_size == 64, "only support page size 64"
             # NOTE(dark): this support extend/decode/decode+graph
@@ -390,15 +490,6 @@ class Indexer(MultiPlatformOp):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
-        # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
-        # otherwise fall back to computing it here.
-        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        if _is_cuda:
-            if schedule_metadata is None:
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, blocksize, self.sm_count
-                )
-
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
@@ -419,6 +510,26 @@ class Indexer(MultiPlatformOp):
         # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
         # and it is necessary to extract the actual q length.
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
+        assert q_offset <= q_fp8.shape[0]
+        if q_offset == 0:
+            return torch.full(
+                (q_fp8.shape[0], self.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=q_fp8.device,
+            )
+
+        # Reuse schedules prepared with the same static chunk layout outside the
+        # model graph. This keeps CUDA Graph capture and replay shapes identical.
+        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        if _is_cuda and schedule_metadata is None:
+            schedule_metadata = build_paged_mqa_schedule_metadata(
+                seqlens_32[:q_offset],
+                blocksize,
+                self.sm_count,
+                max_seq_len,
+            )
+
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
@@ -443,13 +554,59 @@ class Indexer(MultiPlatformOp):
                 TotalCuCount=256,
                 WavePerEU=5,
             )
+        elif isinstance(schedule_metadata, PagedMQAScheduleMetadata):
+            assert schedule_metadata.num_rows == q_offset
+            page_table_size_1 = metadata.get_page_table_1()
+            topk_result = torch.full(
+                (q_fp8.shape[0], self.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=q_fp8.device,
+            )
+            for chunk_idx, schedule_chunk in enumerate(
+                schedule_metadata.schedules
+            ):
+                start = chunk_idx * schedule_metadata.max_rows
+                end = min(start + schedule_metadata.max_rows, q_offset)
+                seqlens_chunk = seqlens_32[start:end]
+                logits_chunk = deep_gemm.fp8_paged_mqa_logits(
+                    q_fp8[start:end],
+                    kv_cache_fp8,
+                    weights[start:end],
+                    seqlens_chunk.unsqueeze(-1),
+                    block_tables[start:end],
+                    schedule_chunk,
+                    max_seq_len,
+                    clean_logits=False,
+                )
+                topk_chunk = metadata.topk_transform(
+                    logits_chunk,
+                    self.index_topk,
+                    cu_seqlens_q_override=schedule_metadata.cu_seqlens_q[
+                        chunk_idx
+                    ],
+                    ke_offset=seqlens_chunk,
+                    page_table_size_1_override=(
+                        page_table_size_1[start:end]
+                        if page_table_size_1 is not None
+                        else None
+                    ),
+                    page_table_size_64_override=(
+                        block_tables[start:end]
+                        if page_table_size_1 is None
+                        else None
+                    ),
+                )
+                topk_result[start:end].copy_(topk_chunk)
+                del logits_chunk, topk_chunk
+            return topk_result
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
-                seqlens_32,
-                block_tables,
+                seqlens_32[:q_offset].unsqueeze(-1),
+                block_tables[:q_offset],
                 schedule_metadata,
                 max_seq_len,
                 clean_logits=False,
@@ -509,11 +666,10 @@ class Indexer(MultiPlatformOp):
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
-        k_fp8_list = []
-        k_scale_list = []
 
         if _is_hip:
             block_tables = metadata.get_page_table_1()
+            assert block_tables is not None
         else:
             block_tables = metadata.get_page_table_64()
 

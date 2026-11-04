@@ -18,21 +18,49 @@ def transform_index_page_table_decode_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
-    page_size: tl.constexpr,
-    max_seqlen_k: tl.constexpr,
+    page_table_stride_0: tl.constexpr,
+    page_table_stride_1: tl.constexpr,
+    topk_indices_stride_0: tl.constexpr,
+    topk_indices_stride_1: tl.constexpr,
+    result_stride_0: tl.constexpr,
+    result_stride_1: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    MAX_NUM_PAGES: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
-    page_table_ptr = page_table_ptr + req_id * max_seqlen_k
-    topk_indices_ptr = topk_indices_ptr + req_id * TOPK
-    result_ptr = result_ptr + req_id * TOPK
+    page_table_ptr = page_table_ptr + req_id * page_table_stride_0
+    topk_indices_ptr = topk_indices_ptr + req_id * topk_indices_stride_0
+    result_ptr = result_ptr + req_id * result_stride_0
 
-    offset = tl.arange(0, TOPK)  # topk should be 2048
-    loaded_topk_indices = tl.load(topk_indices_ptr + offset)
-    mask = loaded_topk_indices >= 0
-    loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
-    tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
-    tl.store(result_ptr + offset, -1, mask=~mask)
+    offset = tl.arange(0, BLOCK_SIZE)
+    topk_mask = offset < TOPK
+    loaded_topk_indices = tl.load(
+        topk_indices_ptr + offset * topk_indices_stride_1,
+        mask=topk_mask,
+        other=-1,
+    )
+    logical_page_indices = loaded_topk_indices // PAGE_SIZE
+    valid = (
+        topk_mask
+        & (loaded_topk_indices >= 0)
+        & (logical_page_indices < MAX_NUM_PAGES)
+    )
+    physical_page_indices = tl.load(
+        page_table_ptr + logical_page_indices * page_table_stride_1,
+        mask=valid,
+        other=-1,
+    )
+    valid = valid & (physical_page_indices >= 0)
+    physical_slots = (
+        physical_page_indices * PAGE_SIZE + loaded_topk_indices % PAGE_SIZE
+    )
+    tl.store(
+        result_ptr + offset * result_stride_1,
+        tl.where(valid, physical_slots, -1),
+        mask=topk_mask,
+    )
 
 
 def transform_index_page_table_decode_fast(
@@ -44,27 +72,45 @@ def transform_index_page_table_decode_fast(
     """
     Transform the page table according to topk indices for sparse topk attention.
     Args:
-        page_table: [qo_len, max_seqlen_k], the original page table
+        page_table: [qo_len, ceil(max_seqlen_k / page_size)] page table
         topk_indices: [qo_len, topk], the topk indices for each query position
     Returns:
         transformed_page_table: [qo_len, topk], the transformed page table
         For out-of-bound indices in topk_indices, this should be filled with -1.
     """
-    assert page_size == 1
+    assert page_size > 0
     assert page_table.shape[0] == topk_indices.shape[0]
-    assert topk_indices.shape[1] == 2048
+    assert page_table.dtype == torch.int32
+    assert topk_indices.dtype in (torch.int32, torch.int64)
     qo_len = topk_indices.shape[0]
-    max_seqlen_k = page_table.shape[1]
+    topk = topk_indices.shape[1]
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
+    assert result.dtype == torch.int32 and result.shape == topk_indices.shape
+    if qo_len == 0 or topk == 0:
+        return result
+    if page_table.shape[1] == 0:
+        result.fill_(-1)
+        return result
+    block_size = triton.next_power_of_2(topk)
+    num_warps = 8 if block_size >= 2048 else 4 if block_size >= 256 else 1
     # Launch triton kernel
     grid = (qo_len,)
     transform_index_page_table_decode_kernel[grid](
         page_table,
         topk_indices,
         result,
-        page_size,
-        max_seqlen_k=max_seqlen_k,
+        page_table.stride(0),
+        page_table.stride(1),
+        topk_indices.stride(0),
+        topk_indices.stride(1),
+        result.stride(0),
+        result.stride(1),
+        PAGE_SIZE=page_size,
+        MAX_NUM_PAGES=page_table.shape[1],
+        TOPK=topk,
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
     )
     return result
 
@@ -76,7 +122,7 @@ def transform_index_page_table_prefill_fast(
     page_size: int = 1,
 ) -> torch.Tensor:
     # TODO(baizhou): can be implemented with another triton kernel
-    assert page_size == 1
+    assert page_size > 0
     result = torch.empty_like(topk_indices, dtype=torch.int32)
     assert len(extend_lens_cpu) == page_table.shape[0]
     offset = 0
@@ -85,6 +131,7 @@ def transform_index_page_table_prefill_fast(
             page_table[i].unsqueeze(0).expand(l, -1),
             topk_indices[offset : offset + l],
             result=result[offset : offset + l],
+            page_size=page_size,
         )
         offset += l
     assert offset == topk_indices.shape[0]
@@ -97,18 +144,28 @@ def transform_index_page_table_decode_ref(
     result: Optional[torch.Tensor] = None,
     page_size: int = 1,
 ) -> torch.Tensor:
-    assert page_size == 1
+    assert page_size > 0
     assert page_table.shape[0] == topk_indices.shape[0]
+    assert page_table.dtype == torch.int32
+    assert topk_indices.dtype in (torch.int32, torch.int64)
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
-    assert result.shape == topk_indices.shape
+    assert result.dtype == torch.int32 and result.shape == topk_indices.shape
+    if page_table.shape[1] == 0:
+        result.fill_(-1)
+        return result
+    safe_indices = topk_indices.clamp(min=0).to(torch.int64)
+    logical_page_indices = torch.div(safe_indices, page_size, rounding_mode="floor")
+    valid = (topk_indices >= 0) & (logical_page_indices < page_table.shape[1])
     torch.gather(
         page_table.to(result.dtype),
         dim=1,
-        index=topk_indices.clamp(min=0),
+        index=logical_page_indices.clamp(max=page_table.shape[1] - 1).to(torch.int64),
         out=result,
     )
-    result[topk_indices < 0] = -1
+    valid &= result >= 0
+    result.mul_(page_size).add_(safe_indices.remainder(page_size).to(result.dtype))
+    result.masked_fill_(~valid, -1)
     return result
 
 
@@ -118,7 +175,7 @@ def transform_index_page_table_prefill_ref(
     extend_lens_cpu: List[int],
     page_size: int = 1,
 ) -> torch.Tensor:
-    assert page_size == 1
+    assert page_size > 0
     result = torch.empty_like(topk_indices, dtype=torch.int32)
     assert len(extend_lens_cpu) == page_table.shape[0]
     offset = 0
@@ -127,6 +184,7 @@ def transform_index_page_table_prefill_ref(
             page_table[i].unsqueeze(0).expand(l, -1),
             topk_indices[offset : offset + l],
             result=result[offset : offset + l],
+            page_size=page_size,
         )
         offset += l
     assert offset == topk_indices.shape[0]

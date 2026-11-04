@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -11,9 +12,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.nsa_indexer import (
     BaseIndexerMetadata,
     Indexer,
+    PagedMQAScheduleMetadata,
+    build_paged_mqa_schedule_metadata,
     rotate_activation,
 )
 from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
@@ -154,12 +158,100 @@ class MockIndexerMetadata(BaseIndexerMetadata):
         ke_offset: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[torch.Tensor] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
+        cu_seqlens_q_override: Optional[torch.Tensor] = None,
+        page_table_size_1_override: Optional[torch.Tensor] = None,
+        page_table_size_64_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform topk selection on the logits.
         For testing, just return the topk indices.
         """
         return torch.topk(logits, k=topk, dim=-1).indices
+
+
+class MockPagedMQAMetadata:
+    def __init__(
+        self,
+        num_rows: int,
+        max_seq_len: int,
+        device: str,
+        include_token_table: bool = True,
+    ):
+        self.num_rows = num_rows
+        self.seqlens = torch.arange(
+            2048,
+            2048 + num_rows,
+            dtype=torch.int32,
+            device=device,
+        )
+        row_ids = torch.arange(num_rows, dtype=torch.int32, device=device)
+        self.block_table = torch.zeros(
+            num_rows,
+            max_seq_len // 64,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.block_table[:, 0] = row_ids
+        self.page_table = None
+        if include_token_table:
+            self.page_table = torch.zeros(
+                num_rows,
+                max_seq_len,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.page_table[:, 0] = row_ids
+        self.paged_mqa_schedule_metadata = None
+        self.transform_ranges = []
+        self.transform_page_sizes = []
+
+    def get_seqlens_int32(self):
+        return self.seqlens
+
+    def get_seqlens_expanded(self):
+        return self.seqlens
+
+    def get_page_table_64(self):
+        return self.block_table
+
+    def get_page_table_1(self):
+        return self.page_table
+
+    def get_nsa_extend_len_cpu(self):
+        return [1] * self.num_rows
+
+    def topk_transform(
+        self,
+        logits,
+        topk,
+        cu_seqlens_q=None,
+        cu_seqlens_q_override=None,
+        ke_offset=None,
+        page_table_size_1_override=None,
+        page_table_size_64_override=None,
+        **kwargs,
+    ):
+        table_override = page_table_size_1_override
+        page_size = 1
+        if table_override is None:
+            table_override = page_table_size_64_override
+            page_size = 64
+        if table_override is not None:
+            assert cu_seqlens_q_override is not None
+            assert ke_offset is not None
+            torch.testing.assert_close(
+                cu_seqlens_q_override,
+                torch.arange(
+                    table_override.shape[0] + 1,
+                    dtype=torch.int32,
+                    device=logits.device,
+                ),
+            )
+            row_ids = table_override[:, 0]
+            torch.testing.assert_close(ke_offset, self.seqlens[row_ids.long()])
+            self.transform_ranges.append(row_ids.tolist())
+            self.transform_page_sizes.append(page_size)
+        return torch.topk(logits, k=topk, dim=-1).indices.to(torch.int32)
 
 
 class MockModelRunner:
@@ -674,6 +766,374 @@ class TestNSAIndexer(CustomTestCase):
                 expected_blocks = (seq_len + 63) // 64
                 self.assertEqual(page_table.shape[0], batch_size)
                 self.assertGreaterEqual(page_table.shape[1], expected_blocks)
+
+    def test_draft_extend_v2_metadata_uses_block_table(self):
+        draft_tokens = 4
+        batch_size = 2
+        seq_lens_cpu = torch.tensor([130, 65], dtype=torch.int32)
+
+        self.model_runner = MockModelRunner(
+            {"context_len": 256, "max_bs": 4, "page_size": 64}
+        )
+        self.model_runner.server_args.speculative_num_draft_tokens = draft_tokens
+        self.backend = NativeSparseAttnBackend(self.model_runner)
+
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        token_offsets = torch.arange(256, dtype=torch.int32, device="cuda")
+        req_to_token[0].copy_(token_offsets + 3 * 64)
+        req_to_token[1].copy_(token_offsets + 11 * 64)
+
+        seq_lens = seq_lens_cpu.to("cuda")
+        extend_seq_lens = torch.full(
+            (batch_size,), draft_tokens, dtype=torch.int32, device="cuda"
+        )
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=batch_size,
+            input_ids=torch.zeros(
+                batch_size * draft_tokens, dtype=torch.int64, device="cuda"
+            ),
+            req_pool_indices=torch.arange(
+                batch_size, dtype=torch.int32, device="cuda"
+            ),
+            seq_lens=seq_lens,
+            out_cache_loc=torch.zeros(
+                batch_size * draft_tokens, dtype=torch.int64, device="cuda"
+            ),
+            seq_lens_sum=int(seq_lens_cpu.sum().item()),
+            seq_lens_cpu=seq_lens_cpu,
+            extend_num_tokens=batch_size * draft_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=[draft_tokens] * batch_size,
+            extend_prefix_lens=seq_lens - draft_tokens,
+            extend_prefix_lens_cpu=(seq_lens_cpu - draft_tokens).tolist(),
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            attn_backend=self.backend,
+        )
+
+        self.backend.init_forward_metadata(forward_batch)
+        metadata = self.backend.forward_metadata
+
+        self.assertIsNone(metadata.page_table_1)
+        self.assertEqual(
+            metadata.real_page_table.shape,
+            (batch_size * draft_tokens, 3),
+        )
+        expected = torch.repeat_interleave(
+            req_to_token[:batch_size, :130:64] // 64,
+            repeats=draft_tokens,
+            dim=0,
+        )
+        torch.testing.assert_close(
+            metadata.real_page_table,
+            expected,
+            rtol=0,
+            atol=0,
+        )
+
+        self.backend.init_cuda_graph_state(
+            max_bs=batch_size,
+            max_num_tokens=batch_size * draft_tokens,
+        )
+        self.assertNotIn("page_table", self.backend.decode_cuda_graph_metadata)
+        self.assertEqual(
+            self.backend.decode_cuda_graph_metadata["block_table"].shape,
+            (batch_size * draft_tokens, 4),
+        )
+
+        self.backend.init_forward_metadata_capture_cuda_graph(
+            bs=batch_size,
+            num_tokens=batch_size * draft_tokens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=seq_lens,
+            encoder_lens=None,
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            spec_info=None,
+        )
+        spec_info = SimpleNamespace(
+            accept_length=torch.tensor(
+                [1, 2], dtype=torch.int32, device="cuda"
+            ),
+            extend_seq_lens_tensor=extend_seq_lens,
+            extend_seq_lens_cpu=[draft_tokens] * batch_size,
+        )
+        self.backend.init_forward_metadata_replay_cuda_graph(
+            bs=batch_size,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=int(seq_lens_cpu.sum().item()),
+            encoder_lens=None,
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+        expected_expanded = torch.tensor(
+            [127, 128, 129, 130, 62, 63, 64, 65],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        torch.testing.assert_close(
+            self.backend.forward_metadata.nsa_seqlens_expanded,
+            expected_expanded,
+            rtol=0,
+            atol=0,
+        )
+
+        # Multi-layer EAGLE V2 can replay more rows than the global draft count.
+        graph_draft_tokens = draft_tokens + 1
+        graph_extend_seq_lens = torch.full(
+            (batch_size,),
+            graph_draft_tokens,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        # The V2 fallback follows the graph's per-request width, not the global
+        # speculative draft count.
+        fallback_spec_info = SimpleNamespace(
+            accept_length=torch.tensor(
+                [1, 2], dtype=torch.int32, device="cuda"
+            ),
+            num_tokens_per_req=graph_draft_tokens,
+        )
+        fallback_lens, fallback_lens_cpu = self.backend._get_draft_extend_lens(
+            batch_size,
+            fallback_spec_info,
+            ForwardMode.DRAFT_EXTEND_V2,
+        )
+        torch.testing.assert_close(
+            fallback_lens,
+            graph_extend_seq_lens,
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(
+            fallback_lens_cpu,
+            [graph_draft_tokens] * batch_size,
+        )
+
+        self.backend.init_cuda_graph_state(
+            max_bs=batch_size,
+            max_num_tokens=batch_size * graph_draft_tokens,
+        )
+        self.backend.init_forward_metadata_capture_cuda_graph(
+            bs=batch_size,
+            num_tokens=batch_size * graph_draft_tokens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=seq_lens,
+            encoder_lens=None,
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            spec_info=None,
+        )
+        graph_spec_info = SimpleNamespace(
+            accept_length=torch.tensor(
+                [1, 2], dtype=torch.int32, device="cuda"
+            ),
+            extend_seq_lens_tensor=graph_extend_seq_lens,
+            extend_seq_lens_cpu=[graph_draft_tokens] * batch_size,
+        )
+        self.backend.init_forward_metadata_replay_cuda_graph(
+            bs=batch_size,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=int(seq_lens_cpu.sum().item()),
+            encoder_lens=None,
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            spec_info=graph_spec_info,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+        expected_expanded = torch.tensor(
+            [126, 127, 128, 129, 130, 61, 62, 63, 64, 65],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.assertEqual(
+            self.backend.forward_metadata.real_page_table.shape[0],
+            batch_size * graph_draft_tokens,
+        )
+        torch.testing.assert_close(
+            self.backend.forward_metadata.nsa_seqlens_expanded,
+            expected_expanded,
+            rtol=0,
+            atol=0,
+        )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestPagedMQALogitsChunking(unittest.TestCase):
+    def _run_paged_case(
+        self,
+        num_rows: int,
+        padding_rows: int,
+        include_token_table: bool = True,
+    ):
+        max_seq_len = 4096
+        topk = 4
+        total_rows = num_rows + padding_rows
+        metadata = MockPagedMQAMetadata(
+            num_rows,
+            max_seq_len,
+            "cuda",
+            include_token_table=include_token_table,
+        )
+
+        q_fp8 = torch.arange(
+            total_rows, dtype=torch.float32, device="cuda"
+        ).reshape(total_rows, 1, 1)
+        weights = q_fp8.clone()
+        kv_cache = torch.zeros(
+            1, 64 * 132, dtype=torch.float32, device="cuda"
+        )
+        token_pool = SimpleNamespace(
+            page_size=64,
+            get_index_k_with_scale_buffer=lambda layer_id: kv_cache,
+        )
+        forward_batch = SimpleNamespace(
+            token_to_kv_pool=token_pool,
+            forward_mode=ForwardMode.DECODE,
+        )
+        indexer = SimpleNamespace(index_topk=topk, sm_count=132)
+
+        schedule_ranges = []
+        logits_ranges = []
+
+        def get_schedule(context_lens, block_kv, num_sms):
+            self.assertEqual(block_kv, 64)
+            self.assertEqual(num_sms, 132)
+            context_lens = context_lens.flatten()
+            row_ids = context_lens - 2048
+            start = int(row_ids[0].item())
+            end = start + row_ids.shape[0]
+            torch.testing.assert_close(
+                row_ids,
+                torch.arange(start, end, dtype=torch.int32, device="cuda"),
+            )
+            schedule_ranges.append((start, end))
+            return torch.tensor(
+                [start, end], dtype=torch.int32, device="cuda"
+            )
+
+        def paged_mqa_logits(
+            q,
+            kv,
+            chunk_weights,
+            context_lens,
+            block_table,
+            schedule,
+            kernel_max_seq_len,
+            clean_logits,
+        ):
+            self.assertFalse(clean_logits)
+            self.assertEqual(kernel_max_seq_len, max_seq_len)
+            row_ids = q[:, 0, 0, 0].to(torch.int32)
+            start = int(row_ids[0].item())
+            end = start + row_ids.shape[0]
+            logits_ranges.append((start, end))
+            torch.testing.assert_close(
+                row_ids,
+                torch.arange(start, end, dtype=torch.int32, device="cuda"),
+            )
+            torch.testing.assert_close(
+                chunk_weights[:, 0].to(torch.int32), row_ids
+            )
+            torch.testing.assert_close(
+                context_lens[:, 0], metadata.seqlens[row_ids.long()]
+            )
+            torch.testing.assert_close(block_table[:, 0], row_ids)
+            torch.testing.assert_close(
+                schedule,
+                torch.tensor([start, end], dtype=torch.int32, device="cuda"),
+            )
+
+            cols = torch.arange(
+                max_seq_len, dtype=torch.float32, device="cuda"
+            ).unsqueeze(0)
+            return torch.where(
+                cols < context_lens.to(torch.float32),
+                cols,
+                torch.full_like(cols, float("-inf")),
+            )
+
+        fake_deep_gemm = SimpleNamespace(
+            get_paged_mqa_logits_metadata=get_schedule,
+            fp8_paged_mqa_logits=paged_mqa_logits,
+        )
+
+        with (  # pylint: disable=not-context-manager
+            patch(
+                "sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm",
+                fake_deep_gemm,
+            ),
+            patch("sglang.srt.layers.attention.nsa.nsa_indexer._is_cuda", True),
+            patch("sglang.srt.layers.attention.nsa.nsa_indexer._is_hip", False),
+            envs.SGLANG_NSA_PAGED_MQA_LOGITS_MAX_CHUNK_MB.override(1),
+        ):
+            metadata.paged_mqa_schedule_metadata = (
+                build_paged_mqa_schedule_metadata(
+                    metadata.seqlens,
+                    64,
+                    132,
+                    max_seq_len,
+                )
+            )
+            result = Indexer._get_topk_paged(
+                indexer,
+                forward_batch,
+                layer_id=0,
+                q_fp8=q_fp8,
+                weights=weights,
+                metadata=metadata,
+            )
+
+        expected = metadata.seqlens.unsqueeze(1) - 1 - torch.arange(
+            topk, dtype=torch.int32, device="cuda"
+        )
+        torch.testing.assert_close(result[:num_rows], expected)
+        if padding_rows:
+            torch.testing.assert_close(
+                result[num_rows:],
+                torch.full(
+                    (padding_rows, topk),
+                    -1,
+                    dtype=torch.int32,
+                    device="cuda",
+                ),
+            )
+        return metadata, schedule_ranges, logits_ranges
+
+    def test_unchunked_paged_mqa_uses_single_call(self):
+        metadata, schedule_ranges, logits_ranges = self._run_paged_case(8, 2)
+        self.assertIsInstance(metadata.paged_mqa_schedule_metadata, torch.Tensor)
+        self.assertEqual(schedule_ranges, [(0, 8)])
+        self.assertEqual(logits_ranges, [(0, 8)])
+
+    def test_chunked_paged_mqa_bounds_and_aligns_rows(self):
+        metadata, schedule_ranges, logits_ranges = self._run_paged_case(130, 4)
+        self.assertIsInstance(
+            metadata.paged_mqa_schedule_metadata,
+            PagedMQAScheduleMetadata,
+        )
+        expected_ranges = [(0, 64), (64, 128), (128, 130)]
+        self.assertEqual(schedule_ranges, expected_ranges)
+        self.assertEqual(logits_ranges, expected_ranges)
+        self.assertEqual(
+            metadata.transform_ranges,
+            [list(range(start, end)) for start, end in expected_ranges],
+        )
+        for start, end in logits_ranges:
+            self.assertLessEqual((end - start) * 4096 * 4, 1024 * 1024)
+
+    def test_chunked_paged_mqa_uses_block_table_when_token_table_is_absent(self):
+        metadata, schedule_ranges, logits_ranges = self._run_paged_case(
+            130,
+            4,
+            include_token_table=False,
+        )
+        expected_ranges = [(0, 64), (64, 128), (128, 130)]
+        self.assertEqual(schedule_ranges, expected_ranges)
+        self.assertEqual(logits_ranges, expected_ranges)
+        self.assertEqual(metadata.transform_page_sizes, [64, 64, 64])
 
 
 if __name__ == "__main__":

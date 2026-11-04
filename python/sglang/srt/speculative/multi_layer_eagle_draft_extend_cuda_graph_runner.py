@@ -501,6 +501,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         forward_batch.spec_info.num_tokens_for_logprob_per_req = 1
         forward_batch.spec_info.positions = self.positions[:num_tokens]
         forward_batch.spec_info.extend_seq_lens_tensor = self.extend_seq_lens[:bs]
+        forward_batch.spec_info.extend_seq_lens_cpu = list(
+            self.extend_seq_lens_cpu[:bs]
+        )
 
         self.eagle_worker.draft_extend_attn_backend_list[
             self.step
