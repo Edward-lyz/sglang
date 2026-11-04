@@ -457,6 +457,7 @@ class PrefillBootstrapQueue:
         return_failed_reqs: bool = False,
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
+        prepolled: Optional[List[int]] = None,
     ) -> List[Req] | tuple[List[Req], List[Req]]:
         """
         pop the reqs which has finished bootstrapping
@@ -464,6 +465,9 @@ class PrefillBootstrapQueue:
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
         pp_good_rids: RIDs that PP consensus determined as WaitingForInput.
         pp_bad_rids: RIDs that PP consensus determined as Failed.
+        prepolled: poll states for `self.queue`, already MIN all-reduced by
+            Scheduler.fuse_bootstrap_polls (shares one all_reduce with the
+            waiting queue). Must be positionally aligned with `self.queue`.
         """
 
         bootstrapped_reqs = []
@@ -494,10 +498,14 @@ class PrefillBootstrapQueue:
                     if local_poll == KVPoll.Failed:
                         polls[i] = KVPoll.Failed
         else:
-            polls = poll_and_all_reduce_attn_cp_tp_group(
-                [req.disagg_kv_sender for req in self.queue],
-                self.scheduler.attn_cp_cpu_group,
-                self.scheduler.attn_tp_cpu_group,
+            polls = (
+                prepolled
+                if prepolled is not None and len(prepolled) == len(self.queue)
+                else poll_and_all_reduce_attn_cp_tp_group(
+                    [req.disagg_kv_sender for req in self.queue],
+                    self.scheduler.attn_cp_cpu_group,
+                    self.scheduler.attn_tp_cpu_group,
+                )
             )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
@@ -582,14 +590,28 @@ class SchedulerDisaggregationPrefillMixin:
         finalizes optimistic requests whose bootstrap completed so they skip
         the post-forward bootstrap check.
         """
-        candidates = [req for req in self.waiting_queue if not is_aborted(req)]
-        if not candidates:
-            return
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in candidates],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
+        # Reuse the poll result that was all-reduced together with the bootstrap
+        # queue at the top of this scheduler iteration (see fuse_bootstrap_polls).
+        # Each gloo MIN all_reduce over the attn-cp group costs 0.25-1ms on the
+        # critical path between two prefill forwards, so the two queues share one.
+        fused = getattr(self, "_fused_waiting_polls", None)
+        self._fused_waiting_polls = None
+        if fused is not None:
+            candidates, polls = fused
+            if not candidates:
+                return
+        else:
+            candidates = [req for req in self.waiting_queue if not is_aborted(req)]
+            if not candidates:
+                return
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in candidates],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
+        self._resolve_waiting_queue_polls(candidates, polls)
+
+    def _resolve_waiting_queue_polls(self: Scheduler, candidates, polls) -> None:
         failed = set()
         for req, poll in zip(candidates, polls):
             if poll == KVPoll.Failed:
@@ -608,6 +630,45 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in failed
             ]
+
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
+    def fuse_bootstrap_polls(self: Scheduler) -> Optional[List[int]]:
+        """Poll bootstrap + waiting + inflight queues under ONE all_reduce.
+
+        Each of the three queues is polled once per scheduler iteration and each
+        poll used to pay its own pair of gloo MIN all_reduces (attn-tp then
+        attn-cp) — 6 CPU collectives per iteration. Between two prefill forwards
+        that is squarely on the critical path: measured 0.25-1ms per attn-cp
+        all_reduce with the GPU fully idle. MIN is associative, so reducing the
+        concatenated poll vector once is bit-exact with reducing the three
+        vectors separately.
+
+        Returns the bootstrap-queue slice (for pop_bootstrapped) and stashes the
+        waiting / inflight slices for resolve_waiting_queue_bootstrap and
+        process_disagg_prefill_inflight_queue. Returns None when fusing does not
+        apply, in which case every caller falls back to its own all_reduce.
+        """
+        self._fused_waiting_polls = None
+        self._fused_inflight_polls = None
+        if self.disagg_prefill_bootstrap_queue.pp_size > 1:
+            return None  # PP has its own consensus path
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue.queue
+        waiting = [req for req in self.waiting_queue if not is_aborted(req)]
+        inflight = list(self.disagg_prefill_inflight_queue)
+        if not bootstrap_queue and not waiting and not inflight:
+            return None
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in bootstrap_queue]
+            + [req.disagg_kv_sender for req in waiting]
+            + [req.disagg_kv_sender for req in inflight],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        n_boot = len(bootstrap_queue)
+        n_wait = len(waiting)
+        self._fused_waiting_polls = (waiting, polls[n_boot : n_boot + n_wait])
+        self._fused_inflight_polls = polls[n_boot + n_wait :]
+        return polls[:n_boot]
 
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
@@ -659,8 +720,14 @@ class SchedulerDisaggregationPrefillMixin:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                    prepolled=self.fuse_bootstrap_polls()
+                )
             )
+            # Runs here (instead of at the bottom of the loop) so it consumes the
+            # same fused poll: one gloo all_reduce per iteration covers bootstrap +
+            # waiting + inflight. The move costs at most one ingest_requests worth
+            # of detection delay (~2ms) and frees KV pages before admission.
             self.process_disagg_prefill_inflight_queue(
                 prepolled=self._fused_inflight_polls
             )
@@ -701,8 +768,14 @@ class SchedulerDisaggregationPrefillMixin:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                    prepolled=self.fuse_bootstrap_polls()
+                )
             )
+            # Runs here (instead of at the bottom of the loop) so it consumes the
+            # same fused poll: one gloo all_reduce per iteration covers bootstrap +
+            # waiting + inflight. The move costs at most one ingest_requests worth
+            # of detection delay (~2ms) and frees KV pages before admission.
             self.process_disagg_prefill_inflight_queue(
                 prepolled=self._fused_inflight_polls
             )
