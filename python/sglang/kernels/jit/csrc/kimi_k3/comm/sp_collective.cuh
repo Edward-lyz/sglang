@@ -41,6 +41,11 @@ struct Params {
   uint32_t rank;
   uint32_t local_vecs;
   uint32_t residual_is_local;
+  // all_gather only (nullptr = off): gather bf16(bf16(input + addend_b) +
+  // addend_c) instead of input, i.e. the add3 that precedes the gather,
+  // folded into the producer loads. Same [rows, hidden] shard layout.
+  const uint8_t* addend_b;
+  const uint8_t* addend_c;
 };
 
 template <typename Vec>
@@ -179,6 +184,16 @@ __global__ void all_gather_kernel(const __grid_constant__ Params params) {
   for (uint32_t vid = tid; vid < params.local_vecs; vid += num_threads) {
     vec_t vec;
     ld_global_16B(vec, params.input, vid);
+    if (params.addend_b != nullptr) {
+      // Same double rounding as the add3 kernel: bf16(bf16(a + b) + c).
+      vec_t b, c;
+      ld_global_16B(b, params.addend_b, vid);
+      ld_global_16B(c, params.addend_c, vid);
+#pragma unroll
+      for (uint32_t i = 0; i < 4; ++i) {
+        vec[i] = __hadd2(__hadd2(vec[i], b[i]), c[i]);
+      }
+    }
     make_nonzero(vec);
     st_multimem_16B(vec, params.push_ws_mc + producer_offset, vid);
   }
@@ -388,6 +403,35 @@ struct SPCollectiveKernel {
     auto params = make_params(data, output, input, std::nullopt, false, ws_mc_base);
     params.input = static_cast<const uint8_t*>(input.data_ptr());
     params.output = static_cast<uint8_t*>(output.data_ptr());
+    host::LaunchKernel(num_blocks + 1, block_size, input.device())
+        .enable_pdl(kUsePDL)(sp_collective::all_gather_kernel<kWorldSize, kUsePDL>, params);
+  }
+
+  // all_gather of bf16(bf16(input + addend_b) + addend_c), the add3 fused
+  // into the producer side (see Params::addend_b).
+  static void all_gather_add3(
+      CommunicatorRef ref,
+      TensorView input,
+      TensorView addend_b,
+      TensorView addend_c,
+      TensorView output,
+      int64_t ws_mc_base,
+      int64_t num_blocks,
+      int64_t block_size) {
+    using namespace host;
+    const auto& data = *ref.get();
+    CHECK_HOST(ws_mc_base != 0) << "all-gather requires multicast workspace";
+    check_launch(data, num_blocks, block_size);
+    auto params = make_params(data, output, input, std::nullopt, false, ws_mc_base);
+    auto local_elems = SymbolicSize{"local_elems"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({local_elems}).with_dtype<bf16_t>().with_device(device).verify(input).verify(addend_b).verify(
+        addend_c);
+    params.input = static_cast<const uint8_t*>(input.data_ptr());
+    params.output = static_cast<uint8_t*>(output.data_ptr());
+    params.addend_b = static_cast<const uint8_t*>(addend_b.data_ptr());
+    params.addend_c = static_cast<const uint8_t*>(addend_c.data_ptr());
     host::LaunchKernel(num_blocks + 1, block_size, input.device())
         .enable_pdl(kUsePDL)(sp_collective::all_gather_kernel<kWorldSize, kUsePDL>, params);
   }

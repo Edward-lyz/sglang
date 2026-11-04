@@ -394,8 +394,16 @@ def reduce_scatter_attn_res(
     return normed, prefix
 
 
-def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
-    """Return the reassembled full batch, or None for the NCCL fallback."""
+def all_gather(
+    tensor: torch.Tensor,
+    addends: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+) -> Optional[torch.Tensor]:
+    """Return the reassembled full batch, or None for the NCCL fallback.
+
+    With addends=(b, c) the gathered shard is bf16(bf16(tensor + b) + c) (the
+    add3 tail of the MoE). The push strategy folds that add into its producer
+    loads; every other strategy materializes it first. On None the caller
+    still owns the add."""
     state = _init_state()
     if state is None:
         return None
@@ -421,8 +429,25 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
     if dispatch is None:
         return None
     output_shape = (global_tokens, tensor.shape[1])
+    if addends is not None:
+        b, c = addends
+        from sglang.kernels.ops.elementwise import add3
+
+        if dispatch.strategy != "push" or not add3.covered(tensor, b, c):
+            tensor = add3.add3(tensor, b, c)
+            addends = None
     if dispatch.strategy == "push":
         output = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
+        if addends is not None:
+            return sp_collective.all_gather_add3(
+                state.group.world_size,
+                tensor,
+                addends[0],
+                addends[1],
+                output,
+                ws_mc_base=state.comm.mc_base_ptr,
+                tuning=dispatch.tuning,
+            )
         return sp_collective.all_gather(
             state.group.world_size,
             tensor,
