@@ -82,6 +82,7 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
+from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -684,10 +685,12 @@ class DeepseekV2MoE(nn.Module):
                     else None
                 ),
             )
-            # DSV4 override: ungrouped sqrtsoftplus + fp4 expert layout flag.
-            if is_deepseek_v4:
+            # DSV4/Kimi K2.6 override: use the checkpoint routing semantics
+            # and force STANDARD top-k for fp4 expert layout so Mega-MoE consumes
+            # explicit routing tensors.
+            if is_deepseek_v4 or envs.SGLANG_KIMI_K26_MXFP4_MODE.get():
                 topk_kwargs.update(
-                    use_grouped_topk=False,
+                    use_grouped_topk=(config.n_group > config.topk_group),
                     scoring_func=config.scoring_func,
                     is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
                     apply_routed_scaling_factor_on_output=(
@@ -2031,6 +2034,32 @@ class DeepseekV2AttentionMLA(
         else:
             raise NotImplementedError
 
+    def _should_delay_attn_allgather_to_qkv_latent(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> bool:
+        if not envs.SGLANG_USE_AG_AFTER_QLORA.get():
+            return False
+        if not forward_batch.forward_mode.is_prefill():
+            return False
+        if isinstance(hidden_states, tuple):
+            return False
+        if hidden_states.shape[0] == 0:
+            return False
+        attn_tp_size = get_parallel().attn_tp_size
+        return (
+            attn_tp_size > 1
+            and hidden_states.shape[0] * attn_tp_size
+            == forward_batch.input_ids.shape[0]
+        )
+
+    def _tp_all_gather_qkv_latent(self, qkv_latent: torch.Tensor) -> torch.Tensor:
+        attn_tp_size = get_parallel().attn_tp_size
+        output = qkv_latent.new_empty(
+            (qkv_latent.shape[0] * attn_tp_size, qkv_latent.shape[-1])
+        )
+        attn_tp_all_gather_into_tensor(output, qkv_latent.contiguous())
+        return output
+
     def prepare_qkv_latent(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -2521,7 +2550,11 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep() or
+            get_moe_a2a_backend().is_mooncake() or
+            get_moe_a2a_backend().is_megamoe()
+        ):
             self.enable_a2a_moe = True
         else:
             self.enable_a2a_moe = False
@@ -2943,6 +2976,23 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def get_embed(self):
+        """Return the embedding weight tensor."""
+        return self.model.embed_tokens.weight
+
+    def set_embed(self, embed):
+        """Share embedding weight from the target model for speculative decoding."""
+        # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
+        if (
+            hasattr(self.config, "target_hidden_size")
+            and self.config.target_hidden_size != self.config.hidden_size
+        ):
+            return
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 

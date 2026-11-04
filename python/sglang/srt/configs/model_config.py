@@ -120,6 +120,10 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
+def is_kimi_k3(config) -> bool:
+    return _hf_arch(config) == "KimiK3ForConditionalGeneration"
+
+
 def is_deepseek_v4(config) -> bool:
     return _hf_arch(config) in (
         "DeepseekV4ForCausalLM",
@@ -339,11 +343,12 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
-        # DSV4 expert layout: env (default True = mxfp4) applies only to V4.
-        # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
-        # FP8 expert tensor layout.
+        # DSV4/Kimi K2.6 expert layout: the routed experts can be stored
+        # either as packed MXFP4 (U8/I8/F4) or converted FP8. Preserve the
+        # original DeepSeek-V4 auto-detection path, and also honor Kimi K2.6
+        # MXFP4 mode because KimiK25 wraps the DeepSeek text config.
         self.is_fp4_experts: bool = False
-        if is_deepseek_v4(self.hf_config):
+        if is_deepseek_v4(self.hf_config) or envs.SGLANG_KIMI_K26_MXFP4_MODE.get():
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
             if (
                 not envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
@@ -355,7 +360,7 @@ class ModelConfig:
                 if detected is not None:
                     self.is_fp4_experts = detected
                     logger.info(
-                        "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
+                        "Auto-detected DSV4/Kimi routed-expert layout: is_fp4_experts=%s",
                         self.is_fp4_experts,
                     )
             if envs.SGLANG_DSV4_FP4_DEQUANT.get():
@@ -469,6 +474,9 @@ class ModelConfig:
         self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
             is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
         )
+        self.is_mla_breakable_cuda_graph_supported = (
+            is_mla_breakable_cuda_graph_supported(self.hf_config.architectures)
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -486,8 +494,10 @@ class ModelConfig:
 
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
-        # Set by scheduler when reasoning_parser is enabled
-        self.think_end_id: Optional[int] = None
+        # Set by scheduler when reasoning_parser is enabled. A token sequence,
+        # since a think-end marker need not be a single token (Kimi-K3 uses
+        # "<|close|>think<|sep|>", three tokens).
+        self.think_end_ids: Optional[List[int]] = None
 
         # multimodal
         self.image_token_id = getattr(
@@ -743,6 +753,7 @@ class ModelConfig:
                 if (
                     envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get()
                     or is_in_ci()  # FIXME: fix this special case
+                    or is_draft_model  # spec decoding intentionally syncs draft to target
                 ):
                     logger.warning(msg)
                     self.context_len = context_length
@@ -884,18 +895,20 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
-        elif "KimiLinearForCausalLM" in self.hf_config.architectures:
+        elif (
+            "KimiLinearForCausalLM" in self.hf_config.architectures
+            or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+        ):
+            tc = self.hf_text_config
             self.head_dim = 72
             self.attention_arch = AttentionArch.MLA
-            self.kv_lora_rank = self.hf_config.kv_lora_rank
-            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            self.v_head_dim = self.hf_config.v_head_dim
-            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.kv_lora_rank = tc.kv_lora_rank
+            self.qk_rope_head_dim = tc.qk_rope_head_dim
+            self.v_head_dim = tc.v_head_dim
+            self.qk_nope_head_dim = tc.qk_nope_head_dim
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            if getattr(tc, "rope_scaling", None):
+                self.scaling = compute_mla_mscale_scaling(tc.rope_scaling, self.scaling)
         elif (
             "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
             or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
@@ -1794,6 +1807,15 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "Qwen3_5MoeForConditionalGeneration",
 ]
 
+# MLA archs validated to run breakable CUDA graph when it is explicitly
+# requested (--cuda-graph-backend-prefill=breakable bypasses the ServerArgs
+# disable rules). Dispatch pins the absorbed MLA path inside capture/replay
+# for these archs, so the prefill runner's MHA-companion prefix restrictions
+# do not apply (see PrefillCudaGraphRunner.mla_pinned_under_bcg).
+mla_breakable_cuda_graph_supported_model_archs = [
+    "KimiK3ForConditionalGeneration",
+]
+
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
     multimodal_model_archs.append(external_mm_model_arch)
 
@@ -1868,6 +1890,14 @@ def is_multimodal_breakable_cuda_graph_supported(model_architectures: List[str])
     )
 
 
+def is_mla_breakable_cuda_graph_supported(model_architectures: List[str]):
+    """Whether an MLA arch may keep prefill breakable CUDA graph enabled."""
+    return any(
+        arch in mla_breakable_cuda_graph_supported_model_archs
+        for arch in model_architectures
+    )
+
+
 # SequenceClassification models that use CrossEncodingPooler
 _cross_encoding_pooler_archs = [
     "BertForSequenceClassification",
@@ -1889,8 +1919,13 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     """Compute MLA attention scaling factor from rope_scaling with mscale.
 
     Used by DeepSeek, BailingMoe, SarvamMLA and similar MLA models.
-    Warns if 'factor' is missing from rope_scaling (common in v5 configs).
+    Transformers v5 also exposes the default RoPE parameters through
+    ``rope_scaling``. Those parameters do not request any scaling.
     """
+    rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+    if rope_type == "default":
+        return base_scaling
+
     if not rope_scaling.get("apply_yarn_scaling", True) or not rope_scaling.get(
         "apply_scale", True
     ):

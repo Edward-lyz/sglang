@@ -1,3 +1,5 @@
+"""JIT kernel to zero-out attention outputs for rows with empty KV caches."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING

@@ -149,6 +149,16 @@ class CompressedTensorsConfig(QuantizationConfig):
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
         self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
+        # For vision-language models (e.g. Kimi-K25 compressed-tensors NVFP4),
+        # the HF `ignore` list entries are prefixed with "language_model." but
+        # sglang's internal Linear layer prefix for the language model may not
+        # carry that prefix. Keep both forms so should_ignore_layer matches.
+        expanded_ignore: List[str] = []
+        for name in self.ignore:
+            expanded_ignore.append(name)
+            if isinstance(name, str) and name.startswith("language_model."):
+                expanded_ignore.append(name.removeprefix("language_model."))
+        self.ignore = list(dict.fromkeys(expanded_ignore))
         self.sparsity_scheme_map = hf_to_sglang_mapper.apply_dict(
             self.sparsity_scheme_map
         )
@@ -178,6 +188,17 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
+            # Detect MXFP4 before the scheme-based path: MXFP4 uses a
+            # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
+            # handles all MoE backends, bypassing the scheme abstraction.
+            if self._is_mxfp4_moe(layer_name=prefix):
+                from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+                logger.info_once(
+                    "Using Mxfp4MoEMethod for MXFP4 compressed-tensors MoE"
+                )
+                return Mxfp4MoEMethod(prefix=prefix)
+
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             if layer.scheme is None:  # ignored layer
                 use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
@@ -547,6 +568,28 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_static = not weight_quant.dynamic
 
         return is_mxint4 and input_quant_none and is_symmetric and is_static
+
+    def _is_mxfp4_moe(self, layer_name: str) -> bool:
+        """Detect MXFP4-quantized MoE from global format or target scheme."""
+        if "mxfp4" in (self.quant_format or ""):
+            return True
+        self._add_fused_moe_to_target_scheme_map()
+        for key in ["FusedMoE", "Linear"]:
+            scheme = self.target_scheme_map.get(key)
+            if scheme is None:
+                continue
+            wq = scheme.get("weights")
+            if wq is None:
+                continue
+            if (
+                wq.num_bits == 4
+                and wq.type == QuantizationType.FLOAT
+                and wq.strategy == QuantizationStrategy.GROUP.value
+                and wq.group_size == 32
+                and wq.symmetric
+            ):
+                return True
+        return False
 
     def _is_dynamic_token_w4(
         self, weight_quant: BaseModel, input_quant: BaseModel

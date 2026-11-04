@@ -49,6 +49,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_draft_decode_kv_indices,
 )
 from sglang.srt.utils import (
+    get_cuda_graph_max_batch_size,
     get_int_env_var,
     is_flashinfer_available,
     is_sm100_supported,

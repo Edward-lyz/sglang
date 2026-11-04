@@ -243,11 +243,17 @@ class AttentionInputs:
         self.qkv_latent_ = self.qkv_latent_func(
             self.hidden_states_local, self.forward_batch
         )
-        if get_attn_tp_context().input_scattered:
+        if get_attn_tp_context().input_scattered and not _use_ag_after_qlora:
             self.qkv_latent_ = self.tp_all_gather_hidden_states(
                 self.qkv_latent_, self.forward_batch
             )
         return self.qkv_latent_
+
+    def all_gather_qkv_latent(self, qkv_latent: torch.Tensor) -> torch.Tensor:
+        """All-gather qkv latent across TP group when input is scattered."""
+        if not get_attn_tp_context().input_scattered:
+            return qkv_latent
+        return self.tp_all_gather_hidden_states(qkv_latent, self.forward_batch)
 
     def fetch_hidden_states(self):
         if self.hidden_states_ is not None:
