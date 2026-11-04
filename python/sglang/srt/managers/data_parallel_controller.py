@@ -477,8 +477,16 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.data_parallel_rank is not None:
-            logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
-            self.workers[req.data_parallel_rank].send_pyobj(req)
+            rank = req.data_parallel_rank
+            if not isinstance(rank, int) or not (0 <= rank < len(self.workers)):
+                rid = getattr(req, "rid", None)
+                logger.warning(
+                    f"Dropping req {rid}: invalid data_parallel_rank={rank!r}, "
+                    f"valid range is [0, {len(self.workers)})"
+                )
+                return True
+            logger.debug(f"Direct routing to DP rank {rank}")
+            self.workers[rank].send_pyobj(req)
             return True
         return False
 
@@ -539,7 +547,16 @@ class DataParallelController:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-                self._request_dispatcher(recv_req)
+                try:
+                    self._request_dispatcher(recv_req)
+                except Exception:
+                    # Never let a single bad request take down the controller
+                    # (would SIGQUIT the parent and hang the whole server).
+                    rid = getattr(recv_req, "rid", None)
+                    logger.error(
+                        f"DP controller dispatch failed for req {rid}: "
+                        f"{get_exception_traceback()}"
+                    )
 
 
 def run_data_parallel_controller_process(

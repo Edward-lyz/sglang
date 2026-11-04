@@ -760,6 +760,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        # Validate dp_rank fields early so a bad client can't crash the DP controller.
+        dp_rank = getattr(obj, "data_parallel_rank", None)
+        if dp_rank is not None:
+            dp_size = self.server_args.dp_size
+            if not isinstance(dp_rank, int) or not (0 <= dp_rank < dp_size):
+                raise ValueError(
+                    f"Invalid data_parallel_rank={dp_rank!r}; "
+                    f"valid range is [0, {dp_size})"
+                )
+        peer_dp_rank = getattr(obj, "peer_data_parallel_rank", None)
+        if peer_dp_rank is not None and (
+            not isinstance(peer_dp_rank, int) or peer_dp_rank < 0
+        ):
+            # Peer dp_size is not known here; only reject obviously malformed
+            # values. Out-of-range values are caught by KV bootstrap and cause
+            # a per-request abort, which does not crash the server.
+            raise ValueError(
+                f"Invalid peer_data_parallel_rank={peer_dp_rank!r}; "
+                f"must be a non-negative int"
+            )
+
         # Tokenize
         input_embeds = None
         input_text = obj.text
