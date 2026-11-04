@@ -466,26 +466,54 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self._release_swa(swa_indices)
 
+    # Open while a caller batches the kv-row segments it evicts (see
+    # begin_swa_segment_batch); None otherwise.
+    _swa_seg_batch = None
+
+    def begin_swa_segment_batch(self) -> None:
+        """Collect free_swa_segment() calls until end_swa_segment_batch(), then free them
+        with one call: the per-request evictions of a decode batch are disjoint kv rows,
+        so one gather / page expansion / mapping clear over their concatenation frees the
+        same slots with ~5 kernels instead of ~5 per request."""
+        self._swa_seg_batch = []
+
+    def end_swa_segment_batch(self) -> None:
+        """Free the SWA peers of a batch of evicted kv rows."""
+        reps, self._swa_seg_batch = self._swa_seg_batch, None
+        if not reps:
+            return
+        self._free_swa_page_reps(reps[0] if len(reps) == 1 else torch.cat(reps))
+
     def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """free_swa() for a kv-row segment; same start-alignment contract as
         free_segment(), and fixed-shape at every page size. No-op for a
         per-request ring, as in free_swa()."""
         if self._swa_req_ring or free_index.numel() == 0:
             return
+        if self._swa_seg_batch is not None and start_pos % self.page_size == 0:
+            # Keep only the page reps (a view): segments of any length concatenate
+            # without breaking the per-segment [::page_size] page alignment.
+            self._swa_seg_batch.append(free_index[:: self.page_size])
+            return
         self._free_swa_pages(free_index, start_pos=start_pos)
 
     def _free_swa_pages(self, free_index: torch.Tensor, *, start_pos: int):
+        """Free the SWA pages touched by a page-aligned kv-row segment."""
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
+        self._free_swa_page_reps(free_index[::ps])
+
+    def _free_swa_page_reps(self, reps: torch.Tensor):
+        """Free the SWA pages whose first full-pool token is in ``reps``."""
+        ps = self.page_size
         # First token of every page the segment touches; the caller allocated
         # each one, so a dead entry means the caller wanted free_full.
-        reps = free_index[::ps]
         swa_tokens = self.full_to_swa_index_mapping[reps]
         expect(_SWA_PEER_MAPPED, swa_tokens > 0, msg="caller wants free_full")
 
         if ps == 1:
             swa_pages = swa_tokens
-            mapping_indices = free_index
+            mapping_indices = reps
         else:
             swa_pages = swa_tokens // ps
             # Both pools page in step (alloc_extend / alloc_decode drive them

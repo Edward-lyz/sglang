@@ -736,6 +736,9 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    # Batch the per-request SWA window evictions of one scheduler step into a single
+    # page free (~5 kernels instead of ~5 per evicting request). Same slots freed.
+    SGLANG_OPT_SWA_EVICT_BATCH = EnvBool(False)
     # DSpark draft Markov step: build the step logits (base + w2 bias) and draw the
     # in-graph inline-RNG token in one kernel, so the fp32 [bs, vocab] step logits are
     # never written and re-read. Same tokens and block logits as the two-kernel path.

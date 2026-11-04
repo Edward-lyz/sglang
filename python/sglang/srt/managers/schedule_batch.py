@@ -3848,6 +3848,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
             self.token_to_kv_pool_allocator.free_group_begin()
+            allocator = self.token_to_kv_pool_allocator
+            batch_segments = envs.SGLANG_OPT_SWA_EVICT_BATCH.get() and hasattr(
+                allocator, "begin_swa_segment_batch"
+            )
+            if batch_segments:
+                allocator.begin_swa_segment_batch()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
@@ -3896,6 +3902,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)
+            if batch_segments:
+                allocator.end_swa_segment_batch()
             self.token_to_kv_pool_allocator.free_group_end()
 
     def _evict_swa(self, req: Req, pre_len: int):
