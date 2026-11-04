@@ -67,6 +67,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     kill_process_tree,
 )
+from sglang.srt.utils.common import configure_logger
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
@@ -634,6 +635,8 @@ class TokenizerWorker(TokenizerManager):
         import torch
 
         torch.set_num_threads(1)
+        # Configure the logger
+        configure_logger(server_args, prefix=f" TokenizerWorker{os.getpid()}")
         super().__init__(
             server_args,
             port_args,

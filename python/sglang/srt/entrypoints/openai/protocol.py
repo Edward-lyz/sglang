@@ -828,6 +828,7 @@ class ChatCompletionRequest(BaseModel):
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
+
     stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -924,6 +925,12 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
+    # For EPD router->prefill task mapping
+    task_results: Optional[List[Dict[str, Any]]] = None
+    # 标识是否为多模态请求 (IC)
+    is_mm_request: Optional[bool] = False
+    sample_fps: Optional[float] = 2.0
+
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
@@ -946,6 +953,38 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_prefill_dp_rank(cls, values):
+        return _migrate_deprecated_prefill_dp_rank(values)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_mm_request(cls, values):
+        """A multi-modal request must carry IC's task_results, and only it may.
+
+        An empty list counts as missing: IC resolves every media item or none.
+        """
+        if not isinstance(values, dict):
+            return values
+
+        is_mm_request = values.get("is_mm_request")
+        task_results = values.get("task_results")
+        detail = None
+        if is_mm_request and not task_results:
+            detail = "Multi-modal request requires task_results parameter from IC"
+        elif is_mm_request is False and task_results:
+            detail = "task_results is only accepted when is_mm_request is true"
+
+        if detail is not None:
+            logger.error(
+                "rid=%s, status_code=400, error: %s",
+                values.get("rid"),
+                detail,
+            )
+            raise ValueError(detail)
+        return values
 
     @model_validator(mode="before")
     @classmethod

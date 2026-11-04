@@ -217,7 +217,7 @@ def get_zmq_socket_on_host(
     Returns:
         Tuple of (port, socket) where port is the randomly assigned TCP port.
     """
-    socket = context.socket(socket_type)
+    socket: zmq.Socket = context.socket(socket_type)
     config_socket(socket, socket_type)
     if host is None:
         host = "127.0.0.1"

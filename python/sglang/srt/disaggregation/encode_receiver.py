@@ -2121,6 +2121,7 @@ class MMReceiverBase(ABC):
             dllm_config=self.scheduler.dllm_config,
         )
         req.tokenizer = self.scheduler.tokenizer
+        req.tokenize_only = getattr(recv_req, "tokenize_only", False)
         return req
 
     async def allocate_embedding_buffer(self, req_id, total_bytes):

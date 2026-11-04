@@ -4729,8 +4729,13 @@ class ServerArgs:
 
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
+            # Decode nodes in disaggregation skip VIT, no need to reserve extra memory.
             model_config = self.get_model_config()
-            if model_config.is_multimodal and not self.language_only:
+            if (
+                model_config.is_multimodal
+                and not self.language_only
+                and self.disaggregation_mode != "decode"
+            ):
                 self.adjust_mem_fraction_for_vlm(model_config)
 
         # If symm mem is enabled and prealloc size is not set, set it to 4GB
@@ -7322,7 +7327,12 @@ class ServerArgs:
                 self.disaggregation_ib_device
             )
 
-        # Validate model type for encoder disaggregation
+        if self.embedding_ib_device:
+            self.embedding_ib_device = self._validate_ib_devices(
+                self.embedding_ib_device
+            )
+
+        # Validate model type: only support known encoder disaggregation models.
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
         if self.encoder_transfer_backend == "auto":
@@ -7356,6 +7366,17 @@ class ServerArgs:
                 f"Model type {model_arch} is not supported for encoder disaggregation. "
                 f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
             )
+
+    def epd_requires_task_results(self) -> bool:
+        """Whether media can only be served through encoder ``task_results``.
+
+        The EPD prefill server derives it from its own flags. The EPD decode
+        server is indistinguishable from a plain PD decode server, which may
+        legitimately expand media placeholders locally, so it must opt in.
+        """
+        return self.require_encoder_task_results or (
+            self.language_only and self.encoder_transfer_backend == "zmq_to_scheduler"
+        )
 
     def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
         """

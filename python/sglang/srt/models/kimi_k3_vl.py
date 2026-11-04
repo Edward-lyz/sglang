@@ -247,9 +247,10 @@ class Learnable2DInterpPosEmbDividedFixed(nn.Module):
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
+                # ``time_weight`` is a non-persistent buffer that stays on CPU.
                 pos_emb_3d = pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[
                     0:t
-                ].to(pos_emb_2d.dtype)
+                ].to(device=pos_emb_2d.device, dtype=pos_emb_2d.dtype)
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
 

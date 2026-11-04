@@ -298,6 +298,7 @@ class GenerateReqInput:
     # Snapshot of encoder URLs at the time tokenizer-side computed
     # ``num_items_assigned``.
     encoder_urls: Optional[List[str]] = None
+    task_results: Optional[List[Dict]] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -851,6 +852,7 @@ class GenerateReqInput:
             return_entropy=self.return_entropy,
             return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
+            task_results=self.task_results,
             received_time=self.received_time,
             # AttentionStore parameters (normalized by _normalize_as_params)
             as_kv_cache_params=(
@@ -976,6 +978,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # encoder_idx assignments stay consistent in the scheduler subprocess.
     # Internal IPC only.
     encoder_urls: Optional[List[str]] = None
+    task_results: Optional[List[Dict]] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None

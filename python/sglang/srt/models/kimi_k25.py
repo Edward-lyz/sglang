@@ -1,4 +1,5 @@
 import logging
+import os
 from copy import deepcopy
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -46,6 +47,7 @@ from sglang.srt.multimodal.mm_utils import (
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
+KIMIV_VT_INFER_MAX_PATCH_NUM = int(os.environ.get("SGLANG_ENCODER_EMBED_MAX_TOKENS", 16328))
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
@@ -259,6 +261,8 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
+                if self.time_weight.device != pos_emb_2d.device or self.time_weight.dtype != pos_emb_2d.dtype:
+                    self.time_weight = self.time_weight.to(device=pos_emb_2d.device, dtype=pos_emb_2d.dtype)
                 pos_emb_3d = (
                     pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[0:t]
                 )
@@ -650,9 +654,27 @@ class KimiK25ForConditionalGeneration(nn.Module):
         )
         # Create mm projector
         self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+        self.encoder_only = getattr(config, "encoder_only", False)
+        self.language_only = getattr(config, "language_only", False)
+        # Decode nodes in EPD disaggregation only receive KV cache from prefill
+        # and don't need the vision tower.
+        self.skip_vision_tower = self.language_only or get_server_args().disaggregation_mode == "decode"
 
         self.language_model = None
-        if not config.encoder_only:
+        if not self.skip_vision_tower:
+            # Create vision tower
+            self.vision_tower = MoonViT3dPretrainedModel(
+                config.vision_config,
+                use_data_parallel=self.use_data_parallel,
+                quant_config=(
+                    quant_config if isinstance(quant_config, ModelSlimConfig) else None
+                ),
+                prefix="vision_tower",
+            )
+            # Create mm projector
+            self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+
+        if not self.encoder_only:
             self.language_model = DeepseekV3ForCausalLM(
                 config.text_config,
                 quant_config,
@@ -663,9 +685,15 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 ),
             )
 
+            self.model = self.language_model.model
+
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
-        if self.language_model is not None and hasattr(self.language_model, "dtype"):
+        if (
+            not self.skip_vision_tower
+            and self.language_model is not None
+            and hasattr(self.language_model, "dtype")
+        ):
             target_dtype = self.language_model.dtype
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
@@ -836,9 +864,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if mapper is not None:
             weights = mapper.apply(weights)
 
+        # Vision params are only needed when the vision tower exists. When
+        # skip_vision_tower is True (language_only or disaggregation decode),
+        # vision weights are dropped inline to avoid buffer-clobber issues with
+        # RunAI's reused tensor backing.
         vision_params = (
             None
-            if self.config.language_only
+            if self.skip_vision_tower
             else dict(self.named_parameters(remove_duplicate=False))
         )
 
@@ -863,7 +895,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
                     continue
                 yield name.replace("language_model.", ""), loaded_weight
 
-        if self.language_model is not None:
+        # Load language model weights (skipped in encoder_only mode); in that
+        # case we still need to drain the generator so vision weights get
+        # loaded inline.
+        if not self.encoder_only and self.language_model is not None:
             self.language_model.load_weights(stream_language_weights())
         else:
             for _ in stream_language_weights():

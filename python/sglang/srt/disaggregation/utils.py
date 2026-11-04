@@ -1173,6 +1173,9 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
     # populate finish metadata and stream output
     req.finished_reason = FINISH_ABORT(error_message, status_code)
 
+    if getattr(req, "multimodal_inputs", None) is not None:
+        req.multimodal_inputs.release_pool_buffers()
+
     if req.return_logprob:
         req.logprob.input_token_logprobs_val = []
         req.logprob.input_token_logprobs_idx = []

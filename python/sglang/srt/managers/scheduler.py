@@ -52,7 +52,11 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.embedding_transfer.queues import (
+    MMPreallocQueue,
+    MMTransferQueue,
+)
+from sglang.srt.disaggregation.encode_receiver_aiak import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -434,6 +438,17 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
         self.init_idle_sleeper()
+
+        self.mm_receiver = None
+
+        # EPD queue
+        self.disagg_prefill_mm_prealloc_queue = None
+        self.disagg_prefill_mm_transfer_queue = None
+
+        self.disagg_prefill_bootstrap_queue = None
+        self.disagg_prefill_inflight_queue = None
+        self.disagg_decode_prealloc_queue = None
+        self.disagg_decode_transfer_queue = None
 
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
@@ -1285,6 +1300,12 @@ class Scheduler(
             and self.server_args.encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
         ):
+            assert (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+            ), f"EPD needs the prefill role, got {self.disaggregation_mode.value}"
+            # Later PP stages receive the admitted requests over the PP ring.
+            if self.ps.pp_rank != 0:
+                return
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
@@ -1828,6 +1849,7 @@ class Scheduler(
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
+            disagg_prefill_mm_prealloc_queue=self.disagg_prefill_mm_prealloc_queue,
             ps=self.ps,
             tp_group=self.tp_group,
             tp_cpu_group=self.tp_cpu_group,
@@ -2160,6 +2182,7 @@ class Scheduler(
             if req.session:
                 continue
             # For non-session requests, clear features and mm_inputs
+            mm_inputs.release_pool_buffers()
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
@@ -2613,6 +2636,8 @@ class Scheduler(
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            if req.multimodal_inputs is not None:
+                req.multimodal_inputs.release_pool_buffers()
             return False
         return True
 
@@ -2648,6 +2673,8 @@ class Scheduler(
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
+                if candidate_req.multimodal_inputs is not None:
+                    candidate_req.multimodal_inputs.release_pool_buffers()
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
@@ -2688,6 +2715,8 @@ class Scheduler(
                     ),
                     req,
                 )
+                if req.multimodal_inputs is not None:
+                    req.multimodal_inputs.release_pool_buffers()
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -4260,6 +4289,9 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            # Abort before prefill: return any held EPD pinned-pool pages
+            if req.multimodal_inputs is not None:
+                req.multimodal_inputs.release_pool_buffers()
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -4304,6 +4336,14 @@ class Scheduler(
                 ):
                     release_kv_cache(req, self.tree_cache, is_insert=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
+        # Abort requests waiting for image embeddings in mm_receiver
+        if (
+            self.ps.pp_rank == 0
+            and self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and hasattr(self, "mm_receiver")
+        ):
+            self.mm_receiver.abort_waiting_request(recv_req)
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`
@@ -4320,6 +4360,8 @@ class Scheduler(
                     if self.enable_hicache_storage:
                         self.tree_cache.release_aborted_request(req.rid)
 
+                    if req.multimodal_inputs is not None:
+                        req.multimodal_inputs.release_pool_buffers()
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 

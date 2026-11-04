@@ -23,7 +23,7 @@ def run_server(server_args):
 
             asyncio.run(serve_grpc_encoder(server_args))
         else:
-            from sglang.srt.disaggregation.encode_server import launch_server
+            from sglang.srt.disaggregation.encode_server_aiak import launch_server
 
             launch_server(server_args)
     elif server_args.smg_grpc_mode:

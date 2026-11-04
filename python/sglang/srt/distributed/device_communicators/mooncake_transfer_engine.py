@@ -303,6 +303,33 @@ def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
     return _mooncake_transfer_engine
 
 
+_mooncake_embedding_engine: Optional[MooncakeTransferEngine] = None
+
+
+def init_mooncake_embedding_engine(
+    hostname: str,
+    gpu_id: Optional[int] = None,
+    ib_device: Optional[str] = None,
+) -> MooncakeTransferEngine:
+    """Initialize the MooncakeTransferEngine dedicated to embedding transfer.
+
+    Kept separate from the KV-transfer engine so that encoder embeddings can use
+    their own IB device (``--embedding-ib-device``).
+    """
+    global _mooncake_embedding_engine
+    if _mooncake_embedding_engine is not None:
+        return _mooncake_embedding_engine
+    _mooncake_embedding_engine = MooncakeTransferEngine(
+        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
+    )
+    return _mooncake_embedding_engine
+
+
+def get_mooncake_embedding_engine() -> Optional[MooncakeTransferEngine]:
+    """Return the embedding MooncakeTransferEngine if initialized, else None."""
+    return _mooncake_embedding_engine
+
+
 def maybe_init_shared_mooncake_transfer_engine(
     *, server_args: ServerArgs, gpu_id: int
 ) -> None:
@@ -356,3 +383,13 @@ def maybe_init_shared_mooncake_transfer_engine(
                     "installation to 0.3.11 or above."
                 ) from e
             set_transfer_engine(_mooncake_transfer_engine.engine)
+
+    # The embedding engine is independent of the KV-transfer engine above: EPD
+    # prefill/decode pull encoder embeddings over their own IB device, and it is
+    # needed even when encoder_transfer_backend is zmq_to_scheduler.
+    if server_args.embedding_ib_device and server_args.language_only:
+        init_mooncake_embedding_engine(
+            hostname=get_local_ip_auto(),
+            gpu_id=gpu_id,
+            ib_device=server_args.embedding_ib_device,
+        )

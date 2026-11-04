@@ -6,7 +6,8 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -14,7 +15,12 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.embedding_transfer.request import metadata_only_recv_req
+from sglang.srt.disaggregation.utils import (
+    is_aborted,
+    poll_and_all_reduce_attn_cp_tp_group,
+    prepare_abort,
+)
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -240,6 +246,7 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+                recv_reqs = self._pp_pd_get_mm_ready_reqs(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -319,6 +326,9 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
+                    # d2h_event misses forward_stream, which reads the pinned pages.
+                    if self.disagg_prefill_mm_prealloc_queue is not None:
+                        self.mb_metadata[next_mb_id].forward_done.synchronize()
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -828,8 +838,42 @@ class SchedulerPPMixin:
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
 
-    def _pp_pd_get_bootstrapped_ids(self: Scheduler):
-        # communicate pre-consensus bootstrapp reqs
+    def _pp_pd_get_mm_ready_reqs(self: Scheduler, recv_reqs: List) -> List:
+        """Admit EPD requests locally and append the copies to relay downstream."""
+        mm_ready = self.process_disagg_prefill_mm_queues()
+        if not mm_ready:
+            return recv_reqs
+
+        relayed = []
+        admitted = []
+        for req in mm_ready:
+            if not self.pp_group.is_last_rank:
+                try:
+                    relayed.append(metadata_only_recv_req(req))
+                except ValueError as e:
+                    logger.error("EPD relay rejected %s: %s", req.rid, e)
+                    self._pp_abort_unrelayable_mm_req(req, str(e))
+                    continue
+            admitted.append(req)
+
+        if admitted:
+            self.process_input_requests(admitted)
+        if not relayed:
+            return recv_reqs
+        return recv_reqs + relayed
+
+    def _pp_abort_unrelayable_mm_req(self: Scheduler, recv_req, error_msg: str) -> None:
+        """Fail one un-relayable EPD request instead of every rank."""
+        req = self.mm_receiver.create_req(recv_req)
+        prepare_abort(req, error_msg, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.output_streamer.stream_output([req], req.return_logprob)
+
+    def _pp_pd_get_bootstrapped_ids(
+        self: Scheduler,
+        *,
+        previous_status: Optional[PPBootstrapStatus] = None,
+    ) -> PPBootstrapStatus:
+        """Combine the upstream bootstrap decision with this stage's readiness."""
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
             good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
@@ -1628,11 +1672,12 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
-                mb_metadata[mb_id] = PPBatchMetadata(
-                    can_run_cuda_graph=result.can_run_cuda_graph,
-                )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                mb_metadata[mb_id] = PPBatchMetadata(
+                    can_run_cuda_graph=result.can_run_cuda_graph,
+                    forward_done=event,
+                )
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(

@@ -1443,11 +1443,11 @@ class VisionAttention(nn.Module):
             attention_mask=attention_mask,
             forward_metadata=forward_metadata,
             sequence_lengths=sequence_lengths,
-            max_seqlen=max_seqlen,
             output_ws=attn_output_ws,
             softmax_scale=self.softmax_scale,
             window_size=effective_window_size,
             s_aux=s_aux,
+            max_seqlen=kwargs.get("max_seqlen", None),
         )
 
         assert output.dim() == 3, output.shape

@@ -36,14 +36,15 @@ def _fake_group() -> SimpleNamespace:
     return SimpleNamespace(rank=0, ranks=[0], cpu_group=object())
 
 
-def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
+def _make_receiver(ps: ParallelState, mm_receiver=None) -> SchedulerRequestReceiver:
     group = _fake_group()
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
         recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
-        mm_receiver=None,
+        mm_receiver=mm_receiver,
+        disagg_prefill_mm_prealloc_queue=[],
         ps=ps,
         tp_group=group,
         tp_cpu_group=group,
@@ -55,10 +56,13 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
         server_args=SimpleNamespace(
             enable_dp_attention=True,
             enable_dp_attention_local_control_broadcast=False,
+            language_only=True,
+            encoder_transfer_backend="zmq_to_scheduler",
         ),
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
         stream_output=lambda *args, **kwargs: None,
+        send_tokenize_output=lambda *args, **kwargs: None,
         get_last_batch=lambda: None,
     )
 
@@ -120,6 +124,27 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 (12, 4, 12, False),
             ],
         )
+
+    def test_apply_mm_receiver_parks_on_first_pp_stage(self):
+        mm_receiver = SimpleNamespace(
+            process_waiting_requests=lambda reqs: ([], ["waiting"], [])
+        )
+        receiver = _make_receiver(_make_ps(pp_rank=0), mm_receiver=mm_receiver)
+
+        self.assertEqual(receiver._apply_mm_receiver(["req"]), [])
+        self.assertEqual(receiver.disagg_prefill_mm_prealloc_queue, ["waiting"])
+
+    def test_apply_mm_receiver_skipped_off_first_pp_stage(self):
+        """Re-parking already-admitted requests would strand them forever."""
+        calls = []
+        mm_receiver = SimpleNamespace(
+            process_waiting_requests=lambda reqs: calls.append(reqs)
+        )
+        receiver = _make_receiver(_make_ps(pp_rank=1), mm_receiver=mm_receiver)
+
+        self.assertEqual(receiver._apply_mm_receiver(["req"]), ["req"])
+        self.assertEqual(calls, [])
+        self.assertEqual(receiver.disagg_prefill_mm_prealloc_queue, [])
 
 
 if __name__ == "__main__":

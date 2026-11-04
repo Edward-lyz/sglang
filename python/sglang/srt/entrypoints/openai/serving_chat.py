@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -8,6 +9,7 @@ import os
 import re
 import time
 import uuid
+from collections import Counter, defaultdict, deque
 from enum import Enum
 from http import HTTPStatus
 from typing import (
@@ -359,6 +361,104 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_max_dynamic_patch = min(img_vals) if img_vals else None
     vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
     return img_max_dynamic_patch, vid_max_dynamic_patch
+
+
+def _compute_image_task_id(model_id: str, media_url: str) -> str:
+    """md5(model_id + media_url)."""
+    return hashlib.md5((model_id + media_url).encode("utf-8")).hexdigest()
+
+
+def _compute_video_task_id(model_id: str, media_url: str, sample_fps: float) -> str:
+    """md5(model_id + media_url + fps). sample_fps default: 2.0"""
+    fps_str = f"{sample_fps:.2f}"
+    return hashlib.md5((model_id + media_url + fps_str).encode("utf-8")).hexdigest()
+
+
+def _extract_ordered_task_ids(
+    request: ChatCompletionRequest, model_id: str
+) -> Optional[List[str]]:
+    """Compute the expected task_id for each image/video media item in content order."""
+    sample_fps = request.sample_fps
+    task_ids: List[str] = []
+    for msg in request.messages:
+        content = msg.content
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if part.type == "image_url":
+                url = part.image_url.url
+                if url:
+                    task_ids.append(_compute_image_task_id(model_id, url))
+            elif part.type == "video_url":
+                url = part.video_url.url
+                if url:
+                    if sample_fps is None:
+                        return None
+                    task_ids.append(_compute_video_task_id(model_id, url, sample_fps))
+    return task_ids
+
+
+_MEDIA_CONTENT_PART_TYPES = frozenset(
+    {"image_url", "input_image", "video_url", "audio_url"}
+)
+
+
+def _contains_media_content(request: ChatCompletionRequest) -> bool:
+    """Whether the messages carry any image/video/audio part."""
+    for msg in request.messages or []:
+        content = getattr(msg, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            part_type = (
+                part.get("type")
+                if isinstance(part, dict)
+                else getattr(part, "type", None)
+            )
+            if part_type in _MEDIA_CONTENT_PART_TYPES:
+                return True
+    return False
+
+
+def _reorder_task_results_by_content(
+    request: ChatCompletionRequest,
+    task_results: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Reorder task_results to align with the media order in request content."""
+    model_ids = {
+        task_result.get("model_id")
+        or (task_result.get("encoder_addr") or {}).get("model_id")
+        for task_result in task_results
+    }
+    model_ids.discard(None)
+    model_ids.discard("")
+    if len(model_ids) != 1:
+        logger.warning(
+            "Skip task_results reorder: expected one model_id, got %s", model_ids
+        )
+        return task_results
+
+    model_id = next(iter(model_ids))
+    ordered_task_ids = _extract_ordered_task_ids(request, model_id)
+    if ordered_task_ids is None:
+        logger.warning("Skip task_results reorder: video sample_fps is not resolved")
+        return task_results
+
+    result_task_ids = [task_result.get("task_id") for task_result in task_results]
+    if Counter(ordered_task_ids) != Counter(result_task_ids):
+        logger.warning("Skip task_results reorder: task_id multiset mismatch")
+        return task_results
+
+    task_id_to_positions = defaultdict(deque)
+    for position, task_id in enumerate(ordered_task_ids):
+        task_id_to_positions[task_id].append(position)
+
+    ranked_results = [
+        (task_id_to_positions[task_result["task_id"]].popleft(), task_result)
+        for task_result in task_results
+    ]
+    ranked_results.sort(key=lambda item: item[0])
+    return [task_result for _, task_result in ranked_results]
 
 
 class OpenAIServingChat(OpenAIServingBase):
@@ -992,6 +1092,19 @@ class OpenAIServingChat(OpenAIServingBase):
             if schema is None:
                 return "schema_ is required for json_schema response format request."
 
+        # Without task_results an EPD server would fall back to local encoding
+        # and only fail much later as a KV-transfer timeout.
+        if (
+            not request.task_results
+            and self.tokenizer_manager.server_args.epd_requires_task_results()
+            and _contains_media_content(request)
+        ):
+            return (
+                "Multi-modal request requires task_results parameter from IC: "
+                "this server offloads media encoding to the encode service and "
+                "cannot process image/video/audio content locally."
+            )
+
         return None
 
     def _convert_to_internal_request(
@@ -1032,8 +1145,18 @@ class OpenAIServingChat(OpenAIServingBase):
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
+        # Reordered before rendering: K3 splices the encoder's video prompts into
+        # the prompt, so it needs them in request content order.
+        ordered_task_results = request.task_results
+        if ordered_task_results:
+            ordered_task_results = _reorder_task_results_by_content(
+                request, ordered_task_results
+            )
+
         # Process messages and apply chat template
-        processed_messages = self._process_messages(request, is_multimodal)
+        processed_messages = self._process_messages(
+            request, is_multimodal, task_results=ordered_task_results
+        )
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -1096,6 +1219,7 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
+            task_results=ordered_task_results,
             routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
@@ -1219,7 +1343,10 @@ class OpenAIServingChat(OpenAIServingBase):
         return None
 
     def _process_messages(
-        self, request: ChatCompletionRequest, is_multimodal: bool
+        self,
+        request: ChatCompletionRequest,
+        is_multimodal: bool,
+        task_results: Optional[List[Dict[str, Any]]] = None,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
         if self.default_chat_template_kwargs:
@@ -1305,7 +1432,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop=request.stop or [],
             )
         elif self.template_manager.chat_template_name is None:
-            result = self._apply_jinja_template(request, tools, is_multimodal)
+            result = self._apply_jinja_template(
+                request, tools, is_multimodal, task_results=task_results
+            )
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 

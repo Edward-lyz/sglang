@@ -46,7 +46,13 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.encode_receiver_aiak import create_mm_receiver
+from sglang.srt.disaggregation.encode_utils import (
+    expand_media_placeholders_with_offsets,
+    num_tokens_from_grid,
+    original_image_sizes_from_task_results,
+    update_raw_text,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -126,6 +132,7 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
+from sglang.srt.utils.common import load_image
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     collect_scheduler_processes,
     pyspy_dump_schedulers,
@@ -146,6 +153,33 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _reject_missing_dispatched_encoder_embedding(server_args, request_obj, mm_inputs):
+    """Do not silently turn a failed EPD request into local vision work."""
+    if (
+        mm_inputs is None
+        and server_args.language_only
+        and server_args.encoder_transfer_backend == "zmq_to_tokenizer"
+        and request_obj.need_wait_for_mm_inputs
+    ):
+        raise fastapi.HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            detail=(
+                "The encoder did not return multimodal embeddings. "
+                "The request was not run locally in language-only mode."
+            ),
+        )
+
+
+def _read_image_size(image) -> Tuple[int, int]:
+    """Return an image's ``(width, height)`` without decoding its pixels.
+
+    ``load_image`` with GPU decode disabled hands back a lazily opened PIL
+    image, so the size comes from the header alone.
+    """
+    image, size = load_image(image, gpu_image_decode=False)
+    return tuple(size) if size is not None else (image.width, image.height)
 
 
 @lru_cache(maxsize=1)
@@ -931,6 +965,125 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids, token_type_ids, input_format, original_batch_size
         )
 
+    def _expand_decode_input_ids(
+        self, input_ids: List[int], task_results: Optional[List[Dict]]
+    ) -> Optional[List[int]]:
+        """Expand multimodal placeholder tokens for decode disaggregation.
+
+        Decode nodes skip image/video downloading and never run the vision
+        encoder. Instead, use img_grid_thw from task_results (provided by the
+        router from the Encoder) to expand each placeholder token so that
+        origin_input_ids has the correct length for KV cache allocation.
+
+        One task_result == one media item. Each row of
+        ``encoder_addr.img_grid_thw`` maps to exactly one placeholder token in
+        the prompt (image: 1 row; video: N rows, one per chunk). KimiK25 pools
+        the temporal dim away, so each row counts as ``(h//merge_h)*(w//merge_w)``.
+
+        Returns ``None`` when ``task_results`` carries no usable grids, so the
+        caller can fall back to reading the image dimensions locally.
+
+        Kimi-K3 additionally frames each image span with its original
+        resolution, so when ``encoder_addr.original_image_sizes`` is present the
+        placeholder is expanded through the same helper the prefill node uses,
+        keeping both nodes' origin_input_ids identical. That helper skips already
+        framed video placeholders, so sizes are needed only for the images.
+        """
+        if not task_results:
+            return None
+
+        grid_thws = []
+        for task_result in task_results:
+            encoder_addr = task_result.get("encoder_addr", {}) or {}
+            thw_rows = encoder_addr.get("img_grid_thw")
+            if thw_rows:
+                grid_thws.extend(thw_rows)
+
+        merge_kernel_size = self.mm_processor.hf_config.vision_config.merge_kernel_size
+        token_counts = [
+            num_tokens_from_grid(grid_thw, merge_kernel_size=merge_kernel_size)
+            for grid_thw in grid_thws
+        ]
+        if not token_counts:
+            return None
+
+        media_token_id = self.mm_processor.IM_TOKEN_ID
+        image_sizes = original_image_sizes_from_task_results(task_results)
+        if image_sizes is not None:
+            from sglang.srt.multimodal.processors.kimi_k3 import (
+                _expand_k3_media_prompt_token_ids,
+            )
+
+            expanded_ids = (
+                _expand_k3_media_prompt_token_ids(
+                    input_ids,
+                    media_token_id,
+                    token_counts,
+                    [tuple(size) for size in image_sizes],
+                    self.tokenizer,
+                )
+                .flatten()
+                .tolist()
+            )
+            logger.debug(
+                f"Decode expanded input_ids via task_results img_grid_thw "
+                f"+ original_image_sizes: {len(expanded_ids)} tokens"
+            )
+            return expanded_ids
+
+        expanded_ids, _ = expand_media_placeholders_with_offsets(
+            input_ids, token_counts, media_token_id
+        )
+        logger.debug(
+            f"Decode expanded input_ids via task_results "
+            f"img_grid_thw: {len(expanded_ids)} tokens"
+        )
+        return expanded_ids
+
+    async def _expand_decode_input_ids_from_image_sizes(
+        self, input_ids: List[int], obj: GenerateReqInput
+    ) -> List[int]:
+        """Expand placeholders on a decode node without any vision work.
+
+        A PD-disaggregated deployment does not necessarily route encoder
+        metadata (``task_results``) to the decode node, but the decode node
+        still sizes its KV allocation from ``origin_input_ids`` and must agree
+        with prefill token for token. For models whose media token count is a
+        function of the uploaded image dimensions, reading each image's header
+        is enough: no pixel decode, no resize, no vision tower.
+        """
+        if not obj.image_data and not getattr(obj, "video_data", None):
+            return input_ids
+
+        expand = getattr(self.mm_processor, "expand_input_ids_from_image_sizes", None)
+        if expand is None or getattr(obj, "video_data", None):
+            # Silently keeping the unexpanded prompt would mis-size the decode
+            # KV allocation and only surface much later as a KV-transfer
+            # failure, so refuse the request here instead.
+            raise ValueError(
+                "Decode-side multimodal prompt expansion is unavailable for "
+                f"{type(self.mm_processor).__name__}: the request carries no "
+                "encoder task_results and only image inputs can be expanded "
+                "from their dimensions. The decode node cannot size its KV "
+                "cache for this request."
+            )
+
+        loop = asyncio.get_running_loop()
+        image_sizes = await asyncio.gather(
+            *(
+                loop.run_in_executor(
+                    self.mm_processor.io_executor, _read_image_size, image
+                )
+                for image in obj.image_data
+            )
+        )
+        expanded_ids = expand(input_ids, image_sizes)
+        logger.debug(
+            f"Decode expanded input_ids via local image sizes {image_sizes}: "
+            f"{len(expanded_ids)} tokens"
+        )
+        return expanded_ids
+
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -943,6 +1096,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
+
+        # Decode/Prefill disaggregation: the video placeholder
+        # (<|kimi_k25_video_placeholder|>) is not a real special token, so it
+        # must be replaced with the per-chunk media prompt text (from
+        # task_results) BEFORE tokenization; otherwise the tokenizer mangles it.
+        # Image placeholders are already real tokens.
+        #   - decode: expansion happens later in _expand_decode_input_ids.
+        #   - prefill: expansion happens in the scheduler's get_mm_data path
+        #     (KimiK2_5VLImageProcessor.build_input_ids).
+        if (
+            self.disaggregation_mode
+            in (DisaggregationMode.DECODE, DisaggregationMode.PREFILL)
+            and input_text
+            and getattr(obj, "task_results", None)
+        ):
+            video_placeholder = getattr(
+                self.model_config.hf_config, "video_placeholder", None
+            )
+            if video_placeholder:
+                video_prompts = []
+                for task_result in obj.task_results:
+                    encoder_addr = task_result.get("encoder_addr", {}) or {}
+                    chunk_timestamps = encoder_addr.get("chunk_timestamps")
+                    if chunk_timestamps:
+                        video_prompts.append("".join(chunk_timestamps))
+                input_text = update_raw_text(
+                    input_text, video_prompts, video_placeholder
+                )
+
         if obj.input_embeds is not None:
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
@@ -1025,19 +1207,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         prompt=mm_processor_input,
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
-                if mm_inputs is None:
-                    if self.server_args.language_only:
-                        logger.warning(
-                            "Encoder embedding not available, "
-                            "falling back to local mm processing"
-                        )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=(input_text or input_ids),
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
+                    _reject_missing_dispatched_encoder_embedding(
+                        self.server_args, obj, mm_inputs
                     )
+                if mm_inputs is None:
+                    if self.server_args.disaggregation_mode == "decode":
+                        expanded_ids = self._expand_decode_input_ids(
+                            input_ids, getattr(obj, "task_results", None)
+                        )
+                        if expanded_ids is None:
+                            expanded_ids = (
+                                await self._expand_decode_input_ids_from_image_sizes(
+                                    input_ids, obj
+                                )
+                            )
+                        input_ids = expanded_ids
+                    else:
+                        if self.server_args.language_only:
+                            logger.warning(
+                                "Encoder embedding not available, "
+                                "falling back to local mm processing"
+                            )
+                        mm_inputs = await self.mm_processor.process_mm_data_async(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text=(input_text or input_ids),
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
             elif (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend
@@ -3278,16 +3475,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _handle_epd_disaggregation_encode_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
-    ):
-        """Handle EPD-disaggregation mode encoding request."""
-        if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
-            # dispatch to encoder by default
+    ) -> Optional[ReqState]:
+        """Handle EPD-disaggregation mode encoding request.
+
+        Returns a ReqState if the request should be short-circuited (error path),
+        or None to continue normal processing.
+        """
+        if not isinstance(obj, GenerateReqInput):
+            return None
+
+        # Pull mode: task_results provided by router
+        if self.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+            if obj.task_results:
+                obj.need_wait_for_mm_inputs = True
+                return None
+            if obj.contains_mm_input():
+                raise ValueError(
+                    "Multi-modal request requires task_results from IC when "
+                    "encoder_transfer_backend=zmq_to_scheduler (pull mode)"
+                )
+            return None
+
+        # Push mode: adaptive dispatch + mm_receiver.send_encode_request
+        if obj.contains_mm_input():
             should_dispatch = True
             if self.server_args.enable_adaptive_dispatch_to_encoder:
                 should_dispatch = self._should_dispatch_to_encoder(obj)
 
-            # Set need_wait_for_mm_inputs flag based on whether we dispatch to encoder
-            # This flag will be used in _tokenize_one_request to determine processing path
             if should_dispatch:
                 obj.need_wait_for_mm_inputs = True
                 if self.server_args.encoder_transfer_backend in [
@@ -3305,6 +3519,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
             else:
                 obj.need_wait_for_mm_inputs = False
+
+        return None
 
     def convert_to_span_attrs(
         self,

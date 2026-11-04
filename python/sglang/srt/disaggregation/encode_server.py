@@ -1930,7 +1930,54 @@ class MMEncoder:
                 serialized_data = pickle.dumps(new_mm_data)
                 buffer = embedding_tensor.__buffer__()
 
-        # Use thread pool executor for parallel ZMQ send operations
+        if (
+            self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and url is not None
+        ):
+            lock = self.scheduler_send_locks.get(endpoint)
+            if lock is None:
+                lock = asyncio.Lock()
+                self.scheduler_send_locks[endpoint] = lock
+
+            async with lock:
+                sock = self.scheduler_send_sockets.get(endpoint)
+                if sock is None:
+                    sock = self.context.socket(zmq.PUSH)
+                    config_socket(sock, zmq.PUSH)
+                    sock.setsockopt(zmq.IMMEDIATE, 1)
+                    sock.setsockopt(zmq.SNDTIMEO, int(self.send_timeout * 1000))
+                    sock.connect(endpoint)
+                    self.scheduler_send_sockets[endpoint] = sock
+                try:
+                    frames = (
+                        [serialized_data, buffer]
+                        if buffer is not None
+                        else [serialized_data]
+                    )
+                    tracker = await sock.send_multipart(frames, copy=False, track=True)
+                except Exception:
+                    if self.scheduler_send_sockets.get(endpoint) is sock:
+                        self.scheduler_send_sockets.pop(endpoint, None)
+                    sock.close(linger=0)
+                    raise
+
+            # MessageTracker.wait() protects the zero-copy source buffer; it
+            # is not a receiver acknowledgement. Waiting under the per-peer
+            # lock serialized every large embedding on that TCP connection.
+            # Queue sends in order under the lock, then wait for buffer
+            # ownership independently so libzmq can pipeline the connection.
+            try:
+                await asyncio.to_thread(tracker.wait, self.send_timeout)
+            except Exception:
+                if self.scheduler_send_sockets.get(endpoint) is sock:
+                    self.scheduler_send_sockets.pop(endpoint, None)
+                    sock.close(linger=0)
+                raise
+
+            return
+
+        # Per-request sockets remain for zmq_to_tokenizer and legacy direct
+        # scheduler sends. Scheduler URL sends use persistent sockets above.
         def send_with_socket():
             sock = self.sync_context.socket(zmq.PUSH)
             config_socket(sock, zmq.PUSH)

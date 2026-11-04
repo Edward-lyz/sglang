@@ -1982,6 +1982,15 @@ def get_mooncake_transfer_engine():
     return _get_engine()
 
 
+def get_mooncake_embedding_engine():
+    """Return the embedding MooncakeTransferEngine if initialized, else None."""
+    from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+        get_mooncake_embedding_engine as _get_engine,
+    )
+
+    return _get_engine()
+
+
 @contextmanager
 def graph_capture(stream=None):
     """

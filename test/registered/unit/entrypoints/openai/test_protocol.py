@@ -618,6 +618,41 @@ class TestValidationEdgeCases(unittest.TestCase):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
 
 
+class TestMultiModalRequestContract(unittest.TestCase):
+    """is_mm_request / task_results contract with the IC router."""
+
+    MESSAGES = [{"role": "user", "content": "Hello"}]
+
+    def _request(self, **kwargs):
+        return ChatCompletionRequest(
+            model="test-model", messages=self.MESSAGES, **kwargs
+        )
+
+    def test_mm_request_with_task_results_is_accepted(self):
+        request = self._request(is_mm_request=True, task_results=[{"task_id": "t0"}])
+        self.assertEqual(request.task_results, [{"task_id": "t0"}])
+
+    def test_mm_request_without_task_results_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            self._request(is_mm_request=True)
+
+    def test_mm_request_with_empty_task_results_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            self._request(is_mm_request=True, task_results=[])
+
+    def test_non_mm_request_without_task_results_is_accepted(self):
+        request = self._request(is_mm_request=False)
+        self.assertIsNone(request.task_results)
+
+    def test_non_mm_request_with_task_results_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            self._request(is_mm_request=False, task_results=[{"task_id": "t0"}])
+
+    def test_task_results_without_the_flag_is_accepted(self):
+        request = self._request(task_results=[{"task_id": "t0"}])
+        self.assertEqual(request.task_results, [{"task_id": "t0"}])
+
+
 class TestParsedResponseFieldsProtocol(unittest.TestCase):
     """Test ParsedResponseFields protocol."""
 
