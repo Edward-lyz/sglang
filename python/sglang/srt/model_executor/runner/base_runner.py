@@ -363,6 +363,7 @@ class BaseRunner(ABC):
 
         forward_mode_override forces EXTEND/DECODE regardless of
         is_generation (used by the PP-parallel DeepGEMM warmup).
+        PD prefill workers always warm up EXTEND without speculative verify state.
 
         buffers: a prepared static buffer set (or lightweight adapter exposing
         the same fields), sized >= this dummy shape, which _dummy_run slices to
@@ -377,7 +378,10 @@ class BaseRunner(ABC):
         None (only the PP warmup set still carries one).
         """
         mr = self.model_runner
-        if forward_mode_override is not None:
+        is_prefill_node = mr.server_args.disaggregation_mode == "prefill"
+        if is_prefill_node:
+            capture_forward_mode = ForwardMode.EXTEND
+        elif forward_mode_override is not None:
             capture_forward_mode = forward_mode_override
         elif mr.is_generation:
             capture_forward_mode = ForwardMode.DECODE
@@ -385,7 +389,7 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_req = 1
-        if mr.spec_algorithm.is_speculative():
+        if mr.spec_algorithm.is_speculative() and not is_prefill_node:
             if mr.is_draft_worker:
                 assert (
                     mr.spec_algorithm.supports_target_verify_for_draft()
@@ -393,7 +397,11 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
 
-        if mr.server_args.enable_return_hidden_states:
+        if mr.server_args.enable_return_hidden_states or (
+            is_prefill_node
+            and mr.spec_algorithm.is_speculative()
+            and not mr.is_draft_worker
+        ):
             capture_hidden_mode = CaptureHiddenMode.FULL
 
         num_tokens = batch_size * num_tokens_per_req
@@ -458,12 +466,13 @@ class BaseRunner(ABC):
 
         # For extend mode
         if capture_forward_mode == ForwardMode.EXTEND:
-            seq_len_fill_value = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
+            seq_lens.fill_(num_tokens_per_req)
+            seq_lens_cpu.fill_(num_tokens_per_req)
             extend_prefix_lens_cpu = [0] * batch_size
-            extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
+            extend_seq_lens_cpu = [num_tokens_per_req] * batch_size
             extend_num_tokens = num_tokens
             extend_seq_lens = torch.full(
-                (batch_size,), seq_len_fill_value, dtype=torch.int32, device=mr.device
+                (batch_size,), num_tokens_per_req, dtype=torch.int32, device=mr.device
             )
             extend_prefix_lens = torch.zeros(
                 (batch_size,), dtype=torch.int32, device=mr.device
@@ -517,12 +526,16 @@ class BaseRunner(ABC):
             global_num_tokens_cpu = None
 
         # Speculative metadata and hidden-state capture mode.
-        spec_info = create_dummy_verify_input(
-            mr.spec_algorithm,
-            mr.server_args,
-            buffers.custom_mask,
-            num_tokens_per_req,
-            mr.is_draft_worker,
+        spec_info = (
+            create_dummy_verify_input(
+                mr.spec_algorithm,
+                mr.server_args,
+                buffers.custom_mask,
+                num_tokens_per_req,
+                mr.is_draft_worker,
+            )
+            if capture_forward_mode == ForwardMode.TARGET_VERIFY
+            else None
         )
         if spec_info is not None and (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
@@ -600,7 +613,7 @@ class BaseRunner(ABC):
                 forward_batch.dp_padding_mode.is_max_len(),
                 global_num_tokens_cpu,
             )
-            set_is_extend_in_batch(False)
+            set_is_extend_in_batch(capture_forward_mode == ForwardMode.EXTEND)
 
             kwargs = {}
             if (

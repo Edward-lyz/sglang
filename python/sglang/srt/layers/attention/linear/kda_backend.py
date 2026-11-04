@@ -5,6 +5,7 @@ import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.kernels.ops.kimi_k3.kda_short_conv import covered as kda_short_conv_covered
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -12,6 +13,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.srt.configs.hybrid_arch import uses_kda_attentionstore_checkpoints
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kernels.kda_native_checkpoint import (
+    KDANativeCheckpointResult,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -21,6 +25,7 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_verify_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.storage.asradix.types import AS_BLOCK_SIZE
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -297,7 +302,9 @@ class KDAKernelDispatcher:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Union[
+        torch.Tensor, Tuple[torch.Tensor, torch.Tensor], KDANativeCheckpointResult
+    ]:
         return self.extend_kernel.extend(
             q,
             k,
@@ -309,6 +316,95 @@ class KDAKernelDispatcher:
             query_start_loc=query_start_loc,
             **kwargs,
         )
+
+
+def _dense_verify_cu_seqlens(
+    seq_len: int, draft_token_num: int, device: torch.device
+) -> torch.Tensor:
+    # Non-compact target-verify is a dense [bs, draft_token_num] grid: every
+    # request contributes exactly draft_token_num tokens. Under static mode the
+    # token buffer is bucket-padded (seq_len rounds bs up to a graph tier) while
+    # forward_metadata.query_start_loc still describes only the real requests,
+    # so it must not be used here — the fused CuTe kernel needs cu_seqlens
+    # covering the full padded buffer (T % N == 0). Padding rows land in ghost
+    # cache slots and are discarded downstream, matching the non-fused
+    # fallback's `batch_size = seq_len // draft_token_num`.
+    return torch.arange(
+        0, seq_len + draft_token_num, draft_token_num, device=device, dtype=torch.int32
+    )
+
+
+def kda_extend_initial_state_and_track(
+    *,
+    prefix_lens: torch.Tensor,
+    mixed_qkv: torch.Tensor,
+    conv_pool: Optional[torch.Tensor] = None,
+    track_indices: Optional[torch.Tensor] = None,
+    destination_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """``has_initial_state`` plus the tracked conv-window snapshot.
+
+    The torch path is three tiny kernels (`prefix_lens > 0`, the
+    ``mixed_qkv[track_indices]`` gather and the ``conv_pool[dst] = ...``
+    index_put) moving ~200KB, so it is launch-bound. The fused kernel does the
+    gather-scatter in place and writes the flag from an otherwise idle block.
+    Uncovered layouts and the no-tracking case fall back to torch.
+    """
+    do_track = track_indices is not None
+    if do_track and envs.SGLANG_OPT_USE_K3_KDA_FUSED_TRACK_CONV_STATE.get():
+        from sglang.kernels.ops.kimi_k3.kda_preprocess import (
+            can_fuse_track_conv_state_flag,
+            fused_track_conv_state_flag,
+        )
+
+        has_initial_state = torch.empty(
+            prefix_lens.shape, dtype=torch.bool, device=prefix_lens.device
+        )
+        if can_fuse_track_conv_state_flag(
+            mixed_qkv,
+            conv_pool,
+            track_indices,
+            destination_indices,
+            prefix_lens,
+            has_initial_state,
+        ):
+            fused_track_conv_state_flag(
+                mixed_qkv,
+                conv_pool,
+                track_indices,
+                destination_indices,
+                prefix_lens,
+                has_initial_state,
+            )
+            return has_initial_state
+
+    has_initial_state = prefix_lens > 0
+    if do_track:
+        conv_pool[destination_indices] = mixed_qkv[track_indices]
+    return has_initial_state
+
+
+def ragged_verify_dense_scatter_indices(
+    *,
+    query_start_loc: torch.Tensor,
+    seq_len: int,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Dense [bs, draft_token_num] slot index per packed ragged-verify token.
+
+    Rows never exceed draft_token_num under either layout variant (cap for
+    graph replay, planner construction for eager -- see
+    RaggedVerifyLayout.padded_to_bucket), so in-row offsets stay in-row;
+    tokens past the layout's coverage collapse into one ghost row at index
+    bs * draft_token_num.
+    """
+    batch_size = query_start_loc.shape[0] - 1
+    token_pos = torch.arange(seq_len, device=query_start_loc.device, dtype=torch.int32)
+    token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
+    return (
+        token_slots * draft_token_num
+        + (token_pos - query_start_loc[token_slots]).to(torch.int64)
+    ).clamp_(max=batch_size * draft_token_num)
 
 
 class KDAAttnBackend(MambaAttnBackendBase):
@@ -330,7 +426,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        # mamba_cache.conv is [..., kernel-1, dim] while conv_states_shape expects the window length (kernel-1) at shape[-1], hence the transpose.
+        self.exact_checkpoint_tracking = uses_kda_attentionstore_checkpoints(
+            model_runner.server_args, model_runner.model_config
+        )
+        self.checkpoint_chunk_size = (
+            AS_BLOCK_SIZE
+            if self.exact_checkpoint_tracking
+            else model_runner.server_args.mamba_cache_chunk_size
+        )
+        # Needed by the extra_buffer track path: _init_track_conv_indices reads
+        # conv_states_shape[-1] as the conv window length (kernel_size - 1).
+        # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
+        # Mamba2/GDN's [dim, kernel-1] — so expose the transposed shape here.
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
             .transpose(-1, -2)
@@ -572,8 +679,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
 
-        query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
+        metadata = self.forward_metadata
+        query_start_loc = metadata.query_start_loc
+        cache_indices = metadata.mamba_cache_indices
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
@@ -585,57 +693,103 @@ class KDAAttnBackend(MambaAttnBackendBase):
             raise RuntimeError(
                 "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
             )
-        has_initial_state = forward_batch.extend_prefix_lens > 0
-
-        if self.forward_metadata.has_mamba_track_mask:
-            mamba_cache_params.conv[0][
-                self.forward_metadata.conv_states_mask_indices
-            ] = mixed_qkv[self.forward_metadata.track_conv_indices]
+        # Snapshot the conv sliding window at the last track-aligned chunk
+        # boundary into the ping-pong track slots (the prefix-cache restore
+        # source). The KDA pool stores conv states as [kernel-1, dim], so
+        # rows of the raw [tokens, dim] pre-conv input index in directly
+        # (GDN needs a transpose here; KDA does not).
+        track = self.forward_metadata.has_mamba_track_mask
+        has_initial_state = kda_extend_initial_state_and_track(
+            prefix_lens=forward_batch.extend_prefix_lens,
+            mixed_qkv=mixed_qkv,
+            conv_pool=mamba_cache_params.conv[0] if track else None,
+            track_indices=(self.forward_metadata.track_conv_indices if track else None),
+            destination_indices=(
+                self.forward_metadata.conv_states_mask_indices if track else None
+            ),
+        )
 
         splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
-        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
-            splits, dim=0
-        )
-        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
-        if layer.bias is not None:
-            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
-        else:
-            q_bias, k_bias, v_bias = None, None, None
+        if envs.SGLANG_K3_KDA_SHORT_CONV.get() and kda_short_conv_covered(
+            mixed_qkv,
+            layer.conv_weights,
+            mamba_cache_params.conv[0],
+            layer.bias,
+            splits,
+            # The flag is already known to be on here (Python short-circuits the
+            # `and`), so a rejection means the user asked for the fused kernel
+            # and did not get it: log the failing predicate once instead of
+            # falling back silently forever.
+            warn_if_rejected=True,
+        ):
+            # One fused launch for q/k/v (plus a small conv-state update launch)
+            # instead of three serial causal_conv1d_fn calls. It returns the same
+            # (dim, tokens) layout, so the same .transpose(0, 1) applies. Every
+            # unsupported shape/dtype is rejected by kda_short_conv_covered above
+            # and falls through to the original branch below.
+            from sglang.kernels.ops.kimi_k3.kda_short_conv import (
+                kimi_k3_kda_short_conv,
+            )
 
-        q = causal_conv1d_fn(
-            q,
-            q_conv_weight,
-            q_bias,
-            activation="silu",
-            conv_states=q_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        k = causal_conv1d_fn(
-            k,
-            k_conv_weight,
-            k_bias,
-            activation="silu",
-            conv_states=k_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        v = causal_conv1d_fn(
-            v,
-            v_conv_weight,
-            v_bias,
-            activation="silu",
-            conv_states=v_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+            q, k, v = kimi_k3_kda_short_conv(
+                mixed_qkv,
+                layer.conv_weights,
+                # The raw pool, not the transposed `conv_states` view: the kernel
+                # reproduces that view's addressing internally and updates the
+                # pool in place, exactly as causal_conv1d_fn does.
+                mamba_cache_params.conv[0],
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
+                has_initial_state=has_initial_state,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            )
+            q = q.transpose(0, 1)
+            k = k.transpose(0, 1)
+            v = v.transpose(0, 1)
+        else:
+            q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+            q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+                splits, dim=0
+            )
+            q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+            if layer.bias is not None:
+                q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+            else:
+                q_bias, k_bias, v_bias = None, None, None
+
+            q = causal_conv1d_fn(
+                q,
+                q_conv_weight,
+                q_bias,
+                activation="silu",
+                conv_states=q_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            k = causal_conv1d_fn(
+                k,
+                k_conv_weight,
+                k_bias,
+                activation="silu",
+                conv_states=k_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            v = causal_conv1d_fn(
+                v,
+                v_conv_weight,
+                v_bias,
+                activation="silu",
+                conv_states=v_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -659,7 +813,23 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
             return_intermediate_states=track_ssm,
+            # Which global chunk rows of h the track snapshot will read; lets
+            # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
+            # fast path when the snapshot only needs the final state.
+            track_ssm_h_src=(
+                self.forward_metadata.track_ssm_h_src if track_ssm else None
+            ),
+            native_checkpoint_offsets=metadata.kda_native_checkpoint_offsets,
+            native_checkpoint_rows=metadata.kda_native_checkpoint_rows,
+            cute_checkpoint_plan=metadata.kda_cute_checkpoint_plan,
         )
+        if isinstance(core_attn_out, KDANativeCheckpointResult):
+            return self._scatter_native_checkpoint_result(
+                core_attn_out,
+                metadata=metadata,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+            )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
@@ -670,6 +840,36 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
 
         return core_attn_out
+
+    @staticmethod
+    def _scatter_native_checkpoint_result(
+        result: KDANativeCheckpointResult,
+        *,
+        metadata,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Commit this layer's active checkpoint rows to PHYSICAL track slots.
+
+        The kernel already copied final states to the original cache slots.
+        Offset-zero dense rows are unwritten and must never be gathered.
+        """
+        rows = metadata.kda_native_checkpoint_rows
+        dst = metadata.track_ssm_h_dst
+        checkpoints = result.checkpoint_states
+        if rows is None or dst is None or rows.numel() != dst.numel():
+            raise RuntimeError("native checkpoint result has no matching owner plan")
+        if checkpoints.shape != (cache_indices.numel(),) + tuple(ssm_states.shape[1:]):
+            raise RuntimeError("native checkpoint result geometry mismatch")
+        ssm_states[dst] = checkpoints[rows].to(ssm_states.dtype, copy=False)
+        if (
+            metadata.track_ssm_final_src is not None
+            and metadata.track_ssm_final_src.numel()
+        ):
+            ssm_states[metadata.track_ssm_final_dst] = ssm_states[
+                metadata.track_ssm_final_src
+            ]
+        return result.output
 
     def _forward_target_verify(
         self,
@@ -712,13 +912,76 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices = self.verify_intermediate_state_indices
 
         draft_token_num = forward_batch.spec_info.draft_token_num
-        batch_size = seq_len // draft_token_num
+        ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        if self._can_run_dspark_cutedsl_mtp(
+            layer=layer,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            draft_token_num=draft_token_num,
+            ragged_layout=ragged_layout,
+            conv_states=conv_states,
+            ssm_states=ssm_states,
+            intermediate_state_cache=intermediate_state_cache,
+            intermediate_conv_window_cache=intermediate_conv_window_cache,
+            retrieve_parent_token=retrieve_parent_token,
+            replayssm_rawv=replayssm_rawv,
+        ):
+            return self._run_dspark_cutedsl_mtp(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                cu_seqlens=(
+                    self._verify_cu_seqlens(
+                        forward_batch,
+                        mixed_qkv.shape[0],
+                        draft_token_num,
+                        mixed_qkv.device,
+                    )
+                    if envs.SGLANG_K3_VERIFY_METADATA_HOIST.get()
+                    else None
+                ),
+                a=a,
+                b=b,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                intermediate_state_cache=intermediate_state_cache,
+                intermediate_conv_window_cache=intermediate_conv_window_cache,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_indices=cache_indices,
+                draft_token_num=draft_token_num,
+                replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=mamba_cache_params.replayssm_rawk,
+                replayssm_g=mamba_cache_params.replayssm_g,
+                replayssm_beta=mamba_cache_params.replayssm_beta,
+            )
+        if ragged_layout is None:
+            batch_size = seq_len // draft_token_num
+            dense_token_indices = None
+            mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
+        else:
+            # Conv update and its per-step scratch want the dense
+            # [bs, draft_token_num] layout: scatter ragged tokens to their
+            # step slots, gather back after (pad steps are never committed).
+            # Uncovered tier-leftover tokens land in the ghost row (see
+            # ragged_verify_dense_scatter_indices); their values are pad
+            # garbage, discarded downstream (ghost collisions are
+            # value-irrelevant).
+            batch_size = query_start_loc.shape[0] - 1
+            num_dense_tokens = batch_size * draft_token_num
+            dense_token_indices = ragged_verify_dense_scatter_indices(
+                query_start_loc=query_start_loc,
+                seq_len=seq_len,
+                draft_token_num=draft_token_num,
+            )
+            dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
+            dense.index_copy_(0, dense_token_indices, mixed_qkv)
+            mixed_qkv_dense = dense[:num_dense_tokens].view(
+                batch_size, draft_token_num, -1
+            )
 
         # causal_conv1d_update expects [.., dim, width]. KDA keeps dense conv-window
         # scratch because the deduplicated overlapping layout cannot be transposed.
-        mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1).transpose(
-            1, 2
-        )
+        mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
         mixed_qkv_processed = causal_conv1d_update(
             mixed_qkv_reshaped,
             conv_states.transpose(-1, -2),
@@ -732,7 +995,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,
         )
-        mixed_qkv = mixed_qkv_processed.transpose(1, 2).reshape(seq_len, -1)
+        mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
+            batch_size * draft_token_num, -1
+        )
+        if dense_token_indices is None:
+            mixed_qkv = mixed_qkv_flat
+        else:
+            # Ghost row (zeros) so uncovered tail tokens gather finite values.
+            padded_flat = mixed_qkv_flat.new_zeros(
+                batch_size * draft_token_num + 1, mixed_qkv_flat.shape[-1]
+            )
+            padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
+            mixed_qkv = padded_flat[dense_token_indices]
 
         q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -773,3 +1047,239 @@ class KDAAttnBackend(MambaAttnBackendBase):
             lower_bound=layer.lower_bound,
             **ring_kwargs,
         )
+        if dense_token_indices is not None:
+            # Kernel output is empty-allocated and the capped qsl skips the
+            # uncovered tail rows; zero them so discarded pad hidden states
+            # stay finite. Uncovered == clamped-to-ghost.
+            covered = dense_token_indices < (batch_size * draft_token_num)
+            core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
+        return core_attn_out
+
+    def _verify_cu_seqlens(
+        self,
+        forward_batch: ForwardBatch,
+        seq_len: int,
+        draft_token_num: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Dense verify cu_seqlens, built once per forward and shared by every
+        KDA layer (it only depends on the padded token count). The slot pins
+        the forward_batch it was built for, so a CUDA graph records the arange
+        once and each replay refreshes it before the first KDA layer reads it.
+        Capture never reuses a tensor built eagerly (the warmup passes run on
+        the same forward_batch), since the graph would then read memory it
+        does not own."""
+        key = (
+            id(forward_batch),
+            seq_len,
+            draft_token_num,
+            torch.cuda.is_current_stream_capturing(),
+        )
+        cached = getattr(self, "_verify_cu_seqlens_slot", None)
+        if cached is None or cached[0] is not forward_batch or cached[1] != key:
+            cached = (
+                forward_batch,
+                key,
+                _dense_verify_cu_seqlens(seq_len, draft_token_num, device),
+            )
+            self._verify_cu_seqlens_slot = cached
+        return cached[2]
+
+    def _can_run_dspark_cutedsl_mtp(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        draft_token_num: int,
+        ragged_layout,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        intermediate_state_cache: torch.Tensor,
+        intermediate_conv_window_cache: torch.Tensor,
+        retrieve_parent_token: Optional[torch.Tensor],
+        replayssm_rawv: Optional[torch.Tensor],
+    ) -> bool:
+        """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
+        if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
+            return False
+        if importlib.util.find_spec("cutlass") is None:
+            return False
+        if torch.cuda.get_device_capability()[0] != 10:
+            return False
+        if ragged_layout is not None or retrieve_parent_token is not None:
+            return False
+        # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
+        # specialized per block size and capped at 8 by shared-memory growth.
+        if not 2 <= draft_token_num <= 8:
+            return False
+        if layer.bias is not None or layer.lower_bound is None:
+            return False
+        if (
+            layer.head_q_dim != 128
+            or layer.head_k_dim != 128
+            or layer.head_v_dim != 128
+        ):
+            return False
+        if (
+            layer.num_q_heads != layer.num_k_heads
+            or layer.num_k_heads != layer.num_v_heads
+        ):
+            return False
+        if (
+            mixed_qkv.dtype != torch.bfloat16
+            or a.dtype != torch.bfloat16
+            or b.dtype != torch.bfloat16
+        ):
+            return False
+        if layer.conv_weights is None or tuple(layer.conv_weights.shape) != (
+            layer.q_dim + layer.k_dim + layer.v_dim,
+            4,
+        ):
+            return False
+        if layer.conv_weights.dtype != torch.float32:
+            return False
+        if (
+            ssm_states.dtype != torch.float32
+            or tuple(ssm_states.shape[-3:])
+            != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
+            or tuple(ssm_states.stride()[-3:])
+            != (
+                layer.head_v_dim * layer.head_k_dim,
+                layer.head_k_dim,
+                1,
+            )
+            or ssm_states.stride(0) % 4 != 0
+            or ssm_states.storage_offset() % 4 != 0
+        ):
+            return False
+        if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
+            return False
+        if intermediate_state_cache is None:
+            # ReplaySSM: the ring replaces the per-step snapshots. The kernel
+            # wrapper validates ring layout/dtypes and raises loudly (there is
+            # no recurrent fallback without intermediate_ssm).
+            return replayssm_rawv is not None
+        if intermediate_state_cache.shape[1] < draft_token_num:
+            return False
+        if tuple(intermediate_state_cache.shape[-3:]) != (
+            layer.num_v_heads,
+            layer.head_v_dim,
+            layer.head_k_dim,
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _run_dspark_cutedsl_mtp(
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        intermediate_state_cache: torch.Tensor,
+        intermediate_conv_window_cache: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        cache_indices: torch.Tensor,
+        draft_token_num: int,
+        replayssm_rawv: Optional[torch.Tensor] = None,
+        replayssm_rawk: Optional[torch.Tensor] = None,
+        replayssm_g: Optional[torch.Tensor] = None,
+        replayssm_beta: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
+            fused_kda_decode_mtp_dspark,
+        )
+
+        seq_len = mixed_qkv.shape[0]
+        h = layer.num_v_heads
+        if cu_seqlens is None:
+            cu_seqlens = _dense_verify_cu_seqlens(
+                seq_len, draft_token_num, mixed_qkv.device
+            )
+        x_q, x_k, x_v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        x_q = x_q.reshape(1, seq_len, h, layer.head_q_dim)
+        x_k = x_k.reshape(1, seq_len, h, layer.head_k_dim)
+        x_v = x_v.reshape(1, seq_len, h, layer.head_v_dim)
+        w_q, w_k, w_v = layer.conv_weights.split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=0
+        )
+        cs_q, cs_k, cs_v = conv_states.split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+        )
+        cs_q = cs_q.transpose(-1, -2)
+        cs_k = cs_k.transpose(-1, -2)
+        cs_v = cs_v.transpose(-1, -2)
+        intermediate_conv_window_cache = intermediate_conv_window_cache.transpose(
+            -1, -2
+        )
+        ic_q, ic_k, ic_v = intermediate_conv_window_cache.split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-2
+        )
+        # The kernel owns all 128 output channels and can fold gated RMSNorm
+        # into the recurrence.
+        onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+        fused_static = getattr(layer, "_k3_fused_decode_args", None)
+        apply_onorm = onorm_gate is not None and fused_static is not None
+        if apply_onorm:
+            onorm_weight = fused_static[5]
+            onorm_eps = fused_static[6]
+            onorm_gate = onorm_gate.reshape(1, seq_len, h, layer.head_v_dim)
+        else:
+            onorm_weight = None
+            onorm_eps = None
+            onorm_gate = None
+        # Set by the model when its o_proj consumes a pre-quantized input.
+        quant_out = (
+            apply_onorm and getattr(layer, "_k3_onorm_quant", False) and h % 4 == 0
+        )
+
+        out = fused_kda_decode_mtp_dspark(
+            x_q=x_q,
+            x_k=x_k,
+            x_v=x_v,
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            cs_q=cs_q,
+            cs_k=cs_k,
+            cs_v=cs_v,
+            g=a,
+            beta=b,
+            A_log=layer.A_log.reshape(-1),
+            dt_bias=layer.dt_bias.reshape(-1),
+            recurrent_state=ssm_states,
+            intermediate_ssm=intermediate_state_cache,
+            intermediate_state_indices=intermediate_state_indices,
+            intermediate_conv_q=ic_q,
+            intermediate_conv_k=ic_k,
+            intermediate_conv_v=ic_v,
+            ssm_state_indices=cache_indices.to(torch.int32),
+            cu_seqlens=cu_seqlens,
+            lower_bound=float(layer.lower_bound),
+            scale=layer.head_q_dim**-0.5,
+            replayssm_rawv=replayssm_rawv,
+            replayssm_rawk=replayssm_rawk,
+            replayssm_g=replayssm_g,
+            replayssm_beta=replayssm_beta,
+            onorm_gate=onorm_gate,
+            onorm_weight=onorm_weight,
+            onorm_eps=onorm_eps,
+            quant_out=quant_out,
+        )
+        if quant_out:
+            # The DeepGEMM o_proj is handed this output (flattened to
+            # [T, H * 128]) and picks the fused quant up.
+            from sglang.srt.layers.quantization.fp8_utils import (
+                set_prequantized_input,
+            )
+
+            out, q, q_scale = out
+            set_prequantized_input(out, q, q_scale)
+        if apply_onorm:
+            layer._k3_onorm_consumed = True
+        return out

@@ -197,6 +197,28 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="quantization.quantize_mla_qkv_fp8",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.quantization.mla_qkv_fp8_cast"
+            ":quantize_mla_qkv_fp8_triton"
+        ),
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn",),
+            in_place=False,
+            description=(
+                "bf16 -> fp8_e4m3fn cast of the TRTLLM MLA prefill Q/K/V triple; "
+                "layout-split launches (flat for contiguous q/k, row-per-program "
+                "for the strided v slice) and bit-exact with Tensor.to"
+            ),
+        ),
+        description="MLA prefill Q/K/V FP8 cast (Triton, bit-exact).",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="quantization.nvfp4_gemm_swiglu_nvfp4_quant",
         backend=KernelBackend.CUTE_DSL,
         target=(

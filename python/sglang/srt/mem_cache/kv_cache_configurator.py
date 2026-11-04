@@ -762,7 +762,11 @@ class KVCacheConfigurator:
             ),
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
             enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
-            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
+            speculative_num_draft_tokens=(
+                None
+                if self.server_args.disaggregation_mode == "prefill" and not _is_npu
+                else self.server_args.max_speculative_num_draft_tokens
+            ),
             speculative_eagle_topk=self.server_args.speculative_eagle_topk,
             enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,

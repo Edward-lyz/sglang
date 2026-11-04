@@ -836,6 +836,162 @@ class Envs:
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
 
+    # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to an unpacked SiTU
+    # cubin pool (cubins + flat ABI headers + overlay/; distributed as a
+    # single downloadable archive). Needs the public flashinfer package
+    # installed for the unmodified JIT sources. Unset = feature off.
+    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
+
+    # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
+    # small messages and in-place NVLS 2shot on symmetric-memory tensors for
+    # large ones, with an optional fused residual add. Covers the KDA o_proj
+    # output and the latent|shared MoE reduce; everything else falls back to
+    # the regular all-reduce path. Auto-enabled on SM100/SM103 when
+    # CustomAllReduceV2 with multicast is available; set 0/1 to override in
+    # either direction. See srt/layers/k3_ar_fusion.py.
+    SGLANG_K3_AR_FUSION = EnvBool(False)
+    # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
+    # CustomAllReduceV2's MNNVL push workspace. Auto-probed for the validated
+    # TP8 GB300 configuration; set 0/1 to override. See
+    # srt/layers/k3_sp_collective.py.
+    SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    # Keep K3's post-MoE residual stream token-sharded between consecutive
+    # SP-MoE layers. The next attention-residual aggregation and snapshot
+    # bank write run on the local shard, then only the normalized attention
+    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # Fused o_proj GEMM + all-reduce (bf16, TP 2..8, SM100+): one
+    # kernel computes the TP-local o_proj partial and the cross-rank sum over
+    # a P2P comm region, replacing the GEMM + NCCL AR pair at M <= 512.
+    SGLANG_K3_GEMM_AR = EnvBool(False)
+    # Directory holding the prebuilt gemm_ar cubins (the kernels are not in
+    # this tree; only the host shim is). Files are looked up as
+    # gemm_ar_k{K}_r{R}_pdl{0,1}_sm{arch}.cubin — see
+    # kernels/ops/kimi_k3/gemm_ar.py and scripts/playground/gemm_ar_cubin.py.
+    SGLANG_K3_GEMM_AR_CUBIN = EnvStr(None)
+    # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
+    # front reads hidden_states once, and run the top-k plus the bf16 cast in one
+    # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
+    SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # EP a2a K3 MoE front when the merged front cannot be built (FP8 latent
+    # down-proj next to a bf16 router gate): run the exact gate + top-k on the
+    # side stream, overlapped with the latent down-proj GEMM. The ops are
+    # unchanged, so routing is bit-identical to the serial front. Default off.
+    SGLANG_K3_FRONT_OVERLAP = EnvBool(False)
+    # K3 attention-residual fast kernel also emits the DeepGEMM block-FP8 input
+    # quant of its normed output, which the following FP8 linears reuse instead
+    # of re-quantizing (bit-identical). Default off.
+    SGLANG_K3_ATTN_RES_FP8_OUT = EnvBool(False)
+    # MiB of the leading local experts' gate_up weights prefetched into L2
+    # during the DeepEP dispatch wait (0 = off, default). 96 fits the Blackwell
+    # L2 next to the dispatch buffers; 48 / 128 measured worse on B300.
+    SGLANG_K3_L2_PREFETCH_W13_MB = EnvInt(0)
+    # Keep only one shard-group rank's row slice of Kimi K3's replicated
+    # weights, reconstructing each layer's full set with one lookahead
+    # AllGather. Covers latent-MoE, TP1 shared-expert, and DP-attention
+    # projections when the attention TP narrow is identity. Trades NVLink
+    # bandwidth for HBM capacity.
+    SGLANG_ENABLE_K3_WEIGHT_SHARD = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_K3_MOE_WEIGHT_SHARD"
+    )
+    # Layer selection: comma-separated ids or inclusive ranges. K3 weight
+    # sharding applies to transformer layers 1-92; layer 0 is never sharded.
+    SGLANG_K3_WEIGHT_SHARD_LAYERS = EnvStr("1-92")
+    # Master switch for sharding the DSPARK dense draft (MTP) layers the same
+    # way as the target model. The draft has no dense layer-0 exclusion, so
+    # when enabled every draft layer is sharded (equivalent to "all").
+    SGLANG_ENABLE_K3_DRAFT_WEIGHT_SHARD = EnvBool(False)
+    # Fuse the K3 KDA short_conv q/k/v width-4 depthwise causal conv1d + SiLU,
+    # plus the in-place conv-state update, into one CUDA launch, replacing the
+    # three serial Triton causal_conv1d_fn calls in KDAAttnBackend.forward_extend.
+    # Bit-exact (torch.equal) against that Triton path and 1.787x aggregate over
+    # 5 prefill shapes on sm_100. Covers width 4, bf16 x, fp32 weight, bias None,
+    # equal q/k/v splits whose per-projection dim is a multiple of 128 (every
+    # attn_tp size), a row-major mixed_qkv whose stride(0) may exceed 3 * dim (the
+    # production torch.split view of the fused q/k/v/g projection is NOT
+    # contiguous), and SM100+; every other case stays on the Triton branch and
+    # logs the failing predicate once. See kernels/ops/kimi_k3/kda_short_conv.py
+    # and srt/layers/attention/linear/kda_backend.py. Default off.
+    SGLANG_K3_KDA_SHORT_CONV = EnvBool(False)
+    # K3 DeepEP: run the shared experts on alt_stream starting right after the
+    # routed combine send is enqueued (gated on the routed GEMMs only), so they
+    # overlap combine send + recv instead of the GEMMs. DeepEP a2a only (not
+    # MegaMoE). Default off.
+    SGLANG_K3_SHARED_IN_COMBINE_HOOK = EnvBool(False)
+    # K3 SP-MoE GEMM-RS: when the o_proj reduction is the push reduce-scatter,
+    # the o_proj DeepGEMM epilogue writes its rows straight into the owner
+    # ranks' RS slots (needs the DeepGEMM fp8_gemm_nt_push_rs fork API) and the
+    # RS only polls + reduces. Bit-identical to GEMM + push RS. Inert when the
+    # installed DeepGEMM lacks the API. Default off.
+    SGLANG_K3_GEMM_RS = EnvBool(False)
+    # With SGLANG_K3_SHARED_IN_COMBINE_HOOK: enqueue the combine send on a
+    # high-priority stream. The send and the shared experts become ready
+    # together when the routed GEMMs drain; at equal priority the shared GEMM
+    # (full-SM persistent grid) takes every SM first and the send waits ~18 us.
+    # Default off.
+    SGLANG_K3_COMBINE_SEND_PRIORITY = EnvBool(False)
+    # KDA extend preprocessing (bit-exact fused CUDA JIT kernels; both fall back
+    # to the original torch path when the tensor layout is not covered).
+    # 1) beta.float().sigmoid() on the strided [f_a|b] slice -> one kernel that
+    #    reads BF16 strided and writes contiguous FP32 sigmoid.
+    #    See kernels/ops/kimi_k3/kda_preprocess.py::fused_beta_sigmoid.
+    SGLANG_OPT_USE_K3_KDA_FUSED_BETA_SIGMOID = EnvBool(False)
+    # 2) has_initial_state compare + tracked conv-window gather + index_put ->
+    #    one kernel writing the conv pool in place.
+    #    See kda_preprocess.py::fused_track_conv_state_flag.
+    SGLANG_OPT_USE_K3_KDA_FUSED_TRACK_CONV_STATE = EnvBool(False)
+    # Debug-only: instantiate only the first N Kimi-K3 routed experts per MoE
+    # layer and load the matching expert prefix. 0/unset keeps the full
+    # checkpoint. This preserves all transformer layers, so DSpark layer capture
+    # still observes the configured target layer ids.
+    SGLANG_KIMI_K3_KEEP_NUM_EXPERTS = EnvInt(0)
+    # MHA-prefill K concat: use the flat-(token,head)-row Triton kernel instead of
+    # the PyTorch slice assignment on the branch where the head count is not a
+    # power of two, so neither concat_mla_k (128 heads only) nor
+    # concat_and_cast_mha_k_triton (power-of-two heads only) applies -- Kimi-K3's
+    # num_local_heads=96. The torch path emits two unvectorized direct_copy
+    # kernels there because a strided destination slice blocks TensorIterator
+    # vectorization, moving 2 bytes per thread. Bit-exact; unsupported inputs
+    # (mixed dtype, non-contiguous k, head dim not a multiple of 8) fall back to
+    # the original assignment. Gates both K concats of chunked prefill: the
+    # extend-token one in _concat_and_cast_mha_k and the per-prefix-chunk one in
+    # _chunked_prefix_attn_mha. See
+    # kernels/ops/kvcache/cache_ops.py:concat_mla_k_flatrow_triton.
+    SGLANG_OPT_USE_FLATROW_CONCAT_MHA_K = EnvBool(False)
+
+    # MHA-prefill Q/K/V FP8 cast: replace the three bf16 -> fp8_e4m3fn
+    # Tensor.to calls in trtllm_mla_backend._quantize_fp8_qkv with one Triton
+    # path that splits by layout -- a flat 1D kernel for the contiguous q/k and a
+    # row-per-program kernel for v, which is kv[..., qk_nope_head_dim:] and
+    # therefore has head stride 256 with only the inner 128 elements contiguous.
+    # That strided source blocks TensorIterator vectorization, so the torch cast
+    # degenerates to gpu_kernel_impl_nocast at 0.667 TB/s: 188.9 us of the
+    # group's 397.6 us on Kimi-K3 prefill (B200, T=32768, H=12). Bit-exact,
+    # including PyTorch's non-saturating overflow encoding (|x| > 464 and every
+    # inf/nan become 0x7f with the sign kept, not the hardware clamp to 448).
+    # Applies only to the k_scale == v_scale == 1.0 branches; the
+    # scaled_fp8_quant branches and unsupported inputs (non-bf16, non-contiguous
+    # q/k, non-unit inner stride on v) fall back to the original casts. A
+    # measured size gate keeps small shapes on torch, where the operator is
+    # host-launch bound rather than bandwidth bound. See
+    # kernels/ops/quantization/mla_qkv_fp8_cast.py:quantize_mla_qkv_fp8_triton.
+    SGLANG_OPT_USE_TRITON_MLA_QKV_FP8_CAST = EnvBool(False)
+
+    # MLA FP8 decode prepare: fuse concat_mla_absorb_q plus the three bf16 ->
+    # fp8_e4m3fn Tensor.to calls in mla_quantize_without_rope_for_fp8 into one
+    # Triton launch. The unfused chain materialises a bf16 [tokens, heads, 576]
+    # concat buffer and reads it straight back to cast it, so a Kimi-K3 decode
+    # step pays two extra full-size HBM trips (11.06 MB written + 11.07 MB read
+    # at cuda-graph-bs=200) plus three extra launches; isolated CUDA-graph replay
+    # on B200 measures 12.805 us -> 3.369 us (3.80x) at 800 tokens x 12 heads,
+    # and 3.63x / 3.98x at 256 / 4 tokens.
+    # Bit-exact, including PyTorch's non-saturating overflow encoding (|x| > 464
+    # and every inf/nan become 0x7f with the sign kept, not the hardware clamp to
+    # 448). Unsupported inputs (non-bf16, non-unit inner stride, dims other than
+    # kv_lora_rank=512 / qk_rope_head_dim=64) fall back to the original chain.
+    # See kernels/ops/attention/fused_mla_prepare_fp8.py:fused_mla_prepare_fp8.
+    SGLANG_OPT_USE_FUSED_MLA_PREPARE_FP8 = EnvBool(False)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
@@ -960,6 +1116,35 @@ class Envs:
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
+    # Opt-in: on the unified radix tree, leave the matched-prefix mamba evictable
+    # during decode (it is already COW'd to the request's own slot) and shrink the
+    # mamba pool ratio accordingly. Frees one resident slot per running request,
+    # raising max_running_requests. Off = original locking + ratio (escape hatch).
+    SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+
+    # FlashKDA
+    # Extend-length window in which the fused FlashKDA prefill kernel is used.
+    # Batches whose shortest extend length is below MIN (fewer than one kernel
+    # chunk) or whose longest exceeds MAX (past the measured crossover where
+    # Triton's chunked prefill wins) fall back to Triton chunk_kda for the whole
+    # batch. Raise MAX to keep large chunked-prefill batches on FlashKDA.
+    SGLANG_FLASHKDA_MIN_SEQ_LEN = EnvInt(64)
+    SGLANG_FLASHKDA_MAX_SEQ_LEN = EnvInt(2048)
+
+    # Replace the external MoonshotAI ``flash_kda`` CUTLASS package with the
+    # vendored CuTe DSL drop-in (sglang.kernels.ops.attention.linear.
+    # flash_kda_cute) in the FlashKDAKernel prefill backend. On = no external
+    # dependency, kernel runs on the in-tree CuTe forward (Blackwell SM100+);
+    # off = import the external ``flash_kda`` as before. Does not change the
+    # Triton fallback gating in FlashKDAKernel.
+    SGLANG_OPT_FLASH_KDA_CUTE = EnvBool(False)
+
+    # KDA extend/prefill output tail: fuse the non-contiguous layout copy
+    # (forced by FusedRMSNormGated's x.reshape(-1, D) on core_attn_out, which
+    # aliases the transposed conv-output buffer) together with the gated
+    # RMSNorm into one JIT kernel. Off by default; falls back to the
+    # existing self.o_norm(...) + squeeze/flatten path when not covered.
+    SGLANG_OPT_USE_KDA_STRIDED_ONORM = EnvBool(False)
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)

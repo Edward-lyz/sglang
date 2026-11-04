@@ -34,6 +34,12 @@ from sglang.kernels.ops.kvcache.cache_ops import (
     concat_and_cast_q_fp8_pad_kernel as concat_and_cast_q_fp8_pad_kernel,
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
+    concat_mla_k_flatrow_supported as concat_mla_k_flatrow_supported,
+)
+from sglang.kernels.ops.kvcache.cache_ops import (
+    concat_mla_k_flatrow_triton as concat_mla_k_flatrow_triton,
+)
+from sglang.kernels.ops.kvcache.cache_ops import (
     launch_reshape_and_cache_flash as launch_reshape_and_cache_flash,
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
