@@ -449,6 +449,9 @@ class NativeSparseAttnBackend(
             draft_token_num = 0
 
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+        # Clamp to context_len to prevent overflow when seq_len approaches context boundary
+        if draft_token_num > 0:
+            cache_seqlens_int32.clamp_(max=self.max_context_len)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         assert forward_batch.seq_lens_cpu is not None
         max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
@@ -1084,10 +1087,14 @@ class NativeSparseAttnBackend(
             max_seqlen_k = int(
                 seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
             )
+            # Clamp to context_len to prevent page_table overflow when
+            # seq_len approaches context boundary.
+            max_seqlen_k = min(max_seqlen_k, self.max_context_len)
 
             cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
             )
+            cache_seqlens.clamp_(max=self.max_context_len)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
