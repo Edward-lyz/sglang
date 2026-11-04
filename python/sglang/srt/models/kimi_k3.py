@@ -8,8 +8,8 @@
 
 import logging
 from collections.abc import Iterable
-from functools import cached_property
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from functools import cached_property, lru_cache
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch import nn
@@ -357,6 +357,16 @@ def _add3(
 
 # One-shot log guard: proves the merged front is live (see _ep_front).
 _EP_FRONT_LOGGED = False
+# One-shot log guard for the mixed-dtype front overlap (see _ep_front_overlap).
+_EP_FRONT_OVERLAP_LOGGED = False
+
+
+@lru_cache(maxsize=None)
+def _combine_send_stream() -> torch.cuda.Stream:
+    """Highest-priority stream shared by all MoE layers for the combine send
+    (see SGLANG_K3_COMBINE_SEND_PRIORITY)."""
+    logger.info("K3 DeepEP combine send on a high-priority stream")
+    return torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])
 
 
 class KimiK3MoE(nn.Module):
