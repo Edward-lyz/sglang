@@ -80,6 +80,8 @@ _is_hip = is_hip()
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
 def _cp_last_token_rows(hidden_states, forward_batch):
     """[fusion-opt] SGLANG_FUSE_CP_LAST_TOKEN_GATHER: when the logits only read each
     request's last prompt token (prefill, no input logprobs, no FULL hidden capture),

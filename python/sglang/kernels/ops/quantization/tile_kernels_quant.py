@@ -35,6 +35,7 @@ _tk_failed = False
 
 
 def _tile_kernels():
+    """Lazily import tile_kernels once; return the module, or None if unavailable."""
     global _tk, _tk_failed
     if _tk is not None or _tk_failed:
         return _tk
@@ -66,10 +67,12 @@ def _tile_kernels():
 
 
 def tk_per_token_cast_enabled() -> bool:
+    """Whether SGLANG_OPT_TK_PER_TOKEN_CAST is on and tile_kernels is loadable."""
     return envs.SGLANG_OPT_TK_PER_TOKEN_CAST.get() and _tile_kernels() is not None
 
 
 def tk_qnorm_cast_enabled() -> bool:
+    """Whether SGLANG_OPT_TK_QNORM_CAST is on and tile_kernels is loadable."""
     return envs.SGLANG_OPT_TK_QNORM_CAST.get() and _tile_kernels() is not None
 
 

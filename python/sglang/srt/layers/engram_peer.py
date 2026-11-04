@@ -33,10 +33,14 @@ _SYS_PIDFD_OPEN, _SYS_PIDFD_GETFD = 434, 438
 
 
 class _Loc(ctypes.Structure):
+    """CUmemLocation."""
+
     _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
 
 
 class _AllocFlags(ctypes.Structure):
+    """CUmemAllocationProp::allocFlags."""
+
     _fields_ = [
         ("compressionType", ctypes.c_ubyte),
         ("gpuDirectRDMACapable", ctypes.c_ubyte),
@@ -46,6 +50,8 @@ class _AllocFlags(ctypes.Structure):
 
 
 class _AllocProp(ctypes.Structure):
+    """CUmemAllocationProp."""
+
     _fields_ = [
         ("type", ctypes.c_int),
         ("requestedHandleTypes", ctypes.c_int),
@@ -56,6 +62,8 @@ class _AllocProp(ctypes.Structure):
 
 
 class _AccessDesc(ctypes.Structure):
+    """CUmemAccessDesc."""
+
     _fields_ = [("location", _Loc), ("flags", ctypes.c_int)]
 
 
@@ -64,6 +72,7 @@ _libc = None
 
 
 def _cu():
+    """Return the lazily loaded libcuda driver library."""
     global _libcuda
     if _libcuda is None:
         _libcuda = ctypes.CDLL("libcuda.so.1")
@@ -71,6 +80,7 @@ def _cu():
 
 
 def _check(err: int, what: str) -> None:
+    """Raise RuntimeError if a CUDA driver call returned a non-zero CUresult."""
     if err != 0:
         msg = ctypes.c_char_p()
         _cu().cuGetErrorString(err, ctypes.byref(msg))
@@ -78,6 +88,7 @@ def _check(err: int, what: str) -> None:
 
 
 def _alloc_prop(device: int) -> _AllocProp:
+    """Pinned device allocation on `device`, exportable as a POSIX fd."""
     prop = _AllocProp()
     prop.type = 1  # CU_MEM_ALLOCATION_TYPE_PINNED
     prop.requestedHandleTypes = _POSIX_FD
@@ -170,6 +181,7 @@ class _CudaArray:
     """Exposes a raw device allocation to torch.as_tensor."""
 
     def __init__(self, ptr: int, nbytes: int):
+        """Wrap `nbytes` bytes at device address `ptr` as a uint8 array."""
         self.__cuda_array_interface__ = {
             "shape": (nbytes,),
             "typestr": "|u1",
@@ -179,6 +191,7 @@ class _CudaArray:
 
 
 def peer_instances() -> int:
+    """Number of instances sharing engram tables (0 when peer sharing is off)."""
     n = envs.SGLANG_DSV41_ENGRAM_PEER_INSTANCES.get()
     return n if n and n > 1 else 0
 
@@ -204,6 +217,7 @@ class EngramPeerTable:
     """
 
     def __init__(self, num_embeddings: int, dim: int, block: int, layer_id: int):
+        """Allocate and map this rank's shard; peers are mapped later by connect()."""
         n = peer_instances()
         assert n > 1
         parallel = get_parallel()
@@ -285,9 +299,11 @@ class EngramPeerTable:
 
     @property
     def ready(self) -> bool:
+        """Whether every peer shard has been mapped (connect() finished)."""
         return self.bases is not None
 
     def _path(self, shard: int) -> str:
+        """Rendezvous file that publishes `shard`."""
         d = envs.SGLANG_DSV41_ENGRAM_PEER_DIR.get()
         tag = envs.SGLANG_DSV41_ENGRAM_PEER_TAG.get()
         return os.path.join(
@@ -295,6 +311,7 @@ class EngramPeerTable:
         )
 
     def _meta(self) -> dict:
+        """Layout fields every instance's shard must agree on."""
         return {
             "model": _checkpoint_id(),
             "num_embeddings": self.num_embeddings,
@@ -378,6 +395,7 @@ class EngramPeerTable:
         )
 
     def _read_peer(self, shard: int) -> Optional[dict]:
+        """Load a peer's published record; None if absent or left by a dead process."""
         try:
             with open(self._path(shard), "rb") as f:
                 peer = pickle.load(f)
@@ -401,6 +419,7 @@ class EngramPeerTable:
         return peer
 
     def _unpublish(self) -> None:
+        """Remove this shard's rendezvous file at exit if this process still owns it."""
         try:
             if self._file is not None:
                 with open(self._file, "rb") as f:

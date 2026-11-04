@@ -295,7 +295,9 @@ class TestFactoryFunctions(CustomTestCase):
     def test_should_use_zmq_multinode_dp_attention(self):
         self._publish(enable_dp_attention=True, nnodes=2, dp_size=2)
         self.assertTrue(should_use_zmq())
+
     def test_fake_dp_gets_one_slot_per_replica(self):
+        """fake_dp replicas each get a load-snapshot slot visible to the controller."""
         # fake_dp=2 with real dp_size=1: replica 1 must be able to publish and
         # the controller-side reader must see it (load-aware dispatch).
         self._publish(enable_dp_attention=False, nnodes=1, dp_size=1, fake_dp_size=2)

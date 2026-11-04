@@ -23,7 +23,10 @@ WIDTH = DIM + DIM // BLK
 
 
 class TestEngramPeerGather(CustomTestCase):
+    """engram_peer_gather_packed vs the single-table packed gather."""
+
     def test_matches_single_table(self):
+        """Multi-shard gather + unpack is bit-identical to engram_gather."""
         torch.manual_seed(5)
         n_rows, shards, layers, cols = 50021, 8, 2, 24
         weight = (torch.randn(n_rows, DIM) * 3).to(torch.float8_e4m3fn)

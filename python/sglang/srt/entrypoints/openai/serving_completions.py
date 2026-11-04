@@ -404,7 +404,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # raising after that point.
                 stream_started = True
                 yield f"data: {chunk.model_dump_json()}\n\n"
-                stream_started = True
 
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():

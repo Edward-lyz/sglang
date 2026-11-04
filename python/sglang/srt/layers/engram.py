@@ -899,7 +899,6 @@ class EngramEmbedding(nn.Module):
         if cp_all_tokens and self.tp_size > 1:
             # Prefill CP: gather the hash ids over the CP group first so every
             # TP rank looks up the same indices, then keep this rank's slice.
-            parallel = get_parallel()
             local_rows = indices.shape[0]
             all_indices = indices.new_empty(
                 (parallel.attn_cp_size * local_rows, *indices.shape[1:])
@@ -910,7 +909,9 @@ class EngramEmbedding(nn.Module):
         if self.tp_size > 1 and get_attention_dp_size() > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
+
     def _peer_lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        """Look up rows from the peer-sharded table (engram_peer) and dequantize."""
         if indices.numel() == 0:
             return self._empty(indices)
         assert self.peer.ready, "engram peer table used before finish_load"
@@ -1308,6 +1309,10 @@ class EngramPeerExchange(EngramPackedExchange):
         forward_batch: ForwardBatch,
         cp_rows: Optional[int] = None,
     ) -> Optional[dict]:
+        """Gather and unpack every engram layer's rows for this rank's tokens.
+
+        Returns None until all peer tables are connected (caller falls back).
+        """
         if not all(e.embed.peer.ready for e in self.engrams):
             return None
         layers = len(self.engrams)
