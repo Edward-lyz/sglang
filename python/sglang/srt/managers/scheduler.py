@@ -2514,7 +2514,21 @@ class Scheduler(
                 )
 
             for req in retracted_reqs:
-                self._add_request_to_queue(req, is_retracted=True)
+                # self._add_request_to_queue(req, is_retracted=True)
+                # Abort retracted requests instead of re-queuing to avoid accuracy degradation
+                if hasattr(req, "kv_cache_cpu"):
+                    del req.kv_cache_cpu
+                logger.info(
+                    "Abort retracted request: " "rid=%s",
+                    req.rid,
+                )
+                self.send_to_tokenizer.send_output(
+                    AbortReq(
+                        abort_message="Request aborted due to KV cache retraction",
+                        rid=req.rid,
+                    ),
+                    req,
+                )
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
