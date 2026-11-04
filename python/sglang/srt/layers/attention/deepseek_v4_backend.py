@@ -1709,8 +1709,17 @@ class DeepseekV4AttnBackend(
             tail_len=SWA_WINDOW,
             device=device,
         )
+        # The contiguous fast path takes rows [start:] to the end of the batch, so it
+        # only holds when the tail ends the batch; MLP-sync padding (tp without
+        # prefill CP) appends rows past the extend -> gather token_indices instead.
         contiguous_start = (
-            extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
+            extend_lens_cpu[0] - tail_lens_cpu[0]
+            if len(extend_lens_cpu) == 1
+            and (
+                is_cp_active(forward_batch)
+                or forward_batch.out_cache_loc.shape[0] == extend_lens_cpu[0]
+            )
+            else None
         )
         out_cache_loc = _tail_rows(
             forward_batch.out_cache_loc,

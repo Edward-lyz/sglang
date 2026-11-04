@@ -61,7 +61,7 @@ def _backend(core, pool, req_to_token):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA only")
 class _PrefillIndexerFixture(CustomTestCase):
-    def _setup(self, ratio, seq_lens, extend_lens):
+    def _setup(self, ratio, seq_lens, extend_lens, pad=0):
         """A batch of requests with random FULL page tables; the fp4 index-K pool
         is written through store_fp4_index_k_cache exactly as production does."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
@@ -145,6 +145,12 @@ class _PrefillIndexerFixture(CustomTestCase):
             torch.randn(T, N_HEADS, HEAD_DIM, device=dev, dtype=torch.bfloat16)
         )
         weights = torch.rand(T, N_HEADS, device=dev, dtype=torch.float32)
+        if pad:
+            # MLP-sync padding (tp without prefill CP): rows past the extend, pos 0
+            pos = torch.cat([pos, pos.new_zeros(pad)])
+            q = torch.cat([q, q.new_zeros(pad, *q.shape[1:])])
+            weights = torch.cat([weights, weights.new_zeros(pad, N_HEADS)])
+            T += pad
         tok_ids = torch.arange(T, device=dev)
 
         lens_clamp1 = ((pos + 1) // ratio).clamp_min(1).to(torch.int32)
@@ -161,7 +167,9 @@ class _PrefillIndexerFixture(CustomTestCase):
 
         forward_batch = SimpleNamespace(
             forward_mode=SimpleNamespace(
-                is_decode=lambda: False, is_extend=lambda: True
+                is_decode=lambda: False,
+                is_target_verify=lambda: False,
+                is_extend=lambda: True,
             ),
             seq_lens_cpu=list(seq_lens),
             extend_seq_lens_cpu=list(extend_lens),
@@ -279,6 +287,29 @@ class TestPrefillIndexerKernelPath(_PrefillIndexerFixture):
                         msg=f"{ratio=} request {b} row {i}: overlap {overlap}",
                     )
                 tok += e
+
+    def test_padded_rows_match_unpadded(self):
+        """Rows past sum(extend_lens) (MLP-sync padding) select nothing and leave the
+        real rows' selection unchanged."""
+        from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
+
+        seq_lens, extend_lens, pad = [300, 45, 700], [300, 45, 700], 3
+        for ratio in (1, 2):
+            ref = self._run(self._setup(ratio, seq_lens, extend_lens))
+            st = self._setup(ratio, seq_lens, extend_lens, pad=pad)
+            page_indices, raw_indices = self._run(st)
+            live = sum(extend_lens)
+            self.assertTrue(torch.equal(raw_indices[:live], ref[1][:live]))
+            self.assertTrue(torch.equal(page_indices[:live], ref[0][:live]))
+            self.assertTrue(bool((raw_indices[live:] == -1).all()))
+            req = token_req_indices(st.forward_batch, num_tokens=live + pad)
+            self.assertEqual(req.shape[0], live + pad)
+            self.assertTrue(bool((req[live:] == 0).all()))
+            self.assertTrue(
+                torch.equal(
+                    req[:live], token_req_indices(st.forward_batch, num_tokens=live)
+                )
+            )
 
 
 if __name__ == "__main__":

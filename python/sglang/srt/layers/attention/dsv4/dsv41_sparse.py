@@ -72,9 +72,22 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     assert forward_batch.forward_mode.is_extend(), (
         "the V4.1 torch attention path serves extend, target-verify and decode"
     )
-    return torch.repeat_interleave(
-        req, forward_batch.extend_seq_lens.to(torch.int64), output_size=num_tokens
+    live = (
+        sum(forward_batch.extend_seq_lens_cpu)
+        if forward_batch.extend_seq_lens_cpu is not None
+        else None
     )
+    if num_tokens is None or live is None or num_tokens <= live:
+        return torch.repeat_interleave(
+            req, forward_batch.extend_seq_lens.to(torch.int64), output_size=num_tokens
+        )
+    # MLP-sync padding (prepare_mlp_sync_batch, e.g. tp without prefill CP) aligns
+    # the token rows to attn_tp_size but not extend_seq_lens: map the padded rows to
+    # the reserved dummy request slot 0 (padded positions/out_cache_loc are 0 too).
+    req = torch.repeat_interleave(
+        req, forward_batch.extend_seq_lens.to(torch.int64), output_size=live
+    )
+    return torch.nn.functional.pad(req, (0, num_tokens - live), value=0)
 
 
 def rope_tail(
