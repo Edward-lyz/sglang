@@ -58,7 +58,6 @@ class FakeKVSender(BaseKVSender):
         if not self.inited or self.curr_idx < self.num_pages:
             return KVPoll.WaitingForInput
 
-        # Assume transfer completed instantly
         logger.debug("FakeKVSender poll success")
         self.conclude_state = KVPoll.Success
         return KVPoll.Success
@@ -76,7 +75,6 @@ class FakeKVSender(BaseKVSender):
         logger.debug(
             f"FakeKVSender init with num_pages: {num_pages}, aux_index: {aux_index}"
         )
-        pass
 
     def send(
         self,
@@ -135,8 +133,14 @@ class FakeKVReceiver(BaseKVReceiver):
         decode_prefix_len: Optional[int] = None,
     ):
         self.has_sent_metadata = True
+        # Lazy %-formatting: kv_indices can hold one entry per prefix token
+        # (60k in decode benchmarks). An f-string would build that string even
+        # when DEBUG is off, costing milliseconds per request.
         logger.debug(
-            f"FakeKVReceiver send_metadata with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}"
+            "FakeKVReceiver send_metadata with kv_indices: %s, aux_index: %s, state_indices: %s",
+            kv_indices,
+            aux_index,
+            state_indices,
         )
 
     def failure_exception(self):
