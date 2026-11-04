@@ -17,6 +17,7 @@ from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
     create_load_snapshot_writer,
     should_use_zmq,
+    snapshot_dp_size,
     zmq_reader_owner,
 )
 from sglang.srt.runtime_context import get_context
@@ -294,6 +295,28 @@ class TestFactoryFunctions(CustomTestCase):
     def test_should_use_zmq_multinode_dp_attention(self):
         self._publish(enable_dp_attention=True, nnodes=2, dp_size=2)
         self.assertTrue(should_use_zmq())
+    def test_fake_dp_gets_one_slot_per_replica(self):
+        # fake_dp=2 with real dp_size=1: replica 1 must be able to publish and
+        # the controller-side reader must see it (load-aware dispatch).
+        self._publish(enable_dp_attention=False, nnodes=1, dp_size=1, fake_dp_size=2)
+        self.assertEqual(snapshot_dp_size(), 2)
+        port_args = SimpleNamespace(instance_id="test_fake_dp_factory")
+        writers = [
+            create_load_snapshot_writer(port_args, dp_size=2, dp_rank=r)
+            for r in range(2)
+        ]
+        writers[1].write(LoadSnapshot(dp_rank=1, num_total_tokens=123))
+        reader = create_load_snapshot_reader(port_args, caller="DataParallelController")
+        loads = {s.dp_rank: s for s in reader.read_all()}
+        self.assertEqual(loads[1].num_total_tokens, 123)
+        reader.close()
+        for w in writers:
+            w.close()
+        from sglang.srt.managers.load_snapshot import shm_path_for
+
+        path = shm_path_for("test_fake_dp_factory")
+        if os.path.exists(path):
+            os.unlink(path)
 
 
 class TestZmqReaderOwner(CustomTestCase):

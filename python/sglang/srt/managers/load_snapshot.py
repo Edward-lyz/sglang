@@ -62,6 +62,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def snapshot_dp_size() -> int:
+    """Slots in the load snapshot: one per DP worker the controller dispatches to.
+
+    fake_dp runs N independent dp1 replicas behind one controller, so the real
+    dp_size (1) would leave replicas 1..N-1 without a slot (their writer init
+    fails) and load-aware dispatch would see them as permanently idle.
+    """
+    p = get_parallel()
+    return max(p.dp_size, getattr(p, "fake_dp_size", 1) or 1)
+
+
 def should_use_zmq() -> bool:
     """Whether to use zmq PUSH/PULL instead of shared memory for load snapshots.
 
@@ -120,10 +131,10 @@ def zmq_reader_owner(caller: str) -> bool:
         return False
     if caller == "DataParallelController":
         return (
-            get_parallel().dp_size > 1
+            snapshot_dp_size() > 1
             and get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
         )
-    if get_parallel().dp_size > 1 and (
+    if snapshot_dp_size() > 1 and (
         get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
     ):
         return False
@@ -659,7 +670,7 @@ def create_load_snapshot_reader(port_args, caller: str):
             ``"MultiTokenizerRouter"`` -- determines who binds the zmq PULL
             socket when zmq mode is active.
     """
-    dp_size = get_parallel().dp_size
+    dp_size = snapshot_dp_size()
     if zmq_reader_owner(caller):
         return ZmqShmLoadSnapshotReader(
             _zmq_addr_for(port_args), shm_path_for(port_args.instance_id), dp_size

@@ -680,6 +680,37 @@ async def handle_scheduler_receive_url_request(request: dict):
     return ORJSONResponse(content=None)
 
 
+def _factory_health_gate(path: str) -> Optional[Response]:
+    """Factory (厂内) producer checks that K3's health endpoint performed.
+
+    Returns a response to short-circuit the probe, or None to continue:
+      - ``/ready`` with the preStop drain flag set: stop fetching new tasks and
+        keep answering 200 so in-flight tasks finish and prefill can still pull.
+      - every mooncake pull to this encoder failing for too long: 503, so the
+        platform restarts an encoder whose RDMA path is broken.
+      - the vit-server polling loop died: 503.
+    """
+    from sglang.srt.disaggregation.encode_health import transfer_health_state
+    from sglang.srt.entrypoints.http_server import stopped_by_external
+
+    workflow = getattr(encoder, "encode_workflow", None)
+    if workflow is None:
+        return None
+    if path.rstrip("/") == "/ready" and stopped_by_external():
+        if not workflow.stopped:
+            logger.warning("Stop signal received: draining, no new vit-server tasks")
+            workflow.graceful_stop()
+        return Response(content="Encoder is shutting down", status_code=200)
+    if not transfer_health_state.is_healthy():
+        logger.error(
+            "Health check failed: embedding transfer unhealthy, sessions=%s",
+            transfer_health_state.unhealthy_sessions(),
+        )
+        return Response(status_code=503)
+    if not workflow.is_alive and not workflow.stopped:
+        logger.error("Health check failed: vit-server polling loop is not alive")
+        return Response(status_code=503)
+    return None
 
 
 @app.get("/health")
@@ -712,6 +743,9 @@ async def health_generate(request: Request = None):
         return Response(status_code=200)
     if encoder is None:
         return Response(status_code=503)
+    gated = _factory_health_gate(request.url.path if request is not None else "")
+    if gated is not None:
+        return gated
 
     # Pick the first available modality for the dummy encode
     if encoder.supports_modality(Modality.IMAGE):

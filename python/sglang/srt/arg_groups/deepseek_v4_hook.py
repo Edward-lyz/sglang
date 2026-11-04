@@ -379,9 +379,19 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, not a per-local-token tensor,
-            # so the tail slice does not apply to it.
-            ("DP attention", cfg.enable_dp_attention),
+            # The late-layer tail slice needs per-request LOCAL tokens. With
+            # dp_size==1 (incl. dp1 + prefill-CP) that holds. With REAL dp_size>1
+            # the DP-wide input_ids_global gather breaks the tail slice (batch_size
+            # mismatch). But under "fake DP" (DWDP / local-control-broadcast, which
+            # sets SGLANG_SCHEDULER_SKIP_ALL_GATHER) each DP worker is independent
+            # and does NOT do the DP-wide gather, so the per-request tail slice
+            # still holds -> allow swa there. Reject only real DP fan-out.
+            (
+                "real DP attention with dp_size>1",
+                cfg.enable_dp_attention
+                and cfg.dp_size > 1
+                and not cfg.enable_dp_attention_local_control_broadcast,
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:

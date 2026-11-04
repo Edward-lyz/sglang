@@ -4006,6 +4006,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             not _use_cp
             and get_parallel().attn_dp_size > 1
             and get_moe_a2a_backend().is_none()
+            # Under SGLANG_SCHEDULER_SKIP_ALL_GATHER (fake-DP) each DP worker is
+            # independent: no cross-DP MoE gather/scatter, run MoE on local tokens.
+            and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
@@ -5064,7 +5067,11 @@ class DeepseekV4Model(nn.Module):
                     "PP stage received no hc pre-mix from the previous stage"
                 )
 
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+        if (
+            get_parallel().attn_dp_size > 1
+            and get_moe_a2a_backend().is_none()
+            and forward_batch.global_num_tokens_gpu is not None
+        ):
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,

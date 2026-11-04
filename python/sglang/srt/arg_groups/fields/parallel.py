@@ -120,6 +120,22 @@ class Parallel(msgspec.Struct):
             "Must equal tp_size. Only supported with --disaggregation-mode null or prefill.",
         ),
     ] = 1
+    fake_dp_size: A[
+        int,
+        Arg(
+            help="Fake data parallelism: number of INDEPENDENT model replicas to "
+            "launch behind a single DataParallelController / HTTP port. Unlike "
+            "--dp-size (which forms one global world for DP-attention), each "
+            "fake-DP replica is a fully independent engine occupying its own "
+            "tp_size GPUs (own weights, own MoE EP group, own KV, no cross-replica "
+            "collectives). The controller round-robins / bootstrap-room routes "
+            "requests across replicas. Total GPUs = fake_dp_size * tp_size. Real "
+            "dp_size stays 1 inside each replica, so every replica uses the clean "
+            "single-instance code paths (CP, SWA, megamoe EP-local). Use this to "
+            "run e.g. two tp4/cp4/ep4 instances on one 8-GPU node.",
+            aliases=["--fake-dp"],
+        ),
+    ] = 1
     dcp_comm_backend: A[
         Optional[str],
         Arg(

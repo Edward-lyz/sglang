@@ -893,7 +893,7 @@ class Scheduler(
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
                 port_args,
-                self.ps.dp_size,
+                max(self.ps.dp_size, get_parallel().fake_dp_size or 1),
                 dp_rank,
                 publish_interval=get_observability().load_snapshot_publish_interval,
             )
@@ -2012,26 +2012,34 @@ class Scheduler(
             # per-replica suffix), with the replica distinguished only by dp_id.
             # Each replica is dp1 internally (attn_dp_rank==0), so dp_id must come
             # from the controller-assigned replica id.
+            fake_dp_size = int(getattr(server_args, "fake_dp_size", 1) or 1)
+            as_namespace_base = model_id
+            as_pod_name = pod_name
+            as_dp_rank = self.ps.attn_dp_rank
+            as_gpu_count = server_args.per_node_gpu_num
+            if fake_dp_size > 1:
+                as_dp_rank = int(getattr(self.ps, "dp_rank", 0) or 0)
             draft_kv_cache, draft_layer_ids = self._as_draft_swa_layers(
                 cache_plan.name, len(target_layer_ids)
             )
             logger.info(
-                "[AS] init: plan=%s pod=%s shard=%d/%d layers=%d draft_layers=%d "
+                "[AS] init: plan=%s pod=%s ns=%s shard=%d/%d layers=%d draft_layers=%d "
                 "page_size=%d gpu_count=%d",
                 cache_plan.name,
-                pod_name,
+                as_pod_name,
+                as_namespace_base,
                 page_shard_id,
                 page_shard_num,
                 len(target_layer_ids),
                 len(draft_layer_ids),
                 self.page_size,
-                server_args.per_node_gpu_num,
+                as_gpu_count,
             )
             ctx = AttentionStoreInitContext(
                 kv_cache=kv_cache,
                 req_to_token_pool=self.req_to_token_pool,
-                namespace_base=model_id,
-                pod_name=pod_name,
+                namespace_base=as_namespace_base,
+                pod_name=as_pod_name,
                 model_version="v1",
                 page_size=self.page_size,
                 block_size=AS_BLOCK_SIZE,
@@ -2041,9 +2049,9 @@ class Scheduler(
                 pp_size=1,
                 node_pp_start=0,
                 node_pp_end=1,
-                dp_rank=self.ps.attn_dp_rank,
+                dp_rank=as_dp_rank,
                 device_id=self.ps.gpu_id,
-                gpu_count=server_args.per_node_gpu_num,
+                gpu_count=as_gpu_count,
                 target_layer_ids=target_layer_ids,
                 page_layer_ids=target_layer_ids,
                 draft_kv_cache=draft_kv_cache,
@@ -2066,7 +2074,7 @@ class Scheduler(
             logger.info(
                 "[AS] initialized: plan=%s namespace=%s forward_stream=%s",
                 cache_plan.name,
-                model_id,
+                as_namespace_base,
                 getattr(_as_coord, "forward_stream", None),
             )
         except Exception as exc:

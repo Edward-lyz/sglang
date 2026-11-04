@@ -155,7 +155,10 @@ class DataParallelController:
         self.run_scheduler_process_func = run_scheduler_process_func
 
         # Init inter-process communication
-        self.context = zmq.Context(1 + get_parallel().dp_size)
+        # fake_dp_size launches N independent replicas behind this controller;
+        # size the IPC context for whichever replica count is larger.
+        self._n_replicas = max(get_parallel().dp_size, get_parallel().fake_dp_size)
+        self.context = zmq.Context(1 + self._n_replicas)
         if get_parallel().node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -175,8 +178,8 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS,
         )
 
-        self.launch_dp_size: int = get_parallel().dp_size
-        self.max_dp_size: int = get_parallel().max_ep_size or get_parallel().dp_size
+        self.launch_dp_size: int = self._n_replicas
+        self.max_dp_size: int = get_parallel().max_ep_size or self._n_replicas
         assert self.max_dp_size >= self.launch_dp_size, (
             f"--max-ep-size ({self.max_dp_size}) must be >= "
             f"--dp ({self.launch_dp_size})."
@@ -186,7 +189,7 @@ class DataParallelController:
             self.max_dp_size - self.launch_dp_size
         )
 
-        self.dp_budget = DPBudget(get_parallel().dp_size)
+        self.dp_budget = DPBudget(self._n_replicas)
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
             caller="DataParallelController",
@@ -203,7 +206,7 @@ class DataParallelController:
         self._active_workers: list[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
 
-        if get_parallel().enable_dp_attention:
+        if get_parallel().enable_dp_attention and get_parallel().fake_dp_size <= 1:
             self.launch_dp_attention_schedulers(server_args, port_args)
             # When local control broadcast is enabled, send control messages to
             # every DP group leader (attn_tp_rank=0) so each leader broadcasts
@@ -374,11 +377,15 @@ class DataParallelController:
         threads = []
         sockets = []
         ready_events = []
-        for dp_rank in range(get_parallel().dp_size):
+        for dp_rank in range(self.launch_dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
             tmp_port_args.instance_id = port_args.instance_id
+            # A user-fixed --nccl-port is shared by every replica (init_new returns it
+            # verbatim) -> EADDRINUSE under fake-dp; offset it per replica instead.
+            if server_args.nccl_port is not None:
+                tmp_port_args.nccl_port = server_args.nccl_port + dp_rank
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -642,7 +649,7 @@ class DataParallelController:
             for tp_rank in tp_rank_range:
                 rank_port_args = port_args
 
-                if get_parallel().enable_dp_attention:
+                if get_parallel().enable_dp_attention and get_parallel().fake_dp_size <= 1:
                     # dp attention has different sharding logic
                     _, _, dp_rank, _ = compute_dp_attention_world_info(
                         get_parallel().enable_dp_attention,
@@ -750,6 +757,13 @@ class DataParallelController:
         )
 
     def maybe_external_dp_rank_routing(self, req: Req):
+        # Under fake_dp the external caller (gateway / OpenAI layer) has no
+        # knowledge of the independent replicas and defaults routed_dp_rank to 0,
+        # which would pin every request to replica 0. Ignore it and let
+        # follow_bootstrap_room distribute by bootstrap_room so prefill routing
+        # stays consistent with the decode-side bootstrap_room % system_dp_size.
+        if get_parallel().fake_dp_size > 1:
+            return False
         if req.routed_dp_rank is not None:
             rank = req.routed_dp_rank
             if (

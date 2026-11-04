@@ -3395,7 +3395,12 @@ def _configure_uvicorn_access_log_filter(
             filters_list.append(filter_name)
 
 
-def launch_dummy_health_check_server(host, port, enable_metrics):
+def launch_dummy_health_check_server(host, port, enable_metrics, server_args=None):
+    """Serve probes on a node that runs no tokenizer manager.
+
+    server_args is optional so existing callers keep working; without it the
+    instance-info probe reports 404 instead of guessing the topology.
+    """
     import asyncio
 
     import uvicorn
@@ -3403,6 +3408,8 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
 
     from sglang.srt.utils.network import NetworkAddress
 
+    # Reused across /ready polls; the platform hits this endpoint every second.
+    ready_session = None
     app = FastAPI()
 
     @app.get("/ping")
@@ -3415,11 +3422,65 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         """Check the health of the http server."""
         return Response(status_code=200)
 
+    @app.get("/health_forward")
+    async def health_forward():
+        """Liveness probe used by the internal gateway and PaaS platform."""
+        return Response(status_code=200)
+
     @app.get("/health_generate")
     async def health_generate():
         """Check the health of the http server."""
         return Response(status_code=200)
 
+    @app.get("/ready")
+    async def ready():
+        """Readiness for a node without a tokenizer manager.
+
+        The platform polls /ready on every node, but only the master node knows
+        whether the engine is serving, so forward the question there. Anything
+        other than a 200 from the master, including a timeout, means this node
+        is not ready either.
+        """
+        import aiohttp
+
+        nonlocal ready_session
+        master = os.environ.get("MASTER_IP", host)
+        try:
+            if ready_session is None or ready_session.closed:
+                ready_session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=10)
+                )
+            async with ready_session.get(f"http://{master}:{port}/ready") as response:
+                if response.status != 200:
+                    return Response(status_code=503)
+        except Exception as error:
+            logger.info(f"Readiness forward to {master}:{port} failed: {error}")
+            return Response(status_code=503)
+        return Response(status_code=200)
+
+    @app.get("/get_instance_info")
+    async def get_instance_info():
+        """This node's slice of the topology; it serves no requests itself."""
+        if server_args is None:
+            return Response(status_code=404)
+        dp_per_node = server_args.dp_size // server_args.nnodes
+        first_dp_rank = server_args.node_rank * dp_per_node
+        return {
+            "kv_role": server_args.disaggregation_mode,
+            "dp_ranks": list(range(first_dp_rank, first_dp_rank + dp_per_node)),
+            "dp_size": server_args.dp_size,
+            "tp_size": server_args.tp_size,
+            "nnodes": server_args.nnodes,
+            "chunked_prefill_enabled": server_args.chunked_prefill_size != -1,
+            "chunked_prefill_size": server_args.chunked_prefill_size,
+            "active_request_count": 0,
+            "max_running_requests": (
+                server_args.max_running_requests * server_args.dp_size
+                if server_args.max_running_requests
+                else None
+            ),
+            "current_input_tokens": 0,
+        }
 
     # Add prometheus middleware
     if enable_metrics:

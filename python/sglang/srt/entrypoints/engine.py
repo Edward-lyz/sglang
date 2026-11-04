@@ -861,7 +861,9 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         scheduler_procs = []
         use_dp_controller = (
-            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().dp_size > 1
+            or get_parallel().fake_dp_size > 1
+            or get_exec().moe.ep_join_mode == "scale"
         )
 
         if not use_dp_controller:
@@ -1179,6 +1181,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     get_serving().host,
                     get_serving().port,
                     get_observability().enable_metrics,
+                    server_args,
                 )
 
             scheduler_init_result.block_until_scheduler_exits()
