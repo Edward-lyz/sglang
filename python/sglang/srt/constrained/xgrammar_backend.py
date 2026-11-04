@@ -392,6 +392,15 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     structural_tag["format"] = format_dict
                     key_string = json.dumps(structural_tag)
                 ctx = self.grammar_compiler.compile_structural_tag(key_string)
+        except RecursionError:
+            # RecursionError is a RuntimeError subclass, so it must be caught
+            # *before* the generic (RuntimeError, JSONDecodeError) clause below:
+            # a pathological structural_tag (e.g. deeply nested JSON) would
+            # otherwise be reported as an ordinary "invalid structural_tag" and
+            # become indistinguishable from a genuine compile failure on the
+            # hot path (seen fleet-wide on the kimi-k3 incident).
+            logger.exception("RecursionError while compiling structural_tag")
+            return InvalidGrammarObject("recursion error while compiling structural_tag")
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))

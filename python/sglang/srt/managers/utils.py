@@ -10,6 +10,7 @@ import torch
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.state_capturer.base import TopkCaptureOutput
@@ -120,7 +121,7 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
-        if return_logprob:
+        if self.logits_output is not None and return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
                     self.logits_output.next_token_logprobs
@@ -144,11 +145,16 @@ class GenerationBatchResult:
                     _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if return_hidden_states and self.logits_output.hidden_states is not None:
+        if (
+            self.logits_output is not None
+            and return_hidden_states
+            and self.logits_output.hidden_states is not None
+        ):
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
+        if self.next_token_ids is not None:
+            self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
@@ -324,5 +330,9 @@ class EmbeddingBatchResult:
 
 
 def is_health_check_generate_req(recv_req):
-    rid = getattr(recv_req, "rid", None)
-    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+    """Health-check generate requests only; an `AbortReq` sharing the rid prefix
+    must not match, or the abort would be skipped."""
+    if not isinstance(recv_req, TokenizedGenerateReqInput):
+        return False
+    rid = recv_req.rid
+    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)

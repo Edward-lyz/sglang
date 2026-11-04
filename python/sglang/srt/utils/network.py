@@ -203,6 +203,7 @@ def get_zmq_socket_on_host(
     context: zmq.Context,
     socket_type: zmq.SocketType,
     host: Optional[str] = None,
+    port: Union[int, Tuple[int, int], None] = None,
 ) -> Tuple[int, zmq.Socket]:
     """Create and configure a ZeroMQ socket.
 
@@ -213,21 +214,28 @@ def get_zmq_socket_on_host(
             "127.0.0.1" (localhost-only) to avoid exposing unauthenticated
             sockets to the network (CVE-2026-3060). Callers that need
             cross-machine reachability must pass an explicit host.
+        port: Port configuration:
+              - int: bind to this fixed port
+              - (min, max): bind to a random port in [min, max)
+              - None: bind to any random port
 
     Returns:
-        Tuple of (port, socket) where port is the randomly assigned TCP port.
+        Tuple of (port, socket) where port is the assigned TCP port.
     """
     socket: zmq.Socket = context.socket(socket_type)
     config_socket(socket, socket_type)
-    if host is None:
-        host = "127.0.0.1"
-    if is_valid_ipv6_address(host):
-        socket.setsockopt(zmq.IPV6, 1)
-        bind_host = f"tcp://[{host}]"
+    bind_host = f"tcp://{host}" if host else "tcp://*"
+
+    if isinstance(port, int):
+        socket.bind(f"{bind_host}:{port}")
+        assigned_port = port
+    elif isinstance(port, tuple):
+        assigned_port = socket.bind_to_random_port(
+            bind_host, min_port=port[0], max_port=port[1]
+        )
     else:
-        bind_host = f"tcp://{host}"
-    port = socket.bind_to_random_port(bind_host)
-    return port, socket
+        assigned_port = socket.bind_to_random_port(bind_host)
+    return assigned_port, socket
 
 
 def config_socket(socket, socket_type: zmq.SocketType):

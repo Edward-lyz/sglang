@@ -51,6 +51,8 @@ from sglang.utils import (
     get_exception_traceback,
 )
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
+
 logger = logging.getLogger(__name__)
 
 # Maximum number of request states that detokenizer can hold. When exceeded,
@@ -107,6 +109,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Init dispatcher
         self.init_request_dispatcher()
+        # Init disaggregation vars
+        self.disaggregation_mode = DisaggregationMode(server_args.disaggregation_mode)
 
     def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):
         context = zmq.Context(2)

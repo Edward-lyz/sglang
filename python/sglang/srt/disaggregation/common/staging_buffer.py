@@ -142,6 +142,9 @@ class StagingBuffer:
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
             alloc_method = "cudaMalloc"
         self.data_ptr = self.buffer.data_ptr()
+        # Lazily created private gather stream (see draft_kv_gather); a slot is
+        # never used by two workers at once, so one stream per buffer is enough.
+        self.draft_gather_stream: Optional[torch.cuda.Stream] = None
 
         logger.info(
             f"StagingBuffer allocated: {size_bytes / (1024*1024):.1f} MB "

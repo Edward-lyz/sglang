@@ -1774,6 +1774,43 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.time_stats = time_stat
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
 
+    def _should_reject_missing_bootstrap_room(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> bool:
+        if self.server_args.load_balance_method != "follow_bootstrap_room":
+            return False
+        if self.server_args.disaggregation_decode_enable_fake_auto:
+            return False
+        if getattr(tokenized_obj, "bootstrap_room", None) is not None:
+            return False
+        if getattr(tokenized_obj, "data_parallel_rank", None) is not None:
+            return False
+        return True
+
+    def _reject_missing_bootstrap_room(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        created_time: Optional[float] = None,
+    ) -> ReqState:
+        error_msg = (
+            "Invalid request: Disaggregated request received without bootstrap room id."
+        )
+        logger.warning(f"{error_msg} {obj.rid=}")
+        state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+        self.rid_to_state[obj.rid] = state
+        self._handle_abort_req(
+            AbortReq(
+                rid=obj.rid,
+                finished_reason={
+                    "type": "abort",
+                    "message": error_msg,
+                    "status_code": HTTPStatus.BAD_REQUEST,
+                },
+            )
+        )
+        return state
+
     def _coalesce_streaming_chunks(
         self,
         out_list: list,

@@ -14,6 +14,45 @@ logger = logging.getLogger(__name__)
 
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
+    # Parse disaggregation_zmq_ports from string to List[int]
+    if server_args.disaggregation_zmq_ports is not None:
+        raw = server_args.disaggregation_zmq_ports
+        if isinstance(raw, str):
+            ports = []
+            for token in raw.split(","):
+                token = token.strip()
+                if "-" in token:
+                    parts = token.split("-")
+                    if len(parts) != 2:
+                        raise ValueError(
+                            f"Invalid port range format: '{token}'. Expected 'start-end'."
+                        )
+                    start, end = int(parts[0]), int(parts[1])
+                    if start > end:
+                        raise ValueError(
+                            f"Invalid port range: start ({start}) > end ({end}). "
+                            f"Expected 'start-end' where start <= end."
+                        )
+                    ports.extend(range(start, end + 1))
+                else:
+                    ports.append(int(token))
+            server_args.disaggregation_zmq_ports = ports
+
+        if len(server_args.disaggregation_zmq_ports) == 0:
+            raise ValueError(
+                "--disaggregation-zmq-ports resulted in an empty port list."
+            )
+
+        if server_args.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(
+                "--disaggregation-zmq-ports can only be used with --disaggregation-mode prefill or decode"
+            )
+
+        if len(server_args.disaggregation_zmq_ports) != len(
+            set(server_args.disaggregation_zmq_ports)
+        ):
+            raise ValueError("Duplicate ports in --disaggregation-zmq-ports.")
+
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.

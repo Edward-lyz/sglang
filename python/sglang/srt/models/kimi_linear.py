@@ -623,12 +623,20 @@ class KimiLinearModel(nn.Module):
                 )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy_tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if self.dspark_layers_to_capture is not None:
+                if aux_hidden_states:
+                    proxy_tensors["dspark_aux_hidden_states"] = torch.cat(
+                        aux_hidden_states, dim=-1
+                    )
+                else:
+                    proxy_tensors["dspark_aux_hidden_states"] = hidden_states.new_empty(
+                        hidden_states.shape[0], 0
+                    )
+            return PPProxyTensors(proxy_tensors)
         else:
             if hidden_states.shape[0] != 0:
                 if residual is None:

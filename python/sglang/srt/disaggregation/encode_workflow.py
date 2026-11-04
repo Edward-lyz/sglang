@@ -707,6 +707,7 @@ class EncodeWorkflow:
 
     @property
     def stopped(self) -> bool:
+        """Return whether the polling loop has been signalled to stop."""
         return self._stopped
 
     async def poll_forever(self):

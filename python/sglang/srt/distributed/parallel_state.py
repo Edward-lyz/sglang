@@ -1275,8 +1275,11 @@ class GroupCoordinator:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
             else:
+                # CPU tensors must use the gloo group; device_group (NCCL)
+                # rejects them with "No backend type associated with device
+                # type cpu".
                 torch.distributed.all_gather_into_tensor(
-                    output_tensor, input_, group=self.device_group
+                    output_tensor, input_, group=self.cpu_group
                 )
         else:
             self.all_gather_into_tensor(output_tensor, input_)

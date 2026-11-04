@@ -58,7 +58,6 @@ class FakeKVSender(BaseKVSender):
         if not self.inited or self.curr_idx < self.num_pages:
             return KVPoll.WaitingForInput
 
-        # Assume transfer completed instantly
         logger.debug("FakeKVSender poll success")
         self.conclude_state = KVPoll.Success
         return KVPoll.Success
@@ -84,7 +83,10 @@ class FakeKVSender(BaseKVSender):
         num_kv_tokens: Optional[int] = None,
         send_aux: bool = True,
     ):
-        self.has_sent = True
+        # send_aux is ignored: there is no aux transfer to skip. Warmup requests
+        # land here on every PP rank, including the non-aux-owner ranks of the
+        # PP+PD early-last-chunk path, which pass send_aux=False.
+        self.curr_idx += len(kv_indices)
         logger.debug(
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
         )

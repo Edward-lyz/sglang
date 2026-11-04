@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.embedding_transfer.queues import (
 )
 from sglang.srt.disaggregation.encode_receiver_aiak import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
+    PendingFinalKV,
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
@@ -108,6 +109,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
     FlushCacheReqInput,
+    FlushCacheReqOutput,
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -177,6 +179,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    PlannedAdmission,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -230,9 +233,11 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     is_health_check_generate_req,
+    is_health_check_rid,
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -251,6 +256,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -392,6 +398,7 @@ class Scheduler(
             server_args.disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
         )
+        self.enable_asradix_cache = server_args.enable_asradix_cache
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = server_args.enable_hisparse
@@ -544,6 +551,12 @@ class Scheduler(
             page_size=self.page_size,
         )
 
+        # Initialize AttentionStore and attach its binding to the selected cache.
+        # Must run after tree_cache, token_to_kv_pool_allocator and draft_worker
+        # are ready (kv_cache_builder.build / maybe_register_hicache_draft above).
+        if self.enable_asradix_cache:
+            self._init_attention_store(server_args)
+
         # Init running status
         self.init_running_status()
 
@@ -609,6 +622,17 @@ class Scheduler(
         self.init_batch_result_processor()
 
         self.is_initializing = False
+
+        if envs.AIAK_ENABLE_MSIT_TRACE.get():
+            from msit_llm.sglang import MsitLLMTracer
+
+            self.msit_tracer = MsitLLMTracer(
+                self.tp_worker.model_runner, envs, self.server_args
+            )
+
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] Scheduler.__init__ (tp{self.ps.tp_rank}) done"
+        )
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -1024,6 +1048,561 @@ class Scheduler(
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
+    def _init_attention_store(self, server_args):
+        """Construct one typed AS binding and attach it after topology consensus."""
+        import os
+
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _init_attention_store start")
+        binding = None
+        init_error = None
+        cache_plan = None
+        local_manifest = None
+        try:
+            from sglang.srt.mem_cache.storage.asradix.capacity import (
+                AttentionStoreNodeEndpoint,
+                plan_pipeline_endpoint_registration,
+            )
+            from sglang.srt.mem_cache.storage.asradix.checkpoint_binding import (
+                _split_kda_namespace_chunks,
+                describe_kda_local_endpoint_bytes,
+            )
+            from sglang.srt.mem_cache.storage.asradix.schema import (
+                merge_endpoint_schemas,
+            )
+            from sglang.srt.mem_cache.storage.asradix.topology import (
+                attention_store_agent_group_membership,
+                attention_store_endpoint_bytes_per_block,
+                attention_store_endpoint_geometry,
+                attention_store_node_pp_range,
+            )
+            from sglang.srt.mem_cache.storage.asradix.types import (
+                AS_BLOCK_SIZE,
+                AttentionStoreEndpointRole,
+                AttentionStoreInitContext,
+            )
+
+            pod_name = os.getenv("POD_NAME")
+            model_id = os.getenv("MODEL_ID")
+            if pod_name is None or model_id is None:
+                raise ValueError(
+                    "enable_asradix_cache but POD_NAME or MODEL_ID not set"
+                )
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+            cache_plan = self.tree_cache.attention_store_plan
+            layer_info = self.tp_worker.model_runner.layer_info
+            target_layer_ids = tuple(
+                range(int(layer_info.start_layer), int(layer_info.end_layer))
+            )
+            draft_layer_ids = ()
+            draft_kv_cache = None
+            if self.draft_worker is not None and self.spec_algorithm.is_eagle():
+                draft_layers, draft_kv_cache = self._get_draft_kv_info()
+                draft_start = int(getattr(draft_kv_cache, "start_layer", 0))
+                draft_count = int(getattr(draft_kv_cache, "layer_num", draft_layers))
+                draft_layer_ids = tuple(range(draft_start, draft_start + draft_count))
+
+            from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+            if isinstance(kv_cache, HybridLinearKVPool):
+                page_layer_ids = tuple(kv_cache.full_attention_layer_id_mapping)
+                state_layer_ids = tuple(self.req_to_token_pool.mamba_map)
+            else:
+                draft_layer_offset = max(
+                    int(self.model_config.num_hidden_layers),
+                    int(
+                        self.model_config.num_attention_layers
+                        or self.model_config.num_hidden_layers
+                    ),
+                )
+                page_layer_ids = target_layer_ids + tuple(
+                    draft_layer_offset + layer_id for layer_id in draft_layer_ids
+                )
+                state_layer_ids = ()
+
+            page_bytes_per_layer = 0
+            state_bytes_per_layer = 0
+            as_shared_memory_size = 0
+            as_total_chunk_count = 0
+            as_checkpoint_chunk_count = 0
+            if cache_plan.name == "KDA":
+                page_bytes_per_layer, state_bytes_per_layer = (
+                    describe_kda_local_endpoint_bytes(
+                        kv_cache,
+                        self.req_to_token_pool,
+                        AS_BLOCK_SIZE,
+                        page_active=bool(page_layer_ids),
+                        state_active=bool(state_layer_ids),
+                    )
+                )
+                raw_shared_memory_size = os.getenv("AS_SHARED_MEMORY_SIZE_BYTES")
+                if raw_shared_memory_size is None:
+                    raise ValueError(
+                        "KDA AttentionStore requires AS_SHARED_MEMORY_SIZE_BYTES "
+                        "to match Agent shared_memory_size"
+                    )
+                try:
+                    as_shared_memory_size = int(raw_shared_memory_size)
+                except ValueError:
+                    raise ValueError(
+                        "AS_SHARED_MEMORY_SIZE_BYTES must be an integer, "
+                        f"got {raw_shared_memory_size!r}"
+                    ) from None
+                as_total_chunk_count = int(server_args.per_node_gpu_num)
+                _, as_checkpoint_chunk_count = _split_kda_namespace_chunks(
+                    as_total_chunk_count
+                )
+            local_manifest = {
+                "page_layer_ids": page_layer_ids,
+                "state_layer_ids": state_layer_ids,
+                "endpoint_schema": dict(cache_plan.schema_factory(kv_cache)),
+                "page_bytes_per_layer": page_bytes_per_layer,
+                "state_bytes_per_layer": state_bytes_per_layer,
+                "agent_address": os.getenv("AS_AGENT_ADDRESS", ""),
+                "shared_memory_size": as_shared_memory_size,
+                "total_chunk_count": as_total_chunk_count,
+                "checkpoint_chunk_count": as_checkpoint_chunk_count,
+            }
+        except Exception as exc:
+            init_error = exc
+
+        manifest_record = (
+            local_manifest,
+            (
+                None
+                if init_error is None
+                else f"{type(init_error).__name__}: {init_error}"
+            ),
+        )
+        try:
+            if self.ps.pp_size > 1:
+                manifest_records = self.pp_group.all_gather_object(manifest_record)
+            else:
+                manifest_records = [manifest_record]
+        except Exception as exc:
+            init_error = init_error or exc
+            manifest_records = []
+
+        manifest_errors = [
+            f"pp_rank={rank}: {error}"
+            for rank, (_, error) in enumerate(manifest_records)
+            if error is not None
+        ]
+        if init_error is None and manifest_errors:
+            init_error = RuntimeError(
+                "AttentionStore manifest preparation failed: "
+                + "; ".join(manifest_errors)
+            )
+
+        pp_manifests = [manifest for manifest, _ in manifest_records]
+
+        manifest_ready = self.tree_cache._as_topology_min(
+            1 if init_error is None else 0
+        )
+        if manifest_ready == 0 and init_error is None:
+            init_error = RuntimeError(
+                "AttentionStore manifest preparation failed on another cache-group rank"
+            )
+
+        cache_member_count, _ = attention_store_agent_group_membership(
+            self.ps.pp_size, server_args.nnodes, server_args.node_rank
+        )
+        if init_error is None and cache_plan.name == "KDA":
+            # Agent memory/indexes use a compact layer coordinate
+            # (0..layer_num-1), while the model pools expose global layer IDs.
+            # KDA clients on one node share one shard, so derive that
+            # coordinate once from the node-wide layer union and give every
+            # PP client its own compact IDs.  Keeping this conversion at the
+            # manifest boundary leaves the local buffer order untouched.
+            compact_manifests = list(pp_manifests)
+            for member_id in range(cache_member_count):
+                member_start, member_end = attention_store_node_pp_range(
+                    self.ps.pp_size, cache_member_count, member_id
+                )
+                member_manifests = compact_manifests[member_start:member_end]
+                for layer_key in ("page_layer_ids", "state_layer_ids"):
+                    layer_union = []
+                    seen_layer_ids = set()
+                    for manifest in member_manifests:
+                        for layer_id in manifest[layer_key]:
+                            layer_id = int(layer_id)
+                            if layer_id not in seen_layer_ids:
+                                seen_layer_ids.add(layer_id)
+                                layer_union.append(layer_id)
+                    compact_ids = {
+                        layer_id: compact_id
+                        for compact_id, layer_id in enumerate(layer_union)
+                    }
+                    for manifest in member_manifests:
+                        manifest[layer_key] = tuple(
+                            compact_ids[int(layer_id)]
+                            for layer_id in manifest[layer_key]
+                        )
+            pp_manifests = compact_manifests
+
+        def create_binding_from_manifests():
+            cache_member_count, local_cache_member_id = (
+                attention_store_agent_group_membership(
+                    self.ps.pp_size, server_args.nnodes, server_args.node_rank
+                )
+            )
+            node_pp_start, node_pp_end = attention_store_node_pp_range(
+                self.ps.pp_size, cache_member_count, local_cache_member_id
+            )
+
+            pp_rank = 0 if self.ps.pp_rank is None else self.ps.pp_rank
+            local_pp_offset = pp_rank - node_pp_start
+            node_manifests = pp_manifests[node_pp_start:node_pp_end]
+            if not 0 <= local_pp_offset < len(node_manifests):
+                raise ValueError(
+                    "AttentionStore PP rank is outside its computed node role: "
+                    f"rank={pp_rank}, role=[{node_pp_start}, {node_pp_end})"
+                )
+            local_manifest = node_manifests[local_pp_offset]
+            # The registration geometry and the I/O binding must use the same
+            # compact coordinate.  The original page/state variables above
+            # are model-global IDs and are only valid for indexing local
+            # SGLang pools, not for the shared-shard Agent protocol.
+            page_layer_ids = tuple(local_manifest["page_layer_ids"])
+            state_layer_ids = tuple(local_manifest["state_layer_ids"])
+
+            def endpoint_geometry(endpoint_index: int):
+                endpoint_key = (
+                    "page_layer_ids" if endpoint_index == 0 else "state_layer_ids"
+                )
+                layer_lists = [manifest[endpoint_key] for manifest in node_manifests]
+                return attention_store_endpoint_geometry(
+                    layer_lists,
+                    local_pp_offset,
+                    self.ps.attn_tp_rank,
+                    self.ps.attn_tp_size,
+                    single_shard=cache_plan.name == "KDA",
+                )
+
+            page_shard_id, page_shard_num, page_layer_num = endpoint_geometry(0)
+            state_shard_id, state_shard_num, state_layer_num = endpoint_geometry(1)
+            endpoint_schema = merge_endpoint_schemas(
+                [manifest["endpoint_schema"] for manifest in node_manifests]
+            )
+            endpoint_registrations = {}
+            if cache_plan.name == "KDA":
+                shared_memory_sizes = {
+                    int(manifest["shared_memory_size"]) for manifest in pp_manifests
+                }
+                total_chunk_counts = {
+                    int(manifest["total_chunk_count"]) for manifest in pp_manifests
+                }
+                checkpoint_chunk_counts = {
+                    int(manifest["checkpoint_chunk_count"]) for manifest in pp_manifests
+                }
+                if len(shared_memory_sizes) != 1:
+                    raise ValueError(
+                        "KDA cache members disagree on AS_SHARED_MEMORY_SIZE_BYTES: "
+                        f"{sorted(shared_memory_sizes)}"
+                    )
+                if len(total_chunk_counts) != 1:
+                    raise ValueError(
+                        "KDA cache members disagree on total Agent chunk count: "
+                        f"{sorted(total_chunk_counts)}"
+                    )
+                if len(checkpoint_chunk_counts) != 1:
+                    raise ValueError(
+                        "KDA cache members disagree on checkpoint chunk split: "
+                        f"{sorted(checkpoint_chunk_counts)}"
+                    )
+                shared_memory_size = shared_memory_sizes.pop()
+                total_chunk_count = total_chunk_counts.pop()
+
+                def build_endpoint_registration(
+                    endpoint_name: str,
+                    endpoint_role: AttentionStoreEndpointRole,
+                    layer_key: str,
+                    bytes_key: str,
+                    chunk_index: int,
+                ):
+                    members = []
+                    for member_id in range(cache_member_count):
+                        member_start, member_end = attention_store_node_pp_range(
+                            self.ps.pp_size, cache_member_count, member_id
+                        )
+                        member_manifests = pp_manifests[member_start:member_end]
+                        endpoint_layer_num = max(
+                            (len(manifest[layer_key]) for manifest in member_manifests),
+                            default=0,
+                        )
+                        if endpoint_layer_num == 0:
+                            continue
+                        per_layer_sizes = {
+                            int(manifest[bytes_key])
+                            for manifest in member_manifests
+                            if manifest[layer_key]
+                        }
+                        if len(per_layer_sizes) != 1 or 0 in per_layer_sizes:
+                            raise ValueError(
+                                f"KDA {endpoint_name} member {member_id} has "
+                                f"incompatible per-layer byte sizes: "
+                                f"{sorted(per_layer_sizes)}"
+                            )
+                        addresses = {
+                            manifest["agent_address"]
+                            for manifest in member_manifests
+                            if manifest["agent_address"]
+                        }
+                        if len(addresses) != 1:
+                            raise ValueError(
+                                f"KDA {endpoint_name} member {member_id} must "
+                                "advertise exactly one Agent address, got "
+                                f"{sorted(addresses)}"
+                            )
+                        has_pages = any(
+                            manifest["page_layer_ids"] for manifest in member_manifests
+                        )
+                        has_states = any(
+                            manifest["state_layer_ids"] for manifest in member_manifests
+                        )
+                        if has_pages and has_states:
+                            member_chunk_counts = _split_kda_namespace_chunks(
+                                total_chunk_count
+                            )
+                        elif has_pages:
+                            member_chunk_counts = (total_chunk_count, 0)
+                        else:
+                            member_chunk_counts = (0, total_chunk_count)
+                        endpoint_tp_size = self.ps.attn_tp_size
+                        if endpoint_name == "kda-page" and kv_cache.use_mla:
+                            endpoint_tp_size = 1
+                        endpoint_bytes_per_block = (
+                            attention_store_endpoint_bytes_per_block(
+                                [manifest[layer_key] for manifest in member_manifests],
+                                per_layer_sizes.pop(),
+                                endpoint_tp_size,
+                                single_shard=cache_plan.name == "KDA",
+                            )
+                        )
+                        members.append(
+                            AttentionStoreNodeEndpoint(
+                                member_id=member_id,
+                                pp_stage_start=member_start,
+                                pp_stage_end=member_end,
+                                agent_address=addresses.pop(),
+                                bytes_per_block=endpoint_bytes_per_block,
+                                chunk_count=member_chunk_counts[chunk_index],
+                            )
+                        )
+                    if not members:
+                        return None
+                    if not any(
+                        member.member_id == local_cache_member_id for member in members
+                    ):
+                        return None
+                    return plan_pipeline_endpoint_registration(
+                        group_id=(
+                            f"{model_id}:dp{self.ps.attn_dp_rank}:"
+                            f"pp{self.ps.pp_size}"
+                        ),
+                        endpoint_name=endpoint_name,
+                        endpoint_role=endpoint_role,
+                        local_member_id=local_cache_member_id,
+                        shared_memory_size=shared_memory_size,
+                        total_chunk_count=total_chunk_count,
+                        nodes=members,
+                    )
+
+                for endpoint_name, endpoint_role, layer_key, bytes_key, chunk_index in (
+                    (
+                        "kda-page",
+                        AttentionStoreEndpointRole.PAGE,
+                        "page_layer_ids",
+                        "page_bytes_per_layer",
+                        0,
+                    ),
+                    (
+                        "kda-state",
+                        AttentionStoreEndpointRole.CHECKPOINT,
+                        "state_layer_ids",
+                        "state_bytes_per_layer",
+                        1,
+                    ),
+                ):
+                    registration = build_endpoint_registration(
+                        endpoint_name,
+                        endpoint_role,
+                        layer_key,
+                        bytes_key,
+                        chunk_index,
+                    )
+                    if registration is not None:
+                        endpoint_registrations[endpoint_name] = registration
+                        logger.info(
+                            "KDA endpoint registration: endpoint=%s "
+                            "group=%s generation=%d desired_blocks=%d members=%s",
+                            endpoint_name,
+                            registration.group_id,
+                            registration.generation,
+                            registration.desired_block_count,
+                            [
+                                (
+                                    member.member_id,
+                                    member.bytes_per_block,
+                                    member.agent_address,
+                                )
+                                for member in registration.members
+                            ],
+                        )
+            return self.tree_cache.create_attention_store_binding(
+                AttentionStoreInitContext(
+                    kv_cache=kv_cache,
+                    req_to_token_pool=self.req_to_token_pool,
+                    namespace_base=model_id,
+                    pod_name=pod_name,
+                    model_version="v1",
+                    page_size=self.page_size,
+                    block_size=AS_BLOCK_SIZE,
+                    tp_rank=self.ps.attn_tp_rank,
+                    tp_size=self.ps.attn_tp_size,
+                    pp_rank=pp_rank,
+                    pp_size=self.ps.pp_size,
+                    node_pp_start=node_pp_start,
+                    node_pp_end=node_pp_end,
+                    dp_rank=self.ps.attn_dp_rank,
+                    device_id=self.ps.gpu_id,
+                    gpu_count=server_args.per_node_gpu_num,
+                    target_layer_ids=target_layer_ids,
+                    draft_kv_cache=draft_kv_cache,
+                    draft_layer_ids=draft_layer_ids,
+                    page_layer_ids=page_layer_ids,
+                    page_shard_id=page_shard_id,
+                    page_shard_num=page_shard_num,
+                    page_layer_num=page_layer_num,
+                    state_layer_ids=state_layer_ids,
+                    state_shard_id=state_shard_id,
+                    state_shard_num=state_shard_num,
+                    state_layer_num=state_layer_num,
+                    endpoint_schema=endpoint_schema,
+                    endpoint_registrations=endpoint_registrations,
+                )
+            )
+
+        if init_error is None:
+            try:
+                binding = create_binding_from_manifests()
+            except Exception as exc:
+                init_error = exc
+
+        # Enable AS only when every TP/CP/PP cache rank initialized successfully.
+        ready = self.tree_cache._as_topology_min(1 if binding is not None else 0)
+        if ready == 0:
+            if binding is not None:
+                try:
+                    binding.cache_store.stop()
+                except Exception as stop_error:
+                    logger.warning(
+                        "Failed to stop AS binding after TP init rollback: %s",
+                        stop_error,
+                    )
+            self.ascli = None
+            if init_error is not None:
+                message = f"AttentionStore initialization failed: {init_error}"
+            else:
+                message = (
+                    "AttentionStore initialization failed on another cache-group rank"
+                )
+            raise RuntimeError(message) from init_error
+
+        if cache_plan.name == "KDA":
+            for endpoint_name in ("kda-page", "kda-state"):
+                registration = binding.endpoint_registrations.get(endpoint_name)
+                generation = 0 if registration is None else registration.generation
+                desired_block_count = (
+                    0 if registration is None else registration.desired_block_count
+                )
+                min_generation = self.tree_cache._as_topology_min(generation)
+                max_generation = self.tree_cache._as_topology_max(generation)
+                min_block_count = self.tree_cache._as_topology_min(desired_block_count)
+                max_block_count = self.tree_cache._as_topology_max(desired_block_count)
+                if (
+                    min_generation != max_generation
+                    or min_block_count != max_block_count
+                ):
+                    try:
+                        binding.cache_store.stop()
+                    finally:
+                        raise RuntimeError(
+                            "AttentionStore registration descriptor mismatch: "
+                            f"endpoint={endpoint_name} generation_range="
+                            f"[{min_generation}, {max_generation}] "
+                            f"block_count_range="
+                            f"[{min_block_count}, {max_block_count}]"
+                        )
+
+        self.tree_cache.ref_as_binding(binding)
+        self.ascli = binding.cache_store
+        # Hand the model's forward_stream to the AS write coordinator so its
+        # producer fence records on the stream the MLA/KDA KV writes actually run
+        # on. The hybrid pool's allocator does not carry forward_stream, so
+        # without this the fence records on the (idle) default stream.
+        _as_coord = getattr(self.tree_cache, "_as_coordinator", None)
+        if _as_coord is not None:
+            _as_coord.forward_stream = getattr(
+                getattr(self.tp_worker, "model_runner", None), "forward_stream", None
+            )
+        if self.ps.attn_tp_rank == 0:
+            logger.info(
+                "AttentionStore initialized: cache_plan=%s namespace=%s "
+                "dp_rank=%s attn_tp_size=%s page_size=%s bytes_per_block=%s "
+                "endpoints=%s",
+                cache_plan.name,
+                binding.namespace,
+                self.ps.attn_dp_rank,
+                self.ps.attn_tp_size,
+                self.page_size,
+                binding.bytes_per_block,
+                [
+                    {
+                        "name": endpoint.name,
+                        "role": endpoint.role.value,
+                        "namespace": endpoint.namespace,
+                        "payload_fields": tuple(endpoint.payload_fields),
+                        "bytes_per_block": endpoint.bytes_per_block,
+                    }
+                    for endpoint in binding.endpoints
+                ],
+            )
+        logger.debug(
+            "AttentionStore layout: dp_rank=%s attn_tp_rank=%s layout_id=%s",
+            self.ps.attn_dp_rank,
+            self.ps.attn_tp_rank,
+            binding.layout_id,
+        )
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _init_attention_store done")
+        return
+
+    def _get_draft_kv_info(self):
+        """Get draft model's layer count and KV cache for EAGLE integration.
+
+        Returns:
+            (num_draft_layers, draft_kv_cache) or (0, None) if unavailable.
+        """
+        try:
+            if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
+                if self.server_args.enable_multi_layer_eagle:
+                    draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+                else:
+                    draft_runner = self.draft_worker.draft_worker.draft_runner
+            else:
+                draft_runner = self.draft_worker.model_runner
+            num_layers = (
+                draft_runner.model_config.num_nextn_predict_layers
+                if draft_runner.model_config.num_nextn_predict_layers is not None
+                else draft_runner.model_config.num_hidden_layers
+            )
+            return (
+                num_layers,
+                draft_runner.token_to_kv_pool,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to get draft KV info: {e}")
+            return 0, None
+
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
@@ -1072,6 +1651,7 @@ class Scheduler(
         )
 
         # Init the dynamic chunking predictor for PP
+        self.chunk_cost_model = None
         self.enable_dynamic_chunking = (
             self.server_args.enable_dynamic_chunking and self.ps.pp_size > 1
         )
@@ -1177,6 +1757,22 @@ class Scheduler(
         self.disagg_prefill_inflight_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
+        # PP + PD prefill early-last-chunk: derived once here, read on the hot
+        # path. Non-prefill roles and pp_size == 1 keep the original path.
+        self._pp_pd_early_last_chunk_enabled = False
+        # Whether this rank still writes and transfers the aux (metadata) row.
+        self._pp_pd_owns_aux = True
+        # Whether this rank sends the final chunk from the loop's CPU phase.
+        self._pp_pd_early_send_final_kv = False
+        # PP + PD prefill: the "all PP ranks acknowledged this room" AND is
+        # evaluated over the sideband ZMQ handshake channel (PP0 counts PP_READY
+        # reports) instead of over the pipeline consensus relay, so PP0's poll()
+        # already means "globally ready".
+        self._pp_pd_sideband_bootstrap = False
+        # Whether this rank answers the client before the release consensus
+        # lands. PP0 only, since it is the only rank with a detokenizer socket.
+        self._pp_pd_prefill_early_stream_output = False
+        self.disagg_prefill_pending_final_kv: List[PendingFinalKV] = []
 
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
@@ -1292,7 +1888,42 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+            self._pp_pd_early_last_chunk_enabled = (
+                envs.SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK.get() and self.ps.pp_size > 1
+            )
+            if self._pp_pd_early_last_chunk_enabled:
+                self._validate_pp_pd_early_last_chunk()
+                # PP0 is the single aux owner and keeps sending its final chunk
+                # from process_batch_result (it samples first anyway), so its KV
+                # and aux stay in one transfer request.
+                self._pp_pd_owns_aux = self.pp_group.is_first_rank
+                self._pp_pd_early_send_final_kv = not self.pp_group.is_first_rank
+                logger.info(
+                    "PP+PD early-last-chunk KV send enabled: "
+                    f"pp_rank={self.pp_group.rank_in_group}, "
+                    f"owns_aux={self._pp_pd_owns_aux}, "
+                    f"speculative_algorithm={self.server_args.speculative_algorithm}."
+                )
+
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
+            self._pp_pd_sideband_bootstrap = (
+                envs.SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS.get()
+                and self.ps.pp_size > 1
+            )
+            if self._pp_pd_sideband_bootstrap:
+                self._validate_pp_pd_sideband_bootstrap()
+
+            self._pp_pd_prefill_early_stream_output = (
+                envs.SGLANG_PP_PD_PREFILL_EARLY_STREAM_OUTPUT.get()
+                and self.ps.pp_size > 1
+                and self.pp_group.is_first_rank
+            )
+            if self._pp_pd_prefill_early_stream_output:
+                logger.info(
+                    "PP+PD prefill early stream output enabled: "
+                    f"pp_rank={self.pp_group.rank_in_group}."
+                )
 
         # Init mm receiver for EPD disaggregation mode
         if (
@@ -1314,6 +1945,75 @@ class Scheduler(
                 tp_rank=self.ps.tp_rank,
                 tp_group=self.tp_group,
                 scheduler=self,
+            )
+            # MMPreallocQueue -> MMTransferQueue -> waiting_queue
+            self.disagg_prefill_mm_prealloc_queue = MMPreallocQueue(self.mm_receiver)
+            self.disagg_prefill_mm_transfer_queue = MMTransferQueue(self.mm_receiver)
+
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_disaggregation done")
+
+    def _validate_pp_pd_early_last_chunk(self):
+        """Reject configurations the early-last-chunk path does not cover yet.
+
+        The path handles the mooncake backend with either no speculative
+        decoding or DSPARK. DSPARK is safe because it never writes the draft
+        fields of the aux row (they are gated on ``is_eagle()``) and its draft
+        KV rides the target's page indices inside the same mooncake chunk; see
+        docs/design/pp-prefill-last-chunk-early-send-phase2.md sections 2 and 3.
+        Other algorithms either carry draft hidden states or have unaudited
+        draft KV ownership, hence the exact ``is_dspark()`` match rather than a
+        negated ``carries_draft_hidden_states()``.
+
+        No per-request admission check is left. return_logprob is served: the
+        topology never depends on it, and PP0 is at once the aux owner, the only
+        holder of the detokenizer socket and the only rank that consumes a real
+        logits_output, so no extra communication is needed. return_sampling_mask
+        is not rejected either, but it is not served under pp_size > 1: its two
+        fields ride the logprob tensor dict, which _pp_prepare_tensor_dict gates
+        on batch.return_logprob, so a mask-only batch silently returns a null
+        mask. That gap is independent of this switch (it reproduces without PD)
+        and is left as is -- see
+        docs/design/pp-pd-early-last-chunk-return-logprob.md section 2.4.
+
+        Should an admission check ever be needed again, it has to be a pure
+        function of the request so that all PP ranks reach the same verdict on
+        their own copy: the output ring topology is a static per-round decision,
+        and a rank that admitted a request its peers aborted would disagree on
+        whether to exchange outputs. See
+        docs/design/pp-prefill-last-chunk-early-send.md sections 5.3 and 6.3.
+
+        If aux ownership ever moves off PP0
+        (SGLANG_PP_PD_PREFILL_LAST_RANK_AUX), PP0 loses the real logits_output
+        and return_logprob has to be rejected again, or its payload sent back
+        over the same last-rank -> PP0 channel. See
+        docs/design/pp-pd-early-last-chunk-return-logprob.md.
+        """
+        if self.transfer_backend != TransferBackend.MOONCAKE:
+            raise ValueError(
+                "SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK only supports the mooncake "
+                f"transfer backend, got {self.transfer_backend.value}."
+            )
+        if not (self.spec_algorithm.is_none() or self.spec_algorithm.is_dspark()):
+            raise ValueError(
+                "SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK supports only DSPARK "
+                "speculative decoding, got "
+                f"{self.server_args.speculative_algorithm}."
+            )
+
+    def _validate_pp_pd_sideband_bootstrap(self):
+        """Reject backends that never report PP_READY.
+
+        The sideband consensus defers PP0's promotion until every PP rank
+        reports, and only ``MooncakeKVManager``'s bootstrap thread emits that
+        report. On any other backend PP0's counter would never fill and every
+        request would stall until the bootstrap timeout, so refuse to boot
+        instead.
+        """
+        if self.transfer_backend != TransferBackend.MOONCAKE:
+            raise ValueError(
+                "SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS only supports "
+                "the mooncake transfer backend, got "
+                f"{self.transfer_backend.value}."
             )
 
     def init_overlap(self):
@@ -1771,14 +2471,37 @@ class Scheduler(
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
-            # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
-            ):
-                self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
+            # Busy servers can skip health probes. In PP, PP0 owns this decision;
+            # downstream ranks must preserve it independently of any batch plan.
+            if is_health_check_generate_req(recv_req):
+                if recv_req._pp_admission_decision is None:
+                    if self.ps.pp_size > 1:
+                        if self.pp_group.is_first_rank:
+                            # PP0 owns the decision; downstream ranks follow
+                            # the decision carried by the relayed request.
+                            recv_req._pp_admission_decision = self.is_fully_idle(
+                                for_health_check=True
+                            )
+                        else:
+                            raise RuntimeError(
+                                "Missing PP0 health-check admission decision: "
+                                f"rid={recv_req.rid} pp_rank={self.ps.pp_rank}"
+                            )
+                    else:
+                        recv_req._pp_admission_decision = self.is_fully_idle(
+                            for_health_check=True
+                        )
+                logger.debug(
+                    "Health-check admission: rid=%s pp_rank=%s admitted=%s",
+                    recv_req.rid,
+                    self.ps.pp_rank,
+                    recv_req._pp_admission_decision,
                 )
-                continue
+                if not recv_req._pp_admission_decision:
+                    self.return_health_check_ipcs.append(
+                        getattr(recv_req, "http_worker_ipc", None)
+                    )
+                    continue
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -1972,6 +2695,9 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+            enable_asradix_cache=self.enable_asradix_cache,
+            load_inquirer_get_loads=self.load_inquirer.get_loads,
         )
 
     def init_batch_result_processor(self) -> None:
@@ -2106,6 +2832,59 @@ class Scheduler(
             return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
             return MultimodalInputs.from_processor_output(mm_inputs_dict)
+
+    def _refresh_as_block_hashs(self, req: Req) -> None:
+        """Refresh AttentionStore hashes after scheduler-side token rewrites.
+
+        TokenizerManager computes hashes before prefill-side multimodal expansion.
+        If the scheduler later rebinds origin_input_ids (MM padding, automatic
+        truncation, etc.), the old hashes describe a different token sequence.
+        Recompute once from the final scheduler-visible input so AS match and write
+        use the same key space.
+        """
+        if (
+            not self.enable_asradix_cache
+            or req.origin_input_ids is req.origin_input_ids_unpadded
+        ):
+            return
+
+        old_count = (
+            len(req.as_block_hashs.hash_ids)
+            if req.as_block_hashs is not None
+            and hasattr(req.as_block_hashs, "hash_ids")
+            else 0
+        )
+        try:
+            from attentionstore_sdk.sdk import Tokens
+
+            from sglang.srt.mem_cache.storage.asradix.types import AS_BLOCK_SIZE
+
+            req.as_block_hashs = Tokens(req.origin_input_ids, AS_BLOCK_SIZE)
+        except ImportError:
+            logger.warning(
+                "attentionstore_sdk not available while refreshing AS block hashes "
+                "for rid=%s; disabling AS matching for this request",
+                req.rid,
+            )
+            req.as_block_hashs = None
+            return
+        except Exception as exc:
+            logger.warning(
+                "failed to refresh AS block hashes after input rewrite for rid=%s: %s",
+                req.rid,
+                exc,
+            )
+            req.as_block_hashs = None
+            return
+
+        logger.debug(
+            "Refreshed AS block hashes after input rewrite: rid=%s old_blocks=%d "
+            "new_blocks=%d input_tokens=%d",
+            req.rid,
+            old_count,
+            len(req.as_block_hashs.hash_ids),
+            len(req.origin_input_ids),
+        )
 
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
@@ -2263,6 +3042,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                skip_radix_cache_insert=recv_req.skip_radix_cache_insert,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
@@ -2545,9 +3325,28 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        self._refresh_as_block_hashs(req)
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
+            if not req.rid.startswith("HEALTH_CHECK"):
+                as_block_hashs = "None"
+                if req.as_block_hashs is not None and hasattr(
+                    req.as_block_hashs, "hash_ids"
+                ):
+                    as_block_hashs = f"count={len(req.as_block_hashs.hash_ids)}"
+                sampling_params_log = {
+                    k: getattr(req.sampling_params, k)
+                    for k in req.sampling_params.__struct_fields__
+                    if k not in ("structural_tag", "ebnf", "regex", "json_schema")
+                }
+                logger.info(
+                    f"A new req {req.rid} has been insert into queue. "
+                    f"Prompt len: {len(req.origin_input_ids)}. "
+                    f"Sampling params: {sampling_params_log}. "
+                    f"AS Block Hashes: {as_block_hashs}"
+                )
 
     def handle_batch_generate_request(
         self,
@@ -2626,11 +3425,15 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
+            message = (
+                "Using priority is disabled for this server. Please send a new "
+                "request without a priority."
+            )
             abort_req = AbortReq(
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": "Using priority is disabled for this server. Please send a new request without a priority.",
+                    "message": message,
                 },
                 rid=req.rid,
             )
@@ -2701,6 +3504,7 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
+                message = "Request waiting timeout reached."
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
@@ -2709,7 +3513,7 @@ class Scheduler(
                         finished_reason={
                             "type": "abort",
                             "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "Request waiting timeout reached.",
+                            "message": message,
                         },
                         rid=req.rid,
                     ),
@@ -2723,6 +3527,100 @@ class Scheduler(
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in deleted_reqs
             ]
+
+    def _abort_local_request(
+        self,
+        req: Req,
+        *,
+        reason_code: str,
+        message: str,
+        status_code,
+        err_type: str,
+    ) -> Dict[str, Any]:
+        """Release local resources and notify the tokenizer that a request is aborted."""
+        finish_reason = FINISH_ABORT(message, status_code, err_type)
+        req.to_finish = finish_reason
+        req.time_stats.trace_ctx.abort(abort_info=finish_reason.to_json())
+
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            maybe_release_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+            req.pending_bootstrap = False
+            sender = getattr(req, "disagg_kv_sender", None)
+            if sender is not None and hasattr(sender, "abort"):
+                sender.abort()
+        # Abort before prefill: return any held EPD pinned-pool pages
+        if req.multimodal_inputs is not None:
+            req.multimodal_inputs.release_pool_buffers()
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
+        if req.req_pool_idx is not None or req.mamba_pool_idx is not None:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(finished_reason=finish_reason.to_json(), rid=req.rid),
+            req,
+        )
+        logger.error("Aborted request (%s): rid=%s", reason_code, req.rid)
+        return {
+            "rid": req.rid,
+            "origin_pp_rank": int(self.ps.pp_rank),
+            "reason_code": reason_code,
+            "reason": message,
+        }
+
+    def _abort_failed_cache_read(self, req: Req) -> Dict[str, Any]:
+        """Remove a waiting request whose AttentionStore read was incomplete."""
+        message = req._as_cache_read_abort_reason or "AttentionStore cache read failed"
+        return self._abort_local_request(
+            req,
+            reason_code="AS_CACHE_READ_FAILED",
+            message=message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            err_type="InternalServerError",
+        )
+
+    def _abort_failed_replay(self, req: Req, result: AddReqResult) -> Dict[str, Any]:
+        """Abort a request that cannot be admitted during PP replay."""
+        if result == AddReqResult.NO_TOKEN:
+            reason_code = "PP_REPLAY_NO_TOKEN"
+            message = (
+                "PP replay NO_TOKEN: local rem_total_tokens insufficient, "
+                f"rid={req.rid}"
+            )
+        else:
+            reason_code = "PP_REPLAY_OTHER"
+            message = (
+                f"PP replay could not admit request locally: result={result}, "
+                f"rid={req.rid}"
+            )
+        message = req._as_cache_read_abort_reason or message
+        return self._abort_local_request(
+            req,
+            reason_code=reason_code,
+            message=message,
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            err_type="ServiceUnavailable",
+        )
+
+    def _abort_failed_replay_record(
+        self, req: Req, record: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Abort a request from a propagated PP replay abort record."""
+        reason_code = str(record.get("reason_code", "PP_REPLAY_OTHER"))
+        message = record.get("reason") or (
+            f"PP replay could not admit request locally, rid={req.rid}"
+        )
+        return self._abort_local_request(
+            req,
+            reason_code=reason_code,
+            message=message,
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            err_type="ServiceUnavailable",
+        )
 
     def handle_embedding_request(
         self,
@@ -3034,7 +3932,20 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+    def get_new_batch_prefill(
+        self,
+        running_batch: ScheduleBatch,
+        authoritative_plan: Optional[Dict[str, Any]] = None,
+    ) -> NextBatchPlan:
+        """Build the next prefill batch, optionally replaying PP0's batch plan.
+
+        Args:
+            running_batch: The active batch to account for during admission.
+            authoritative_plan: PP0's committed plan for a downstream PP stage.
+
+        Returns:
+            The batch selected for prefill and the updated running batch.
+        """
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -3045,26 +3956,65 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
-        ret, running_batch = self._get_new_batch_prefill_raw(
+        ret, running_batch, pp_local_aborts = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             running_batch=running_batch,
+            authoritative_plan=authoritative_plan,
         )
 
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
 
-        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+        return NextBatchPlan(
+            batch_to_run=ret,
+            running_batch=running_batch,
+            pp_local_aborts=pp_local_aborts,
+        )
 
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
-    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
-        # Check if the grammar is ready in the grammar queue
+        authoritative_plan: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch, Tuple[Dict[str, Any], ...]]:
+        authoritative_admissions = (
+            tuple(
+                PlannedAdmission.from_wire(admission)
+                for admission in authoritative_plan.get("admissions", ())
+            )
+            if authoritative_plan is not None
+            else None
+        )
+        authoritative_admissions_by_rid = (
+            {admission.rid: admission for admission in authoritative_admissions}
+            if authoritative_admissions is not None
+            else None
+        )
+
+        # Check if the grammar is ready in the grammar queue.
+        # NOTE: This must run before the empty-plan early return below. The
+        # grammar PP sync pairs one async send on a PP rank with one recv on
+        # the next rank per scheduler iteration in which the grammar queue is
+        # non-empty. Skipping it on an idle microbatch leaves PP0's send
+        # unmatched, and PP0 deadlocks in _drain_pp_sync_work on its next
+        # grammar sync while later ranks block waiting for pipeline messages.
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
+
+        # Fixed PP cache-maintenance round; it must precede every early return.
+        if self.enable_asradix_cache:
+            self.tree_cache.check_ascache_events(
+                maintenance_round=getattr(
+                    self, "_pp_current_cache_maintenance_round", None
+                )
+            )
+
+        # A downstream PP stage may have queued requests beyond PP0's committed
+        # microbatch. An empty authoritative plan means it must stay idle.
+        if authoritative_admissions == ():
+            return None, running_batch, ()
 
         if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
@@ -3074,13 +4024,15 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if (
-            running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
-            return None, running_batch
+            authoritative_plan is None
+            and (running_batch.batch_is_full or len(self.waiting_queue) == 0)
+            and self.chunked_req is None
+        ):
+            return None, running_batch, ()
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
-        if (
+        if authoritative_plan is None and (
             self.min_free_slots_delayer is not None
             and self.chunked_req is None
             and self.min_free_slots_delayer.should_delay(
@@ -3088,33 +4040,55 @@ class Scheduler(
                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
             )
         ):
-            return None, running_batch
+            return None, running_batch, ()
 
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked requests has just been released.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
-        if (
+        if authoritative_plan is None and (
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
-            return None, running_batch
+            return None, running_batch, ()
+
+        if self.enable_hierarchical_cache:
+            self.tree_cache.check_hicache_events()
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, running_batch)
+        if authoritative_plan is None:
+            self.policy.calc_priority(self.waiting_queue, running_batch)
 
-        if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+        if (
+            authoritative_plan is None
+            and TEST_RETRACT
+            and running_bs > TEST_RETRACT_NO_PREFILL_BS
+        ):
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
-            return None, running_batch
+            return None, running_batch, ()
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
+        cost_model = self.chunk_cost_model
+        use_cost_model = (
+            self.enable_dynamic_chunking
+            and cost_model is not None
+            and cost_model.is_ready
+        )
+        rem_cost = None
+        if use_cost_model:
+            # Cost-model mode: the compute budget is the binding constraint;
+            # the token budget stays as a memory/workspace guard (the A2A
+            # workspace is validated against max_prefill_tokens).
+            chunked_prefill_size = self.max_prefill_tokens
+            # Copied: PrefillAdder decrements it in place per admission.
+            rem_cost = cost_model.target_cost.copy()
+        elif self.chunked_req is not None and self.enable_dynamic_chunking:
             history_len = len(self.chunked_req.prefix_indices)
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
@@ -3137,11 +4111,73 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            cost_model=cost_model if use_cost_model else None,
+            rem_cost=rem_cost,
+            cost_chunk_cap=self.chunked_prefill_size if use_cost_model else None,
+            checkpoint_end_align_size=self._get_prefill_checkpoint_end_align_size(),
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        cache_read_aborted_reqs = set()
+        pp_local_aborts = []
+        skip_waiting_admission = False
+        resumed_chunked_req = self.chunked_req
+        if resumed_chunked_req is not None:
+            planned_chunk_admission = (
+                None
+                if authoritative_admissions_by_rid is None
+                else authoritative_admissions_by_rid.get(resumed_chunked_req.rid)
+            )
+            authoritative_chunk_admitted = authoritative_admissions is None or (
+                planned_chunk_admission is not None
+                and planned_chunk_admission.source == "chunked"
+            )
+            if authoritative_chunk_admitted:
+                resumed_chunked_req.init_next_round_input()
+                new_chunked_req = adder.add_chunked_req(
+                    resumed_chunked_req,
+                    planned_admission=planned_chunk_admission,
+                )
+                if resumed_chunked_req._pp_replay_local_abort:
+                    reason = resumed_chunked_req._as_cache_read_abort_reason or (
+                        "PP replay resumed chunk cannot be admitted locally, "
+                        f"rid={resumed_chunked_req.rid}"
+                    )
+                    record = {
+                        "rid": resumed_chunked_req.rid,
+                        "origin_pp_rank": int(self.ps.pp_rank),
+                        "reason_code": "PP_REPLAY_OTHER",
+                        "reason": reason,
+                    }
+                    # Prior chunks can still own an in-flight proxy send. Stop
+                    # scheduling now, then release at the existing safe point.
+                    self._pp_defer_chunked_cache_read_abort(resumed_chunked_req, record)
+                    pp_local_aborts.append(record)
+                    cache_read_aborted_reqs.add(resumed_chunked_req)
+                else:
+                    self.chunked_req = new_chunked_req
+            if authoritative_admissions is None:
+                post_chunk_budget_state = adder.budget_state()
+                # NO_TOKEN takes precedence over chunk exhaustion in
+                # budget_state(), so inspect the chunk budget explicitly.
+                chunk_budget_exhausted = (
+                    self.dllm_config is None
+                    and adder.rem_chunk_tokens is not None
+                    and adder.rem_chunk_tokens <= 0
+                )
+                skip_waiting_admission = (
+                    post_chunk_budget_state == AddReqResult.OTHER
+                    or chunk_budget_exhausted
+                )
+                if (
+                    skip_waiting_admission
+                    and post_chunk_budget_state == AddReqResult.NO_TOKEN
+                ):
+                    if self.enable_hierarchical_cache:
+                        running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                            not running_batch.is_empty()
+                        )
+                    else:
+                        running_batch.batch_is_full = True
 
         if self.enable_lora:
             running_loras = {
@@ -3156,13 +4192,27 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
+        candidate_reqs = self.waiting_queue
+        if authoritative_admissions is not None:
+            candidate_reqs = self._pp_select_authoritative_waiting_reqs(
+                authoritative_admissions, resumed_chunked_req
+            )
+        elif skip_waiting_admission:
+            # A resumed chunk is admitted outside the waiting-queue loop, so it
+            # cannot propagate add_one_req()'s stop result. If it closes the
+            # budget, do not match/load another request that cannot run.
+            candidate_reqs = ()
+
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+            mamba_allocator.alloc_group_begin(len(candidate_reqs))
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in candidate_reqs:
+            replay_rejection = None
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
-                continue
+                if authoritative_plan is None:
+                    continue
+                replay_rejection = "PP replay LoRA is not schedulable locally"
 
             running_bs = len(running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -3174,7 +4224,9 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
+                if authoritative_plan is not None:
+                    replay_rejection = "PP replay request slots exhausted locally"
+                elif (
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
@@ -3184,23 +4236,86 @@ class Scheduler(
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
-                    continue
+                    if authoritative_plan is None:
+                        continue
+                    replay_rejection = "PP replay cache prefetch is not ready locally"
                 # Pop the number of tokens loaded from storage (L3 hits)
-                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
-                if loaded_tokens > 0:
-                    req.storage_hit_length = loaded_tokens
+                else:
+                    loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                    if loaded_tokens > 0:
+                        req.storage_hit_length = loaded_tokens
+
+            # Prefix matching can allocate a Mamba COW state before add_one_req
+            # checks admission. Leave enough room for the state and buffers
+            # before entering that allocation path.
+            if not adder._has_mamba_slots_for_req(req):
+                if authoritative_plan is not None:
+                    replay_rejection = "PP replay Mamba slots exhausted locally"
+                else:
+                    running_batch.batch_is_full = (
+                        len(adder.can_run_list) > 0 or not running_batch.is_empty()
+                        if self.enable_hierarchical_cache
+                        else True
+                    )
+                    break
+
+            if authoritative_plan is not None:
+                # Prefix matching contains TP/CP collectives. Every shard must
+                # agree to enter it, even when only one ran out of request slots.
+                if replay_rejection is not None:
+                    req._pp_replay_local_abort = True
+                    req._as_cache_read_abort_reason = replay_rejection
+                if (
+                    adder._sync_attention_store_read_abort(req, AddReqResult.CONTINUE)
+                    == AddReqResult.ABORT
+                ):
+                    pp_local_aborts.append(
+                        self._abort_failed_replay(req, AddReqResult.OTHER)
+                        if req._pp_replay_local_abort
+                        else self._abort_failed_cache_read(req)
+                    )
+                    cache_read_aborted_reqs.add(req)
+                    continue
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
+                planned_admission=(
+                    None
+                    if authoritative_admissions_by_rid is None
+                    else authoritative_admissions_by_rid[req.rid]
+                ),
             )
 
-            if self.enable_lora:
+            if self.enable_lora and res != AddReqResult.ABORT:
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.ABORT:
+                    if req._pp_replay_local_abort:
+                        pp_local_aborts.append(
+                            self._abort_failed_replay(req, AddReqResult.OTHER)
+                        )
+                    else:
+                        pp_local_aborts.append(self._abort_failed_cache_read(req))
+                    cache_read_aborted_reqs.add(req)
+                    # Preserve the fixed PP candidate sequence after a local abort.
+                    continue
+                # A non-CONTINUE result can follow a successful admit.
+                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                if (
+                    not added
+                    and authoritative_admissions is not None
+                    and authoritative_admissions_by_rid is not None
+                    and req.rid in authoritative_admissions_by_rid
+                ):
+                    # Aborting an admitted req would trip the replay invariant below.
+                    pp_local_aborts.append(self._abort_failed_replay(req, res))
+                    cache_read_aborted_reqs.add(req)
+                    # Preserve the fixed PP candidate sequence after a local abort.
+                    continue
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
@@ -3213,7 +4328,6 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
@@ -3226,15 +4340,42 @@ class Scheduler(
                             req.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.mamba_pool_idx = None
+                if added and authoritative_admissions is not None:
+                    # Replay: keep visiting so every remaining planned req is either
+                    # admitted or aborted; `break` would trip the replay invariant.
+                    continue
                 break
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
 
+        if cache_read_aborted_reqs:
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req not in cache_read_aborted_reqs
+            ]
+
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        local_admissions = self._pp_prefill_admissions(
+            can_run_list,
+            resumed_chunked_req,
+        )
+        if authoritative_admissions is not None:
+            aborted_rids = {record["rid"] for record in pp_local_aborts}
+            expected_local_admissions = tuple(
+                admission
+                for admission in authoritative_admissions
+                if admission.rid not in aborted_rids
+            )
+            if local_admissions != expected_local_admissions:
+                raise RuntimeError(
+                    "PP0 batch admission could not be reproduced locally: "
+                    f"planned={authoritative_admissions} "
+                    f"aborted={tuple(sorted(aborted_rids))} "
+                    f"local={local_admissions}"
+                )
         if len(can_run_list) == 0:
-            return None, running_batch
+            return None, running_batch, tuple(pp_local_aborts)
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
@@ -3263,6 +4404,7 @@ class Scheduler(
             self.spec_algorithm,
             chunked_req=self.chunked_req,
         )
+        new_batch._pp_prefill_admissions = local_admissions
 
         new_batch.contains_last_prefill_chunk = (
             self.chunked_req is None or len(can_run_list) != 1
@@ -3284,7 +4426,7 @@ class Scheduler(
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
-            running_batch.reqs,
+            running_batch.reqs + can_run_list,
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
@@ -3315,7 +4457,7 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
-        return new_batch, running_batch
+        return new_batch, running_batch, tuple(pp_local_aborts)
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
@@ -3376,6 +4518,17 @@ class Scheduler(
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
+            # retract_decode only frees the target-side KV (ScheduleBatch.release_req);
+            # it has no draft_worker reference, so the draft-side SWA slot map
+            # (DSpark's DraftWindowSlotMap) is not told these req_pool_idx are free.
+            # Without this, a retracted req's stale evict_frontier/mapped_high_water
+            # survives and corrupts the window mapping once the slot is reused.
+            if isinstance(self.draft_worker, BaseSpecWorker):
+                for req in retracted_reqs + reqs_to_abort:
+                    if req.req_pool_idx is not None:
+                        self.draft_worker.release_draft_kv(
+                            req_pool_idx=int(req.req_pool_idx)
+                        )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -3630,13 +4783,28 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    fwd_kwargs = {}
+                    if (
+                        pp_proxy_tensors is not None
+                        and batch.spec_algorithm.is_dspark()
+                    ):
+                        fwd_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **fwd_kwargs
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
                 if batch_result.new_seq_lens is not None:
+                    # Extend steps hand back the batch's own seq_lens tensor, so
+                    # seq_lens_cpu still matches and the D2H is pure waste. It is
+                    # not free: a blocking .to("cpu") parks the host until the
+                    # whole forward drains, emptying the GPU queue right before
+                    # the PP consensus-ring waits. Decode returns a new tensor
+                    # (accept lengths) and still needs the copy.
+                    seq_lens_replaced = batch_result.new_seq_lens is not batch.seq_lens
                     batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
+                    if seq_lens_replaced and batch.seq_lens_cpu is not None:
                         batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
                         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 batch.input_ids = None  # rebuilt next iter from draft_token
@@ -3812,7 +4980,8 @@ class Scheduler(
         is_prefill = mode.is_extend_without_speculative()
         if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
             return
-        if all(is_health_check_generate_req(req) for req in batch.reqs):
+        # `batch.reqs` are `Req` objects, so match on the rid only.
+        if all(is_health_check_rid(req.rid) for req in batch.reqs):
             return
         if is_prefill:
             # Busy span = run_batch entry -> result processed.
@@ -3872,6 +5041,45 @@ class Scheduler(
                 message="Ngram speculative decoding is not enabled.",
             )
         return self.external_corpus_manager.list(recv_req)
+
+    def flush_cache_wrapped(
+        self, recv_req: FlushCacheReqInput
+    ) -> Optional[FlushCacheReqOutput]:
+        """Flush the cache, optionally running best-effort evictable eviction."""
+        if getattr(recv_req, "evict_evictable", False):
+            # Best-effort eviction: does not require the scheduler to be idle.
+            # Run 5 rounds with 100ms spacing so blocks freed by requests
+            # finishing between rounds also get reclaimed.
+            ROUNDS = 5
+            INTERVAL_S = 0.1
+            # Retire pending AS writes first so their retained cache nodes
+            # become evictable before the best-effort sweep.
+            if hasattr(self.tree_cache, "drain_attention_store_writes"):
+                self.tree_cache.drain_attention_store_writes()
+            for i in range(1, ROUNDS + 1):
+                evict_size = self.tree_cache.evictable_size()
+                if evict_size > 0:
+                    self.tree_cache.evict(EvictParams(num_tokens=evict_size))
+                if i < ROUNDS:
+                    time.sleep(INTERVAL_S)
+            logger.info("Device cache cleared.")
+            return FlushCacheReqOutput(success=True)
+
+        if self._pending_flush is not None:
+            return FlushCacheReqOutput(
+                success=False,
+                message="Another flush_cache is already in progress.",
+            )
+
+        timeout_s = float(recv_req.timeout_s or 0.0)
+        if timeout_s <= 0.0:
+            return FlushCacheReqOutput(success=self.flush_cache())
+
+        if self.is_fully_idle():
+            return FlushCacheReqOutput(success=self.flush_cache())
+
+        self._pending_flush = (recv_req, time.monotonic() + timeout_s)
+        return None
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
@@ -3951,6 +5159,8 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                # Final chunks whose early send has not been flushed yet.
+                idle &= len(self.disagg_prefill_pending_final_kv) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
@@ -4172,6 +5382,8 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "log_as_cache_digest",
+                "log_as_barrier_debug",
             ]
         )
 
@@ -4298,7 +5510,20 @@ class Scheduler(
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                # A waiting-queue req here already went through `pop_preallocated`,
+                # so besides the target KV it also holds a draft SWA window mapping
+                # (DSpark's DraftWindowSlotMap, mapped in `map_slots`). Free only the
+                # target KV and its ~window draft pages leak until the draft pool
+                # exhausts and the scheduler crashes -- release both, mirroring the
+                # normal finish path (batch_result_processor) and retract path.
+                draft_req_pool_idx = req.req_pool_idx
                 release_kv_cache(req, self.tree_cache)
+                if draft_req_pool_idx is not None and isinstance(
+                    self.draft_worker, BaseSpecWorker
+                ):
+                    self.draft_worker.release_draft_kv(
+                        req_pool_idx=int(draft_req_pool_idx)
+                    )
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 bootstrap_pending = req.pending_bootstrap
@@ -4364,6 +5589,8 @@ class Scheduler(
                         req.multimodal_inputs.release_pool_buffers()
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                    if self.ps.pp_size > 1:
+                        prepare_abort(req, "Aborted by AbortReq.")
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
@@ -4378,6 +5605,8 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    if self.ps.pp_size > 1:
+                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:

@@ -139,10 +139,13 @@ class CommonKVManager(BaseKVManager):
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
+        parallel = get_parallel()
+        self.attn_tp_size = parallel.attn_tp_size
+        self.attn_tp_rank = parallel.attn_tp_rank
+        self.attn_cp_size = parallel.attn_cp_size
+        self.attn_cp_rank = parallel.attn_cp_rank
+        self.dcp_size = server_args.dcp_size
+        self.dcp_rank = parallel.dcp_rank if self.dcp_size > 1 else 0
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
         self.system_dp_size = (
@@ -170,14 +173,29 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
+        self._zmq_ctx.set(zmq.MAX_SOCKETS, server_args.disaggregation_zmq_max_sockets)
+        zmq_port: Union[int, Tuple[int, int], None] = None
+        if server_args.disaggregation_zmq_ports is not None:
+            port_index = self.kv_args.gpu_id
+            ports = server_args.disaggregation_zmq_ports
+            if port_index >= len(ports):
+                raise ValueError(
+                    f"gpu_id {port_index} exceeds the number of specified ports ({len(ports)}). "
+                    f"Provide at least {port_index + 1} ports via --disaggregation-zmq-ports."
+                )
+            zmq_port = ports[port_index]
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            self._zmq_ctx, zmq.PULL, host=self.local_ip
+            self._zmq_ctx, zmq.PULL, host=self.local_ip, port=zmq_port
         )
-        logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
+        port_type = "fixed" if isinstance(zmq_port, int) else "random"
+        logger.debug(
+            f"kv manager bind to {self.local_ip}:{self.rank_port} ({port_type} port)"
+        )
 
         self.request_status: Dict[int, KVPoll] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
+        self._socket_send_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
@@ -206,6 +224,7 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+            self._init_pp_sideband_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -244,6 +263,79 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+    def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
+        if self.dcp_size == dst_dcp_size:
+            if self.dcp_rank != dst_dcp_rank:
+                raise RuntimeError(
+                    "PD peers must connect matching DCP ranks, got "
+                    f"prefill={self.dcp_rank}, decode={dst_dcp_rank}"
+                )
+            return False
+
+        if (
+            self.dcp_size == 1
+            and dst_dcp_size > 1
+            and (self.is_mla_backend or self.is_hybrid_mla_backend)
+        ):
+            return True
+
+        raise RuntimeError(
+            f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
+        )
+
+    def prepare_dcp_token_item_lens(
+        self,
+        dst_page_item_lens: List[int],
+        *,
+        num_mla_kv_entries: Optional[int] = None,
+    ) -> List[int]:
+        """Per-token byte strides for a DCP relayout, indexed in local entry order.
+
+        ``dst_page_item_lens`` must already be paired into this side's entry
+        order (see ``resolve_dcp_dst_entry_indices``), since a PP prefill stage
+        registers only the entries of its own layers.
+        """
+        page_size = self.kv_args.page_size
+        src_token_lens = [
+            item_len // page_size for item_len in self.kv_args.kv_item_lens
+        ]
+        dst_token_lens = [item_len // page_size for item_len in dst_page_item_lens]
+        # Only the leading MLA (main) entries take the DCP token relayout, so
+        # they must have matching src/dst geometry. Trailing speculative-draft
+        # (MHA) entries are head-sharded and legitimately differ across prefill
+        # and decode attn_tp sizes; they take a separate head-slice replicated
+        # transfer and are excluded from this equality check.
+        boundary = num_mla_kv_entries
+        if boundary is None:
+            boundary = len(src_token_lens)
+        if src_token_lens[:boundary] != dst_token_lens[:boundary]:
+            raise RuntimeError(
+                "PD DCP source/destination KV geometry differs: "
+                f"src={src_token_lens[:boundary]}, dst={dst_token_lens[:boundary]}"
+            )
+        return src_token_lens
+
+    def _resolve_mla_entry_boundaries(
+        self, dst_num_mla_kv_entries: int
+    ) -> Tuple[int, int]:
+        """Resolve the MLA/draft entry boundary on each side of a PD DCP transfer.
+
+        Both sides append the draft pool's entries after the main MLA entries,
+        but the counts are per-side: a PP prefill stage registers only the MLA
+        entries of its own layers while the decode peer registers the whole
+        model's. So the two boundaries are resolved independently and the entries
+        are paired by model layer id, not by position."""
+        src_boundary = self.kv_args.num_mla_kv_entries or len(self.kv_args.kv_item_lens)
+        # Older decode peers do not report their boundary. Without PP both sides
+        # register the same entry layout, so the local boundary describes them too.
+        dst_boundary = dst_num_mla_kv_entries or src_boundary
+        if src_boundary > dst_boundary:
+            raise RuntimeError(
+                "PD DCP prefill registered more MLA KV entries than the decode "
+                f"peer: prefill={src_boundary}, decode={dst_boundary}"
+            )
+        return src_boundary, dst_boundary
+
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
 
@@ -267,6 +359,154 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    # ---------------------------------------------------------------- #
+    # PP + PD prefill: sideband bootstrap consensus
+    # ---------------------------------------------------------------- #
+    # Admission requires the AND over all PP ranks: a room may only leave the
+    # bootstrap queue once *every* prefill PP rank has received the
+    # transfer_infos of all its decode peers. Upstream evaluates that AND by
+    # relaying an intersection of bootstrapped ids around the PP ring, which
+    # costs one pipeline iteration per hop. Here the same AND is evaluated over
+    # the sideband ZMQ handshake socket instead: every rank reports PP_READY to
+    # PP0 the moment its own handshake completes, and PP0 promotes the room only
+    # after all pp_size reports landed. Same invariant, no pipeline hops.
+    #
+    # Everything below runs on the single bootstrap thread (the local-ready
+    # callback, the PP_READY receive and the ABORT cleanup all dispatch from
+    # `recv_multipart`), so the ledger needs no lock.
+
+    PP_READY_HEADER = b"PP_READY"
+
+    def _init_pp_sideband_bootstrap(self):
+        """Cache PP0's sideband endpoint and the per-room PP_READY ledger.
+
+        Must run before the bootstrap thread starts. PP0's address is
+        broadcast over the PP CPU group rather than fetched from the bootstrap
+        server, because `/route` only answers once *every* rank has registered
+        and we are still inside registration here.
+        """
+        # PP0's ledger: room -> set of PP ranks that reported a local handshake.
+        self._pp_ready_ranks: Dict[int, Set[int]] = {}
+        self._pp0_sideband_endpoint: Optional[str] = None
+        self._pp0_sideband_is_ipv6 = False
+        self._pp_pd_sideband_bootstrap = (
+            envs.SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS.get()
+            and self.pp_size > 1
+        )
+        if self.pp_size > 1:
+            # Before the early return below, so every rank reaches the collective.
+            self._check_uniform_sideband_flag()
+        if not self._pp_pd_sideband_bootstrap:
+            return
+
+        pp0_ip, pp0_port = self.pp_group.broadcast_object(
+            (self.local_ip, self.rank_port), src=0
+        )
+        if self.pp_rank != 0:
+            pp0_na = NetworkAddress(pp0_ip, pp0_port)
+            self._pp0_sideband_endpoint = pp0_na.to_tcp()
+            self._pp0_sideband_is_ipv6 = pp0_na.is_ipv6
+        logger.info(
+            f"PP+PD sideband bootstrap consensus enabled: pp_rank={self.pp_rank}, "
+            f"pp_size={self.pp_size}, pp0_sideband={pp0_ip}:{pp0_port}."
+        )
+
+    def _check_uniform_sideband_flag(self):
+        """Fail fast if the PP ranks disagree on whether the sideband path is on.
+
+        The flag gates a `point_to_point_pyobj` isend/irecv pair (the consensus
+        ring) that carries no tag, so channels on a link match purely by issue
+        order. A rank that keeps the ring while its neighbour drops it shifts
+        every later channel on that link by one message, and the ranks then
+        exchange each other's payloads silently -- an admission table read as a
+        release list, with no exception anywhere. A mixed rollout (env var set on
+        some hosts only, or a partially updated code tree) is the realistic way
+        to get there, so trade it for a startup error.
+
+        Cheap and bubble-free: one CPU-group broadcast during construction, not
+        on the event loop.
+        """
+        pp0_enabled = self.pp_group.broadcast_object(
+            self._pp_pd_sideband_bootstrap, src=0
+        )
+        if pp0_enabled != self._pp_pd_sideband_bootstrap:
+            raise RuntimeError(
+                "SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS must be set "
+                "identically on every PP rank: pp_rank="
+                f"{self.pp_rank} has {self._pp_pd_sideband_bootstrap}, pp_rank=0 "
+                f"has {pp0_enabled}. Mixed settings desynchronise the "
+                "point_to_point_pyobj channels on the PP ring."
+            )
+
+    def on_local_pp_bootstrap_ready(self, bootstrap_room: int):
+        """The local handshake for `bootstrap_room` just completed on this rank.
+
+        Replaces the plain `update_status(room, WaitingForInput)` when the
+        sideband path is on. Non-PP0 ranks keep their local status semantics
+        untouched and additionally report to PP0; PP0 records only itself and
+        defers its own promotion until every rank reported.
+        """
+        if self.pp_rank != 0:
+            # Read the abort state *before* the local update: `update_status`
+            # takes max() for non-Failed statuses, so WaitingForInput would mask
+            # an already-Failed room and we would report a dead room to PP0.
+            aborted = self.request_status.get(bootstrap_room) == KVPoll.Failed
+            self.update_status(bootstrap_room, KVPoll.WaitingForInput)
+            if not aborted:
+                self._report_pp_ready(bootstrap_room)
+            return
+
+        self._pp_ready_ranks.setdefault(bootstrap_room, set()).add(0)
+        self._try_promote_pp_ready(bootstrap_room)
+
+    def _report_pp_ready(self, bootstrap_room: int):
+        """Tell PP0 that this rank finished `bootstrap_room`'s handshake.
+
+        One message per room, sent the moment the handshake completes. A send
+        failure is logged and swallowed: PP0 then never reaches pp_size for this
+        room and the request degrades to the existing bootstrap timeout instead
+        of taking the bootstrap thread down.
+        """
+        try:
+            self._send_multipart_locked(
+                self._pp0_sideband_endpoint,
+                [
+                    self.PP_READY_HEADER,
+                    str(bootstrap_room).encode("ascii"),
+                    str(self.pp_rank).encode("ascii"),
+                ],
+                is_ipv6=self._pp0_sideband_is_ipv6,
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to report PP_READY for room {bootstrap_room} from "
+                f"pp_rank {self.pp_rank} to {self._pp0_sideband_endpoint}: {e}"
+            )
+
+    def handle_pp_ready(self, parts: List[bytes]):
+        """PP0: record a peer rank's PP_READY report. `parts` is the raw frame."""
+        bootstrap_room = int(parts[1].decode("ascii"))
+        reporter_pp_rank = int(parts[2].decode("ascii"))
+        self._pp_ready_ranks.setdefault(bootstrap_room, set()).add(reporter_pp_rank)
+        self._try_promote_pp_ready(bootstrap_room)
+
+    def _try_promote_pp_ready(self, bootstrap_room: int):
+        """PP0: promote the room once all pp_size ranks reported."""
+        ready_ranks = self._pp_ready_ranks.get(bootstrap_room)
+        if ready_ranks is None or len(ready_ranks) < self.pp_size:
+            return
+        self._pp_ready_ranks.pop(bootstrap_room, None)
+        if self.request_status.get(bootstrap_room) == KVPoll.Failed:
+            # Deferring the promotion opens a window an immediate one did not
+            # have: an abort can land while we wait for the remaining ranks.
+            # `update_status`'s max() would resurrect the room, so drop it.
+            return
+        self.update_status(bootstrap_room, KVPoll.WaitingForInput)
+
+    def clear_pp_ready(self, bootstrap_room: int):
+        """Drop the room's ledger entry; safe to call on any rank at any time."""
+        self._pp_ready_ranks.pop(bootstrap_room, None)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -445,7 +685,11 @@ class CommonKVManager(BaseKVManager):
 
         info: PrefillServerInfo = None
         try:
-            url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
+            url = (
+                f"http://{bootstrap_addr}/route?"
+                f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
+                f"target_tp_rank={-1}&target_pp_rank={-1}"
+            )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -476,6 +720,17 @@ class CommonKVManager(BaseKVManager):
                 f"but decode server has kv_cache_dtype={get_model().kv_cache_dtype}. "
                 f"Both servers must use the same --kv-cache-dtype value."
             )
+
+        if self.dcp_size > 1:
+            if not (self.is_mla_backend or self.is_hybrid_mla_backend):
+                raise RuntimeError(
+                    "PD decode DCP requires an MLA or hybrid-MLA KV pool."
+                )
+            if info.attn_cp_size != 1:
+                raise RuntimeError(
+                    "PD decode DCP currently requires prefill attention CP=1, "
+                    f"got {info.attn_cp_size}."
+                )
 
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
@@ -1113,7 +1368,15 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
+        send_aux: bool = True,
     ):
+        """Send one KV chunk.
+
+        send_aux=False means this rank is not the aux (metadata) owner, so the
+        last chunk carries KV/state only. Used by the PP+PD early-last-chunk
+        path where PP0 is the single aux owner.
+        """
         pass
 
     def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
@@ -1162,6 +1425,12 @@ class CommonKVReceiver(BaseKVReceiver):
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()
+
+    @classmethod
+    def configure_max_sockets(cls, max_sockets: int):
+        """Configure the ZMQ context MAX_SOCKETS for this receiver class."""
+        cls._ctx.set(zmq.MAX_SOCKETS, max_sockets)
+        logger.info(f"{cls.__name__} ZMQ Context MAX_SOCKETS set to {max_sockets}")
 
     def __init__(
         self,
@@ -1266,6 +1535,8 @@ class CommonKVReceiver(BaseKVReceiver):
                 # registration does not leave a stale entry that later requests would reuse.
                 if not self._register_kv_args():
                     return
+
+                # Only cache after successful registration to avoid poisoned entries
                 self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
             else:
                 self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]

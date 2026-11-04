@@ -5,7 +5,16 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    overload,
+)
 
 import numpy as np
 import torch
@@ -32,6 +41,24 @@ if TYPE_CHECKING:
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+
+
+def poll_and_all_reduce_pp(
+    rids: Iterable[str],
+    ready_poll: int,
+    pp_good_rids: Optional[List[str]] = None,
+    pp_bad_rids: Optional[List[str]] = None,
+) -> List[Optional[int]]:
+    """Map authoritative PP consensus to poll states without polling again."""
+    if pp_good_rids is None or pp_bad_rids is None:
+        raise ValueError("PP consensus is required")
+
+    good_rids = set(pp_good_rids)
+    bad_rids = set(pp_bad_rids)
+    return [
+        KVPoll.Failed if rid in bad_rids else ready_poll if rid in good_rids else None
+        for rid in rids
+    ]
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
@@ -166,6 +193,35 @@ def poll_and_all_reduce_attn_cp_tp_group(
         group=attn_cp_cpu_group,
     )
     return tensor_to_reduce.tolist()
+
+
+def poll_and_all_reduce_attn_cp_tp_group_with_readiness(
+    pollers,
+    forward_ready: List[bool],
+    send_ready: List[bool],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> Tuple[List[int], List[int]]:
+    """Carry forward readiness in the existing transfer-status reductions.
+
+    Early KV sends can finish at different times on attention shards. A failure
+    must not release pages while a peer is still writing them, and Success must
+    not be advertised before every shard has submitted its final send.
+    """
+    polls = _poll_with_failure_injection(pollers)
+    polls = [
+        KVPoll.Transferring if poll == KVPoll.Success and not sent else poll
+        for poll, sent in zip(polls, send_ready, strict=True)
+    ]
+    # Two host bytes per request, with the same TP -> CP collective order and
+    # number of rounds as poll_and_all_reduce_attn_cp_tp_group. No GPU wait.
+    tensor_to_reduce = torch.tensor(
+        [polls, forward_ready], dtype=torch.uint8, device="cpu"
+    )
+    for group in (attn_tp_cpu_group, attn_cp_cpu_group):
+        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    polls, ready = tensor_to_reduce.tolist()
+    return polls, ready
 
 
 def poll_and_all_reduce_with_staging(
@@ -900,6 +956,73 @@ def build_transfer_entry_pairs(
             f"both peers; got src={n_src} dst={n_dst} entries"
         )
     return [(i, i) for i in range(n_src)]
+
+
+def resolve_dcp_dst_entry_indices(
+    src_layer_ids: List[int],
+    dst_layer_ids: List[int],
+    n_src: int,
+    n_dst: int,
+) -> List[int]:
+    """Destination entry index for each local KV entry, for a DCP relayout.
+
+    DCP re-splits the KV by context while PP re-splits it by layer, so the two
+    index spaces only line up when neither peer is pipelined. Both backends
+    need the same resolution, hence the shared helper.
+    """
+    if not src_layer_ids and not dst_layer_ids:
+        # Legacy/non-PP layout. n_dst may exceed n_src when the decode side
+        # runs speculative decoding and the prefill side does not.
+        return list(range(n_src))
+    # A one-sided mapping is rejected by build_transfer_entry_pairs itself.
+    return [
+        j
+        for _, j in build_transfer_entry_pairs(
+            src_layer_ids, dst_layer_ids, n_src, n_dst
+        )
+    ]
+
+
+_DRAFT_KV_LAYER_ID_BASE = 1_000_000
+
+
+def get_transfer_kv_layer_ids(kv_pool, num_entries: int) -> List[int]:
+    """Return global layer ids aligned with ``kv_pool.get_contiguous_buf_infos``.
+
+    Pools with a custom sparse/MLA layout expose ``get_kv_layer_ids`` directly.
+    Plain MHA-like draft pools usually expose only ``start_layer``/``end_layer``;
+    infer either one entry per layer or K/V tensor-major entries.
+    """
+    if kv_pool is None or num_entries <= 0:
+        return []
+
+    if hasattr(kv_pool, "get_kv_layer_ids"):
+        layer_ids = list(kv_pool.get_kv_layer_ids())
+        if len(layer_ids) == num_entries:
+            return layer_ids
+
+    start_layer = int(getattr(kv_pool, "start_layer", 0) or 0)
+    end_layer = getattr(kv_pool, "end_layer", None)
+    if end_layer is not None:
+        layer_ids = list(range(start_layer, int(end_layer)))
+        if len(layer_ids) == num_entries:
+            return layer_ids
+        if len(layer_ids) * 2 == num_entries:
+            return layer_ids * 2
+
+    return []
+
+
+def get_transfer_draft_kv_layer_ids(num_entries: int) -> List[int]:
+    """Return layer-id metadata for draft KV entries.
+
+    Draft KV is not target-model KV and should not share the target layer-id
+    namespace, especially when PP prefill sends target KV by layer subset but a
+    single rank also sends replicated draft KV.
+    """
+    if num_entries <= 0:
+        return []
+    return [_DRAFT_KV_LAYER_ID_BASE + i for i in range(num_entries)]
 
 
 def append_state_component(

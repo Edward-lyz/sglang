@@ -1844,7 +1844,7 @@ class KVCacheConfigurator:
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
+                    local_mamba_cache_per_req
                     * (capped_reqs + 1)
                     * server_args.speculative_num_draft_tokens
                 )
@@ -1864,7 +1864,7 @@ class KVCacheConfigurator:
             # prefill nodes which never run speculative verify.
             if has_spec_dec and not replayssm_active and not is_prefill_node:
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
+                    local_mamba_cache_per_req
                     * (server_args.max_mamba_cache_size + 1)
                     * server_args.speculative_num_draft_tokens
                 )
@@ -1872,7 +1872,7 @@ class KVCacheConfigurator:
         else:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
-            per_req = config.mamba2_cache_params.mamba_cache_per_req
+            per_req = local_mamba_cache_per_req
 
             # Solve jointly for max_mamba_cache_size (K), including the pool's
             # +1 padding slot on both buffers (see memory_pool.py):
@@ -1884,7 +1884,7 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if has_spec_dec:
+            if has_spec_dec and not replayssm_active and not is_prefill_node:
                 ratio = self._calculate_mamba_ratio()
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
@@ -1949,7 +1949,8 @@ class KVCacheConfigurator:
                 f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
                 f"Computed max_mamba_cache_size={server_args.max_mamba_cache_size} "
                 f"(total_rest_memory={total_rest_memory:.2f} GB, "
-                f"mamba_cache_per_req={config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f} MB). "
+                f"local_mamba_cache_per_req={local_mamba_cache_per_req / (1 << 20):.2f} MB, "
+                f"local_kda_layers={num_local_kda_layers}/{num_kda_layers}). "
                 f"Try: (1) reduce --max-running-requests, "
                 f"(2) increase --mem-fraction-static, "
                 f"(3) reduce --speculative-num-draft-tokens, or "
@@ -1962,7 +1963,7 @@ class KVCacheConfigurator:
         # Use local_mamba_cache_per_req for actual memory: pool only stores PP-local layers.
         mamba_state_memory = (
             (server_args.max_mamba_cache_size + 1)
-            * config.mamba2_cache_params.mamba_cache_per_req
+            * (local_mamba_cache_per_req + replayssm_ring_per_req)
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory

@@ -95,7 +95,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
@@ -982,6 +982,9 @@ class Req(ReqDllmMixin):
         # A short/failed AttentionStore read is fatal for this request under PP;
         # allowing forward with a different prefix would desynchronize stages.
         self._as_cache_read_abort_reason: Optional[str] = None
+        # A PP replay admission cannot run locally. AS abort consensus relays
+        # this flag within the attention group before any shard admits it.
+        self._pp_replay_local_abort: bool = False
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1142,6 +1145,16 @@ class Req(ReqDllmMixin):
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False
+        # PP + PD prefill early last chunk: set on non-PP0 ranks once this
+        # request's final KV/state has already been sent from the scheduler
+        # loop's CPU phase, so process_batch_result must not send it again.
+        self.pp_early_final_kv_done = False
+        # Register in common batch order, independently of local GPU readiness.
+        self.pp_early_final_kv_registered = False
+        # Filled by the existing transfer poll on all attention shards.
+        self.pp_early_final_kv_forward_ready = False
+        # PP failure consensus may arrive before this rank's forward finishes.
+        self.pp_pending_transfer_failure = False
         # Number of optimistic prefill forward passes started. preserved across retracts.
         self.prefill_attempt_count = 0
 
@@ -1717,6 +1730,10 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
+        self.pp_early_final_kv_done = False
+        self.pp_early_final_kv_registered = False
+        self.pp_early_final_kv_forward_ready = False
+        self.pp_pending_transfer_failure = False
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -2242,6 +2259,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+
+    # AttentionStore PP write ownership. Kept at the end of the dataclass so
+    # adding this host-only field does not change existing positional callers.
+    cache_write_owner: Optional[Any] = None
 
     @classmethod
     def init_new(
@@ -3380,6 +3401,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             extend_num_tokens=self.extend_num_tokens,
+            cache_write_owner=self.cache_write_owner,
         )
 
     def maybe_evict_swa(self):

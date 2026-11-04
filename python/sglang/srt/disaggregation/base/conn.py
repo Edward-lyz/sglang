@@ -64,6 +64,16 @@ class KVArgs:
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    # Count of leading "main" KV entries in kv_data_ptrs/kv_item_lens that belong
+    # to the target model's (MLA) pool, i.e. the boundary before the speculative
+    # draft pool's entries are appended. Draft entries live at the tail. Used by
+    # PD DCP relayout to route the MLA prefix through token relayout while the
+    # head-sharded draft tail takes a separate replicated head-slice transfer.
+    # Equals len(kv_item_lens) when there is no draft pool.
+    num_mla_kv_entries: int
+    # Per-rank KV head count of the speculative draft (MHA) pool, or 0 when there
+    # is no draft pool. The global draft head total is this times attn_tp_size.
+    draft_kv_head_num: int
     # for system dp
     system_dp_rank: int
     # for pp prefill
@@ -110,6 +120,13 @@ class BaseKVManager(ABC):
         """Register prefill server info to the bootstrap server."""
         ...
 
+    def set_draft_kv_entry_tensors(self, entry_tensors: list) -> None:
+        """Receive the speculative draft KV pool tensors registered for transfer.
+
+        Only backends that can gather a head slice on the GPU before the transfer
+        use these; the default is to ignore them and address the pool directly.
+        """
+
 
 class BaseKVSender(ABC):
     @abstractmethod
@@ -140,6 +157,10 @@ class BaseKVSender(ABC):
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
+
+        send_aux=False means this rank is not the aux (metadata) owner, so the last
+        chunk carries KV/state only. Only mooncake honors it; every other backend
+        requires the default.
         """
         ...
 

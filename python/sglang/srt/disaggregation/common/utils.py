@@ -3,7 +3,7 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -25,6 +25,7 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
+    num_kv_tokens: Optional[int] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
@@ -127,3 +128,217 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+
+def contiguous_run_starts_and_counts(
+    src_indices: npt.NDArray[np.int64],
+    dst_indices: npt.NDArray[np.int64],
+) -> Tuple[
+    npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]
+]:
+    """Run-length form of :func:`group_concurrent_contiguous`.
+
+    Returns ``(src_starts, dst_starts, counts)``: the first src index, the first
+    dst index and the length of every maximal run in which both sides advance by
+    one. Equivalent to taking ``g[0]`` and ``len(g)`` of each group the grouping
+    helper returns, but keeps everything in NumPy instead of materialising one
+    Python list per run -- under a DCP relayout the source side is strided by
+    ``dcp_size``, so every run has length 1 and the group lists would be as long
+    as the token count.
+    """
+    if src_indices.size == 0 or dst_indices.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return empty, empty.copy(), empty.copy()
+
+    if src_indices.size != dst_indices.size:
+        raise ValueError(
+            "contiguous_run_starts_and_counts requires equal-length src/dst "
+            f"index arrays, got {src_indices.size} and {dst_indices.size}"
+        )
+
+    src = np.asarray(src_indices, dtype=np.int64)
+    dst = np.asarray(dst_indices, dtype=np.int64)
+    brk = np.where((np.diff(src) != 1) | (np.diff(dst) != 1))[0] + 1
+    starts = np.concatenate((np.zeros(1, dtype=np.int64), brk))
+    bounds = np.concatenate((starts, np.array([src.size], dtype=np.int64)))
+    return src[starts], dst[starts], np.diff(bounds)
+
+
+def build_paged_transfer_descriptors(
+    *,
+    src_ptrs: Sequence[int],
+    dst_ptrs: Sequence[int],
+    item_lens: Sequence[int],
+    src_indices: npt.NDArray[np.int32],
+    dst_indices: npt.NDArray[np.int32],
+) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Entry-major, run-minor RDMA descriptors for a paged flat transfer.
+
+    One buffer entry (typically one layer) is described by ``(src_ptr, dst_ptr,
+    item_len)``; every entry ships the same page index pairs. Replaces the
+    per-(entry, run) Python tuple loop with a single ``(E, R)`` broadcast, so the
+    number of Python objects created while holding the GIL is O(1) rather than
+    O(E*R) -- the transfer call itself releases the GIL, the descriptor build did
+    not.
+
+    The output order is entry-major, run-minor -- the same order the tuple loop
+    appended in, and part of the contract: callers pass these straight to
+    ``batch_transfer_sync``.
+
+    Arithmetic is ``int64``, not Python's arbitrary precision. ``ptr + index *
+    item_len`` is a host virtual address plus a buffer offset, orders of
+    magnitude below 2**63, so this cannot overflow in practice.
+    """
+    src_starts, dst_starts, counts = contiguous_run_starts_and_counts(
+        src_indices, dst_indices
+    )
+    if counts.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return empty, empty.copy(), empty.copy()
+
+    item = np.asarray(item_lens, dtype=np.int64)[:, None]
+    src = np.asarray(src_ptrs, dtype=np.int64)[:, None] + src_starts[None, :] * item
+    dst = np.asarray(dst_ptrs, dtype=np.int64)[:, None] + dst_starts[None, :] * item
+    return src.ravel(), dst.ravel(), (counts[None, :] * item).ravel()
+
+
+@dataclasses.dataclass(frozen=True)
+class DCPTokenTransferPlan:
+    src_token_indices: npt.NDArray[np.int64]
+    dst_token_indices: npt.NDArray[np.int64]
+
+
+def build_dcp_token_transfer_plan(
+    src_page_indices: npt.NDArray[np.int32],
+    dst_page_indices: npt.NDArray[np.int32],
+    *,
+    physical_page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    src_page_offset: int = 0,
+    decode_prefix_len: int = 0,
+    num_kv_tokens: Optional[int] = None,
+) -> DCPTokenTransferPlan:
+    virtual_page_size = physical_page_size * dcp_size
+    if decode_prefix_len % virtual_page_size != 0:
+        raise ValueError(
+            "PD DCP transfer requires decode_prefix_len to align to the virtual "
+            f"DCP page size ({virtual_page_size}), got {decode_prefix_len}"
+        )
+
+    src_pages = np.asarray(src_page_indices, dtype=np.int64)
+    dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
+    source_capacity = src_pages.size * physical_page_size
+    if num_kv_tokens is None:
+        num_kv_tokens = source_capacity
+    if not 0 <= num_kv_tokens <= source_capacity:
+        raise ValueError(
+            "num_kv_tokens must fit in the provided source pages, "
+            f"got tokens={num_kv_tokens}, capacity={source_capacity}"
+        )
+    if src_pages.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return DCPTokenTransferPlan(empty, empty.copy())
+
+    chunk_start = decode_prefix_len + src_page_offset * physical_page_size
+    first_owned_offset = (dcp_rank - chunk_start) % dcp_size
+    owned_offsets = np.arange(
+        first_owned_offset, num_kv_tokens, dcp_size, dtype=np.int64
+    )
+    src_token_indices = (
+        src_pages[owned_offsets // physical_page_size] * physical_page_size
+        + owned_offsets % physical_page_size
+    )
+
+    relative_positions = src_page_offset * physical_page_size + owned_offsets
+    dst_local_offsets = relative_positions // dcp_size
+    dst_page_ordinals = dst_local_offsets // physical_page_size
+    if dst_page_ordinals.size and (
+        dst_pages.size == 0 or int(dst_page_ordinals.max()) >= dst_pages.size
+    ):
+        required_pages = int(dst_page_ordinals.max()) + 1
+        raise ValueError(
+            "Insufficient destination DCP pages: "
+            f"required={required_pages}, provided={dst_pages.size}, "
+            f"src_page_offset={src_page_offset}, dcp_rank={dcp_rank}"
+        )
+
+    dst_token_indices = (
+        dst_pages[dst_page_ordinals] * physical_page_size
+        + dst_local_offsets % physical_page_size
+    )
+    return DCPTokenTransferPlan(src_token_indices, dst_token_indices)
+
+
+def build_dcp_replicated_token_transfer_plan(
+    src_page_indices: npt.NDArray[np.int32],
+    dst_page_indices: npt.NDArray[np.int32],
+    *,
+    physical_page_size: int,
+    dcp_size: int,
+    src_page_offset: int = 0,
+    decode_prefix_len: int = 0,
+    num_kv_tokens: Optional[int] = None,
+) -> DCPTokenTransferPlan:
+    """Transfer plan for a DCP-*replicated* pool (e.g. the speculative draft KV
+    pool), where every decode DCP rank stores ALL tokens at their full virtual
+    loc rather than a ``1/dcp_size`` shard.
+
+    Unlike :func:`build_dcp_token_transfer_plan` (which strides the source by
+    ``dcp_size`` and compresses the destination loc by ``dcp_size``), this plan:
+
+    - selects EVERY source token (no ``dcp_rank`` ownership stride), and
+    - maps each token to its FULL virtual loc on the decode side
+      (``dst_page * virtual_page_size + within_page_offset``), since the
+      replicated pool is sized for the whole virtual space and consumes those
+      locs untranslated.
+
+    ``dst_page_indices`` are the decode-side page ids computed with the virtual
+    (``physical_page_size * dcp_size``) page size, exactly as sent for the main
+    MLA pool; the draft pool shares those same indices with the target model.
+    """
+    virtual_page_size = physical_page_size * dcp_size
+    if decode_prefix_len % virtual_page_size != 0:
+        raise ValueError(
+            "PD DCP replicated transfer requires decode_prefix_len to align to "
+            f"the virtual DCP page size ({virtual_page_size}), got "
+            f"{decode_prefix_len}"
+        )
+
+    src_pages = np.asarray(src_page_indices, dtype=np.int64)
+    dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
+    source_capacity = src_pages.size * physical_page_size
+    if num_kv_tokens is None:
+        num_kv_tokens = source_capacity
+    if not 0 <= num_kv_tokens <= source_capacity:
+        raise ValueError(
+            "num_kv_tokens must fit in the provided source pages, "
+            f"got tokens={num_kv_tokens}, capacity={source_capacity}"
+        )
+    if src_pages.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return DCPTokenTransferPlan(empty, empty.copy())
+
+    offsets = np.arange(num_kv_tokens, dtype=np.int64)
+    src_token_indices = (
+        src_pages[offsets // physical_page_size] * physical_page_size
+        + offsets % physical_page_size
+    )
+
+    relative_positions = src_page_offset * physical_page_size + offsets
+    dst_page_ordinals = relative_positions // virtual_page_size
+    if dst_page_ordinals.size and (
+        dst_pages.size == 0 or int(dst_page_ordinals.max()) >= dst_pages.size
+    ):
+        required_pages = int(dst_page_ordinals.max()) + 1
+        raise ValueError(
+            "Insufficient destination DCP pages for replicated transfer: "
+            f"required={required_pages}, provided={dst_pages.size}, "
+            f"src_page_offset={src_page_offset}"
+        )
+
+    dst_token_indices = (
+        dst_pages[dst_page_ordinals] * virtual_page_size
+        + relative_positions % virtual_page_size
+    )
+    return DCPTokenTransferPlan(src_token_indices, dst_token_indices)

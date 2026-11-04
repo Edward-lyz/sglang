@@ -8656,8 +8656,13 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
+            pp_dspark_pd = (
+                (self.speculative_algorithm or "").upper() == "DSPARK"
+                and self.disaggregation_mode in ("prefill", "decode")
+            )
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
+                self.disable_overlap_schedule
+                and (self.speculative_algorithm is None or pp_dspark_pd)
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
 
         assert not (

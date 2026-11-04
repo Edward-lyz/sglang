@@ -470,8 +470,68 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
+    # Decode-side LAZY KV allocation for PD disaggregation (mooncake only).
+    # When enabled, decode claims the request first, then allocates KV after
+    # prefill reports compute completion. Must be set identically on prefill
+    # and decode: the prefill advertises its value over /route and decode
+    # rejects the request at bootstrap if the two disagree.
+    SGLANG_DISAGGREGATION_DECODE_LAZY_ALLOC = EnvBool(False)
+    # Maximum time prefill waits for decode KV indices after compute completion.
+    SGLANG_DISAGGREGATION_LAZY_INDICES_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # PP + PD prefill: cut the last chunk's "wait one PP round" latency. On
+    # non-PP0 ranks the final KV/state is sent from the next iteration's CPU
+    # phase instead of from process_batch_result, the aux buffer (first sampled
+    # token) is written and transferred by PP0 only, and the PP output ring's
+    # relay half-circle is dropped so only the last rank sends and PP0 receives.
+    # First phase supports mooncake only, without speculative decoding,
+    # return_logprob, return_sampling_mask or grammar.
+    SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK = EnvBool(False)
+    # PP + PD prefill (mooncake): pick a chunk's transfer queue by
+    # ``hash(bootstrap_room)`` instead of by the legacy key (sum of the
+    # destination rpc ports). The legacy key is identical for every room whenever
+    # the decode fleet is fixed, so all of a prefill rank's rooms collapse onto one
+    # queue -- one worker thread -- and serialize behind each other. Independent of
+    # the fan-out below, but implied by it (the fan-out shards by room as well).
+    SGLANG_PP_PD_KV_TRANSFER_ROOM_SHARDING = EnvBool(False)
+    # PP + PD prefill (mooncake): expand a chunk's multi-destination fan-out into
+    # one transfer queue entry per decode destination, so the fan-out runs on
+    # several worker threads instead of serially inside one. Only rooms with two or
+    # more real destinations take this path; a single-destination room (e.g. decode
+    # DP without DCP) has nothing to parallelize and keeps the whole-room path, with
+    # SGLANG_PP_PD_KV_TRANSFER_ROOM_SHARDING above choosing its queue. Forces that
+    # knob on, since the fan-out's shard key is the room-based one. Kill-switch: set
+    # to 0 to restore the byte-identical legacy whole-room path.
+    SGLANG_PP_PD_KV_TRANSFER_TARGET_PARALLEL = EnvBool(False)
+    # PP + PD prefill (mooncake): evaluate the "all PP ranks acknowledged this
+    # room's bootstrap" AND over the sideband ZMQ handshake channel instead of
+    # over the pipeline relay chain. Every prefill PP rank reports PP_READY to
+    # PP0 the moment its own transfer_infos are complete; PP0 only promotes the
+    # room to KVPoll.WaitingForInput once all pp_size ranks reported, so PP0's
+    # poll() already means "globally ready" and the fixed pp_size-iteration wait
+    # on the admission path disappears. The invariant is unchanged: a room is
+    # admitted only when every PP rank acknowledged it. Kill-switch: set to 0 to
+    # restore the byte-identical two-pass (pre-consensus + consensus ring) path.
+    SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS = EnvBool(False)
+    # PP + PD prefill: answer the client as soon as this rank's own prefill is
+    # done, instead of waiting for the all-PP-ranks release consensus (whose
+    # second lap runs against the pipeline direction, one microbatch slot per
+    # hop). The terminal FINISH_LENGTH(length=0) response carries no token the
+    # client needs, and the paired decode judges KV transfer success/failure
+    # from its own in-band notification, so the consensus only has to gate the
+    # dequeue (KV page + req slot release), not the HTTP answer. Takes effect on
+    # PP0 only -- no other rank holds a detokenizer socket. Kill-switch: set to
+    # 0 to restore the byte-identical release-time answer.
+    SGLANG_PP_PD_PREFILL_EARLY_STREAM_OUTPUT = EnvBool(False)
+    # Cap on the tokens whose KV one transfer chunk ships, i.e. one synchronous
+    # RDMA batch. Only requests whose cached prefix exceeds this ever split:
+    # chunked prefill already bounds every other send to chunked_prefill_size,
+    # while a fully cached prefix has no boundary left and goes out in a single
+    # call that occupies one transfer queue shard for its whole duration. Rounded
+    # down to a page multiple so intermediate boundaries stay on the page grid.
+    # 0 disables the cap.
+    SGLANG_DISAGG_MAX_SEND_CHUNK_TOKENS = EnvInt(256 * 1024)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
@@ -514,6 +574,12 @@ class Envs:
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    # Per-PP-stage compute cost model for dynamic chunking: price each request
+    # as cost_s(L, x) = k_g*x + k_e*(L+x) + k_a*x*(L+0.5x) on every stage and
+    # form prefill batches against a compute budget instead of a token budget.
+    # Coefficients are pure FLOPs counts derived at startup from a walk of the
+    # loaded weights plus the model config, so no configuration is needed.
+    SGLANG_DYNAMIC_CHUNKING_COST_MODEL = EnvBool(False)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     # Per-rank constant that stands in for the all-gathered sync value when
     # SGLANG_SCHEDULER_SKIP_ALL_GATHER is on but the MLP path still needs a
@@ -621,6 +687,19 @@ class Envs:
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
+    # Gather the speculative draft KV head slice into registered GPU staging
+    # memory before the RDMA, collapsing one descriptor per token into one per
+    # contiguous destination run (see disaggregation/common/draft_kv_gather.py).
+    SGLANG_ENABLE_DISAGG_DRAFT_GATHER = EnvBool(True)
+    SGLANG_DISAGG_DRAFT_GATHER_BUFFERS = EnvInt(8)
+    # Cap on the CTAs the gather kernel launches (0 = one per block, uncapped).
+    # It runs on its own stream, concurrently with the forward, so the grid is the
+    # only SM throttle available: one CTA occupies one SM. Measured on B200 for a
+    # 24k-token chunk (2 entries, 128B slice): uncapped 6144 CTAs = 10.9 us,
+    # 148 = 18.5 us, 64 = 41.5 us, 32 = 81 us, 8 = 311 us. The extra latency lands
+    # on the transfer thread only, against the ~10 ms this path saves per call, so
+    # the default trades it for a peak footprint of ~1/5 of the GPU.
+    SGLANG_DISAGG_DRAFT_GATHER_MAX_CTAS = EnvInt(32)
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
@@ -628,6 +707,10 @@ class Envs:
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
+    # Seconds a decode session stays blacklisted after a transfer failure before
+    # the cooldown self-release re-admits it (see MooncakeKVManager session
+    # bookkeeping in disaggregation/mooncake/conn.py).
+    SGLANG_MOONCAKE_COOLDOWN = EnvFloat(120.0)
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)

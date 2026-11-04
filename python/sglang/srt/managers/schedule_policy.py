@@ -29,9 +29,21 @@ import os
 import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
+import numpy as np
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
@@ -52,6 +64,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.common import (
+    MAMBA_STATE_PER_REQ_NO_CACHE,
+    MAMBA_STATE_PER_REQ_PREFIX_CACHE,
+    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
+)
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
@@ -369,7 +387,9 @@ class SchedulePolicy:
         enable_priority_scheduling: bool,
         priority_sign: int,
     ) -> None:
-        """Sorts the waiting queue based on the longest output (max_new_tokens). If using priority scheduling, sort by priority first."""
+        """Sort by longest output (max_new_tokens), considering priority first
+        when priority scheduling is enabled.
+        """
         if enable_priority_scheduling:
             waiting_queue.sort(
                 key=lambda x: (
@@ -456,9 +476,78 @@ class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
+    ABORT = auto()  # Fatal cache-read inconsistency; never run forward
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedAdmission:
+    """One request admission committed by the PP0 authoritative plan."""
+
+    rid: str
+    source: str
+    extend_range: Tuple[int, int]
+
+    def __post_init__(self) -> None:
+        try:
+            start, end = self.extend_range
+            normalized_range = (int(start), int(end))
+            start, end = normalized_range
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid planned admission extend range: {self.extend_range!r}"
+            ) from exc
+        object.__setattr__(self, "extend_range", normalized_range)
+        if not isinstance(self.rid, str) or not self.rid:
+            raise ValueError(f"invalid planned admission rid: {self.rid!r}")
+        if self.source not in ("waiting", "chunked"):
+            raise ValueError(f"invalid planned admission source: {self.source!r}")
+        if start < 0 or end <= start:
+            raise ValueError(
+                f"invalid planned admission extend range: {self.extend_range!r}"
+            )
+
+    def to_wire(self) -> Dict[str, Any]:
+        """Return the dict representation used by the PP plan relay."""
+        return {
+            "rid": self.rid,
+            "source": self.source,
+            "extend_range": self.extend_range,
+        }
+
+    @classmethod
+    def from_wire(cls, value: Any) -> PlannedAdmission:
+        """Parse one admission from the PP plan relay representation."""
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError(f"invalid planned admission: {value!r}")
+        start, end = value["extend_range"]
+        return cls(
+            rid=value["rid"],
+            source=value["source"],
+            extend_range=(int(start), int(end)),
+        )
+
+    @classmethod
+    def from_req(cls, req: Req, source: str) -> PlannedAdmission:
+        """Build an admission plan from a request's committed token range."""
+        if req.extend_range is None:
+            raise RuntimeError(f"request has no extend range: rid={req.rid}")
+        return cls(
+            rid=req.rid,
+            source=source,
+            extend_range=(int(req.extend_range.start), int(req.extend_range.end)),
+        )
 
 
 class PrefillAdder:
+    # How far a whole request may overshoot the remaining cost budget before it
+    # is chunked instead. Admitting it whole keeps the batch full and avoids a
+    # sliver chunk that would repay the prefix re-expansion a second time; the
+    # overshoot is absorbed by the next batch, whose budget_state() sees a
+    # non-positive remainder.
+    COST_OVERSHOOT_TOL = 1.05
+
     def __init__(
         self,
         page_size: int,
@@ -476,6 +565,9 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        cost_model=None,
+        rem_cost: Optional[np.ndarray] = None,
+        cost_chunk_cap: Optional[int] = None,
         checkpoint_end_align_size: Optional[int] = None,
     ):
         self.page_size = page_size
@@ -485,6 +577,17 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        # Optional compute-based budget (see ChunkCostModel). When set, each
+        # admitted request is charged its predicted per-PP-stage cost (which
+        # depends on its cached-history length), so batches are bounded by
+        # predicted compute instead of raw token count.
+        self.cost_model = cost_model
+        self.rem_cost = rem_cost if cost_model is not None else None
+        # Per-request chunk cap in cost-model mode: budgets admit more
+        # requests, they must never inflate a single chunk beyond the
+        # validated base chunk size (long chunks hit untested kernel paths,
+        # e.g. KDA's >16K triton fallback).
+        self.cost_chunk_cap = cost_chunk_cap
         self.dllm_config = dllm_config
         self.checkpoint_end_align_size = checkpoint_end_align_size
 
@@ -500,6 +603,11 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        # Whether this batch already carries a partial (chunked) request,
+        # either resumed from the previous batch or created here. At most one
+        # is allowed, and it is the only reason the cost model defers a
+        # request that would otherwise fit.
+        self.batch_has_partial_req = False
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
@@ -547,14 +655,39 @@ class PrefillAdder:
         # MAMBA-recoverable bytes for a mamba slot (shared gap + peer holes +
         # mamba-evictable radix), NOT full-evictable. Gate new mamba slots on
         # that mamba-recoverable budget separately or an over-admit hits the
-        # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
-        self.rem_mamba_slots = None
+        # fail-loud `RuntimeError`. `None` when there is no mamba pool.
+        #
+        # Plain pools also need a slot budget for state + ping-pong buffers.
+        # Prefix matching/load-back may allocate a state before admission, so
+        # use live capacity there and reserve only slots not yet allocated.
+        req_pool = getattr(self.tree_cache, "req_to_token_pool", None)
+
+        self._rem_mamba_slots = None
+        self._plain_mamba_pool = None
+        self._reserved_mamba_slots = 0
         if self._mamba_slot_cost:
-            self.rem_mamba_slots = (
+            self._rem_mamba_slots = (
                 self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             )
             if self.is_hybrid_ssm_cache:
-                self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
+                self._rem_mamba_slots += self.tree_cache.mamba_evictable_size()
+        elif (
+            isinstance(req_pool, HybridReqToTokenPool)
+            and req_pool.enable_mamba_extra_buffer
+            and getattr(req_pool, "mamba_allocator", None) is not None
+        ):
+            self._plain_mamba_pool = req_pool
+
+        self._mamba_slot_alloc_factor = 1
+        if isinstance(req_pool, HybridReqToTokenPool):
+            if self.tree_cache.supports_mamba():
+                self._mamba_slot_alloc_factor = (
+                    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+                    if req_pool.enable_mamba_extra_buffer_lazy
+                    else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+                )
+            else:
+                self._mamba_slot_alloc_factor = MAMBA_STATE_PER_REQ_NO_CACHE
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -745,8 +878,107 @@ class PrefillAdder:
             return self._mamba_slot_cost
         return 0
 
+    @property
+    def rem_mamba_slots(self) -> Optional[int]:
+        """Return recoverable Mamba slots after pending admission reservations."""
+        pool = self._plain_mamba_pool
+        if pool is None:
+            return self._rem_mamba_slots
+        allocator = pool.mamba_allocator
+        # alloc_group_begin temporarily removes unused COW slots from the free
+        # list; alloc_group_end returns them before alloc_req_slots runs.
+        available = allocator.schedulable_available_size() + allocator.preallocated_size
+        if self.is_hybrid_ssm_cache and getattr(pool, "mamba_ckpt_pool", None) is None:
+            # Int8 checkpoints have a separate allocator: evicting them cannot
+            # supply active state or ping-pong slots.
+            available += self.tree_cache.mamba_evictable_size()
+        return available - self._reserved_mamba_slots
+
+    def _mamba_slots_for_req(self, req: Req) -> int:
+        """Slots still needed by alloc_req_slots, excluding existing state/buffers."""
+        pool = self._plain_mamba_pool
+        if pool is None:
+            return 0
+        owner = req
+        if req.mamba_pool_idx is None and getattr(req, "session", None) is not None:
+            # PP replay may reach the pre-match gate before a streaming
+            # session has restored its already-owned state and buffers.
+            session_cache = self.tree_cache
+            find_slot = getattr(type(session_cache), "find_active_slot", None)
+            if not callable(find_slot):
+                session_cache = getattr(self.tree_cache, "session", None)
+                find_slot = getattr(type(session_cache), "find_active_slot", None)
+            if callable(find_slot):
+                owner = find_slot(session_cache, req) or req
+        needed = int(owner.mamba_pool_idx is None)
+        if owner.mamba_ping_pong_track_buffer is None:
+            needed += (
+                1
+                if pool.enable_mamba_extra_buffer_lazy
+                else pool.mamba_ping_pong_track_buffer_size
+            )
+        return needed
+
+    def _has_mamba_slots_for_req(self, req: Req) -> bool:
+        """Return whether the request's missing Mamba state and buffers fit."""
+        remaining = self.rem_mamba_slots
+        needed = self._mamba_slots_for_req(req)
+        return needed == 0 or remaining is None or needed <= remaining
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def _req_cost(self, prefix_len: int, extend_len: int):
+        """Per-PP-stage cost this request would add to the batch, or None when
+        the cost model is off. Page-aligned to match what
+        ``_update_prefill_budget`` actually charges to the token budgets."""
+        if self.cost_model is None:
+            return None
+        return self.cost_model.req_cost(prefix_len, self.ceil_paged_tokens(extend_len))
+
+    def _cost_chunk_limit(self, prefix_len: int) -> int:
+        """Largest page-aligned chunk that fits every stage's remaining budget,
+        capped at the validated base chunk size, with one page of forced
+        progress so a chunked request can never stall."""
+        x = self.cost_model.solve_x(prefix_len, self.rem_cost)
+        # solve_x(0, target) is base_chunk_size exactly in theory, but the
+        # quadratic root lands a few ULPs below it; truncating there would cost
+        # a whole page on every fresh chunk relative to the static token budget.
+        x = int(x * (1.0 + 1e-9) + 1e-6)
+        if self.cost_chunk_cap is not None:
+            x = min(x, self.cost_chunk_cap)
+        return max(x // self.page_size * self.page_size, self.page_size)
+
+    def _cost_admit(self, prefix_len: int, extend_len: int, can_defer: bool):
+        """Cost-model verdict for a request that is not yet in this batch.
+
+        Returns ("whole", None), ("chunk", limit) or ("defer", None).
+
+        Three rules, in order:
+        1. Admit whole if it fits, tolerating a small overshoot: leaving a
+           sliver chunk behind costs more (see rule 3) than briefly exceeding
+           the budget, which the next batch absorbs via budget_state().
+        2. Defer only when the batch already holds a partial request. SGLang
+           allows one per batch; anything stricter (e.g. "the batch is
+           non-empty") leaves the tail of every batch idle.
+        3. Prefer deferring over carving a sliver: every extra chunk repays
+           the whole prefix re-expansion (k_e * L), so splitting is only worth
+           it when the budget it fills exceeds that repayment.
+        """
+        full_cost = self._req_cost(prefix_len, extend_len)
+        over_cap = self.cost_chunk_cap is not None and extend_len > self.cost_chunk_cap
+        if not over_cap and np.all(
+            full_cost <= self.rem_cost * self.COST_OVERSHOOT_TOL
+        ):
+            return "whole", None
+        if can_defer:
+            if self.batch_has_partial_req:
+                return "defer", None
+            if self.cost_model.reexpand_cost(prefix_len) >= float(
+                np.min(self.rem_cost)
+            ):
+                return "defer", None
+        return "chunk", self._cost_chunk_limit(prefix_len)
 
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
@@ -754,7 +986,13 @@ class PrefillAdder:
             no_token = self.rem_swa_tokens <= 0
         # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
         # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
-        if not no_token and self.rem_mamba_slots is not None:
+        # Plain pools check each candidate before admission, allowing requests
+        # that already own all their slots to proceed even at zero free slots.
+        if (
+            not no_token
+            and self._plain_mamba_pool is None
+            and self.rem_mamba_slots is not None
+        ):
             no_token = self.rem_mamba_slots <= 0
         if no_token:
             return AddReqResult.NO_TOKEN
@@ -768,6 +1006,8 @@ class PrefillAdder:
         else:
             if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
+            if self.rem_cost is not None and np.any(self.rem_cost <= 0):
+                return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
 
@@ -778,8 +1018,11 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
+        cost=None,
+        mamba_slots_needed: int = 0,
     ):
-        # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
+        # TODO(lsyin): check this workaround logic, which only ensures the
+        # prefill will not run out of memory and may be too conservative.
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
@@ -794,10 +1037,10 @@ class PrefillAdder:
         self.cur_rem_token_offset += (
             extend_input_len + page_overhead + mamba_gap_reserve
         )
-        # The new mamba slot also consumes one mamba-recoverable slot (gated
-        # separately so full_evictable can't cover it — see __init__).
-        if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= 1
+        if self._plain_mamba_pool is not None:
+            self._reserved_mamba_slots += mamba_slots_needed
+        elif mamba_gap_reserve and self._rem_mamba_slots is not None:
+            self._rem_mamba_slots -= self._mamba_slot_alloc_factor
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
@@ -809,6 +1052,8 @@ class PrefillAdder:
             self.rem_dllm_tokens -= extend_input_len
         elif self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= extend_input_len
+        if self.rem_cost is not None and cost is not None:
+            self.rem_cost -= cost
 
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
@@ -849,15 +1094,28 @@ class PrefillAdder:
             0,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slots_needed=self._mamba_slots_for_req(req),
         )
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
+        # match locks this node's components, so clear any stale skip set
+        # carried from a previous scheduling of this req.
+        req.skip_lock_node_ids = {}
+        if req.as_read_pending_lock:
+            # The lock now protects the loaded prefix, so the one-shot AS read
+            # latch is safe to arm. Until then a rejected admission must be
+            # free to match and load again, or this rank would fall behind the
+            # prefix its PP peers still see.
+            req.ever_read_as = True
+            req.as_read_pending_lock = False
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
+        if not self._has_mamba_slots_for_req(req):
+            return AddReqResult.NO_TOKEN
         _rem_tokens = self._get_dllm_remain_tokens()
 
         if _rem_tokens <= 0:
@@ -886,6 +1144,7 @@ class PrefillAdder:
             max_new_tokens,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slots_needed=self._mamba_slots_for_req(req),
         )
 
         # Return based on remaining token availability
@@ -895,7 +1154,12 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(
+        self,
+        req: Req,
+        planned_admission: Optional[PlannedAdmission] = None,
+    ):
+        """Admit a resumed chunk, optionally replaying PP0's exact range."""
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -908,10 +1172,29 @@ class PrefillAdder:
                 )
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
-            if _rem_tokens <= 0:
+            if _rem_tokens <= 0 and planned_admission is None:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+
+        if (
+            planned_admission is None
+            and self.cost_model is not None
+            and self.rem_cost is not None
+        ):
+            # A resumed chunked request must make progress, so there is no
+            # defer option here: take the largest chunk that fits. Skipped on
+            # replay ranks: `prefix_indices` is a local cache-hit length, so a
+            # rank whose hit is shorter would compute a smaller limit than the
+            # range PP0 already committed to and reject it below.
+            cost_tokens = self._cost_chunk_limit(len(req.prefix_indices))
+            _rem_tokens = min(_rem_tokens, cost_tokens)
+            logger.debug(
+                "[ChunkCostModel-Admit] resumed L=%d rem=%s cost_tokens=%d",
+                len(req.prefix_indices),
+                self.rem_cost,
+                cost_tokens,
+            )
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -924,13 +1207,63 @@ class PrefillAdder:
                 waiting_queue_len=self.waiting_queue_len,
             )
 
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
-        truncated = cand_extend_input_len > _rem_tokens
-        new_len = min(cand_extend_input_len, _rem_tokens)
-        req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        if not self._has_mamba_slots_for_req(req):
+            if planned_admission is None:
+                return req
+            # Join the existing replay abort sync after every shard has
+            # participated in the delayer negotiation above.
+            req._pp_replay_local_abort = True
+            req._as_cache_read_abort_reason = (
+                "PP replay resumed chunk exceeds the local Mamba slot budget: "
+                f"rid={req.rid}"
+            )
+
+        prefix_len = len(req.prefix_indices)
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - prefix_len
+        if planned_admission is None:
+            new_len = min(cand_extend_input_len, _rem_tokens)
+            if self.dllm_config is None:
+                new_len = _align_chunk_extend_end(
+                    prefix_len,
+                    len(req.full_untruncated_fill_ids),
+                    new_len,
+                    self.checkpoint_end_align_size,
+                )
+            truncated = new_len < cand_extend_input_len
+        else:
+            self._validate_planned_admission(req, planned_admission, "chunked")
+            start, end = self._validate_authoritative_extend_range(
+                req, planned_admission.extend_range, prefix_len=None
+            )
+            new_len = end - start
+            if start != prefix_len:
+                # Local prefix != PP0 chunk start: abort this req, not the scheduler.
+                req._pp_replay_local_abort = True
+                req._as_cache_read_abort_reason = (
+                    "PP replay chunk start unreachable on this stage: "
+                    f"rid={req.rid} planned_start={start} local_prefix={prefix_len}"
+                )
+            elif new_len > _rem_tokens:
+                req._pp_replay_local_abort = True
+                req._as_cache_read_abort_reason = (
+                    "PP replay resumed chunk exceeds the local token budget: "
+                    f"rid={req.rid} planned={planned_admission.extend_range} "
+                    f"available={_rem_tokens}"
+                )
+            # All attention shards replay the same admission. Agree on its
+            # cancellation before any shard mutates the request or batch.
+            if (
+                self._sync_attention_store_read_abort(req, AddReqResult.CONTINUE)
+                == AddReqResult.ABORT
+            ):
+                req._pp_replay_local_abort = True
+                return None
+            truncated = end < len(req.full_untruncated_fill_ids)
+        req.set_extend_range(prefix_len, prefix_len + new_len)
         self.can_run_list.append(req)
+        # Still partial after this chunk: it stays this batch's one chunked
+        # request, so no waiting request may be chunked as well.
+        self.batch_has_partial_req = truncated
         self._update_prefill_budget(
             0,
             req.extend_range.length,
@@ -941,6 +1274,14 @@ class PrefillAdder:
             ),
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slots_needed=self._mamba_slots_for_req(req),
+            # Decision-side only: charging the replay ranks would let their
+            # rem_cost hit zero and abort an admission PP0 already promised.
+            cost=(
+                self._req_cost(len(req.prefix_indices), req.extend_range.length)
+                if planned_admission is None
+                else None
+            ),
         )
 
         # Return if chunked prefill not finished
@@ -963,7 +1304,79 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
+    @staticmethod
+    def _validate_planned_admission(
+        req: Req, planned_admission: PlannedAdmission, expected_source: str
+    ) -> None:
+        if planned_admission.rid != req.rid:
+            raise RuntimeError(
+                "PP planned admission request mismatch: "
+                f"planned={planned_admission.rid} local={req.rid}"
+            )
+        if planned_admission.source != expected_source:
+            raise RuntimeError(
+                "PP planned admission source mismatch: "
+                f"rid={req.rid} planned={planned_admission.source} "
+                f"expected={expected_source}"
+            )
+
+    @staticmethod
+    def _validate_authoritative_extend_range(
+        req: Req,
+        extend_range: Tuple[int, int],
+        prefix_len: Optional[int],
+    ) -> Tuple[int, int]:
+        try:
+            start, end = extend_range
+            start = int(start)
+            end = int(end)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"invalid PP authoritative extend range for rid={req.rid}: "
+                f"{extend_range}"
+            ) from exc
+        full_input_len = len(req.full_untruncated_fill_ids)
+        if (
+            start < 0
+            or end <= start
+            or end > full_input_len
+            or (prefix_len is not None and start != prefix_len)
+        ):
+            raise RuntimeError(
+                f"invalid PP authoritative extend range for rid={req.rid}: "
+                f"planned={(start, end)} prefix={prefix_len} full={full_input_len}"
+            )
+        return start, end
+
+    def _sync_attention_store_read_abort(
+        self, req: Req, result: AddReqResult, *, check_load_back: bool = False
+    ) -> AddReqResult:
+        """Synchronize one request's AS read outcome within its PP stage.
+
+        Each phase must reach this helper exactly once on every attention
+        shard. Authoritative replay has a preflight before load-back's own
+        collectives; only a stage-wide successful preflight proceeds to the
+        final admission sync. The scheduler also gates prefix matching before
+        calling ``add_one_req``.
+        """
+        sync_read_abort = getattr(
+            type(self.tree_cache), "sync_attention_store_read_abort", None
+        )
+        if callable(sync_read_abort):
+            aborted = (
+                sync_read_abort(self.tree_cache, req, check_load_back=True)
+                if check_load_back
+                else sync_read_abort(self.tree_cache, req)
+            )
+            if aborted:
+                return AddReqResult.ABORT
+        elif req._as_cache_read_abort_reason or req._pp_replay_local_abort:
+            return AddReqResult.ABORT
+        return result
+
     def add_one_req_ignore_eos(self, req: Req):
+        if not self._has_mamba_slots_for_req(req):
+            return self._sync_attention_store_read_abort(req, AddReqResult.NO_TOKEN)
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -972,7 +1385,7 @@ class PrefillAdder:
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
-            return AddReqResult.NO_TOKEN
+            return self._sync_attention_store_read_abort(req, AddReqResult.NO_TOKEN)
         if self.is_hybrid_swa:
             if (
                 self._swa_budget_for_req(
@@ -980,7 +1393,7 @@ class PrefillAdder:
                 )
                 > self.rem_swa_tokens
             ):
-                return AddReqResult.NO_TOKEN
+                return self._sync_attention_store_read_abort(req, AddReqResult.NO_TOKEN)
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
@@ -1028,7 +1441,9 @@ class PrefillAdder:
                 min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
                 # reserve tokens for corner cases
                 if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
-                    return AddReqResult.NO_TOKEN
+                    return self._sync_attention_store_read_abort(
+                        req, AddReqResult.NO_TOKEN
+                    )
                 tokens_freed += tokens_occupied
 
         if (self.prefill_delayer_single_pass is not None) and (
@@ -1036,17 +1451,40 @@ class PrefillAdder:
                 local_prefillable=True
             )
         ):
-            return AddReqResult.OTHER
+            return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
+
+        # The cost budget applies to ignore_eos traffic too (benchmarks/warmup
+        # take this path when the radix cache is off); otherwise oversized
+        # whole-request chunks bypass the budget and reach untested long-chunk
+        # kernel paths.
+        cost_chunk_limit = None
+        if self.cost_model is not None and self.rem_cost is not None:
+            verdict, cost_chunk_limit = self._cost_admit(
+                len(req.prefix_indices),
+                cand_extend_input_len,
+                can_defer=len(self.can_run_list) != 0,
+            )
+            logger.debug(
+                "[ChunkCostModel-Admit] ignore_eos L=%d x=%d verdict=%s "
+                "limit=%s rem=%s",
+                len(req.prefix_indices),
+                cand_extend_input_len,
+                verdict,
+                cost_chunk_limit,
+                self.rem_cost,
+            )
+            if verdict == "defer":
+                return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
-                return AddReqResult.OTHER
+                return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
             self._add_dllm_req(req, 0)
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
-        ):
+        ) and (cost_chunk_limit is None or cand_extend_input_len <= cost_chunk_limit):
             # Non-chunked prefill — the whole sequence is committed this iter.
             req.set_extend_range(
                 len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1058,13 +1496,21 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                mamba_slots_needed=self._mamba_slots_for_req(req),
+                cost=self._req_cost(len(req.prefix_indices), req.extend_range.length),
             )
         else:
-            if self.rem_chunk_tokens <= 0:
-                return AddReqResult.OTHER
+            if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
+                return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = (
+                self.rem_chunk_tokens
+                if self.rem_chunk_tokens is not None
+                else cost_chunk_limit
+            )
+            if cost_chunk_limit is not None:
+                trunc_len = min(trunc_len, cost_chunk_limit)
 
             assert len(req.prefix_indices) == 0
             req.set_extend_range(
@@ -1072,29 +1518,56 @@ class PrefillAdder:
             )
             self.can_run_list.append(req)
             self.new_chunked_req = req
+            self.batch_has_partial_req = True
             self._update_prefill_budget(
                 0,
                 trunc_len,
                 0,
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                mamba_slots_needed=self._mamba_slots_for_req(req),
+                cost=self._req_cost(len(req.prefix_indices), trunc_len),
             )
 
-        return self.budget_state()
+        return self._sync_attention_store_read_abort(req, self.budget_state())
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        planned_admission: Optional[PlannedAdmission] = None,
     ):
+        before_load_back = planned_admission is not None
+
+        def sync_admission(result: AddReqResult) -> AddReqResult:
+            if planned_admission is not None and result != AddReqResult.CONTINUE:
+                # A replay rank cannot merely stop locally: all attention
+                # shards must omit the same committed request from the batch.
+                if not req._as_cache_read_abort_reason:
+                    req._as_cache_read_abort_reason = (
+                        f"PP replay admission failed: rid={req.rid} result={result}"
+                    )
+                if result in (AddReqResult.NO_TOKEN, AddReqResult.OTHER):
+                    req._pp_replay_local_abort = True
+            return self._sync_attention_store_read_abort(
+                req, result, check_load_back=before_load_back
+            )
+
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
         if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
-            return AddReqResult.OTHER
+            return sync_admission(AddReqResult.OTHER)
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
-            return AddReqResult.OTHER
+            return sync_admission(AddReqResult.OTHER)
 
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+        if (
+            planned_admission is None
+            and req.sampling_params.ignore_eos
+            and getattr(self.tree_cache, "disable", True)
+        ):
             return self.add_one_req_ignore_eos(req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
@@ -1104,10 +1577,68 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
+        full_input_len = len(req.full_untruncated_fill_ids)
+        current_prefix_len = len(req.prefix_indices)
+        if planned_admission is None:
+            authoritative_start = authoritative_end = None
+            cand_extend_input_len = full_input_len - current_prefix_len
+            budgeted_max_new = max_new
+        else:
+            self._validate_planned_admission(req, planned_admission, "waiting")
+            authoritative_start, authoritative_end = (
+                self._validate_authoritative_extend_range(
+                    req, planned_admission.extend_range, prefix_len=None
+                )
+            )
+            if current_prefix_len > authoritative_start:
+                # Per-stage eviction diverges once the AS cache is on, so this
+                # stage can hold more of the prefix in HBM than PP0 did when it
+                # committed the range. The plan cannot be renegotiated here, and
+                # running a longer prefix would make this batch disagree with
+                # PP0's, so fail this one request through the cache-read abort
+                # path rather than killing the scheduler.
+                logger.error(
+                    "[PPPlanReplay] rid=%s local device prefix exceeds the planned "
+                    "start: local=%d planned=%d; aborting this request locally",
+                    req.rid,
+                    current_prefix_len,
+                    authoritative_start,
+                )
+                req._as_cache_read_abort_reason = (
+                    "PP authoritative prefix is shorter than the local device "
+                    f"prefix: local={current_prefix_len} "
+                    f"planned={authoritative_start}"
+                )
+                return sync_admission(AddReqResult.ABORT)
+            # Include any host-hit prefix still awaiting load-back, but reserve
+            # and schedule no token beyond PP0's committed end position.
+            cand_extend_input_len = authoritative_end - current_prefix_len
+            budgeted_max_new = max_new if authoritative_end == full_input_len else 0
+            # `host_hit_length` comes from this stage's AttentionStore match, and
+            # a replay rank can reach the admission holding a match PP0 did not
+            # have when it committed the range. Loading the whole host hit back
+            # would push the local prefix past `authoritative_start` and make the
+            # batch disagree with PP0's. Load only what the plan counts as
+            # prefix. The tail is not reloaded later: `ever_read_as` is a
+            # one-shot latch (see the guards in
+            # mem_cache/storage/asradix/cache.py::_match_checkpointed_page_prefix
+            # and page_coordinator.py::extend_match), so this request never
+            # matches the store again and a later chunk recomputes those
+            # tokens. That costs compute, never correctness.
+            max_load_back = max(authoritative_start - current_prefix_len, 0)
+            if req.host_hit_length > max_load_back:
+                logger.info(
+                    "[PPPlanReplay] rid=%s capping host load-back to the planned "
+                    "prefix: host_hit=%d local_prefix=%d planned_start=%d",
+                    req.rid,
+                    req.host_hit_length,
+                    current_prefix_len,
+                    authoritative_start,
+                )
+                req.host_hit_length = max_load_back
+                if getattr(req, "swa_host_hit_length", 0) > max_load_back:
+                    req.swa_host_hit_length = max_load_back
+        total_tokens = cand_extend_input_len + budgeted_max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
@@ -1118,7 +1649,7 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
+            return sync_admission(AddReqResult.NO_TOKEN)
 
         chunk_tokens_limit = self.rem_chunk_tokens
         if self.is_hybrid_swa:
@@ -1127,15 +1658,13 @@ class PrefillAdder:
             # charged separately via swa_host_hit_length).
             swa_needed = self._swa_budget_for_req(
                 real_input_tokens,
-                self._swa_new_tokens(req),
+                budgeted_max_new,
                 swa_host_hit_length=req.swa_host_hit_length,
             )
             if swa_needed >= self.rem_swa_tokens:
-                swa_cap = self._swa_chunk_cap(
-                    self._swa_new_tokens(req), req.swa_host_hit_length
-                )
+                swa_cap = self._swa_chunk_cap(budgeted_max_new, req.swa_host_hit_length)
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
-                    return AddReqResult.NO_TOKEN
+                    return sync_admission(AddReqResult.NO_TOKEN)
                 chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
         if (
@@ -1146,26 +1675,52 @@ class PrefillAdder:
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
-            return AddReqResult.OTHER
+            return sync_admission(AddReqResult.OTHER)
+
+        logger.info(
+            f"before lock, for req {req.rid} current rem_total_tokens: "
+            f"{self.rem_total_tokens}, "
+            f"local rem total: "
+            f"{self.token_to_kv_pool_allocator.available_size() + self._log_evictable_size()}, "
+            f"available: {self.token_to_kv_pool_allocator.available_size()}, "
+            f"evictable: {self._log_evictable_size()}, "
+            f"extend_input_len: {cand_extend_input_len}, "
+            f"prefix len {prefix_len}, "
+            f"host_hit_length {req.host_hit_length}"
+        )
 
         with self._lock_node(req.last_node):
+            logger.info(
+                f"after lock, for req {req.rid} current rem_total_tokens: "
+                f"{self.rem_total_tokens}, "
+                f"local rem total: "
+                f"{self.token_to_kv_pool_allocator.available_size() + self._log_evictable_size()}, "
+                f"available: {self.token_to_kv_pool_allocator.available_size()}, "
+                f"evictable: {self._log_evictable_size()}, "
+                f"extend_input_len: {cand_extend_input_len}, "
+                f"prefix len {prefix_len}, "
+                f"host_hit_length {req.host_hit_length}"
+            )
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
-                return AddReqResult.NO_TOKEN
+                return sync_admission(AddReqResult.NO_TOKEN)
+
+            if not self._has_mamba_slots_for_req(req):
+                return sync_admission(AddReqResult.NO_TOKEN)
 
             if self.is_hybrid_swa:
                 # self.rem_swa_tokens may decrease after the lock acquisition
                 swa_needed = self._swa_budget_for_req(
                     real_input_tokens,
-                    self._swa_new_tokens(req),
+                    budgeted_max_new,
                     swa_host_hit_length=req.swa_host_hit_length,
                 )
                 if swa_needed >= self.rem_swa_tokens:
                     swa_cap = self._swa_chunk_cap(
-                        self._swa_new_tokens(req), req.swa_host_hit_length
+                        budgeted_max_new, req.swa_host_hit_length
                     )
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
-                        return AddReqResult.NO_TOKEN
+                        return sync_admission(AddReqResult.NO_TOKEN)
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
@@ -1180,23 +1735,119 @@ class PrefillAdder:
                     waiting_queue_len=self.waiting_queue_len,
                 )
             ):
-                return AddReqResult.OTHER
+                return sync_admission(AddReqResult.OTHER)
+
+            if (
+                planned_admission is None
+                and self.cost_model is not None
+                and self.rem_cost is not None
+            ):
+                # Compute budget: charge this request for its cached history
+                # (k_e/k_a terms), which the token budget cannot see. A 4K
+                # extend on a 124K prefix costs several times more than its
+                # token count suggests. Gated on the projected post-load-back
+                # shape and kept ahead of init_load_back: a rejected admission
+                # reserves nothing, so KV pulled first is left evictable and the
+                # H2D is wasted. An authoritative admission is neither gated nor
+                # charged here: `budget_state` ends the admission loop once
+                # `rem_cost` reaches zero, so a replay rank that charged would
+                # drop requests PP0 had already planned into this batch.
+                projected_prefix_len = current_prefix_len + req.host_hit_length
+                verdict, cost_limit = self._cost_admit(
+                    projected_prefix_len,
+                    real_input_tokens,
+                    can_defer=len(self.can_run_list) != 0,
+                )
+                logger.debug(
+                    "[ChunkCostModel-Admit] L=%d x=%d verdict=%s limit=%s "
+                    "rem=%s cap=%s",
+                    projected_prefix_len,
+                    real_input_tokens,
+                    verdict,
+                    cost_limit,
+                    self.rem_cost,
+                    self.cost_chunk_cap,
+                )
+                if verdict == "defer":
+                    return sync_admission(AddReqResult.OTHER)
+                if verdict == "chunk":
+                    # Route through the existing truncation branch below.
+                    chunk_tokens_limit = (
+                        min(chunk_tokens_limit, cost_limit)
+                        if chunk_tokens_limit is not None
+                        else cost_limit
+                    )
+
+            if planned_admission is not None:
+                # Local budget failures above join this same preflight. Do not
+                # enter load-back collectives while a peer is already aborting.
+                if sync_admission(AddReqResult.CONTINUE) == AddReqResult.ABORT:
+                    return AddReqResult.ABORT
+                before_load_back = False
 
             if req.needs_host_load_back():
-                new_indices, req.last_node = self.tree_cache.init_load_back(
-                    InitLoadBackParams(
-                        best_match_node=req.best_match_node,
-                        host_hit_length=req.host_hit_length,
-                        req=req,
+                try:
+                    new_indices, req.last_node = self.tree_cache.init_load_back(
+                        InitLoadBackParams(
+                            best_match_node=req.best_match_node,
+                            host_hit_length=req.host_hit_length,
+                            req=req,
+                        )
                     )
+                except Exception as exc:
+                    req._as_cache_read_abort_reason = (
+                        f"AttentionStore cache read raised: {exc}"
+                    )
+                    logger.exception("AS load_back raised for req=%s", req.rid)
+                    new_indices = req.prefix_indices[:0]
+                actual_loaded = len(new_indices)
+                logger.info(
+                    f"AS load_back: req:{req.rid}, "
+                    f"expected={req.host_hit_length}, set host_hit_length to actual={actual_loaded}"
                 )
+                req.host_hit_length = actual_loaded
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
-            input_tokens = self.ceil_paged_tokens(
-                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
-            )
+            if planned_admission is None:
+                input_tokens = self.ceil_paged_tokens(
+                    len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                )
+            else:
+                authoritative_start, authoritative_end = (
+                    self._validate_authoritative_extend_range(
+                        req,
+                        planned_admission.extend_range,
+                        prefix_len=None,
+                    )
+                )
+                if len(req.prefix_indices) != authoritative_start:
+                    # The load-back cap above keeps this stage from overshooting,
+                    # so a disagreement here means it could not reach PP0's start
+                    # (a short load-back, or a device prefix PP0 did not have).
+                    # Fail this one request through the existing cache-read abort
+                    # path instead of killing the scheduler: the plan is already
+                    # committed, so this rank cannot renegotiate the range.
+                    logger.error(
+                        "[PPPlanReplay] rid=%s cannot honour the planned range: "
+                        "planned=%s local_prefix=%d host_hit=%d full=%d; "
+                        "aborting this request locally",
+                        req.rid,
+                        (authoritative_start, authoritative_end),
+                        len(req.prefix_indices),
+                        req.host_hit_length,
+                        len(req.full_untruncated_fill_ids),
+                    )
+                    req._as_cache_read_abort_reason = (
+                        "PP authoritative prefix unreachable on this stage: "
+                        f"planned_start={authoritative_start} "
+                        f"local_prefix={len(req.prefix_indices)}"
+                    )
+                    return sync_admission(AddReqResult.ABORT)
+                input_tokens = self.ceil_paged_tokens(
+                    authoritative_end - authoritative_start
+                )
 
             if (
                 self.rem_chunk_tokens is None
@@ -1206,9 +1857,60 @@ class PrefillAdder:
                 # If without chunked prefill:
                 # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
                 # - if the can_run_list is empty, always accept the first prefill request
-                return AddReqResult.OTHER
+                return sync_admission(AddReqResult.OTHER)
 
-            if self.dllm_config is not None:
+            if planned_admission is not None:
+                if self.dllm_config is not None:
+                    available_chunk_tokens = self.rem_dllm_tokens
+                else:
+                    available_chunk_tokens = chunk_tokens_limit
+                if (
+                    available_chunk_tokens is not None
+                    and input_tokens > available_chunk_tokens
+                ):
+                    req._as_cache_read_abort_reason = (
+                        "PP authoritative request exceeds the local chunk budget: "
+                        f"rid={req.rid} planned={planned_admission.extend_range} "
+                        f"available={available_chunk_tokens}"
+                    )
+                    return sync_admission(AddReqResult.ABORT)
+
+            # Load-back may allocate the state itself or lock more cached
+            # states. Recheck the remaining buffer demand before committing.
+            if not self._has_mamba_slots_for_req(req):
+                return sync_admission(AddReqResult.NO_TOKEN)
+
+            # Validate both the restored prefix and the local chunk budget
+            # before the final sync. No request has been admitted yet, and an
+            # abort on any attention shard must cancel it on all of them.
+            read_result = sync_admission(AddReqResult.CONTINUE)
+            if read_result == AddReqResult.ABORT:
+                return read_result
+
+            if planned_admission is not None:
+                truncated = authoritative_end < len(req.full_untruncated_fill_ids)
+                req.set_extend_range(authoritative_start, authoritative_end)
+                self.can_run_list.append(req)
+                if truncated:
+                    self.new_chunked_req = req
+                self._req_inc_lock_ref(req)
+                self._update_prefill_budget(
+                    prefix_len,
+                    authoritative_end - authoritative_start,
+                    (
+                        0
+                        if truncated
+                        else min(
+                            req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKENS,
+                        )
+                    ),
+                    req.retracted_stain,
+                    req.host_hit_length,
+                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_slots_needed=self._mamba_slots_for_req(req),
+                )
+            elif self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 
@@ -1219,6 +1921,12 @@ class PrefillAdder:
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
+                if self.cost_model is not None:
+                    logger.debug(
+                        "[ChunkCostModel-Admit] whole x=%d limit=%s",
+                        input_tokens,
+                        chunk_tokens_limit,
+                    )
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1234,7 +1942,10 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                     req.retracted_stain,
+                    req.host_hit_length,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_slots_needed=self._mamba_slots_for_req(req),
+                    cost=self._req_cost(prefix_len, input_tokens),
                 )
             else:
                 # Checkpoint alignment can leave a few pages after a partial
@@ -1251,7 +1962,8 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
+                # When truncation alignment is set, the prefill prefix length
+                # must be a multiple of the truncation alignment size.
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                 # we need the prefill prefix length to be multiple of attention split size
                 if truncation_align_size is not None:
@@ -1284,6 +1996,7 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
+                self.batch_has_partial_req = True
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
@@ -1292,13 +2005,16 @@ class PrefillAdder:
                     0,
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_slots_needed=self._mamba_slots_for_req(req),
+                    cost=self._req_cost(prefix_len, trunc_len),
                 )
 
         return self.budget_state()
 
     def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
         """
-        Preempt running requests to serve the new request if the priority threshold is met and token count sum is verified.
+        Preempt running requests to serve the new request if the priority
+        threshold is met and the token count sum is verified.
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests

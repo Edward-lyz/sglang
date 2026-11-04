@@ -3191,16 +3191,29 @@ class KimiK3LinearModel(nn.Module):
                 )
 
         if not self.pp_group.is_last_rank:
+            proxy_tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if self.dspark_layers_to_capture is not None:
+                if aux_hidden_states:
+                    proxy_tensors["dspark_aux_hidden_states"] = torch.cat(
+                        aux_hidden_states, dim=-1
+                    )
+                else:
+                    proxy_tensors["dspark_aux_hidden_states"] = hidden_states.new_empty(
+                        hidden_states.shape[0], 0
+                    )
             assert not sp_sharded
             if attn_res is not None:
                 if residual is not None:
                     # Materialize the delayed MLP add: the wire carries the
                     # full stream head (bit-identical to the fused fold).
                     hidden_states = residual + hidden_states
+                    proxy_tensors["hidden_states"] = hidden_states
                 residual = attn_res.block_residual  # raw bank across ranks
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+                proxy_tensors["residual"] = residual
+            return PPProxyTensors(proxy_tensors)
 
         if hidden_states.shape[0] != 0:
             if attn_res is not None:
@@ -3330,18 +3343,17 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.model.force_weight_shard_finalize()
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if self.pp_group.world_size > 1:
-            # Capture layers living on non-last PP ranks would be silently
-            # skipped (the flag is only set on the last rank).
-            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        local_layer_ids = [
+            int(layer_id)
+            for layer_id in layer_ids
+            if self.model.start_layer <= int(layer_id) < self.model.end_layer
+        ]
+        self.capture_aux_hidden_states = bool(local_layer_ids)
+        self.model.dspark_layers_to_capture = local_layer_ids or None
 
     @torch.no_grad()
     def forward(
@@ -3497,12 +3509,22 @@ class KimiK3LinearForCausalLM(nn.Module):
             param.data.copy_(truncated_weight)
             return True
 
+        next_stage_params = self._next_stage_weight_map()
 
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
 
             layer_id = get_layer_id(name)
+            if next_stage_params and layer_id == self.model.end_layer:
+                for suffix, pname in next_stage_params.items():
+                    if name.endswith(suffix):
+                        param = params_dict[pname]
+                        getattr(param, "weight_loader", default_weight_loader)(
+                            param, loaded_weight
+                        )
+                        loaded_params.add(pname)
+                        break
             if layer_id is not None and (
                 layer_id < self.model.start_layer or layer_id >= self.model.end_layer
             ):

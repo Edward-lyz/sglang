@@ -1288,29 +1288,42 @@ class HybridReqToTokenPool(ReqToTokenPool):
             return None
 
         mamba_indices: list[torch.Tensor] = []
+        mamba_host_ids: list = []  # parallel host-int slot ids (None if preset on device)
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
-            if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
-                pass
-            else:
-                mid = self.mamba_allocator.alloc(1)
+            if req.mamba_pool_idx is None:
+                mid, mid_host = self.mamba_allocator.alloc_with_host(1)
                 assert (
                     mid is not None
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
+                mamba_host_ids.append(mid_host[0] if mid_host is not None else None)
+                # Reset the per-slot ReplaySSM state in place with a device-side
+                # fill (``.zero_()``) indexed by the host slot id. The previous
+                # ``buf[idx] = 0`` lifted the Python ``0`` to a pageable CPU
+                # scalar and issued a *synchronous* H2D ``aten::copy_`` into the
+                # device element; on the admission path (pop_preallocated ->
+                # _pre_alloc -> alloc) that copy blocks the decode scheduler until
+                # the CUDA stream drains (observed ~50 ms stalls), defeating async
+                # scheduling. ``.zero_()`` is a device kernel on the current stream
+                # (no host copy, no sync); the host int index avoids the extra
+                # .item() sync of a 0-dim CUDA index. Numerically identical.
+                reset_idx = mid_host[0] if mid_host is not None else req.mamba_pool_idx
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
                 # ring. write_pos=0 means "ring empty", so the decode kernel
                 # ignores ring contents and reads only the checkpoint state
                 # (the post-prefill state that prefill wrote into this slot).
                 if self.mamba_pool.replayssm_write_pos is not None:
-                    self.mamba_pool.replayssm_write_pos[req.mamba_pool_idx] = 0
+                    self.mamba_pool.replayssm_write_pos[reset_idx].zero_()
                 # ReplaySSM spec-verify ring: an empty ring also resets the
                 # circular origin + flush flag so the first verify step on this
                 # freshly-prefilled slot reconstructs from the checkpoint alone.
                 if self.mamba_pool.replayssm_cache_base is not None:
-                    self.mamba_pool.replayssm_cache_base[req.mamba_pool_idx] = 0
-                    self.mamba_pool.replayssm_is_flush[req.mamba_pool_idx] = 0
+                    self.mamba_pool.replayssm_cache_base[reset_idx].zero_()
+                    self.mamba_pool.replayssm_is_flush[reset_idx].zero_()
+            else:  # preset slot (radix cache / continuing chunked): id lives on device
+                mamba_host_ids.append(None)
             mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
@@ -1323,11 +1336,40 @@ class HybridReqToTokenPool(ReqToTokenPool):
             assert len(select_index) == len(
                 mamba_ping_pong_track_buffers
             ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-        mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        # Build the int32 slot-id tensor via *pinned* host memory + a
+        # ``non_blocking=True`` H2D when every id is known on the host (the common
+        # --disable-radix-cache admission path). torch.stack() of 0-dim device
+        # views + .to(int32) is a device op whose CPU call still parks the decode
+        # scheduler on the stream (observed ~55 ms aten::to under
+        # pop_preallocated->_pre_alloc->alloc). torch.tensor(list, device=cuda)
+        # would instead be a *pageable* H2D = cudaMemcpyAsync + implicit sync.
+        # A pinned source + non_blocking=True enqueues the copy on the stream
+        # without blocking the CPU; PyTorch's host caching allocator keeps the
+        # pinned block alive until the copy's event completes (reuse-safe).
+        if mamba_host_ids and all(h is not None for h in mamba_host_ids):
+            mamba_index_tensor = torch.tensor(
+                mamba_host_ids, dtype=torch.int32, pin_memory=True
+            ).to(
+                device=self.req_index_to_mamba_index_mapping.device,
+                non_blocking=True,
+            )
+        else:
+            mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
+        # ``select_index`` is a Python list, so ``mapping[select_index] = v`` would
+        # convert it to an int64 index via a *pageable* (synchronous) H2D. Stage it
+        # through pinned memory + non_blocking so the index copy is async too,
+        # leaving no pageable H2D on the admission path.
+        _map_dev = self.req_index_to_mamba_index_mapping.device
+        if _map_dev.type == "cuda":
+            select_index_dev = torch.tensor(
+                select_index, dtype=torch.int64, pin_memory=True
+            ).to(device=_map_dev, non_blocking=True)
+        else:
+            select_index_dev = select_index
+        self.req_index_to_mamba_index_mapping[select_index_dev] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index_dev] = (
                 ping_pong_tensor
             )
         return select_index
