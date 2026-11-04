@@ -51,6 +51,13 @@ struct AttnResTMAParams {
   int64_t stride_bm;  // bank stride along T (in elements)
   float eps;
   uint32_t num_tokens;
+  // Optional fused FP8 copy of `out` for the next DeepGEMM block-FP8 linear
+  // (nullptr = off): fp8_e4m3 [T, H] plus the group-128 UE8M0 scales in the
+  // column-major TMA-aligned int32 layout, addressed as bytes:
+  // (g / 4) * q_scale_group_stride + token * 4 + g % 4.
+  uint8_t* q_out;
+  uint8_t* q_scale;
+  uint32_t q_scale_group_stride;
 };
 
 template <int64_t kDim_, uint32_t kNumBankRows_, uint32_t kChunkRows_, uint32_t kConsumerRegs_ = 0>
@@ -111,6 +118,43 @@ struct KimiK3AttnResTrait {
   };
 
   static SGL_DEVICE void forward(const AttnResTMAParams& params, Smem* smem);
+
+  // Per-token-group FP8 quant of this thread's 16B output slice, bit-identical
+  // to per_token_group_quant (group 128, UE8M0, column-major) run on `out`:
+  // 16 consecutive lanes hold one 128-element group, absmax and the scale
+  // multiply stay in the bf16 domain as in that kernel.
+  template <typename RowVec>
+  static SGL_DEVICE void quantize_out(
+      const AttnResTMAParams& params, uint32_t token, uint32_t row_vid, const RowVec& v, uint32_t lane_id) {
+    using namespace device;
+    using deepseek_v4::fp8::cast_to_ue8m0;
+    using deepseek_v4::fp8::inv_scale_ue8m0;
+    constexpr uint32_t kGroupLanes = 128 / kVecElems;
+    constexpr float kMaxValue = DTypeTrait<fp8_e4m3_t>::kFloatMax;
+    constexpr float kMaxValueInv = 1.f / kMaxValue;
+    bf16x2_t amax2 = math::abs(v[0]);
+#pragma unroll
+    for (uint32_t j = 1; j < kVecElems / 2; ++j) {
+      amax2 = math::max(amax2, math::abs(v[j]));
+    }
+    const auto amax_f2 = cast<float2>(warp::reduce_max<kGroupLanes>(amax2));
+    const auto amax = math::max(math::max(amax_f2.x, amax_f2.y), 1e-10f);
+    const auto exp = cast_to_ue8m0(amax * kMaxValueInv);
+    const float quant_scale = inv_scale_ue8m0(exp);
+    const auto scale2 = cast<bf16x2_t>(float2{quant_scale, quant_scale});
+    const auto max_clip = cast<bf16_t>(kMaxValue);
+    const auto max_clip2 = bf16x2_t{max_clip, max_clip};
+    AlignedVector<fp8x2_e4m3_t, kVecElems / 2> q;
+#pragma unroll
+    for (uint32_t j = 0; j < kVecElems / 2; ++j) {
+      q[j] = static_cast<fp8x2_e4m3_t>(__hmin2(__hmul2(v[j], scale2), max_clip2));
+    }
+    q.store(params.q_out + static_cast<int64_t>(token) * kDim, row_vid);
+    if (lane_id % kGroupLanes == 0) {
+      const uint32_t g = row_vid / kGroupLanes;
+      params.q_scale[(g / 4) * params.q_scale_group_stride + token * 4 + g % 4] = static_cast<uint8_t>(exp);
+    }
+  }
 };
 
 SGL_DEVICE float2 fma_f32x2(float2 a, float2 b, float2 c) {
@@ -408,6 +452,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
           out_vec[j] = cast<bf16x2_t>(mul_f32x2(scaled, q2[j]));
         }
         const auto row_vid = tile * (kTile / kVecElems) + tid_in_group;
+        if (params.q_out != nullptr) quantize_out(params, token, row_vid, out_vec, lane_id);
         if (params.output_mc != nullptr) {
           const auto global_token = static_cast<int64_t>(params.rank) * params.num_tokens + token;
           const auto global_vid = global_token * (kDim / kVecElems) + row_vid;
@@ -588,6 +633,35 @@ struct AttnResFusedTmaKernel {
       int64_t nvb,
       double eps,
       bool write_prefix) {
+    run_impl(prefix_sum, bank, cw, ow, out, std::nullopt, std::nullopt, nvb, eps, write_prefix);
+  }
+
+  // run() plus the fused FP8 copy of `out` (see AttnResTMAParams::q_out).
+  static void run_quant(
+      const tvm::ffi::TensorView prefix_sum,
+      const tvm::ffi::TensorView bank,
+      const tvm::ffi::TensorView cw,
+      const tvm::ffi::TensorView ow,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView q_out,
+      const tvm::ffi::TensorView q_scale,
+      int64_t nvb,
+      double eps,
+      bool write_prefix) {
+    run_impl(prefix_sum, bank, cw, ow, out, q_out, q_scale, nvb, eps, write_prefix);
+  }
+
+  static void run_impl(
+      const tvm::ffi::TensorView prefix_sum,
+      const tvm::ffi::TensorView bank,
+      const tvm::ffi::TensorView cw,
+      const tvm::ffi::TensorView ow,
+      const tvm::ffi::TensorView out,
+      std::optional<tvm::ffi::TensorView> q_out,
+      std::optional<tvm::ffi::TensorView> q_scale,
+      int64_t nvb,
+      double eps,
+      bool write_prefix) {
     using namespace host;
 
     auto T_ = SymbolicSize{"num_tokens"};
@@ -620,6 +694,16 @@ struct AttnResFusedTmaKernel {
         " NB=",
         NB);
 
+    uint32_t q_scale_group_stride = 0;
+    if (q_out.has_value()) {
+      auto G_ = SymbolicSize{"num_scale_packs"};
+      TensorMatcher({T_, H_}).with_strides({-1, 1}).with_dtype<fp8_e4m3_t>().with_device(device).verify(q_out.value());
+      RuntimeCheck(q_out.value().stride(0) == kDim, "attn_res_fused_tma: q_out must be contiguous");
+      TensorMatcher({T_, G_}).with_strides({1, -1}).with_dtype<int32_t>().with_device(device).verify(q_scale.value());
+      RuntimeCheck(G_.unwrap() * 4 * 128 == kDim, "attn_res_fused_tma: q_scale must hold H / 128 / 4 packs");
+      q_scale_group_stride = static_cast<uint32_t>(q_scale.value().stride(1) * 4);
+    }
+
     if (num_tokens == 0) return;
 
     [[maybe_unused]] static const bool attrs_set = [] {
@@ -649,6 +733,9 @@ struct AttnResFusedTmaKernel {
         .stride_bm = NB * H,
         .eps = static_cast<float>(eps),
         .num_tokens = static_cast<uint32_t>(num_tokens),
+        .q_out = q_out.has_value() ? static_cast<uint8_t*>(q_out.value().data_ptr()) : nullptr,
+        .q_scale = q_scale.has_value() ? static_cast<uint8_t*>(q_scale.value().data_ptr()) : nullptr,
+        .q_scale_group_stride = q_scale_group_stride,
     };
     LaunchKernel(grid, kNumThreads, device.unwrap(), kSmemBytes).enable_pdl(true)(kTable[nvb], params);
   }
