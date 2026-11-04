@@ -1172,6 +1172,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
             )
+            # Fuse q/k RMSNorm + per-token FP8 quant only on the q_b_proj
+            # block-fp8 + DeepGEMM path (block_quant implies fp8 e4m3 weight).
+            self.use_fused_qkv_norm_quant = (
+                envs.SGLANG_OPT_USE_FUSED_QKV_NORM_QUANT.get()
+                and getattr(self.q_b_proj.quant_method, "block_quant", False)
+                and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            )
         else:
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1189,6 +1196,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 quant_config=quant_config,
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
+            self.use_fused_qkv_norm_quant = False
 
         self.skip_topk = None
         self.next_skip_topk = None
@@ -1681,6 +1689,31 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                                 res1=None,
                                 output_unquantized_inp1=False,
                             )
+
+                    elif self.use_fused_qkv_norm_quant:
+                        # Fuse q RMSNorm + per-token group FP8 quant + k_nope
+                        # RMSNorm into a single launch. q_norm (bf16) feeds the
+                        # NSA indexer via q_lora; (q_fp8, q_scale) is a drop-in
+                        # for the q_b_proj block-fp8 path (Fp8LinearMethod.apply
+                        # consumes an (input, input_scale) tuple directly).
+                        from sglang.jit_kernel.qkv_norm_quant import (
+                            fused_qkv_norm_quant,
+                        )
+
+                        q_norm, q_fp8, q_scale, k_nope = fused_qkv_norm_quant(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            k_nope,
+                            self.kv_a_layernorm.weight,
+                            self.kv_a_layernorm.variance_epsilon,
+                            group_size=128,
+                            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                            write_q_norm=self.use_nsa,
+                        )
+                        if self.use_nsa:
+                            q_lora = q_norm
+                        q = (q_fp8, q_scale)
 
                     else:
                         q = self.q_a_layernorm(q)

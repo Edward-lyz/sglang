@@ -494,6 +494,13 @@ class Envs:
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+
+    # GLM 5.2 / DeepSeek MLA fused ops
+    # Fuse q RMSNorm + per-token group FP8 quant + k_nope RMSNorm in
+    # forward_absorb_prepare into a single launch (see
+    # jit_kernel/csrc/elementwise/qkv_norm_quant.cuh). Opt-in; only takes effect
+    # on a block-fp8 + DeepGEMM q_b_proj path.
+    SGLANG_OPT_USE_FUSED_QKV_NORM_QUANT = EnvBool(False)
     # GLM 5.2 / DeepSeek NSA fused ops
     # Fuse the stable-TopK ragged index transform (topk_stable.py::
     # transform_index_ragged_stable) 3 elementwise launches into one. Opt-in;
