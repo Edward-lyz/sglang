@@ -2988,6 +2988,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             else None
         )
 
+
+
     def forward_hc_pre_from_prev(
         self,
         positions: torch.Tensor,

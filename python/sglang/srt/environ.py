@@ -1701,6 +1701,18 @@ class Envs:
     # ties. OFF by default (must pass the live decode boot gate).
     # (see record_kernel_opt/deepseekv4.1_flash_decode_kernel_candsrc_0923).
     SGLANG_FUSE_CANDIDATE_SOURCE_OPT = EnvBool(False)
+    # DeepGEMM mega mHC: one `deep_gemm.mega_mhc` launch replaces the whole
+    # attn->FFN mHC boundary of the DeepSeek-V4.1 predecessor-pre scheme
+    # (hc_post + hc_combine + the sublayer input RMSNorm + the next pre-norm
+    # GEMM / sinkhorn mix stats). SM100 + hc_mult=4 only; any other geometry
+    # falls through to the existing kernels. OFF by default (must pass the live
+    # CUDA-graph boot gate on the target build).
+    SGLANG_OPT_DEEPGEMM_MEGA_MHC = EnvBool(False)
+    # DeepGEMM mega gate: one `deep_gemm.bf16_mega_gate` launch replaces the MoE
+    # router GEMM + biased top-k (moe_fused_gate) on the MegaMoE path. Requires
+    # a bf16 router weight, ungrouped noaux_tc routing, no fused shared expert
+    # and no EPLB physical remap; otherwise falls back. OFF by default.
+    SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
