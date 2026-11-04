@@ -13,6 +13,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
+from sglang.srt.environ import envs
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -72,6 +73,8 @@ def scale_kv_cell_size_per_token_for_dflash(
         scaled version of `target_cell_size_per_token`, unless an explicit
         `draft_cell_size_per_token` is provided (in which case we sum them).
     """
+    if envs.SGLANG_K3_DSPARK_MHA_CELL_SIZE.get():
+        draft_cell_size_per_token = envs.SGLANG_K3_DSPARK_MHA_CELL_SIZE.get()
     if target_cell_size_per_token <= 0:
         raise ValueError(
             "target_cell_size_per_token must be positive, "

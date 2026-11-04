@@ -130,7 +130,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = kvc.layer_info.num_effective_layers
 
-        self._cell_size = self._compute_cell_size(kvc, num_layers)
+        # Reserved bytes for a window-bounded (SWA) draft KV pool. Defaults to 0;
+        # set by the DFLASH/DSPARK branch below only when the draft is compacted.
+        self._draft_fixed_budget_bytes = 0
+        self._draft_cell_size = 0
+
+        self._cell_size = (
+            envs.SGLANG_K3_MLA_CELL_SIZE.get()
+            if envs.SGLANG_K3_MLA_CELL_SIZE.get()
+            else self._compute_cell_size(kvc, num_layers)
+        )
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None

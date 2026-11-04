@@ -392,6 +392,35 @@ class Envs:
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
+    SGLANG_K3_MLA_CELL_SIZE = EnvInt(None)
+    SGLANG_K3_DSPARK_MHA_CELL_SIZE = EnvInt(None)
+    SGLANG_K3_ONLY_LANGUAGE = EnvBool(False)
+    SGLANG_K3_DEL_MLA_KVB_DCP = EnvBool(False)
+    # K3 decode switches cherry-picked from base (each default off).
+    # DSPARK target-verify: build the dense KDA cu_seqlens / MLA q_indptr
+    # arange once per forward and share it across layers. Same values.
+    SGLANG_K3_VERIFY_METADATA_HOIST = EnvBool(False)
+    # tokenspeed_mla DCP decode / target verify: run the KV-balanced FP8 MLA
+    # decode (vLLM PR #63638), which picks each request's KV split count from
+    # its own length. Needs nvidia-cutlass-dsl >= 4.8. Rounding order changes.
+    SGLANG_K3_KV_BALANCED_MLA_DECODE = EnvBool(False)
+    # Dense MLP: fuse the SiTU activation with the down-proj DeepGEMM block-FP8
+    # input quant (situ_and_mul_quant).
+    SGLANG_K3_MLP_SITU_QUANT = EnvBool(False)
+    # route_radix also stores the top-k ids as int64 for DeepEP dispatch,
+    # saving the int32 -> int64 cast kernel.
+    SGLANG_K3_ROUTE_RADIX_INT64_IDS = EnvBool(False)
+    # MLA output gate kernel also emits the DeepGEMM block-FP8 input quant
+    # that o_proj consumes.
+    SGLANG_K3_MLA_GATE_QUANT = EnvBool(False)
+    # KDA fused verify kernel (output norm) also emits the DeepGEMM block-FP8
+    # input quant that o_proj consumes.
+    SGLANG_K3_KDA_ONORM_QUANT = EnvBool(False)
+    # SP-MoE: fold the MoE add3 tail into the push row all-gather.
+    SGLANG_K3_SP_AG_ADD3 = EnvBool(False)
+    # Routed SiTU+quant varlen kernel: persistent grid striding over the packed
+    # (expert, token) rows instead of one CTA per padded row.
+    SGLANG_K3_SITU_QUANT_PERSISTENT_GRID = EnvBool(False)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)

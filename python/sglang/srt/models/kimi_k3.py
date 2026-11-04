@@ -3281,9 +3281,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # The dedicated K3 tower runs replicated (per-rank full weights);
         # shard work across ranks image-wise via the DP runner.
         self.use_data_parallel = True
-
-        self.vision_tower = KimiK3VisionTower(config.vision_config)
-        self.mm_projector = KimiK3MultiModalProjector(config.vision_config)
+        if not envs.SGLANG_K3_ONLY_LANGUAGE.get():
+            self.vision_tower = KimiK3VisionTower(config.vision_config)
+            self.mm_projector = KimiK3MultiModalProjector(config.vision_config)
+        else:
+            self.config.language_only = envs.SGLANG_K3_ONLY_LANGUAGE.get()
 
         self.language_model = None
         if not config.encoder_only:
