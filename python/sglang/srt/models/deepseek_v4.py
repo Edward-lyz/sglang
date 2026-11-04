@@ -1481,7 +1481,12 @@ class MQALayer(MqaAttentionBase):
         extend into the paged V4 / V4.1 fp8 SWA cache (no tail layout / request window)."""
         if not envs.SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST.get():
             return False
-        if attn_backend.forward_metadata.late_layer_tail is not None:
+        if (
+            attn_backend.forward_metadata.late_layer_tail is not None
+            and not envs.SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST_TAIL.get()
+        ):
+            # tail rows: the tail CP metadata carries a gather_index, which the
+            # scatter kernel takes as its row map (SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST_TAIL)
             return False
         pool = get_token_to_kv_pool()
         ok = (
@@ -2071,11 +2076,37 @@ class MQALayer(MqaAttentionBase):
                     torch.cuda.current_stream(),
                 )
                 tail = attn_backend.forward_metadata.late_layer_tail
-                global_positions = (
-                    tail.pos_global
-                    if tail is not None
-                    else forward_batch.positions[: kv.shape[0]]
-                )
+                if tail is not None:
+                    # Bounded-replay tail under CP: materialize the local tail
+                    # positions with the SAME transform applied to kv above so
+                    # kv / positions / swa_loc stay length-consistent. kv is the
+                    # CP-materialized tensor (global-logical order); tail.positions
+                    # is this rank's local-logical slice and tail.pos_global is the
+                    # padded cross-rank concat -- neither matches kv directly once
+                    # the gather yields logical counts under skip-all-gather (fake
+                    # DP). Gathering tail.positions the same way keeps them aligned
+                    # for both real DP (physical) and fake DP (logical).
+                    # [fusion-opt] SGLANG_FUSE_TAIL_POS_GATHER_ONCE: the gathered tail
+                    # positions are the same for every tail layer of this forward;
+                    # gather them once and reuse (an all-gather + reorder per layer).
+                    tail_meta = attn_backend.forward_metadata
+                    cached = getattr(tail_meta, "_fo_tail_global_positions", None)
+                    if (
+                        cached is not None
+                        and cached[0] is tail
+                        and envs.SGLANG_FUSE_TAIL_POS_GATHER_ONCE.get()
+                    ):
+                        global_positions = cached[1]
+                    else:
+                        global_positions = cp_materialize_global_token_order(
+                            tail.positions,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
+                        if envs.SGLANG_FUSE_TAIL_POS_GATHER_ONCE.get():
+                            tail_meta._fo_tail_global_positions = (tail, global_positions)
+                else:
+                    global_positions = forward_batch.positions[: kv.shape[0]]
                 get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
                     layer_id=self.layer_id,
                     swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),

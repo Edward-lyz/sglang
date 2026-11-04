@@ -158,6 +158,8 @@ def _cp_last_token_rows(hidden_states, forward_batch):
             return out[0]
         return out
     return pick(hidden_states)
+
+
 def _cp_embed_reduce_scatter(embed, input_ids, forward_batch):
     """[fusion-opt] SGLANG_FUSE_CP_EMBED_REDUCE_SCATTER: this rank's interleave-CP shard of
     the vocab-parallel embedding via one reduce-scatter of rank-major ids, instead of an

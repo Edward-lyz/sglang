@@ -43,6 +43,9 @@ def _silu_mul_mxfp8_kernel(
         up = tl.minimum(tl.maximum(up, -lim), lim)
     gf = gate.to(tl.float32)
     val = gf / (1.0 + tl.exp(-gf)) * up.to(tl.float32)
+    # round through bf16 like silu_and_mul_clamp's bf16 output, so the quantized
+    # values are the ones the unfused silu -> bf16 -> group-quant chain produces
+    val = val.to(tl.bfloat16).to(tl.float32)
     v3 = tl.reshape(val, (ROWS, QUADS * 4, 32))
     amax = tl.maximum(tl.max(tl.abs(v3), axis=2), 1e-10)
     bits = (amax / 448.0).to(tl.int32, bitcast=True)

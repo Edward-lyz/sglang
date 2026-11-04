@@ -1717,12 +1717,25 @@ class DeepseekV4AttnBackend(
             token_indices=token_indices,
             contiguous_start=contiguous_start,
         )
-        tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
-        cp_tail = (
-            self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
-            if is_cp_active(forward_batch)
-            else None
-        )
+        if envs.SGLANG_FUSE_TAIL_META_NO_SYNC.get():
+            # [fusion-opt] pinned non-blocking H2D: torch.tensor(list, device=cuda)
+            # stream-synchronises, which stalls the next batch's host prep until the
+            # previous forward has drained the GPU
+            tail_lens = torch.tensor(
+                tail_lens_cpu, dtype=torch.int32, pin_memory=True
+            ).to(device, non_blocking=True)
+        else:
+            tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
+        if not is_cp_active(forward_batch):
+            cp_tail = None
+        elif envs.SGLANG_FUSE_TAIL_CP_LAYOUT_CPU.get():
+            cp_tail = self._late_layer_tail_cp_layout_cpu(
+                forward_batch, extend_lens_cpu, tail_lens_cpu, device
+            )
+        else:
+            cp_tail = self._late_layer_tail_cp_layout(
+                forward_batch, token_indices, tail_lens
+            )
 
         metadata = self.init_forward_metadata_prefill(
             max_seq_len=int(seq_lens_cpu.max().item()),
@@ -1748,7 +1761,12 @@ class DeepseekV4AttnBackend(
         )
         metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         metadata.low_ratio_req_indices = torch.repeat_interleave(
-            forward_batch.req_pool_indices.to(torch.int64), tail_lens.to(torch.int64)
+            forward_batch.req_pool_indices.to(torch.int64),
+            tail_lens.to(torch.int64),
+            # host-known size: no device sync to size the output
+            output_size=(
+                sum(tail_lens_cpu) if envs.SGLANG_FUSE_TAIL_META_NO_SYNC.get() else None
+            ),
         )
         positions = _tail_rows(
             forward_batch.positions,
@@ -1782,6 +1800,84 @@ class DeepseekV4AttnBackend(
             )
         return metadata
 
+    def _late_layer_tail_cp_layout_cpu(
+        self,
+        forward_batch: ForwardBatch,
+        extend_lens_cpu,
+        tail_lens_cpu: List[int],
+        device,
+    ) -> dict:
+        """[fusion-opt] SGLANG_FUSE_TAIL_CP_LAYOUT_CPU: _late_layer_tail_cp_layout computed
+        on the host from the CPU lengths (the tail token indices are a pure function of
+        them), so the per-forward bincount/.tolist() syncs, the argsort and the index
+        arithmetic kernels go away; one H2D copy carries the index vectors. Same values."""
+        import numpy as np
+
+        cp_rank = get_parallel().attn_cp_rank
+        cp_size = get_parallel().attn_cp_size
+        bs = forward_batch.batch_size
+        ext = np.asarray(list(extend_lens_cpu), dtype=np.int64)
+        tl = np.asarray(tail_lens_cpu, dtype=np.int64)
+        req_ids = np.repeat(np.arange(bs, dtype=np.int64), tl)
+        total = int(tl.sum())
+        first = np.cumsum(tl) - tl
+        token_indices = (np.cumsum(ext) - tl)[req_ids] + (
+            np.arange(total) - first[req_ids]
+        )
+        owner = token_indices % cp_size
+        counts = np.bincount(owner, minlength=cp_size).astype(np.int64)
+        max_local = int(counts.max())
+        order = np.argsort(owner, kind="stable")
+        rank_starts = np.cumsum(counts) - counts
+        slot = np.empty(total, dtype=np.int64)
+        slot[order] = np.arange(total, dtype=np.int64) - rank_starts[owner[order]]
+        gather_index = owner * max_local + slot
+        local_tail_rows = np.nonzero(owner == cp_rank)[0].astype(np.int64)
+        pad_rows = max_local - int(counts[cp_rank])
+        pad_start = total + int(sum(max_local - int(c) for c in counts[:cp_rank]))
+        local_metadata_rows = np.concatenate(
+            [
+                local_tail_rows,
+                np.arange(pad_start, pad_start + pad_rows, dtype=np.int64),
+            ]
+        )
+        local_tok = token_indices[local_tail_rows]
+        n_g, n_m, n_t = total, local_metadata_rows.shape[0], local_tok.shape[0]
+        packed = torch.from_numpy(
+            np.concatenate([gather_index, local_metadata_rows, local_tok])
+        ).to(device, non_blocking=True)
+        gather_index_t = packed[:n_g]
+        local_metadata_rows_t = packed[n_g : n_g + n_m]
+        local_tok_t = packed[n_g + n_m : n_g + n_m + n_t]
+        local_positions = torch.cat(
+            [
+                forward_batch.positions[local_tok_t],
+                forward_batch.positions.new_zeros(pad_rows),
+            ]
+        )
+        counts_list = [int(c) for c in counts]
+        cp_metadata = InterleaveContextParallelMetadata(
+            per_rank_actual_token=[max_local] * cp_size,
+            max_rank_len=[max_local] * cp_size,
+            total_seq_lens=total,
+            bs=bs,
+            per_rank_logical_token=counts_list,
+            gather_index=gather_index_t,
+            local_index=local_metadata_rows_t,
+        )
+        log_community_opt_once(
+            "fusion-opt tail_cp_layout_cpu",
+            "late-layer tail CP layout built on the host (total=%d max_local=%d)",
+            total,
+            max_local,
+        )
+        return dict(
+            cp_metadata=cp_metadata,
+            local_token_indices=(local_tok_t - cp_rank) // cp_size,
+            local_positions=local_positions,
+            local_lens_cpu=np.bincount(req_ids[local_tail_rows], minlength=bs).tolist(),
+            pad_rows=pad_rows,
+        )
 
     def _late_layer_tail_cp_layout(
         self,
@@ -4689,14 +4785,39 @@ class DeepseekV4AttnBackend(
             return False
         mode = forward_batch.forward_mode
         return (
-            forward_batch.forward_mode.is_decode()
+            (
+                mode.is_decode()
+                or (mode.is_target_verify() and not self.is_dspark_draft)
+                or self.fused_o_tail_extend(forward_batch)
+            )
             and isinstance(
-                getattr(self.forward_metadata, "core_attn_metadata", None), DSV4AttnMetadata
+                getattr(self.forward_metadata, "core_attn_metadata", None),
+                DSV4AttnMetadata,
             )
             and not get_platform().is_sm120
             and not self.trtllm_attn
             and not getattr(pool, "uniform_fp8", False)
         )
+
+    def fused_o_tail_extend(self, forward_batch: ForwardBatch) -> bool:
+        """[fusion-opt] SGLANG_FUSE_TAIL_FUSED_O_DECODE: the late-layer tail rows of a
+        prefill already run the paged decode kernel (flash_mla_with_kvcache); route them
+        through the same fused norm+RoPE+attn+inv-RoPE+fp8-cast op decode uses, which
+        drops the q unpermute, q RoPE, o inverse RoPE, bf16 wo_a GEMM and its input
+        quant. wo_a then runs as the fp8 einsum the full rows use."""
+        ok = (
+            envs.SGLANG_FUSE_TAIL_FUSED_O_DECODE.get()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and getattr(self.forward_metadata, "late_layer_tail", None) is not None
+            and self.token_to_kv_pool.request_window is None
+            and not self.is_dspark_draft
+        )
+        if ok:
+            log_community_opt_once(
+                "fusion-opt tail_fused_o_decode",
+                "late-layer tail rows take the fused attention-o decode op",
+            )
+        return ok
 
     def forward_fused_o_decode(
         self,

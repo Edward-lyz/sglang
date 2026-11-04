@@ -295,6 +295,9 @@ class LogitsMetadata:
     top_logprobs_nums: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
+    # [fusion-opt] SGLANG_FUSE_CP_LAST_TOKEN_GATHER: the prefill-CP boundary already
+    # handed over only each request's last-token row ([bs, hidden], batch order).
+    cp_last_rows_pruned: bool = False
 
     # logits and logprobs post processing
     temperature: torch.Tensor = None
@@ -382,6 +385,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            cp_last_rows_pruned=getattr(forward_batch, "cp_last_rows_pruned", False),
         )
 
     def compute_dp_attention_metadata(self):

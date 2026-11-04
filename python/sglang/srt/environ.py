@@ -1792,6 +1792,25 @@ class Envs:
     # [fusion-opt] Prefill-CP embedding: reduce-scatter the vocab-parallel partial
     # embedding of rank-major ids instead of all-reduce of all rows + interleave shard.
     SGLANG_FUSE_CP_EMBED_REDUCE_SCATTER = EnvBool(False)
+    # [fusion-opt] Prefill-CP model boundary: CP-gather only each request's last-token
+    # hidden row (all the logits read without input logprobs / FULL capture) instead of
+    # all-gathering + reordering the whole [T, hidden].
+    SGLANG_FUSE_CP_LAST_TOKEN_GATHER = EnvBool(False)
+    # [fusion-opt] Late-layer tail under prefill CP: CP-gather the tail positions once
+    # per forward instead of once per tail layer.
+    SGLANG_FUSE_TAIL_POS_GATHER_ONCE = EnvBool(False)
+    # [fusion-opt] Build the late-layer tail CP layout on the host from CPU lengths
+    # (no bincount/.tolist() syncs, no index kernels).
+    SGLANG_FUSE_TAIL_CP_LAYOUT_CPU = EnvBool(False)
+    # [fusion-opt] Late-layer tail rows (bounded replay) through FlashMLA's fused
+    # attention-o decode op instead of the unfused decode-style chain.
+    SGLANG_FUSE_TAIL_FUSED_O_DECODE = EnvBool(False)
+    # [fusion-opt] Also use the CP KV store local-first path on the late-layer tail rows.
+    SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST_TAIL = EnvBool(False)
+    # [fusion-opt] Late-layer tail metadata without host<->device syncs (pinned
+    # non-blocking H2D, host-sized repeat_interleave) so the next batch's host prep
+    # overlaps the previous forward instead of waiting for it to drain.
+    SGLANG_FUSE_TAIL_META_NO_SYNC = EnvBool(False)
     # DeepGEMM mega mHC: one `deep_gemm.mega_mhc` launch replaces the whole
     # attn->FFN mHC boundary of the DeepSeek-V4.1 predecessor-pre scheme
     # (hc_post + hc_combine + the sublayer input RMSNorm + the next pre-norm
