@@ -292,6 +292,7 @@ def test_preprocessed_token_count_corrects_the_fetch_budget():
 
 def test_stage_costs_are_recorded_and_popped_once():
     enc = types.SimpleNamespace(rank=0, encode_workflow=object(), task_time_costs={})
+    MMEncoder._record_workflow_task_timings(enc, [{"task_id": "t"}], 0.12345, 0.5)
     pop = MMEncoder.pop_task_time_costs.__get__(enc)
     assert pop("t") == {"process_time_cost": 0.1235, "embed_time_cost": 0.5}
     assert pop("t") == {}

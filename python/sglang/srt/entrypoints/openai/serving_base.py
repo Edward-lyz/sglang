@@ -20,6 +20,7 @@ from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingR
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
+from sglang.srt.observability.request_trace import trace, traced_rid
 from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
 
@@ -97,6 +98,8 @@ class OpenAIServingBase(ABC):
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
+        if rid := traced_rid(getattr(request, "rid", None)):
+            trace(logger, "api server received request %s", rid)
 
         try:
             # Validate request

@@ -48,6 +48,7 @@ class _PageWriteTask:
     release_after_write: Callable[[], None] = _noop_release
     release: Callable[[], None] = _noop_release
     owner: Optional[AttentionStoreWriteOwner] = None
+    trace_recorder: Any = None
 
     @property
     def requested_blocks(self) -> int:
@@ -144,6 +145,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
         block_size = cache.attention_store_block_size
         local_hit_len = len(local_result.device_indices) // block_size * block_size
         start_block = local_hit_len // block_size
+        recorder = cache.get_as_trace_recorder(req)
         # Router hints describe one namespace/host. Multi-node PP requests use
         # an Agent-coordinated quote before this coordinator is entered.
         remote_addrs = req.as_max_hit_host_ip if cache.pp_size <= 1 else []
@@ -154,6 +156,15 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
                 (remote_len[0] - local_hit_len) // block_size
             ) * block_size
             if as_hit_tokens <= 0:
+                if recorder is not None:
+                    recorder.record(
+                        "AS_MATCH",
+                        raw_match_blocks=0,
+                        final_match_blocks=0,
+                        start_block=start_block,
+                        hash_ids=[],
+                        status="miss",
+                    )
                 return None
         else:
             requested_hashes = req.as_block_hashs.hash_ids[start_block:]
@@ -192,6 +203,15 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
                     started=started,
                 )
             if match_count == 0:
+                if recorder is not None:
+                    recorder.record(
+                        "AS_MATCH",
+                        raw_match_blocks=0,
+                        final_match_blocks=0,
+                        start_block=start_block,
+                        hash_ids=recorder.hash_ids(requested_hashes),
+                        status="miss",
+                    )
                 return None
             as_hit_tokens = match_count * block_size
 
@@ -201,8 +221,29 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             * block_size
         )
         if max_as_tokens <= 0:
+            if recorder is not None:
+                recorder.record(
+                    "AS_MATCH",
+                    raw_match_blocks=as_hit_tokens // block_size,
+                    final_match_blocks=0,
+                    start_block=start_block,
+                    hash_ids=[],
+                    status="miss",
+                )
             return None
         as_hit_tokens = min(as_hit_tokens, max_as_tokens)
+        if recorder is not None:
+            hashes = req.as_block_hashs.hash_ids[
+                start_block : start_block + as_hit_tokens // block_size
+            ]
+            recorder.record(
+                "AS_MATCH",
+                raw_match_blocks=as_hit_tokens // block_size,
+                final_match_blocks=as_hit_tokens // block_size,
+                start_block=start_block,
+                hash_ids=recorder.hash_ids(hashes),
+                status="hit",
+            )
 
         anchor = local_result.last_device_node
         req._as_load_info = {
@@ -212,6 +253,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             "as_block_hashs": req.as_block_hashs,
             "remote_addrs": remote_addrs,
             "remote_len": remote_len,
+            "trace_recorder": recorder,
         }
         return MatchResult(
             device_indices=local_result.device_indices,
@@ -289,6 +331,8 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
         requested = len(block_hash_ids)
         remote_addrs = load_info.get("remote_addrs", [])
         remote_addr = remote_addrs[0] if remote_addrs else ""
+        recorder = load_info.get("trace_recorder")
+        digest_capture = recorder.new_digest_capture() if recorder is not None else None
         read_error = None
         try:
             read_count = cache.ascli.read(
@@ -297,6 +341,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
                 timeout=5.0,
                 remote_addrs=(remote_addr,) if remote_addr else (),
                 logical_start=start_block,
+                on_digest_snapshot=digest_capture,
             )
         except Exception as exc:
             read_error = exc
@@ -322,6 +367,18 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             cache.token_to_kv_pool_allocator.free(alloc_indices)
             return None
 
+        if recorder is not None:
+            recorder.record(
+                "AS_READ",
+                phase="complete",
+                hash_ids=recorder.hash_ids(block_hash_ids[:read_count]),
+                data_id_list=data_ids[:read_count],
+                swa_id_list=[],
+                actual_blocks=read_count,
+                start_transfer_block_index=start_block,
+                md5_after_read=digest_capture.value(),
+                status="ok",
+            )
 
         loaded_tokens = read_count * block_size
         loaded_indices = alloc_indices[:loaded_tokens]
@@ -427,13 +484,31 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             producer_ready = self.record_device_event(
                 cache.device, self._producer_stream(cache)
             )
+            digest_capture = (
+                task.trace_recorder.new_digest_capture()
+                if task.trace_recorder is not None
+                else None
+            )
             written = endpoint.store.write(
                 task.block_hash_ids,
                 data_ids,
                 timeout=1.0,
                 params=task.write_params,
                 producer_ready=producer_ready,
+                on_digest_snapshot=digest_capture,
             )
+            if task.trace_recorder is not None:
+                task.trace_recorder.record(
+                    "AS_WRITE",
+                    phase="complete",
+                    task_id=id(task),
+                    hash_ids=task.trace_recorder.hash_ids(task.block_hash_ids),
+                    data_id_list=data_ids,
+                    swa_id_list=[],
+                    start_transfer_block_index=0,
+                    md5_before_write=digest_capture.value(),
+                    status="ok",
+                )
             cache._log_as_result(
                 "write",
                 rid=task.rid,
@@ -443,6 +518,18 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             )
             return written
         except Exception as exc:
+            if task.trace_recorder is not None:
+                task.trace_recorder.record(
+                    "AS_WRITE",
+                    phase="complete",
+                    task_id=id(task),
+                    hash_ids=task.trace_recorder.hash_ids(task.block_hash_ids),
+                    data_id_list=[],
+                    swa_id_list=[],
+                    start_transfer_block_index=0,
+                    status="error",
+                    error=str(exc),
+                )
             cache._log_as_failure(
                 "write",
                 rid=task.rid,
@@ -511,6 +598,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
                 # writes that are still draining, so recording here is too early.
                 producer_ready=None,
                 release_after_write=data_ids.release,
+                trace_recorder=cache.get_as_trace_recorder(req),
             )
             task.release = _acquire_node_release(cache, node)
             self.submit_write(cache, task)

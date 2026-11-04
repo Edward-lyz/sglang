@@ -89,6 +89,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.observability.mm_cache_trace import maybe_log_mm_cache_trace
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -113,6 +114,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
 class _DeferredChunkFinalize(msgspec.Struct, frozen=True):
     """A chunked req's chunk whose finalize the threaded AHEAD loop deferred
     (see SchedulerDisaggregationPrefillMixin.process_prefill_chunk)."""
@@ -162,6 +165,8 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+
+
 @contextmanager
 def _batched_kv_release(allocator):
     """Defer the KV frees of one inflight-queue pass into a single free group (and one
@@ -831,6 +836,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+
     def _ensure_prefill_fwd_thread(self: Scheduler) -> None:
         """Lazily start the forward worker thread (never created when the
         SGLANG_ENABLE_PREFILL_FWD_THREAD gate is off, so the base loop is
@@ -1377,7 +1383,8 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         if copy_done is not None:
-            copy_done.synchronize()
+            with operations_nvtx_range("sched.pr.copy_sync"):
+                copy_done.synchronize()
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
@@ -1435,6 +1442,8 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+                if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                    maybe_log_mm_cache_trace(logger, req)
 
                 if is_aborted(req):
                     if self._retire_aborted_prefill_result(req):
@@ -1524,8 +1533,17 @@ class SchedulerDisaggregationPrefillMixin:
                         i, req, logits_output
                     )
                 if not req.pending_bootstrap and not self._prefill_fake_free_kv(req):
-                    self.send_kv_chunk(req, last_chunk=True)
+                    with operations_nvtx_range("sched.pr.send_kv"):
+                        self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
+                if self.metrics_reporter.enable_metrics:
+                    self.metrics_collector.observe_prompt_calculation_time(
+                        max(
+                            0.0,
+                            req.time_stats.prefill_transfer_queue_entry_time
+                            - req.time_stats.forward_entry_time,
+                        )
+                    )
 
             else:
                 # being chunked reqs' prefill is not finished
@@ -1576,7 +1594,8 @@ class SchedulerDisaggregationPrefillMixin:
                     assert req.metadata_buffer_index >= 0, (
                         f"Req {req.rid} does not have metadata buffer allocated"
                     )
-                    self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                    with operations_nvtx_range("sched.pr.send_kv"):
+                        self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
         if auxiliary_output is not None:
@@ -1692,11 +1711,25 @@ class SchedulerDisaggregationPrefillMixin:
                 elif poll == KVPoll.Success:  # transfer done
                     if not isinstance(req.finished_reason, FINISH_ABORT):
                         req.finished_reason = FINISH_LENGTH(length=0)
+                    self._fire_pending_trace(req)
                     release_kv_cache(req, self.tree_cache)  # unlock the tree
                     # FIXME: clean up req's data in transfer engine
                     req.disagg_kv_sender.clear()
                     done_reqs.append(req)
                     req.time_stats.set_prefill_kv_transfer_finish_time()
+                    if self.metrics_reporter.enable_metrics:
+                        self.metrics_collector.observe_kvcache_transfer_time(
+                            max(
+                                0.0,
+                                req.time_stats.prefill_kv_transfer_finish_time
+                                - req.time_stats.prefill_transfer_queue_entry_time,
+                            )
+                        )
+                    if self.metrics_reporter.enable_metrics:
+                        self.metrics_collector.observe_time_to_first_token(
+                            req.time_stats.prefill_kv_transfer_finish_time
+                            - req.time_stats.prefill_bootstrap_queue_entry_time
+                        )
                 elif poll == KVPoll.Failed:
                     self.handle_inflight_transfer_failure(req)
                     done_reqs.append(req)
@@ -1707,6 +1740,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
+            if self.metrics_reporter.enable_metrics and not isinstance(
+                req.finished_reason, FINISH_ABORT
+            ):
+                self.metrics_collector.observe_request_first_token_forward_time(
+                    req.time_stats.get_request_first_token_forward_time()
+                )
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -1932,6 +1971,7 @@ class SchedulerDisaggregationPrefillMixin:
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
+
     def _run_serial_deferred_finalize(
         self: Scheduler, deferred_finalize: DeferredFinalize
     ) -> List[_DeferredChunkFinalize]:

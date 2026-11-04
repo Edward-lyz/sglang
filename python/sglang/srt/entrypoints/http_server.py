@@ -159,7 +159,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
-from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.observability.func_timer import enable_func_timer, time_func_latency
 from sglang.srt.observability.trace import (
     process_tracing_init,
     set_global_trace_level,
@@ -171,6 +171,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
+    configure_logger,
     delete_directory,
     get_bool_env_var,
     is_mps,
@@ -241,6 +242,13 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
+
+    # Align this worker's log schema with the other subprocess entry points.
+    # uvicorn spawns it through multiprocessing.get_context("spawn"), so
+    # without this call it keeps whatever the parent left on the root logger
+    # after re-import.
+    configure_logger(server_args, f" Tokenizer {os.getpid()}")
+
     logger.info(
         f"Start multi-tokenizer worker process {os.getpid()}, "
         f"ipc_name={port_args.tokenizer_ipc_name}"
@@ -974,6 +982,7 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
     methods=["POST", "PUT"],
     response_class=SGLangORJSONResponse,
 )
+@time_func_latency
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
@@ -2001,6 +2010,7 @@ async def continue_generation(
 
 
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
+@time_func_latency
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
     return await raw_request.app.state.openai_serving_completion.handle_request(
@@ -2009,6 +2019,7 @@ async def openai_v1_completions(request: CompletionRequest, raw_request: Request
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
+@time_func_latency
 async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):

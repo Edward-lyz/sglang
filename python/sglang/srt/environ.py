@@ -378,8 +378,10 @@ class Envs:
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
+    SGLANG_LOG_REQUEST_TRACE = EnvBool(False)
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    SGLANG_LOG_TOKEN_IDS = EnvBool(False)
     # Budget (MB of int64 ids) of the per-tokenizer-worker segment tokenize cache;
     # 0 disables it. Reuses the ids of a multi-turn prompt's unchanged history.
     SGLANG_OPT_TOKENIZE_SEGMENT_CACHE_MB = EnvInt(0)

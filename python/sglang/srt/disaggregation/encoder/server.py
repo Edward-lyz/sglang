@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import pickle
+import threading
 import time
 import traceback
 from abc import ABC, abstractmethod
@@ -23,11 +24,17 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.encode_collector import (
+    EncoderMetricsCollector as FactoryEncoderMetricsCollector,
+    StageReadyMark,
+)
 from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
     _convert,
     _mm_grid_attrs,
+    embed_ready,
+    media_load_seconds,
 )
 from sglang.srt.disaggregation.encoder.receiver import (
     EmbeddingData,
@@ -801,6 +808,7 @@ class FactoryEncodeBatcher:
 
 class MMEncoder:
     # Class default so instances built without __init__ (tests) read None.
+    metrics_collector: Optional[FactoryEncoderMetricsCollector] = None
 
     def __init__(
         self,
@@ -827,6 +835,9 @@ class MMEncoder:
         # DP rank for metric labels; overridden by runtime.run_dp_worker.
         # 0 in the single-instance (non-DP) path.
         self.dp_rank = 0
+        # 厂内 dashboard metrics (encode_collector); set by attach_metrics when
+        # --enable-metrics is on. EncodeWorkflow reads it for request counters.
+        self.metrics_collector: Optional[FactoryEncoderMetricsCollector] = None
         self.profiler = EncoderProfiler(rank)
 
         self.model_config = ModelConfig.from_server_args(
@@ -1503,6 +1514,12 @@ class MMEncoder:
             logger.warning("Evicting un-pulled factory embedding task_id=%s", tid)
             self._drop_task_embedding_locked(tid, self.task_embeddings[tid])
 
+    def attach_metrics(self, collector: FactoryEncoderMetricsCollector) -> None:
+        """Enable 厂内 dashboard metrics, incl. the loader / process queues."""
+        self.metrics_collector = collector
+        self.preprocessor.io_executor.stage = collector.loader_stage
+        self.preprocessor.preproc_executor.stage = collector.process_stage
+
     async def acquire_task_embedding(
         self, task_id: str
     ) -> Optional[WorkflowTaskEmbedding]:
@@ -1646,7 +1663,10 @@ class MMEncoder:
         registered at ``store_task_embedding`` time.
         """
         entry = await self.acquire_task_embedding(task_id)
+        metrics = self.metrics_collector
         if entry is None:
+            if metrics is not None:
+                metrics.record_cache_miss(int(byte_size), source="transfer")
             raise MMError(
                 f"embedding not held for task_id={task_id}",
                 code=HTTPStatus.NOT_FOUND,
@@ -1661,11 +1681,19 @@ class MMEncoder:
                     f"byte_size {size} != held embedding {embedding.nbytes} bytes "
                     f"for task_id={task_id}"
                 )
+            if metrics is not None:
+                metrics.record_cache_hit(size, source="transfer")
             transfer_start = time.perf_counter()
             await self._run_mooncake_transfer(
                 session_id, embedding.data_ptr(), int(buffer_address), size
             )
             transfer_s = time.perf_counter() - transfer_start
+            if metrics is not None:
+                metrics.transfer_stage.observe_batch(transfer_s, 1, size)
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.observe_transfer(
+                    transfer_s, backend="mooncake"
+                )
             digest = (
                 compute_embed_digest(embedding)
                 if envs.SGLANG_EMBED_DIGEST.get()
@@ -1675,6 +1703,38 @@ class MMEncoder:
         finally:
             await self.release_task_embedding(task_id)
 
+    def _record_workflow_cache(
+        self, hit: bool, nbytes: int, entry: Optional[WorkflowTaskEmbedding] = None
+    ) -> None:
+        """Count a task served from its hold as a workflow cache hit.
+
+        Only hits: a miss falls through to ``encode``, whose prefix mm_cache
+        lookup already records the hit/miss for that request.
+        """
+        collector = getattr(self, "metrics_collector", None)
+        if collector is None:
+            return
+        if hit:
+            collector.record_cache_hit(nbytes, source="workflow")
+        else:
+            collector.record_cache_miss(nbytes, source="workflow")
+        if encoder_metrics_collector is not None:
+            # Same hit/miss on the New EPD series (encoder_cache_hit_tokens/
+            # files_total), counted in rows and in images.
+            rows = nbytes // max(1, self._task_row_bytes())
+            # Same labels as the prefix path, where video frames are images;
+            # a held video counts one file per frame (one grid row each).
+            grids = entry.image_grid_thw if entry is not None else None
+            files = len(grids) if isinstance(grids, (list, tuple)) and grids else 1
+            encoder_metrics_collector.record_cache_tokens(
+                rows if hit else 0, rows, modality="image"
+            )
+            encoder_metrics_collector.record_cache_files(
+                files if hit else 0, files, modality="image"
+            )
+            encoder_metrics_collector.set_cache_state(
+                self.task_embeddings_bytes, len(self.task_embeddings)
+            )
 
     def _task_row_bytes(self) -> int:
         """Bytes of one embedding row, from any held entry (0 if none)."""
@@ -2223,6 +2283,7 @@ class MMEncoder:
         """Flatten a batch of requests into one EncodeContext (single = N of 1)."""
         modality_str = modality.name.lower()
         preprocess_start = time.perf_counter()
+        media_load_seconds.set(0.0)
         try:
             (
                 preprocess_result,
@@ -2253,6 +2314,17 @@ class MMEncoder:
                 )
             encoder_metrics_collector.observe_mm_items_per_batch(
                 sum(items_per_req), modality=modality_str
+            )
+        if self.metrics_collector is not None and not is_health_check:
+            load_seconds = media_load_seconds.get()
+            num_tokens = sum(preprocess_result.token_counts)
+            self.metrics_collector.loader_stage.observe_batch(
+                load_seconds, len(requests), num_tokens
+            )
+            self.metrics_collector.process_stage.observe_batch(
+                time.perf_counter() - preprocess_start - load_seconds,
+                len(requests),
+                num_tokens,
             )
         target = self.model.thinker if hasattr(self.model, "thinker") else self.model
         get_feature_fn = getattr(target, f"get_{modality_str}_feature")
@@ -2899,7 +2971,6 @@ class MMEncoder:
         modality = ctx.modality
         modality_str = modality.name.lower()
         try:
-            cache_hit = False
             mm_items = self._build_model_mm_items(
                 ctx.mm_feature,
                 ctx.preprocess_result,
@@ -2967,18 +3038,29 @@ class MMEncoder:
                             self.mm_cache.free(mm_hash, None)
                 raise
 
-            # Per-request cache hit metrics: tokens = embedding rows.
-            if use_mm_cache and encoder_metrics_collector is not None:
-                total_tokens = int(mm_embedding.shape[0])
-                hit_tokens = total_tokens if cache_hit else 0
-                encoder_metrics_collector.record_cache_tokens(
-                    hit_tokens, total_tokens, modality=modality_str
-                )
-                encoder_metrics_collector.record_cache_files(
-                    len(mm_items) if cache_hit else 0,
-                    len(mm_items),
-                    modality=modality_str,
-                )
+            if use_mm_cache:
+                for (item_start, item_end, _), part, hit in zip(
+                    segments, parts, cached
+                ):
+                    # Per-request cache hit metrics: tokens = embedding rows.
+                    num_files = item_end - item_start
+                    if encoder_metrics_collector is not None:
+                        total_tokens = int(part.shape[0])
+                        encoder_metrics_collector.record_cache_tokens(
+                            total_tokens if hit is not None else 0,
+                            total_tokens,
+                            modality=modality_str,
+                        )
+                        encoder_metrics_collector.record_cache_files(
+                            num_files if hit is not None else 0,
+                            num_files,
+                            modality=modality_str,
+                        )
+                    if self.metrics_collector is not None:
+                        if hit is not None:
+                            self.metrics_collector.record_cache_hit(part.nbytes)
+                        else:
+                            self.metrics_collector.record_cache_miss(part.nbytes)
 
             if use_mm_cache and missing:
                 # Host copies of the fresh parts only (one copy when the whole
@@ -3002,7 +3084,6 @@ class MMEncoder:
                         added += 0 if already_present else (1 if inserted else 0)
                     entries_after = len(self.mm_cache)
                     if encoder_metrics_collector is not None:
-                        added = 0 if already_present else (1 if inserted else 0)
                         evictions = max(0, added - (entries_after - entries_before))
                         if evictions > 0:
                             encoder_metrics_collector.inc_cache_evictions(
@@ -3162,6 +3243,10 @@ class MMEncoder:
                 encoder_metrics_collector.observe_transfer(
                     xfer_ms / 1000.0, backend="mooncake"
                 )
+            if self.metrics_collector is not None:
+                self.metrics_collector.transfer_stage.observe_batch(
+                    xfer_ms / 1000.0, 1, embedding.nbytes
+                )
             if xfer_ret < 0:
                 raise InternalError(
                     f"Mooncake transfer_sync failed for {req_id} "
@@ -3294,16 +3379,33 @@ class MMEncoder:
         size: int,
     ) -> int:
         """Keep the send active until its blocking transfer stops using the MR."""
-        return await _await_transfer_completion(
-            asyncio.to_thread(
-                self.engine.transfer_sync,
-                session_id,
-                source_address,
-                destination_address,
-                size,
-            ),
-            f"Mooncake transfer to session={session_id}",
+        stage = (
+            self.metrics_collector.transfer_stage
+            if self.metrics_collector is not None
+            else None
         )
+        enqueued = time.perf_counter()
+        # Whoever takes this first (worker start or cancel) leaves the queue.
+        queue_claim = threading.Lock()
+        if stage is not None:
+            stage.queue_enter()
+
+        def transfer() -> int:
+            if stage is not None and queue_claim.acquire(blocking=False):
+                stage.queue_leave(wait_seconds=time.perf_counter() - enqueued)
+            return self.engine.transfer_sync(
+                session_id, source_address, destination_address, size
+            )
+
+        try:
+            return await _await_transfer_completion(
+                asyncio.to_thread(transfer),
+                f"Mooncake transfer to session={session_id}",
+            )
+        finally:
+            # Cancelled before a worker thread picked it up.
+            if stage is not None and queue_claim.acquire(blocking=False):
+                stage.queue_leave()
 
     def _register_shared_mr(self, mm_data: EmbeddingData, embedding: torch.Tensor):
         """Register one MR shared by every rank's /send; _send re-registers on failure."""
@@ -3465,18 +3567,45 @@ class MMEncoder:
             and not self._embeddings_go_to_host(requests)
         )
         use_global_cache = self.mm_global_cache is not None and not is_health_check
+        ready_mark = None
+        if self.metrics_collector is not None and not is_health_check:
+            ready_mark = StageReadyMark(
+                self.metrics_collector.embed_stage, len(requests)
+            )
+        ready_token = embed_ready.set(ready_mark)
         started_at = time.perf_counter()
         try:
             if self.rank == 0:
                 async with encode_state_condition:
                     encode_state_condition.notify_all()
-            ctx = await self._prepare_encode_context_on_all_ranks(
-                requests,
-                modality,
-                use_global_cache=use_global_cache,
-                is_health_check=is_health_check,
-            )
+            try:
+                ctx = await self._prepare_encode_context_on_all_ranks(
+                    requests,
+                    modality,
+                    use_global_cache=use_global_cache,
+                    is_health_check=is_health_check,
+                )
+            finally:
+                embed_ready.reset(ready_token)
+            prepared_at = time.perf_counter()
+            self._correct_workflow_task_tokens(ctx, requests)
+            if ready_mark is not None:
+                ready_mark.start()
+            embed_start = time.perf_counter()
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
+            self._record_workflow_task_timings(
+                requests, prepared_at - started_at, time.perf_counter() - prepared_at
+            )
+            if (
+                self.metrics_collector is not None
+                and not is_health_check
+                and mm_embedding is not None
+            ):
+                self.metrics_collector.embed_stage.observe_batch(
+                    time.perf_counter() - embed_start,
+                    len(requests),
+                    int(mm_embedding.shape[0]),
+                )
 
             if self.profiler is not None:
                 for _ in requests:
@@ -3488,6 +3617,8 @@ class MMEncoder:
         except Exception as e:
             return self._stage_errors(requests, modality, e)
         finally:
+            if ready_mark is not None:
+                ready_mark.discard()
             for state in states:
                 await self._release_encode_ref(state)
 

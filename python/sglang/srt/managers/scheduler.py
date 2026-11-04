@@ -185,6 +185,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TraceReq,
+    TraceTrigger,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -212,6 +214,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.trace_manager import TraceManager
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -314,11 +317,22 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.observability.admission_diag import (
+    ADMISSION_DIAG,
+    admission_stage,
+    trace_admission,
+)
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
     set_schedule_time_batch,
     set_time_batch,
+)
+from sglang.srt.observability.request_trace import (
+    log_input_ids,
+    trace,
+    traced_rid,
+    traced_sampling_params,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -755,6 +769,22 @@ class Scheduler(
         # Init LoRA overlap loader
         self.init_lora_overlap_loader()
 
+        # Init trace manager
+        self.trace_manager = TraceManager(
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
+            num_hidden_layers=self.model_config.num_hidden_layers,
+            dp_rank=0 if self.ps.dp_rank is None else self.ps.dp_rank,
+            dp_size=self.ps.dp_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tokenizer=self.tokenizer,
+            disaggregation_mode=get_disagg().disaggregation_mode,
+        )
+        self.trace_manager.on_online_trace_ready = self._stream_deferred_trace_output
+
         # Init the grammar backend for constrained generation
         self.init_grammar_manager()
 
@@ -801,6 +831,11 @@ class Scheduler(
                 else self.draft_worker.graph_time_usage
             ),
         )
+        if get_observability().enable_metrics:
+            self.metrics_collector.emit_startup_durations(
+                engine_startup_time=self.startup_time["scheduler_e2e"],
+                engine_load_weights_time=self.startup_time["load_weight"],
+            )
 
     def maybe_init_hccl_dp_prewarm(self) -> None:
         if not (
@@ -1650,6 +1685,7 @@ class Scheduler(
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
             # Benchmark-only fake-transfer shortcut (see
             # disaggregation/prefill.py: _sendkv_fake_transfer). Never on for
             # real PD: requires the env gate AND fake bootstrap hosts.
@@ -1808,6 +1844,7 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (TraceReq, self.trace_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (
@@ -2340,6 +2377,7 @@ class Scheduler(
                 slot_ids, swa_page_idxs, draft_pool.swa_kv_pool, half=1
             )
 
+    @admission_stage("retire")
     def retire_ascache_writes(self) -> None:
         """Retire completed AttentionStore async writes in submission order.
 
@@ -2361,6 +2399,7 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            self.metrics_reporter.iter_start_time = time.perf_counter()
             self.retire_ascache_writes()
             # Receive requests
             self.ingest_requests()
@@ -2406,6 +2445,7 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            self.metrics_reporter.iter_start_time = time.perf_counter()
             self.retire_ascache_writes()
             # Receive requests
             self.ingest_requests()
@@ -2514,6 +2554,7 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
+    @admission_stage("ingest")
     def ingest_requests(self) -> List:
         """Receive, broadcast and dispatch this iteration's external input.
 
@@ -2521,17 +2562,18 @@ class Scheduler(
         value exists for the pipeline stages that relay requests onward.
         """
         local_reqs = []
-        if (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
-        ):
-            local_reqs = self._poll_timeout_aborts()
-        recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
-        if recv_reqs:
-            self.metrics_reporter.record_scheduler_active()
-        self.process_input_requests(recv_reqs)
-        return recv_reqs
+        with operations_nvtx_range("sched.recv_req"):
+            if (
+                self.ps.pp_rank == 0
+                and self.ps.attn_tp_rank == 0
+                and self.ps.attn_cp_rank == 0
+            ):
+                local_reqs = self._poll_timeout_aborts()
+            recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+            if recv_reqs:
+                self.metrics_reporter.record_scheduler_active()
+            self.process_input_requests(recv_reqs)
+            return recv_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
@@ -2965,6 +3007,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
+            fire_pending_trace=self._fire_pending_trace,
             abort_request=self.abort_request,
         )
 
@@ -3321,9 +3364,24 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
+                dispatch_to_scheduler_time=recv_req.dispatch_to_scheduler_time,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                trace_config=recv_req.trace_config
             )
+            self.trace_manager.log_trace_request(req)
             req.tokenizer = self.tokenizer
+            if recv_req.dispatch_to_scheduler_time is not None:
+                req.time_stats.dispatch_to_scheduler_time = max(
+                    0.0, recv_req.dispatch_to_scheduler_time
+                )
+            # Wall clock, to stay comparable with the dispatch timestamp the
+            # tokenizer took: the two can sit on different hosts.
+            req.time_stats.arrive_scheduler_time = time.time()
+            if self.metrics_reporter.enable_metrics:
+                zmq_time = req.time_stats.get_request_zmq_time()
+                if zmq_time > 0:
+                    self.metrics_collector.observe_request_zmq_time(zmq_time)
+
             # AttentionStore: carry the tokenizer-computed block hashes / cache
             # params / prior-hit hints onto the request for AS match & write.
             if self.enable_asradix_cache:
@@ -3515,6 +3573,7 @@ class Scheduler(
                 )
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
+            log_input_ids(logger, req.rid, "padded", req.origin_input_ids)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -3611,6 +3670,14 @@ class Scheduler(
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
+            if rid := traced_rid(req.rid):
+                trace(
+                    logger,
+                    "scheduler queued request %s: prompt_len=%d sampling=%s",
+                    rid,
+                    len(req.origin_input_ids),
+                    traced_sampling_params(req.sampling_params),
+                )
 
     def handle_batch_generate_request(
         self,
@@ -3719,6 +3786,13 @@ class Scheduler(
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
+            if rid := traced_rid(req.rid):
+                trace(
+                    logger,
+                    "%s request %s entered the decode prealloc queue",
+                    "retracted" if is_retracted else "new",
+                    rid,
+                )
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
             else:
@@ -3927,6 +4001,7 @@ class Scheduler(
 
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
+            log_input_ids(logger, req.rid, "padded", req.origin_input_ids)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -4299,6 +4374,8 @@ class Scheduler(
         if not pending:
             return ()
         wanted = set(pending) - set(adder.can_run_list)
+        if ADMISSION_DIAG is not None:
+            ADMISSION_DIAG.phase(self, "refill_commit_before")
         self.tree_cache.commit_ascache_load_backs()
         wait_us = max(0, min(5000, envs.SGLANG_AS_LOAD_BACK_COALESCE_WAIT_US.get()))
         if wait_us and self.tree_cache.pending_ascache_load_back_requests():
@@ -4309,6 +4386,8 @@ class Scheduler(
             # admission loop before launching a small forward.
             time.sleep(wait_us / 1_000_000)
             self.tree_cache.commit_ascache_load_backs()
+        if ADMISSION_DIAG is not None:
+            ADMISSION_DIAG.phase(self, "refill_commit_after")
         if rescan:
             admitted = set(adder.can_run_list)
             return [
@@ -4323,6 +4402,7 @@ class Scheduler(
             and req.as_read_pending_lock
         ]
 
+    @trace_admission
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4407,6 +4487,11 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        # Retired AS writes may have released held-back online traces; this
+        # bounds the wait for writes that never retire. Every event loop,
+        # including the PP ones that skip retire_ascache_writes, reaches here.
+        self.trace_manager.check_deferred_online_traces()
+
         if (
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
@@ -4423,6 +4508,8 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if ADMISSION_DIAG is not None:
+                ADMISSION_DIAG.reason("no_queue_or_batch_full")
             return PrefillAdmission(
                 running_batch=running_batch,
                 prefill_delayer_single_pass=prefill_delayer_single_pass,
@@ -4440,6 +4527,8 @@ class Scheduler(
                 ),
             )
         ):
+            if ADMISSION_DIAG is not None:
+                ADMISSION_DIAG.reason("min_free_slots_delay")
             return PrefillAdmission(
                 running_batch=running_batch,
                 prefill_delayer_single_pass=prefill_delayer_single_pass,
@@ -4456,6 +4545,8 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            if ADMISSION_DIAG is not None:
+                ADMISSION_DIAG.reason("no_allocatable_req_slots")
             return PrefillAdmission(
                 running_batch=running_batch,
                 prefill_delayer_single_pass=prefill_delayer_single_pass,
@@ -4513,6 +4604,8 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
         )
+        if ADMISSION_DIAG is not None:
+            ADMISSION_DIAG.attach(adder)
 
         skip_waiting_admission = False
         if self.chunked_req is not None:
@@ -4541,6 +4634,11 @@ class Scheduler(
             skip_waiting_admission = (
                 post_chunk_budget_state == AddReqResult.OTHER or chunk_budget_exhausted
             )
+            if ADMISSION_DIAG is not None and ADMISSION_DIAG.active:
+                ADMISSION_DIAG.emit(
+                    "continuation", budget=ADMISSION_DIAG.budget(adder),
+                    skip_waiting=skip_waiting_admission,
+                )
             if (
                 skip_waiting_admission
                 and post_chunk_budget_state == AddReqResult.NO_TOKEN
@@ -4635,11 +4733,15 @@ class Scheduler(
             for req in candidate_reqs:
                 admission.offered.add(req.rid)
                 if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                    if ADMISSION_DIAG is not None:
+                        ADMISSION_DIAG.skip("lora")
                     continue
                 # Deferred AS load-back in flight: commit_load_backs publishes the
                 # prefix at a loop top; until then this request must neither
                 # re-prefill nor block admission of the requests behind it.
                 if req._as_pending_load_back is not None:
+                    if ADMISSION_DIAG is not None:
+                        ADMISSION_DIAG.skip("pending_load_back")
                     continue
 
                 running_bs = len(running_batch.reqs)
@@ -4662,6 +4764,8 @@ class Scheduler(
                     if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                         req
                     ):
+                        if ADMISSION_DIAG is not None:
+                            ADMISSION_DIAG.reason("req_slots_limit", adder, req)
                         stopped = True
                         break
 
@@ -4669,6 +4773,8 @@ class Scheduler(
                     prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                     if not prefetch_done:
                         # skip staging requests that are ongoing prefetch
+                        if ADMISSION_DIAG is not None:
+                            ADMISSION_DIAG.skip("storage_prefetch")
                         continue
                     # Pop the L3-loaded span. Unified cache exposes its absolute
                     # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -4721,6 +4827,8 @@ class Scheduler(
                     # chunk leaves budget behind): only requests that finish fit.
                     continue
                 previous_count = len(adder.can_run_list)
+                if ADMISSION_DIAG is not None:
+                    ADMISSION_DIAG.candidate(req, adder)
                 with clamped_chunk_budget(
                     adder,
                     self._cost_chunk_cap(
@@ -4741,6 +4849,8 @@ class Scheduler(
                     req is adder.can_run_list[-1]
                 ):
                     res = adder.budget_state()
+                if ADMISSION_DIAG is not None:
+                    ADMISSION_DIAG.candidate(req, adder, res, previous_count)
 
                 if self.enable_lora:
                     running_loras.add(req.lora_id)
@@ -4819,6 +4929,11 @@ class Scheduler(
             req for req in can_run_list if req.time_stats.forward_entry_time == 0
         ]
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if self.metrics_reporter.enable_metrics:
+            for req in newly_forwarded_reqs:
+                self.metrics_collector.observe_request_waiting_time(
+                    req.time_stats.get_request_waiting_time()
+                )
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -4843,6 +4958,8 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        if ADMISSION_DIAG is not None:
+            ADMISSION_DIAG.phase(self, "prepare_extend_after", new_batch)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -5089,6 +5206,7 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.metrics_reporter.record_scheduler_active()
+        self.metrics_reporter.iter_forward_start_time = time.perf_counter()
         self.forward_ct += 1
         # Encode this forward's new-token count into the run_batch NVTX name so
         # equal-token batches can be matched across captures (e.g. a 0%-hit and
@@ -5480,17 +5598,19 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self.metrics_reporter.iter_forward_finish_time = time.perf_counter()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
-        # Router-facing gauge on the dedicated PUB socket, reusing the
-        # snapshot above rather than walking the queues again.
-        self.load_publisher.publish_load_stat(
-            self.load_inquirer.get_loads,
-            force=batch.forward_mode.is_extend(),
-            snapshot=snapshot,
-        )
+        with operations_nvtx_range("sched.pr.load_pub"):
+            snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+            # Router-facing gauge on the dedicated PUB socket, reusing the
+            # snapshot above rather than walking the queues again.
+            self.load_publisher.publish_load_stat(
+                self.load_inquirer.get_loads,
+                force=batch.forward_mode.is_extend(),
+                snapshot=snapshot,
+            )
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
@@ -6358,6 +6478,58 @@ class Scheduler(
                     )
                 else:
                     req.to_finish = FINISH_ABORT()
+
+    def trace_request(self, recv_req: TraceReq):
+        """Handle a trace request from the frontend.
+
+        The frontend only sends the rid. The TraceReq was already built at
+        Req init time from trace_config. We look up the Req and decide
+        whether to execute the trace immediately or defer to on_finish.
+        """
+        req = self._find_req_by_rid(recv_req.rid)
+        if req is None:
+            logger.warning(
+                f"trace_request: rid={recv_req.rid} not found in any queue; skipping"
+            )
+            return
+
+        cfg = req.trace_config
+        if cfg and not cfg.get('enable_trace'):
+            cfg.update({'enable_trace': True})
+        req.to_trace_req = req.build_trace_req()
+        trace_req = req.to_trace_req
+        if trace_req is None:
+            return
+        if trace_req.trigger != TraceTrigger.IMMEDIATE:
+            # Already stored in req.to_trace_req; _fire_pending_trace will pick it up
+            return
+        self._run_trace(trace_req, req)
+
+    def _fire_pending_trace(self, req: Req) -> None:
+        if req.to_trace_req is None:
+            return
+        trace_req = req.to_trace_req
+        if trace_req.trigger != TraceTrigger.IMMEDIATE:
+            self._run_trace(trace_req, req)
+
+    def _find_req_by_rid(self, rid: str) -> Optional[Req]:
+        """Find a request by its rid across all queues."""
+        reqs = list(self.running_batch.reqs) if self.running_batch else []
+        cur_batch = self.cur_batch_for_debug
+        if cur_batch is not None and cur_batch is not self.running_batch:
+            reqs = reqs + list(cur_batch.reqs)
+        reqs = reqs + list(self.waiting_queue)
+        for req in reqs:
+            if req.rid == rid:
+                return req
+        return None
+
+    def _run_trace(self, trace_req: TraceReq, req: Req):
+        self.trace_manager.run_trace(trace_req, req)
+
+    def _stream_deferred_trace_output(self, req: Req) -> None:
+        # Finish output held back until its online AS trace finalized.
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

@@ -29,9 +29,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
+    FINISH_ABORT,
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.observability.request_trace import trace, traced_rid
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -181,6 +183,11 @@ class SchedulerOutputStreamer:
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
+                continue
+            if req.finished() and req.defer_finish_output:
+                # The online AS trace is still waiting for AS writes to retire;
+                # TraceManager resends this finish output once trace_info is set.
+                req.finish_output_deferred = True
                 continue
 
             acc.accept(req=req)
@@ -382,6 +389,7 @@ class _GenerationStreamAccumulator:
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
     rust_server_mode: bool = False
+    trace_infos: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.return_hidden_states:
@@ -415,6 +423,31 @@ class _GenerationStreamAccumulator:
         # Only the leader is ever streamed, and only at group finish.
         return req.is_beam_leader and req.finished()
 
+    def _trace_finalized(self, req: Req, rid: str) -> None:
+        """Trace a request leaving this role. An abort is traced everywhere; a
+        normal finish only where it is the user-visible one, since the prefill
+        role hands the request over after the first token."""
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            trace(
+                logger,
+                "request %s aborted: reason=%r status_code=%s "
+                "input_len=%d output_len=%d",
+                rid,
+                req.finished_reason.message,
+                req.finished_reason.status_code,
+                len(req.origin_input_ids),
+                len(req.output_ids),
+            )
+        elif self.disaggregation_mode != DisaggregationMode.PREFILL:
+            trace(
+                logger,
+                "request %s finished: %s input_len=%d output_len=%d",
+                rid,
+                req.finished_reason.to_json() if req.finished_reason else None,
+                len(req.origin_input_ids),
+                len(req.output_ids),
+            )
+
     def accept(self, *, req: Req) -> None:
         if req.beam_group is not None and not self._beam_admits(req=req):
             return
@@ -423,6 +456,8 @@ class _GenerationStreamAccumulator:
             req.finished_output = True
             if req.finished_len is None:
                 req.finished_len = len(req.output_ids)
+            if rid := traced_rid(req.rid):
+                self._trace_finalized(req, rid)
             should_output = True
         else:
             if req.stream:
@@ -668,6 +703,7 @@ class _GenerationStreamAccumulator:
             self.indexer_topk.append(
                 req.indexer_topk if req.return_indexer_topk else None
             )
+        self.trace_infos.append(req.trace_info)
 
         current_output_len = len(self.output_ids[-1])
         if req.customized_info is not None:
@@ -759,6 +795,11 @@ class _GenerationStreamAccumulator:
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            trace_infos=(
+                self.trace_infos
+                if any(info is not None for info in self.trace_infos)
+                else None
+            ),
             retraction_counts=self.retraction_counts,
             # All-None means no beam item in this batch; drop the list so
             # non-beam traffic pays no carrier cost.

@@ -123,7 +123,6 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -152,12 +151,11 @@ from sglang.srt.utils.nvtx_utils import (
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
-    from typing import Any, Dict
-
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
+    from sglang.srt.managers.io_struct import TraceReq
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -1016,6 +1014,7 @@ class Req(ReqDllmMixin):
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        dispatch_to_scheduler_time: Optional[float] = None,
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
@@ -1024,6 +1023,7 @@ class Req(ReqDllmMixin):
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
         skip_radix_cache_insert: bool = False,
+        trace_config=None,
     ):
         # Input and output info
         self.rid = rid
@@ -1107,6 +1107,7 @@ class Req(ReqDllmMixin):
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
+        self.dispatch_to_scheduler_time = dispatch_to_scheduler_time
 
         # Require reasoning for the request
         self.require_reasoning = require_reasoning
@@ -1234,6 +1235,30 @@ class Req(ReqDllmMixin):
         # would make it stale); the only allocation-time reader is the
         # ChunkCache fallback, which has no tree nodes and no rebind.
         self.kv_rotation_base: Optional[int] = None
+        # for trace
+        self.trace_config: Optional[Dict[str, Any]] = trace_config
+        self.to_trace_req: Optional[TraceReq] = self.build_trace_req()
+        self.trace_info: Optional[Dict[str, Any]] = None
+        # Online AS trace: hold the finish output until AS writes retire.
+        # defer_finish_output is set by TraceManager; finish_output_deferred
+        # marks that output_streamer skipped the finish output and owes a resend.
+        self.defer_finish_output: bool = False
+        self.finish_output_deferred: bool = False
+        # AS trace: pure in-memory event collector owned by the request.
+        # unique_trace_id lives on to_trace_req so normal trace and AS trace
+        # share the same id; JSON writing and rank info are owned by TraceManager.
+        self.as_trace_context: Optional[Any] = None
+        if (
+            trace_config
+            and trace_config.get("enable_trace")
+            and trace_config.get("trace_type") in ("as_cache", "all")
+            and self.to_trace_req is not None
+        ):
+            from sglang.srt.mem_cache.as_trace import ASTraceContext
+
+            self.as_trace_context = ASTraceContext(
+                self, self.to_trace_req.unique_trace_id
+            )
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1426,6 +1451,30 @@ class Req(ReqDllmMixin):
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
 
+    def build_trace_req(self):
+        """Build TraceReq from trace_config at init time.
+
+        Parses trace_config to create a TraceReq. Returns None if tracing is
+        not enabled or trace_type is missing.
+        """
+        from sglang.srt.content_detection.config import DETECTION_CONFIG
+        from sglang.srt.managers.io_struct import TraceReq, TraceTrigger, TraceType
+        from sglang.srt.mem_cache.as_trace import build_unique_trace_id
+
+        cfg = self.trace_config or {}
+        if not cfg.get("enable_trace") or not cfg.get("trace_type"):
+            return None
+        return TraceReq(
+            rid=self.rid,
+            trace_type=cfg.get("trace_type", TraceType.METADATA),
+            dump_dir=cfg.get("dump_dir") or DETECTION_CONFIG.trace_dump_dir,
+            trigger=cfg.get("trigger", TraceTrigger.ON_FINISH),
+            payload=cfg.get("payload"),
+            return_logprob=cfg.get("return_logprob", False),
+            return_online=cfg.get("online", True),
+            unique_trace_id=build_unique_trace_id(self),
+        )
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1529,6 +1578,7 @@ class Req(ReqDllmMixin):
 
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.extend_range.end]
+
     _GET_FILL_IDS_FOR_LENGTH = get_fill_ids
 
     def _get_fill_ids_len(self) -> int:
@@ -2542,6 +2592,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    dp_global_num_tokens_for_metric: Optional[List[int]] = None
+    all_gather_latency: float = 0.0
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
@@ -2801,9 +2853,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 r.kv.req_pool_idx is None or r.is_retracted for r in reqs
             ]
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
-        )
+        with operations_nvtx_range("sched.prepare_extend.alloc"):
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                alloc_for_extend(self)
+            )
 
         # Set fields
         input_embeds = []
@@ -3813,6 +3866,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            dp_global_num_tokens_for_metric=self.dp_global_num_tokens_for_metric,
+            all_gather_latency=self.all_gather_latency,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
@@ -3832,6 +3887,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
+            admission_attempt_id=self.admission_attempt_id,
+            as_kv_ready_event=self.as_kv_ready_event,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,

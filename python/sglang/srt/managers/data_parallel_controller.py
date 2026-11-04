@@ -47,6 +47,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
+from sglang.srt.observability.request_trace import trace, traced_rid
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.runtime_context import (
@@ -338,6 +339,8 @@ class DataParallelController:
         self.dispatching(req)
         req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
+        if rid := traced_rid(req.rid):
+            trace(logger, "dp controller routed request %s to a scheduler", rid)
 
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
         if self.refresh_load_budget_on_dispatch:
@@ -849,7 +852,7 @@ def run_data_parallel_controller_process(
 
     # This process reads the config namespaces before spawning schedulers.
     publish(server_args, role="dp_controller")
-    configure_logger(server_args)
+    configure_logger(server_args, " DPController")
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,

@@ -165,6 +165,8 @@ def _extract_field_by_indices(
 
     new_field = [field[j] for j in idx]
     return wrap_as_pickle(new_field) if should_wrap_result else new_field
+
+
 def _extract_field_by_index(
     output: Any, field_name: str, index: int, check_length: bool = True
 ) -> Any:
@@ -300,6 +302,9 @@ def _handle_output_by_indices(output, idx: List[int]):
                 output, "customized_info", idx, check_length=False
             ),
             dp_ranks=_extract_field_by_indices(output, "dp_ranks", idx, check_length=False),
+            trace_infos=_extract_field_by_indices(
+                output, "trace_infos", idx, check_length=False
+            ),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
@@ -314,6 +319,7 @@ def _handle_output_by_indices(output, idx: List[int]):
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
             rids=[output.rids[j] for j in idx],
+            detokenize_completed_time=output.detokenize_completed_time,
             spec_verify_ct=_extract_field_by_indices(output, "spec_verify_ct", idx),
             spec_num_correct_drafts=_extract_field_by_indices(
                 output, "spec_num_correct_drafts", idx
@@ -420,6 +426,9 @@ def _handle_output_by_indices(output, idx: List[int]):
             weight_versions=_extract_field_by_indices(output, "weight_versions", idx),
             token_steps=_extract_field_by_indices(
                 output, "token_steps", idx, check_length=False
+            ),
+            trace_infos=_extract_field_by_indices(
+                output, "trace_infos", idx, check_length=False
             ),
         )
     else:

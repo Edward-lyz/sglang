@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -106,6 +107,7 @@ class MLPSyncBatchInfo:
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    all_gather_latency: float = 0.0
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -237,6 +239,12 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+    batch.dp_global_num_tokens_for_metric = (
+        mlp_sync_info.global_num_tokens
+        if mlp_sync_info.global_num_tokens is not None
+        else [mlp_sync_info.num_tokens]
+    )
+    batch.all_gather_latency = mlp_sync_info.all_gather_latency
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -440,6 +448,7 @@ def prepare_mlp_sync_batch_raw(
         group = tp_group.cpu_group
         device = "cpu"
 
+    gather_start = time.perf_counter()
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
     if use_world_group:
         dp_size = _resolve_elastic_world_dp_size(
@@ -472,6 +481,10 @@ def prepare_mlp_sync_batch_raw(
             group=group,
             use_all_reduce=use_world_group,
         )
+        # Only the collective belongs in this gauge. The local paths above
+        # leave it at 0 so a dp_size=1 or skip_all_gather instance does not
+        # report local preparation time as network latency.
+        mlp_sync_info.all_gather_latency = time.perf_counter() - gather_start
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
     if metadata_ready:

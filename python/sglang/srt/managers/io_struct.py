@@ -1074,6 +1074,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     as_max_hit_host_ip: Optional[List[str]] = None
     as_max_hit_token_len: Optional[List[int]] = None
 
+    # Per-request trace settings resolved by the OpenAI entrypoint.
+    trace_config: Optional[Dict[str, Any]] = None
+
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
     # Whether to return entropy
@@ -1095,6 +1098,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+    # Monotonic timestamp captured immediately before scheduler IPC send.
+    dispatch_to_scheduler_time: Optional[float] = None
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
@@ -1552,6 +1557,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
+    # Trace info for each request (populated by TraceManager for online return)
+    trace_infos: Optional[List[Optional[Dict[str, Any]]]] = None
 
     # Scheduler-side flat assembly of prompt top logprobs for requests with
     # return_flat_raw_top_logprobs: float32 / int32 [rows, k] arrays plus the
@@ -1635,6 +1642,10 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
 
+    # Wall-clock timestamp of detokenization, used to measure the
+    # detokenizer -> tokenizer IPC latency across processes.
+    detokenize_completed_time: Optional[float] = None
+
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
     audio_tokens: Optional[List[int]] = None
@@ -1655,6 +1666,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+    # Trace info for each request (populated by TraceManager for online return)
+    trace_infos: Optional[List[Optional[Dict[str, Any]]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
@@ -2099,8 +2112,48 @@ class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
 
 
+class TraceType:
+    """Trace action types.
+    """
+
+    KV = "kv"
+    METADATA = "metadata"
+    PROMPT = "prompt"
+    SAMPLE = "sample"
+    LOGPROBS = "logprobs"
+    ALL = "all"
+    AS_CACHE = "as_cache"
 
 
+class TraceTrigger:
+    """When to trigger a trace action."""
+
+    IMMEDIATE = "immediate"
+    ON_FINISH = "on_finish"
+
+
+class TraceReq(BaseReq):
+    """Request to trigger KV cache or metadata tracing."""
+
+    # Directory to dump KV metadata to. If None, use default path.
+    dump_dir: Optional[str] = None
+    # Which trace mode to execute; see TraceType for valid values.
+    trace_type: str = TraceType.KV
+    # When to trigger the trace; see TraceTrigger for valid values.
+    trigger: str = TraceTrigger.IMMEDIATE
+    # Optional JSON-serializable payload for prompt/sample trace data.
+    payload: Optional[Dict[str, Any]] = None
+    # Whether to include logprobs data in the trace output.
+    return_logprob: bool = False
+    # Whether to return trace data online via the response
+    return_online: bool = False
+    # Deterministic request id shared by normal trace and AS trace. Minted at
+    # Req init (build_trace_req); downstream (TraceManager, ASCache) reads it here.
+    unique_trace_id: Optional[str] = None
+
+    def __post_init__(self):
+        if self.rid is None:
+            self.rid = ""
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     """Report asynchronous Elastic EP scale completion or failure."""

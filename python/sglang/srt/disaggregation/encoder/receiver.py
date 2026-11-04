@@ -2349,6 +2349,11 @@ class EmbeddingPool:
             self._coalesce_free_locked(off, aligned)
             self._cond.notify_all()
 
+    def used_bytes(self) -> int:
+        """Return bytes reserved by in-flight embedding transfers."""
+        with self._cond:
+            return self._total_inflight
+
     def _coalesce_free_locked(self, off: int, length: int) -> None:
         self._segments_free.append((off, length))
         self._segments_free.sort()
@@ -2574,6 +2579,30 @@ class MMReceiverBase(ABC):
     @abstractmethod
     def process_waiting_requests(self, recv_reqs):
         pass
+
+    def _report_receiver_metrics(self) -> None:
+        """Publish receiver-side EPD metrics when scheduler metrics are enabled."""
+        if self.scheduler is None or self.scheduler.metrics_collector is None:
+            return
+        collector = self.scheduler.metrics_collector
+        # The waiting queue exists in every receiver mode, so it is reported
+        # before the pool check returns early.
+        collector.set_mm_receiver_waiting_requests(len(self.waiting_list))
+        pool = self.embedding_pool
+        if pool is None:
+            # Factory mooncake pulls land in the pinned EmbeddingLandingPool
+            # instead; report it here so pool-full backpressure is visible.
+            from sglang.srt.disaggregation.encoder.factory_transport import (
+                EmbeddingLandingPool,
+            )
+
+            pool = EmbeddingLandingPool.get_instance_if_exists()
+        if pool is None:
+            collector.set_gpu_buffer_pool_used_bytes(0)
+            collector.set_gpu_buffer_pool_total_bytes(0)
+            return
+        collector.set_gpu_buffer_pool_used_bytes(pool.used_bytes())
+        collector.set_gpu_buffer_pool_total_bytes(pool.size_bytes)
 
     def abort_waiting_requests(self, recv_req) -> None:
         """Mark matching waiting requests FAIL and free their resources; the
@@ -3012,6 +3041,7 @@ class MMReceiverBase(ABC):
         new_recv_reqs = []
         abort_reqs = []
         started_this_round = []
+        self._report_receiver_metrics()
         for recv_req in recv_reqs:
             if isinstance(recv_req, EncoderDispatchErrorReq):
                 waiting_req = self.waiting_by_rid.get(recv_req.rid)
@@ -3173,12 +3203,24 @@ class MMReceiverBase(ABC):
         for i, waiting_req in enumerate(self.waiting_list):
             status_value = local_status[i].item()
             if status_value == WaitingMMRequestStatus.SUCCESS:
+                if (
+                    self.scheduler is not None
+                    and self.scheduler.metrics_collector is not None
+                ):
+                    self.scheduler.metrics_collector.observe_mm_receiver_embedding_transfer_time(
+                        current_time - waiting_req.start_time
+                    )
                 new_recv_reqs.append(waiting_req.recv_req)
             elif status_value == WaitingMMRequestStatus.FAIL:
                 self._sync_fail_info_across_tp(waiting_req)
                 logger.error(
                     f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
                 )
+                if (
+                    self.scheduler is not None
+                    and self.scheduler.metrics_collector is not None
+                ):
+                    self.scheduler.metrics_collector.increment_mm_receiver_failed_requests()
                 # A peer's FAIL can force-abort this locally PENDING/SUCCESS
                 # rank, so release any buffer/slot it still holds.
                 waiting_req.release_resources()
@@ -3193,6 +3235,11 @@ class MMReceiverBase(ABC):
                 logger.error(
                     f"Timed out waiting for image embeddings for request {waiting_req.rid}"
                 )
+                if (
+                    self.scheduler is not None
+                    and self.scheduler.metrics_collector is not None
+                ):
+                    self.scheduler.metrics_collector.increment_mm_receiver_timeout_requests()
                 waiting_req.release_resources()
                 abort_reqs.append(
                     (

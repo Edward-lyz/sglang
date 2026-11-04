@@ -67,6 +67,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.observability.admission_diag import admission_result
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -886,17 +887,17 @@ class PrefillAdder:
         if not no_token and self.rem_mamba_slots is not None:
             no_token = self.rem_mamba_slots <= 0
         if no_token:
-            return AddReqResult.NO_TOKEN
+            return admission_result(self, AddReqResult.NO_TOKEN, "budget_empty")
 
         if self.rem_input_tokens <= 0:
-            return AddReqResult.OTHER
+            return admission_result(self, AddReqResult.OTHER, "input_budget_empty")
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
-                return AddReqResult.OTHER
+                return admission_result(self, AddReqResult.OTHER, "dllm_budget_empty")
         else:
             if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
-                return AddReqResult.OTHER
+                return admission_result(self, AddReqResult.OTHER, "chunk_budget_empty")
 
         return AddReqResult.CONTINUE
 
@@ -1255,7 +1256,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if not self.allow_new_chunk:
-                return AddReqResult.OTHER
+                return admission_result(self, AddReqResult.OTHER, "chunk_slot_taken", req)
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
@@ -1283,7 +1284,7 @@ class PrefillAdder:
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
-            return AddReqResult.OTHER
+            return admission_result(self, AddReqResult.OTHER, "prefill_request_limit", req)
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
@@ -1312,7 +1313,10 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
+            return admission_result(
+                self, AddReqResult.NO_TOKEN, "full_prelock", req,
+                required=total_tokens, real_new=real_input_tokens,
+            )
 
         chunk_tokens_limit = self.rem_chunk_tokens
         if self.is_hybrid_swa:
@@ -1336,12 +1340,18 @@ class PrefillAdder:
                     self._swa_new_tokens(req),
                     req.swa_host_hit_length,
                 ):
-                    return AddReqResult.NO_TOKEN
+                    return admission_result(
+                        self, AddReqResult.NO_TOKEN, "swa_prelock", req,
+                        required=swa_needed, real_new=real_input_tokens,
+                    )
                 swa_cap = self._swa_chunk_cap(
                     self._swa_new_tokens(req), req.swa_host_hit_length
                 )
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
-                    return AddReqResult.NO_TOKEN
+                    return admission_result(
+                        self, AddReqResult.NO_TOKEN, "swa_cap_prelock", req,
+                        required=swa_needed, swa_cap=swa_cap,
+                    )
                 chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
         if (
@@ -1352,7 +1362,7 @@ class PrefillAdder:
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
-            return AddReqResult.OTHER
+            return admission_result(self, AddReqResult.OTHER, "input_budget_preload", req)
 
         with self._lock_node(req.last_node):
             # The lock now protects a prefix an AS read published, so the
@@ -1364,7 +1374,10 @@ class PrefillAdder:
                 req.as_read_pending_lock = False
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
-                return AddReqResult.NO_TOKEN
+                return admission_result(
+                    self, AddReqResult.NO_TOKEN, "full_postlock", req,
+                    required=total_tokens, real_new=real_input_tokens,
+                )
 
             if self.is_hybrid_swa:
                 # self.rem_swa_tokens may decrease after the lock acquisition
@@ -1383,12 +1396,18 @@ class PrefillAdder:
                         self._swa_new_tokens(req),
                         req.swa_host_hit_length,
                     ):
-                        return AddReqResult.NO_TOKEN
+                        return admission_result(
+                            self, AddReqResult.NO_TOKEN, "swa_postlock", req,
+                            required=swa_needed, real_new=real_input_tokens,
+                        )
                     swa_cap = self._swa_chunk_cap(
                         self._swa_new_tokens(req), req.swa_host_hit_length
                     )
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
-                        return AddReqResult.NO_TOKEN
+                        return admission_result(
+                            self, AddReqResult.NO_TOKEN, "swa_cap_postlock", req,
+                            required=swa_needed, swa_cap=swa_cap,
+                        )
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
@@ -1403,7 +1422,7 @@ class PrefillAdder:
                     waiting_queue_len=self.waiting_queue_len,
                 )
             ):
-                return AddReqResult.OTHER
+                return admission_result(self, AddReqResult.OTHER, "prefill_delay", req)
 
             if req.needs_host_load_back():
                 if envs.SGLANG_ENABLE_AS_LOAD_BACK_ASYNC.get():
@@ -1413,7 +1432,9 @@ class PrefillAdder:
                     if batch_full is not None and batch_full():
                         # Leave this request queued. Returning an empty failed
                         # load-back would instead admit a full re-prefill.
-                        return AddReqResult.OTHER
+                        return admission_result(
+                            self, AddReqResult.OTHER, "as_load_back_inflight_limit", req
+                        )
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
@@ -1432,7 +1453,9 @@ class PrefillAdder:
                 # OTHER) so the waiting-queue loop keeps admitting the
                 # requests behind this one.
                 if req._as_pending_load_back is not None:
-                    return AddReqResult.CONTINUE
+                    return admission_result(
+                        self, AddReqResult.CONTINUE, "pending_load_back_submit", req,
+                    )
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
@@ -1446,7 +1469,7 @@ class PrefillAdder:
                 # If without chunked prefill:
                 # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
                 # - if the can_run_list is empty, always accept the first prefill request
-                return AddReqResult.OTHER
+                return admission_result(self, AddReqResult.OTHER, "input_budget_postload", req)
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
@@ -1489,19 +1512,23 @@ class PrefillAdder:
                 self._account_prefill_cache_admission(req, prefix_len)
             else:
                 if not self.allow_new_chunk:
-                    return AddReqResult.OTHER
+                    return admission_result(
+                        self, AddReqResult.OTHER, "chunk_slot_taken", req
+                    )
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
                 if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                    return admission_result(self, AddReqResult.OTHER, "chunk_no_page", req)
 
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                 # we need the prefill prefix length to be multiple of attention split size
                 if truncation_align_size is not None:
                     if trunc_len < truncation_align_size:
-                        return AddReqResult.OTHER
+                        return admission_result(
+                            self, AddReqResult.OTHER, "truncation_alignment", req,
+                        )
                     else:
                         trunc_len = truncation_align_size * (
                             trunc_len // truncation_align_size
@@ -1512,7 +1539,7 @@ class PrefillAdder:
                 trunc_len = now_input_len - len(req.prefix_indices)
 
                 if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                    return admission_result(self, AddReqResult.OTHER, "chunk_aligned_empty", req)
 
                 if (
                     tile_stop := self._check_prefill_tile_budget(trunc_len)

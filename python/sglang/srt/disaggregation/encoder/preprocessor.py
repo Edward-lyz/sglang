@@ -7,9 +7,10 @@ GPU tensor operations remain in :mod:`server.MMEncoder`.
 """
 
 import asyncio
-import concurrent.futures
 import functools
 import logging
+import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Callable, List, Optional, Tuple, Union
@@ -19,6 +20,10 @@ import torch
 from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.encode_collector import (
+    QueueMeteredExecutor,
+    StageReadyMark,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
@@ -78,6 +83,21 @@ def _convert(data):
         return data
 
 
+# Wall time spent loading media in the current preprocess call. MMEncoder
+# reads it to split preprocess time into the mm_loader / mm_process stages.
+# A ContextVar keeps concurrent encode tasks from mixing their timings.
+media_load_seconds: ContextVar[float] = ContextVar("media_load_seconds", default=0.0)
+
+
+def _add_media_load_seconds(start: float) -> None:
+    media_load_seconds.set(media_load_seconds.get() + time.perf_counter() - start)
+
+
+# StageReadyMark of the current encode batch; preproc jobs mark it when they
+# finish so MMEncoder can report the mm_embed queue (ready -> forward start).
+embed_ready: ContextVar[Optional[StageReadyMark]] = ContextVar(
+    "embed_ready", default=None
+)
 
 
 def _get_original_image_size(image):
@@ -157,10 +177,11 @@ class EncoderPreprocessor:
         self.model_audio_sr = self._resolve_audio_sr()
         logger.info(f"Resolved model audio sample rate: {self.model_audio_sr} Hz")
 
-        self.preproc_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=envs.SGLANG_ENCODER_PREPROC_WORKERS.get()
+        self.preproc_executor = QueueMeteredExecutor(
+            max_workers=envs.SGLANG_ENCODER_PREPROC_WORKERS.get(),
+            ready_mark_var=embed_ready,
         )
-        self.io_executor = concurrent.futures.ThreadPoolExecutor(
+        self.io_executor = QueueMeteredExecutor(
             max_workers=envs.SGLANG_ENCODER_MM_LOAD_WORKERS.get()
         )
 
@@ -390,6 +411,13 @@ class EncoderPreprocessor:
         return futures, task_info
 
     async def _flatten_and_load_data_by_modality(self, mm_items, modality):
+        start = time.perf_counter()
+        try:
+            return await self._load_data_by_modality(mm_items, modality)
+        finally:
+            _add_media_load_seconds(start)
+
+    async def _load_data_by_modality(self, mm_items, modality):
         if not isinstance(mm_items, (list, tuple)):
             futures, _ = self._submit_data_loading_tasks([mm_items], [modality])
             return await asyncio.wrap_future(futures[0])
@@ -528,11 +556,15 @@ class EncoderPreprocessor:
                 {**defaults, **dict(config or {})} for config in video_configs
             ]
 
+        load_start = time.perf_counter()
         futures, _ = self._submit_data_loading_tasks(
             mm_items, [Modality.VIDEO] * len(mm_items)
         )
         async_futures = [asyncio.wrap_future(f) for f in futures]
-        video_items = await asyncio.gather(*async_futures)
+        try:
+            video_items = await asyncio.gather(*async_futures)
+        finally:
+            _add_media_load_seconds(load_start)
 
         video_processor_kwargs = {}
         if "qwen" in self.model_type:

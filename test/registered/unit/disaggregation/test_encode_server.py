@@ -649,6 +649,12 @@ class TestEncoderDelivery(CustomTestCase):
             torch.testing.assert_close(first, second)
             cached = encoder.mm_cache.get([123])
             self.assertEqual(cached.embedding.device.type, "cpu")
+            encoder.metrics_collector.record_cache_miss.assert_called_once_with(
+                first.nbytes
+            )
+            encoder.metrics_collector.record_cache_hit.assert_called_once_with(
+                first.nbytes
+            )
             # Community encoder_cache_* series share the same gate.
             self.assertEqual(
                 community_metrics.record_cache_tokens.call_args_list,
@@ -663,6 +669,9 @@ class TestEncoderDelivery(CustomTestCase):
                     unittest.mock.call(0, 1, modality="image"),
                     unittest.mock.call(1, 1, modality="image"),
                 ],
+            )
+            community_metrics.set_cache_state.assert_called_with(
+                encoder.mm_cache.current_size, 1
             )
 
         asyncio.run(run())
@@ -836,6 +845,8 @@ class TestEncoderDelivery(CustomTestCase):
                     encoder, request, release_without_count=True
                 )
             )
+            metrics.record_cache_hit.assert_called_once_with(4096, source="transfer")
+            metrics.record_cache_miss.assert_called_once_with(4096, source="transfer")
 
         asyncio.run(run())
 

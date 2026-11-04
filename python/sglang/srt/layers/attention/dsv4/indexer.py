@@ -875,51 +875,52 @@ class C4IndexerBackendMixin:
             topk_plan: Optional[torch.Tensor] = None,
         ) -> None:
             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
-            if self.dsa_topk_backend.is_torch():
-                topk_transform_pytorch_vectorized(
-                    logits,
-                    c4_seq_lens[rows],
-                    page_table[rows],
-                    c4_sparse_page_indices[rows],
-                    indexer_metadata.compressed_page_size,
-                    row_raw_indices,
-                )
-            elif self.dsa_topk_backend.is_flashinfer():
-                self.flashinfer_topk_transform(
-                    logits,
-                    c4_seq_lens[rows],
-                    page_table[rows],
-                    c4_sparse_page_indices[rows],
-                    indexer_metadata.compressed_page_size,
-                    row_raw_indices,
-                )
-            elif self.dsa_topk_backend.should_use_topk_v2():
-                if topk_plan is None:
-                    # The cached plan routes rows by their index in the full
-                    # range, so a chunk needs one built over its own rows.
-                    topk_plan = (
-                        indexer_metadata.topk_metadata
-                        if rows == all_rows
-                        else plan_topk_v2(c4_seq_lens[rows])
+            with operations_nvtx_range("attn.indexer.topk"):
+                if self.dsa_topk_backend.is_torch():
+                    topk_transform_pytorch_vectorized(
+                        logits,
+                        c4_seq_lens[rows],
+                        page_table[rows],
+                        c4_sparse_page_indices[rows],
+                        indexer_metadata.compressed_page_size,
+                        row_raw_indices,
                     )
-                topk_transform_paged_v2(
-                    logits,
-                    c4_seq_lens[rows],
-                    page_table[rows],
-                    c4_sparse_page_indices[rows],
-                    indexer_metadata.compressed_page_size,
-                    topk_plan,
-                    row_raw_indices,
-                )
-            else:
-                topk_transform_paged(
-                    logits,
-                    c4_seq_lens[rows],
-                    page_table[rows],
-                    c4_sparse_page_indices[rows],
-                    indexer_metadata.compressed_page_size,
-                    row_raw_indices,
-                )
+                elif self.dsa_topk_backend.is_flashinfer():
+                    self.flashinfer_topk_transform(
+                        logits,
+                        c4_seq_lens[rows],
+                        page_table[rows],
+                        c4_sparse_page_indices[rows],
+                        indexer_metadata.compressed_page_size,
+                        row_raw_indices,
+                    )
+                elif self.dsa_topk_backend.should_use_topk_v2():
+                    if topk_plan is None:
+                        # The cached plan routes rows by their index in the full
+                        # range, so a chunk needs one built over its own rows.
+                        topk_plan = (
+                            indexer_metadata.topk_metadata
+                            if rows == all_rows
+                            else plan_topk_v2(c4_seq_lens[rows])
+                        )
+                    topk_transform_paged_v2(
+                        logits,
+                        c4_seq_lens[rows],
+                        page_table[rows],
+                        c4_sparse_page_indices[rows],
+                        indexer_metadata.compressed_page_size,
+                        topk_plan,
+                        row_raw_indices,
+                    )
+                else:
+                    topk_transform_paged(
+                        logits,
+                        c4_seq_lens[rows],
+                        page_table[rows],
+                        c4_sparse_page_indices[rows],
+                        indexer_metadata.compressed_page_size,
+                        row_raw_indices,
+                    )
 
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
@@ -1002,16 +1003,17 @@ class C4IndexerBackendMixin:
                 topk_plan: Optional[torch.Tensor] = None,
             ) -> None:
                 row_q = (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows]
-                logits = fn(
-                    row_q,
-                    c4_indexer_kv_cache,
-                    weights[rows],
-                    _c4sl[rows],
-                    page_table[rows],
-                    metadata,
-                    indexer_metadata.max_compressed_seq_len,
-                    False,
-                )
+                with operations_nvtx_range("attn.indexer.mqa_logits"):
+                    logits = fn(
+                        row_q,
+                        c4_indexer_kv_cache,
+                        weights[rows],
+                        _c4sl[rows],
+                        page_table[rows],
+                        metadata,
+                        indexer_metadata.max_compressed_seq_len,
+                        False,
+                    )
                 run_topk_transform(rows, logits, topk_plan)
 
             deep_gemm_metadata = indexer_metadata.deep_gemm_metadata

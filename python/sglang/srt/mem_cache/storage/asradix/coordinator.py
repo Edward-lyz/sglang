@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.observability.admission_diag import ADMISSION_DIAG
 
 from .transport import _once, barrier_debug_enabled, cache_digest_logger
 from .types import AttentionStoreWriteContext, AttentionStoreWriteOwner
@@ -142,7 +143,6 @@ class _PreparedPageIds:
 
 @dataclass
 class _PreparedSlot:
-
     host: Any = None
     ready_event: Any = None
     source: Optional[torch.Tensor] = None
@@ -261,9 +261,6 @@ class AttentionStoreCoordinator:
         if stream is not None:
             device = torch.device(stream.device)
         device_module = torch.get_device_module(device)
-        # This may be called from the writer thread (do_write), whose current
-        # device can differ from the KV pool's; pin it so the event and the
-        # producer stream are created on the same device.
         with device_module.device(device):
             if stream is None:
                 stream = device_module.current_stream(device)
@@ -429,6 +426,24 @@ class AttentionStoreCoordinator:
             cache, task, task.release_after_write, "staging resource"
         )
         self._release_task_resource(cache, task, task.release, "retained resource")
+        self._release_trace_write(task)
+
+    @staticmethod
+    def _retain_trace_write(task) -> None:
+        recorder = getattr(task, "trace_recorder", None)
+        if recorder is None or getattr(task, "_as_trace_retained", False):
+            return
+        recorder.ctx.retain_write()
+        task._as_trace_retained = True
+
+    @staticmethod
+    def _release_trace_write(task) -> None:
+        if not getattr(task, "_as_trace_retained", False):
+            return
+        task._as_trace_retained = False
+        recorder = getattr(task, "trace_recorder", None)
+        if recorder is not None:
+            recorder.ctx.release_write()
 
     def _resolve_write_owner(self, cache, task) -> Optional[AttentionStoreWriteOwner]:
         """Resolve the scheduler owner attached to an asynchronous write.
@@ -467,6 +482,7 @@ class AttentionStoreCoordinator:
                     f"rid={getattr(task, 'rid', '<unknown>')}"
                 )
             self._set_task_owner(task, owner)
+        self._retain_trace_write(task)
         try:
             logical_id = self._task_logical_id(task)
             native_submit = getattr(self, "_submit_native_write", None)
@@ -484,6 +500,8 @@ class AttentionStoreCoordinator:
                 owner=owner,
             )
         )
+        if ADMISSION_DIAG is not None:
+            ADMISSION_DIAG.write_event("write_submit", self._pending_writes[-1])
 
     def submit_completed(self, task, result: int = 0, owner=None) -> None:
         """Queue an already completed task for ordered retirement."""
@@ -504,6 +522,8 @@ class AttentionStoreCoordinator:
                 owner=owner,
             )
         )
+        if ADMISSION_DIAG is not None:
+            ADMISSION_DIAG.write_event("write_submit_completed", self._pending_writes[-1])
 
     def _resolve_result(
         self, cache, pending: _PendingWrite, timeout: Optional[float]
@@ -548,7 +568,10 @@ class AttentionStoreCoordinator:
                 pending.task.release,
                 "retained resource",
             )
+            if ADMISSION_DIAG is not None:
+                ADMISSION_DIAG.write_event("write_unlock", pending)
             first_error = first_error or release_error
+            self._release_trace_write(pending.task)
         retirement_succeeded = first_error is None
         if synchronize:
             retirement_succeeded = bool(cache._tp_min(int(retirement_succeeded)))
@@ -716,11 +739,19 @@ class AttentionStoreCoordinator:
             return
         completed = 0
         for pending in self._pending_writes:
-            if not pending.future.done():
+            done = pending.future.done()
+            if ADMISSION_DIAG is not None:
+                ADMISSION_DIAG.write_event("write_poll", pending, done=done)
+            if not done:
                 break
             completed += 1
         local_completed = completed
         completed = cache._tp_min(completed)
+        if ADMISSION_DIAG is not None:
+            ADMISSION_DIAG.write_event(
+                "write_frontier", local_completed=local_completed,
+                completed=completed, pending=len(self._pending_writes),
+            )
         if not completed:
             return
         pending_writes = self._pending_writes[:completed]

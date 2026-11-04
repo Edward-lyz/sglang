@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import math
+import threading
 import types
 import unittest
 from unittest.mock import patch
@@ -508,6 +509,30 @@ class TestSchedulerTimeAccounting(CustomTestCase):
 
         self.assertEqual(self.idle_seconds, [])
         self.assertEqual(self.process_cpu_seconds, [0.0])
+
+    def test_off_thread_record_is_ignored(self):
+        """record_scheduler_active from the prefill forward thread must not
+        advance the scheduler thread's accounting window or emit samples."""
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                side_effect=[0, 2_000_000_000],
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                side_effect=[0, 0],
+            ),
+        ):
+            self.reporter.start_scheduler_time_accounting()
+            worker = threading.Thread(target=self.reporter.record_scheduler_active)
+            worker.start()
+            worker.join()
+
+        accounting = self.reporter._scheduler_time_accounting
+        self.assertEqual(accounting.start_ns, 0)
+        self.assertEqual(accounting.last_sample_ns, 0)
+        self.assertEqual(self.process_cpu_seconds, [])
+        self.assertEqual(self.stage_seconds, [])
 
 
 class TestEstimatedPrefillPerf(CustomTestCase):

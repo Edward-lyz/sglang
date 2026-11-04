@@ -30,6 +30,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
+    seal_as_trace,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -112,6 +113,8 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
+    # Runs a request's on-finish trace right before its KV cache is released.
+    fire_pending_trace: Callable[[Req], None] = lambda req: None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -125,6 +128,7 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                self.fire_pending_trace(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -373,12 +377,17 @@ class SchedulerBatchResultProcessor:
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
+                        self.fire_pending_trace(req)
                         release_kv_cache(
                             req,
                             self.tree_cache,
                             is_insert=sampling_mask_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
+                        if self.server_args.enable_metrics:
+                            self.metrics_collector.observe_request_first_token_forward_time(
+                                req.time_stats.get_request_first_token_forward_time()
+                            )
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
@@ -468,6 +477,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
+                        self.fire_pending_trace(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
@@ -1323,9 +1333,15 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_indexer_topk(req)
 
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
+                # KV is still on device here; the async offload frees it later
+                # without a trace hook, so trace before handing it off.
+                self.fire_pending_trace(req)
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
+                # Neither branch runs release_kv_cache; decode issues no AS
+                # writes, so the AS trace can finalize now.
+                seal_as_trace(req)
             else:
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
@@ -1339,6 +1355,7 @@ class SchedulerBatchResultProcessor:
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
+                self.fire_pending_trace(req)
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()

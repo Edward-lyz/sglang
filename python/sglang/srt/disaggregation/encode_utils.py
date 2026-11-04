@@ -33,6 +33,9 @@ def normalize_transfer_type(backend: str) -> str:
     return _TRANSFER_TYPE_MAP.get(backend, backend)
 
 
+from sglang.srt.disaggregation.encode_collector import (  # noqa: E402
+    BatchExecutorCollector,
+)
 
 
 class WithRidProto(Protocol):
@@ -69,6 +72,7 @@ class QueueEntry:
 
     req: ReqType
     future: Future
+    enqueue_time: float
 
 
 class StreamingImplProto(Protocol[ReqType, ResType]):
@@ -78,6 +82,7 @@ class StreamingImplProto(Protocol[ReqType, ResType]):
     """
 
     name: str
+    collector: BatchExecutorCollector
 
     def submit(self, req: ReqType) -> Future[ResType]:
         """Submit a single request and return a Future for its result."""
@@ -90,7 +95,9 @@ class StreamingImplProto(Protocol[ReqType, ResType]):
 class _BaseExecutor(Generic[ReqType, ResType]):
     """Common base for the executors: a bounded request queue + pending count."""
 
-    def __init__(self, name: str, backlog: int=100000):
+    def __init__(
+        self, name: str, collector: BatchExecutorCollector, backlog: int = 100000
+    ):
         """Initialize the base executor.
 
         Args:
@@ -99,6 +106,7 @@ class _BaseExecutor(Generic[ReqType, ResType]):
             backlog: Maximum queue capacity for pending requests.
         """
         self._name = name
+        self._collector = collector
         self.stopped = False
         self.requests: queue.Queue[Optional[QueueEntry]] = queue.Queue(backlog)
         self._pending_num_tokens = 0
@@ -120,7 +128,7 @@ class _BaseExecutor(Generic[ReqType, ResType]):
             raise RuntimeError(f"batch executor {self._name} has been stopped!")
         future: Future[ResType] = Future()
         self.requests.put(
-            QueueEntry(req=req, future=future),
+            QueueEntry(req=req, future=future, enqueue_time=time.monotonic()),
             block=False,
         )
         with self._pending_lock:
@@ -150,10 +158,10 @@ class StreamExecutor(_BaseExecutor[ReqType, ResType]):
             impl: The streaming implementation that provides a submit() method.
             backlog: Maximum queue capacity for pending requests.
         """
-        super().__init__(impl.name, backlog=backlog)
+        super().__init__(impl.name, impl.collector, backlog=backlog)
         self._impl = impl
-        # impl_future -> user_future
-        self.in_flight: Dict[Future[ResType], Future[ResType]] = {}
+        # impl_future -> (user_future, submit_time)
+        self.in_flight: Dict[Future[ResType], Tuple[Future[ResType], float]] = {}
 
     def __get_reqs(self) -> List[QueueEntry]:
         """Drain every currently available request from the queue."""
@@ -188,10 +196,14 @@ class StreamExecutor(_BaseExecutor[ReqType, ResType]):
         while True:
             entries = self.__get_reqs()
 
+            self._collector.set_queue_wait_num_reqs(self.requests.qsize())
             for entry in entries:
+                self._collector.observe_queue_wait_seconds(
+                    time.monotonic() - entry.enqueue_time
+                )
                 logger.debug(f"{self._name} submit {entry.req.rid}")
                 impl_fut = self._impl.submit(entry.req)
-                self.in_flight[impl_fut] = entry.future
+                self.in_flight[impl_fut] = (entry.future, time.monotonic())
 
             if not self.in_flight:
                 if self.stopped:
@@ -204,7 +216,8 @@ class StreamExecutor(_BaseExecutor[ReqType, ResType]):
             done, _ = wait(self.in_flight.keys(), return_when=FIRST_COMPLETED)
 
             for impl_fut in done:
-                user_fut = self.in_flight.pop(impl_fut)
+                user_fut, start_time = self.in_flight.pop(impl_fut)
+                self._collector.observe_run_batch_seconds(time.monotonic() - start_time)
                 try:
                     result = impl_fut.result()
                     if not user_fut.done():

@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence, Tuple
 
 import torch
@@ -220,6 +220,9 @@ class _SPAWriteTask:
     swa_owned_end: int = 0
     request: Any = None
     producer_ready: Any = None
+    # Logical checkpoint slots of the terminal page, kept for the AS trace only.
+    checkpoint_slots: dict[str, int] = field(default_factory=dict)
+    trace_recorder: Any = None
 
     @property
     def requested_blocks(self) -> int:
@@ -241,6 +244,7 @@ class _KDAWriteTask:
     release_after_write: Callable[[], None] = _noop_release
     release: Callable[[], None] = _noop_release
     owner: Optional[AttentionStoreWriteOwner] = None
+    trace_recorder: Any = None
 
     @property
     def requested_blocks(self) -> int:
@@ -327,71 +331,73 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
         requested = int(load_info["block_count"])
         started = time.perf_counter()
         token_count = requested * cache.page_size
-        available = cache.token_to_kv_pool_allocator.available_size()
-        if available < token_count and cache.full_evictable_size() > 0:
-            cache.evict(
-                EvictParams(
-                    num_tokens=token_count - available + cache.page_size,
-                    swa_num_tokens=cache.page_size,
+        with operations_nvtx_range("radix.as.lb.evict"):
+            available = cache.token_to_kv_pool_allocator.available_size()
+            if available < token_count and cache.full_evictable_size() > 0:
+                cache.evict(
+                    EvictParams(
+                        num_tokens=token_count - available + cache.page_size,
+                        swa_num_tokens=cache.page_size,
+                    )
                 )
-            )
         local_hit_len = int(load_info["start_block"]) * cache.page_size
         device = cache.token_to_kv_pool_allocator.device
         prefix_cpu = torch.tensor([local_hit_len], dtype=torch.int64)
         seq_cpu = torch.tensor([local_hit_len + token_count], dtype=torch.int64)
         # The allocator consumes a one-element tensor; keep an existing index on device.
         last_loc = req.prefix_indices[-1].reshape(1) if local_hit_len else None
-        try:
-            if torch.device(device).type == "cuda" and torch.version.hip is None:
-                # Keep existing last_loc on device; only pack Python scalars.
-                metadata_cpu = torch.tensor(
-                    [local_hit_len, local_hit_len + token_count, -1],
-                    dtype=torch.int64,
-                    device="cpu",
+        with operations_nvtx_range("radix.as.lb.alloc"):
+            try:
+                if torch.device(device).type == "cuda" and torch.version.hip is None:
+                    # Keep existing last_loc on device; only pack Python scalars.
+                    metadata_cpu = torch.tensor(
+                        [local_hit_len, local_hit_len + token_count, -1],
+                        dtype=torch.int64,
+                        device="cpu",
+                    )
+                    metadata = metadata_cpu.to(device, non_blocking=True)
+                    prefix_lens = metadata[:1]
+                    seq_lens = metadata[1:2]
+                    load_last_loc = (
+                        last_loc.to(device=device, dtype=torch.int64)
+                        if last_loc is not None
+                        else metadata[2:3]
+                    )
+                else:
+                    prefix_lens = prefix_cpu.to(device)
+                    seq_lens = seq_cpu.to(device)
+                    load_last_loc = (
+                        last_loc.to(device=device, dtype=torch.int64)
+                        if last_loc is not None
+                        else torch.tensor([-1], dtype=torch.int64, device=device)
+                    )
+                loaded = cache.token_to_kv_pool_allocator.alloc_extend_swa_tail(
+                    prefix_lens,
+                    prefix_cpu,
+                    seq_lens,
+                    seq_cpu,
+                    load_last_loc,
+                    token_count,
+                    # One whole SWA page, even though a plan may restore only its
+                    # upper half: alloc_extend_swa_tail maps the *last* swa_tail_len
+                    # full slots onto the freshly allocated SWA page, so asking for
+                    # less than a page would land the restored window in the page's
+                    # lower half and desynchronize it from the stored byte offset.
+                    min(token_count, cache.page_size),
                 )
-                metadata = metadata_cpu.to(device, non_blocking=True)
-                prefix_lens = metadata[:1]
-                seq_lens = metadata[1:2]
-                load_last_loc = (
-                    last_loc.to(device=device, dtype=torch.int64)
-                    if last_loc is not None
-                    else metadata[2:3]
+            except Exception as exc:
+                if defer_vote:
+                    return self._failed_allocation(
+                        cache, req, load_info, local_hit_len, started, exc)
+                cache._log_as_failure(
+                    "load_back",
+                    rid=req.rid,
+                    requested=requested,
+                    error=exc,
+                    started=started,
                 )
-            else:
-                prefix_lens = prefix_cpu.to(device)
-                seq_lens = seq_cpu.to(device)
-                load_last_loc = (
-                    last_loc.to(device=device, dtype=torch.int64)
-                    if last_loc is not None
-                    else torch.tensor([-1], dtype=torch.int64, device=device)
-                )
-            loaded = cache.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-                prefix_lens,
-                prefix_cpu,
-                seq_lens,
-                seq_cpu,
-                load_last_loc,
-                token_count,
-                # One whole SWA page, even though a plan may restore only its
-                # upper half: alloc_extend_swa_tail maps the *last* swa_tail_len
-                # full slots onto the freshly allocated SWA page, so asking for
-                # less than a page would land the restored window in the page's
-                # lower half and desynchronize it from the stored byte offset.
-                min(token_count, cache.page_size),
-            )
-        except Exception as exc:
-            if defer_vote:
-                return self._failed_allocation(
-                    cache, req, load_info, local_hit_len, started, exc)
-            cache._log_as_failure(
-                "load_back",
-                rid=req.rid,
-                requested=requested,
-                error=exc,
-                started=started,
-            )
-            cache._as_min(0)
-            return None
+                cache._as_min(0)
+                return None
         if loaded is None and defer_vote:
             return self._failed_allocation(
                 cache, req, load_info, local_hit_len, started,
@@ -507,56 +513,57 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
         return self._run_local_load_back_read(cache, task)
 
     def _run_local_load_back_read(self, cache, task: _SPLoadBackTask):
-        try:
-            page_ids, read_args, read_kwargs = self._prepare_read(
-                cache, task.req, task.load_info, task.loaded
-            )
-        except Exception as exc:
-            return exc
-        try:
-            hashes = task.load_info["hashes"]
-            diffuser = getattr(cache, "_as_read_diffuser", None)
-            sharded = diffuser is not None and task.requested > 1
-            if sharded:
-                terminal = task.requested - 1
-                indices = sorted(
-                    set(diffuser.local_shard(task.requested)) | {terminal}
+        with operations_nvtx_range("radix.as.lb.read"):
+            try:
+                page_ids, read_args, read_kwargs = self._prepare_read(
+                    cache, task.req, task.load_info, task.loaded
                 )
-                task.diffuse_page_slots = tuple(int(page) for page in page_ids)
-                task.diffuse_extra_blocks = (terminal,)
-                hashes = [hashes[index] for index in indices]
-                page_ids = [task.diffuse_page_slots[index] for index in indices]
-            submit_native = (
-                getattr(cache.ascli, "submit_read_native", None)
-                if os.environ.get("ATTENTIONSTORE_NATIVE_CONTROL") == "1" else None
-            )
-            if submit_native is not None:
-                native = submit_native(
-                    hashes, page_ids, *read_args, timeout=5.0,
+            except Exception as exc:
+                return exc
+            try:
+                hashes = task.load_info["hashes"]
+                diffuser = getattr(cache, "_as_read_diffuser", None)
+                sharded = diffuser is not None and task.requested > 1
+                if sharded:
+                    terminal = task.requested - 1
+                    indices = sorted(
+                        set(diffuser.local_shard(task.requested)) | {terminal}
+                    )
+                    task.diffuse_page_slots = tuple(int(page) for page in page_ids)
+                    task.diffuse_extra_blocks = (terminal,)
+                    hashes = [hashes[index] for index in indices]
+                    page_ids = [task.diffuse_page_slots[index] for index in indices]
+                submit_native = (
+                    getattr(cache.ascli, "submit_read_native", None)
+                    if os.environ.get("ATTENTIONSTORE_NATIVE_CONTROL") == "1" else None
+                )
+                if submit_native is not None:
+                    native = submit_native(
+                        hashes, page_ids, *read_args, timeout=5.0,
+                        remote_addrs=task.load_info.get("remote_addrs") or None,
+                        **read_kwargs,
+                    )
+                    if native is not None:
+                        task.native_sharded_blocks = len(hashes) if sharded else None
+                        # Last task mutation on the reader. Native copy/release
+                        # completion is now visible without executor.set_result.
+                        task.native_read_future = native
+                        return None
+                got = cache.ascli.read(
+                    hashes,
+                    page_ids,
+                    *read_args,
+                    timeout=5.0,
                     remote_addrs=task.load_info.get("remote_addrs") or None,
                     **read_kwargs,
                 )
-                if native is not None:
-                    task.native_sharded_blocks = len(hashes) if sharded else None
-                    # Last task mutation on the reader. Native copy/release
-                    # completion is now visible without executor.set_result.
-                    task.native_read_future = native
-                    return None
-            got = cache.ascli.read(
-                hashes,
-                page_ids,
-                *read_args,
-                timeout=5.0,
-                remote_addrs=task.load_info.get("remote_addrs") or None,
-                **read_kwargs,
-            )
-            # This is a local readiness vote, not published host credit.
-            # commit_load_backs MIN-reduces it across ranks, then diffuses.
-            if sharded:
-                return task.requested if got == len(hashes) else 0
-            return got
-        except Exception as exc:
-            return exc
+                # This is a local readiness vote, not published host credit.
+                # commit_load_backs MIN-reduces it across ranks, then diffuses.
+                if sharded:
+                    return task.requested if got == len(hashes) else 0
+                return got
+            except Exception as exc:
+                return exc
 
     def _release_task_requests(self, tasks: list) -> None:
         """Drop the submit-side flags so the waiting request re-admits."""
@@ -882,9 +889,10 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
             match.device_indices[cache_len - cache.page_size : cache_len]
         )
         swa_page_id = int(swa_indices[0].item()) // cache.page_size
-        new_snapshot = task.checkpoint_store.snapshot(
-            self.state_slots(cache, context.req.kv.req_pool_idx, swa_page_id)
+        task.checkpoint_slots = self.state_slots(
+            cache, context.req.kv.req_pool_idx, swa_page_id
         )
+        new_snapshot = task.checkpoint_store.snapshot(task.checkpoint_slots)
         if task.checkpoint_snapshot is not None:
             task.checkpoint_snapshot.release()
         task.checkpoint_snapshot = new_snapshot
@@ -1030,8 +1038,12 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
                 block_hash_ids=hashes,
                 page_ids=None,
                 checkpoint_snapshot=checkpoint_snapshot,
+                checkpoint_slots=self.state_slots(
+                    cache, req.kv.req_pool_idx, swa_page_id
+                ),
                 params=getattr(req, "as_kv_cache_params", None) or {},
                 release_after_write=release_staging,
+                trace_recorder=cache.get_as_trace_recorder(req),
             )
         except Exception as exc:
             if checkpoint_snapshot is not None:
@@ -1082,49 +1094,51 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
         requested = int(load_info["block_count"])
         started = time.perf_counter()
         token_count = requested * cache.page_size
-        available = cache.token_to_kv_pool_allocator.available_size()
-        if available < token_count and cache.full_evictable_size() > 0:
-            cache.evict(
-                EvictParams(
-                    num_tokens=token_count - available + cache.page_size,
-                    swa_num_tokens=cache.page_size,
+        with operations_nvtx_range("radix.as.lb.evict"):
+            available = cache.token_to_kv_pool_allocator.available_size()
+            if available < token_count and cache.full_evictable_size() > 0:
+                cache.evict(
+                    EvictParams(
+                        num_tokens=token_count - available + cache.page_size,
+                        swa_num_tokens=cache.page_size,
+                    )
                 )
-            )
         local_hit_len = int(load_info["start_block"]) * cache.page_size
         device = cache.token_to_kv_pool_allocator.device
         prefix_cpu = torch.tensor([local_hit_len], dtype=torch.int64)
         seq_cpu = torch.tensor([local_hit_len + token_count], dtype=torch.int64)
         # The allocator consumes a one-element tensor; keep an existing index on device.
         last_loc = req.prefix_indices[-1].reshape(1) if local_hit_len else None
-        try:
-            loaded = cache.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-                prefix_cpu.to(device),
-                prefix_cpu,
-                seq_cpu.to(device),
-                seq_cpu,
-                (
-                    last_loc.to(device=device, dtype=torch.int64)
-                    if last_loc is not None
-                    else torch.tensor([-1], dtype=torch.int64, device=device)
-                ),
-                token_count,
-                # One whole SWA page, even though a plan may restore only its
-                # upper half: alloc_extend_swa_tail maps the *last* swa_tail_len
-                # full slots onto the freshly allocated SWA page, so asking for
-                # less than a page would land the restored window in the page's
-                # lower half and desynchronize it from the stored byte offset.
-                min(token_count, cache.page_size),
-            )
-        except Exception as exc:
-            cache._log_as_failure(
-                "load_back",
-                rid=req.rid,
-                requested=requested,
-                error=exc,
-                started=started,
-            )
-            cache._as_min(0)
-            return empty, anchor
+        with operations_nvtx_range("radix.as.lb.alloc"):
+            try:
+                loaded = cache.token_to_kv_pool_allocator.alloc_extend_swa_tail(
+                    prefix_cpu.to(device),
+                    prefix_cpu,
+                    seq_cpu.to(device),
+                    seq_cpu,
+                    (
+                        last_loc.to(device=device, dtype=torch.int64)
+                        if last_loc is not None
+                        else torch.tensor([-1], dtype=torch.int64, device=device)
+                    ),
+                    token_count,
+                    # One whole SWA page, even though a plan may restore only its
+                    # upper half: alloc_extend_swa_tail maps the *last* swa_tail_len
+                    # full slots onto the freshly allocated SWA page, so asking for
+                    # less than a page would land the restored window in the page's
+                    # lower half and desynchronize it from the stored byte offset.
+                    min(token_count, cache.page_size),
+                )
+            except Exception as exc:
+                cache._log_as_failure(
+                    "load_back",
+                    rid=req.rid,
+                    requested=requested,
+                    error=exc,
+                    started=started,
+                )
+                cache._as_min(0)
+                return empty, anchor
         if loaded is None:
             cache._log_as_failure(
                 "load_back",
@@ -1135,26 +1149,31 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
             )
             cache._as_min(0)
             return empty, anchor
-        try:
-            page_ids, read_args, read_kwargs = self._prepare_read(
-                cache, req, load_info, loaded
-            )
-        except Exception as exc:
-            # Validation may have failed on malformed indices or a missing SWA
-            # mapping, so keep the arbitrary-index cleanup for this branch.
-            cache.token_to_kv_pool_allocator.free(loaded)
-            cache._log_as_failure(
-                "load_back",
-                rid=req.rid,
-                requested=requested,
-                error=exc,
-                started=started,
-            )
-            cache._as_min(0)
-            return empty, anchor
+        with operations_nvtx_range("radix.as.lb.prepare"):
+            try:
+                page_ids, read_args, read_kwargs = self._prepare_read(
+                    cache, req, load_info, loaded
+                )
+            except Exception as exc:
+                # Validation may have failed on malformed indices or a missing SWA
+                # mapping, so keep the arbitrary-index cleanup for this branch.
+                cache.token_to_kv_pool_allocator.free(loaded)
+                cache._log_as_failure(
+                    "load_back",
+                    rid=req.rid,
+                    requested=requested,
+                    error=exc,
+                    started=started,
+                )
+                cache._as_min(0)
+                return empty, anchor
         if cache._as_min(1) == 0:
             self._free_loaded_pages(cache, loaded, start_pos=local_hit_len)
             return empty, anchor
+        recorder = cache.get_as_trace_recorder(req)
+        digest_capture = recorder.new_digest_capture() if recorder is not None else None
+        if digest_capture is not None:
+            read_kwargs = {**read_kwargs, "on_digest_snapshot": digest_capture}
         diffuser = getattr(cache, "_as_read_diffuser", None)
         read_error = None
         if diffuser is not None and requested > 1:
@@ -1162,18 +1181,19 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
                 cache, diffuser, load_info, page_ids, read_args, read_kwargs, requested
             )
         else:
-            try:
-                read_count = cache.ascli.read(
-                    load_info["hashes"],
-                    page_ids,
-                    *read_args,
-                    timeout=5.0,
-                    remote_addrs=load_info.get("remote_addrs") or None,
-                    **read_kwargs,
-                )
-            except Exception as exc:
-                read_error = exc
-                read_count = 0
+            with operations_nvtx_range("radix.as.lb.read"):
+                try:
+                    read_count = cache.ascli.read(
+                        load_info["hashes"],
+                        page_ids,
+                        *read_args,
+                        timeout=5.0,
+                        remote_addrs=load_info.get("remote_addrs") or None,
+                        **read_kwargs,
+                    )
+                except Exception as exc:
+                    read_error = exc
+                    read_count = 0
         read_count = cache._as_min(read_count)
         if read_error is None:
             cache._log_as_result(
@@ -1194,46 +1214,69 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
         if read_count != requested:
             self._free_loaded_pages(cache, loaded, start_pos=local_hit_len)
             return empty, anchor
+        if recorder is not None:
+            # SPA passes its checkpoint slot map positionally; SPAG carries the
+            # restored SWA window in read_kwargs["swa_ids"] instead.
+            state_slots = (
+                read_args[0] if read_args and isinstance(read_args[0], dict) else {}
+            )
+            if "swa_page" in state_slots:
+                swa_id_list = [state_slots["swa_page"]]
+            else:
+                swa_id_list = list(read_kwargs.get("swa_ids") or ())
+            recorder.record(
+                "AS_READ",
+                phase="complete",
+                hash_ids=recorder.hash_ids(load_info["hashes"]),
+                data_id_list=page_ids,
+                swa_id_list=swa_id_list,
+                checkpoint_slots=state_slots,
+                actual_blocks=read_count,
+                start_transfer_block_index=load_info["start_block"],
+                md5_after_read=digest_capture.value(),
+                status="ok",
+            )
 
         total_prefix_len = local_hit_len + token_count
-        token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
-        values = torch.cat([req.prefix_indices, loaded]).to(dtype=torch.int64)
-        restored_swa_len = self._restored_swa_len(cache, token_count)
-        cache.insert(
-            InsertParams(
-                key=RadixKey(
-                    token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
-                ),
-                value=values,
-                prev_prefix_len=local_hit_len,
-                # Everything before the restored window is an SWA tombstone. This
-                # must describe the bytes actually read back, not the SWA pages
-                # allocated: over-claiming makes the tree serve uninitialized SWA.
-                swa_evicted_seqlen=local_hit_len
-                + max(0, token_count - restored_swa_len),
+        with operations_nvtx_range("radix.as.lb.insert"):
+            token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
+            values = torch.cat([req.prefix_indices, loaded]).to(dtype=torch.int64)
+            restored_swa_len = self._restored_swa_len(cache, token_count)
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(
+                        token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
+                    ),
+                    value=values,
+                    prev_prefix_len=local_hit_len,
+                    # Everything before the restored window is an SWA tombstone. This
+                    # must describe the bytes actually read back, not the SWA pages
+                    # allocated: over-claiming makes the tree serve uninitialized SWA.
+                    swa_evicted_seqlen=local_hit_len
+                    + max(0, token_count - restored_swa_len),
+                )
             )
-        )
-        match = UnifiedRadixCache.match_prefix(
-            cache,
-            MatchPrefixParams(
-                key=RadixKey(
-                    token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
+            match = UnifiedRadixCache.match_prefix(
+                cache,
+                MatchPrefixParams(
+                    key=RadixKey(
+                        token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
+                    ),
+                    req=req,
                 ),
-                req=req,
-            ),
-        )
-        tree_indices = match.device_indices[local_hit_len:total_prefix_len].to(
-            dtype=loaded.dtype
-        )
-        if len(tree_indices) != token_count:
-            logger.warning(
-                "AS cache insert: cache_plan=%s rid=%s status=error "
-                "reason=shortened_prefix expected_tokens=%s actual_tokens=%s",
-                cache.attention_store_plan.name,
-                req.rid,
-                token_count,
-                len(tree_indices),
             )
+            tree_indices = match.device_indices[local_hit_len:total_prefix_len].to(
+                dtype=loaded.dtype
+            )
+            if len(tree_indices) != token_count:
+                logger.warning(
+                    "AS cache insert: cache_plan=%s rid=%s status=error "
+                    "reason=shortened_prefix expected_tokens=%s actual_tokens=%s",
+                    cache.attention_store_plan.name,
+                    req.rid,
+                    token_count,
+                    len(tree_indices),
+                )
         req.as_read_pending_lock = True
         return tree_indices, match.last_device_node
 
@@ -1284,6 +1327,9 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
         if not task.block_hash_ids:
             return 0
         started = time.perf_counter()
+        transfer_start = 0
+        transfer_hashes = ()
+        transfer_page_ids = ()
         try:
             page_ids = task.page_ids.materialize()
             # RAW fix (align with KDACacheCoordinator.do_write / commit 763d75172f):
@@ -1293,18 +1339,27 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
             producer_ready = self.record_device_event(
                 cache.device, self._producer_stream(cache)
             )
+            digest_capture = (
+                task.trace_recorder.new_digest_capture()
+                if task.trace_recorder is not None
+                else None
+            )
             confirmed_pages = task.page_endpoint.store.match(
                 task.block_hash_ids,
                 timeout=1.0,
             )
             confirmed_pages = max(0, min(confirmed_pages, task.requested_blocks))
             if confirmed_pages < task.requested_blocks:
+                transfer_start = confirmed_pages
+                transfer_hashes = task.block_hash_ids[transfer_start:]
+                transfer_page_ids = page_ids[transfer_start:]
                 task.page_endpoint.store.write(
-                    task.block_hash_ids[confirmed_pages:],
-                    page_ids[confirmed_pages:],
+                    transfer_hashes,
+                    transfer_page_ids,
                     timeout=1.0,
                     params=task.params,
                     producer_ready=producer_ready,
+                    on_digest_snapshot=digest_capture,
                 )
                 confirmed_pages = task.page_endpoint.store.match(
                     task.block_hash_ids,
@@ -1324,6 +1379,7 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
                         task.checkpoint_snapshot,
                         timeout=1.0,
                         params=task.params,
+                        on_digest_snapshot=digest_capture,
                     )
                 result = confirmed_pages if checkpoint_result == 1 else -1
             cache._log_as_result(
@@ -1333,8 +1389,38 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
                 result=result,
                 started=started,
             )
+            if task.trace_recorder is not None and transfer_hashes:
+                task.trace_recorder.record(
+                    "AS_WRITE",
+                    phase="complete",
+                    task_id=id(task),
+                    hash_ids=task.trace_recorder.hash_ids(transfer_hashes),
+                    data_id_list=transfer_page_ids,
+                    swa_id_list=[task.checkpoint_slots["swa_page"]]
+                    if "swa_page" in task.checkpoint_slots
+                    else [],
+                    checkpoint_slots=task.checkpoint_slots,
+                    start_transfer_block_index=transfer_start,
+                    md5_before_write=digest_capture.value(),
+                    status="ok" if result >= task.requested_blocks else "partial",
+                )
             return result
         except Exception as exc:
+            if task.trace_recorder is not None and transfer_hashes:
+                task.trace_recorder.record(
+                    "AS_WRITE",
+                    phase="complete",
+                    task_id=id(task),
+                    hash_ids=task.trace_recorder.hash_ids(transfer_hashes),
+                    data_id_list=[],
+                    swa_id_list=[task.checkpoint_slots["swa_page"]]
+                    if "swa_page" in task.checkpoint_slots
+                    else [],
+                    checkpoint_slots=task.checkpoint_slots,
+                    start_transfer_block_index=transfer_start,
+                    status="error",
+                    error=str(exc),
+                )
             cache._log_as_failure(
                 "write",
                 rid=task.rid,
@@ -1356,6 +1442,7 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
                 block_hash_ids=(),
                 page_ids=(),
                 checkpoint_snapshot=None,
+                checkpoint_slots={},
                 params={},
             )
         )
@@ -1690,7 +1777,6 @@ class SPAGCacheCoordinator(SPACacheCoordinator):
         cache_len = (len(token_ids) // cache.page_size) * cache.page_size
         if cache_len == 0 or len(snapshot) < cache_len:
             return None
-        token_ids = token_ids[:cache_len]
         requested = 0
         try:
             hashes = _request_block_hash_ids(
@@ -1715,6 +1801,8 @@ class SPAGCacheCoordinator(SPACacheCoordinator):
                 params=getattr(req, "as_kv_cache_params", None) or {},
                 swa_slot_ids=swa_slot_ids,
                 swa_owned_end=owned_end,
+                request=req,
+                trace_recorder=cache.get_as_trace_recorder(req),
             )
         except Exception as exc:
             cache._log_as_failure(
@@ -1809,20 +1897,29 @@ class SPAGCacheCoordinator(SPACacheCoordinator):
         if not task.block_hash_ids:
             return 0
         started = time.perf_counter()
+        transfer_start = 0
+        transfer_page_ids = ()
+        transfer_swa_ids = []
         try:
             page_ids = task.page_ids.materialize()
-            # RAW fix (align with SPACacheCoordinator.do_write): record the
-            # producer fence on the writer thread, targeting the injected
-            # forward_stream, right before the gather.
-            producer_ready = self.record_device_event(
-                cache.device, self._producer_stream(cache)
+            producer_ready = task.producer_ready
+            if producer_ready is None:
+                producer_ready = self.record_device_event(
+                    cache.device, self._producer_stream(cache)
+                )
+            digest_capture = (
+                task.trace_recorder.new_digest_capture()
+                if task.trace_recorder is not None
+                else None
             )
             store = task.page_endpoint.store
             confirmed_pages = self._match_pages(store, task)
             if confirmed_pages < task.requested_blocks:
-                for start, end, swa_ids, block_step in self._write_chunks(
-                    cache, task, confirmed_pages
-                ):
+                chunks = self._write_chunks(cache, task, confirmed_pages)
+                transfer_start = chunks[0][0] if chunks else confirmed_pages
+                transfer_page_ids = page_ids[transfer_start:]
+                for start, end, swa_ids, block_step in chunks:
+                    transfer_swa_ids.extend(int(x) for x in swa_ids)
                     store.write(
                         task.block_hash_ids[start:end],
                         page_ids[start:end],
@@ -1832,6 +1929,7 @@ class SPAGCacheCoordinator(SPACacheCoordinator):
                         swa_ids=swa_ids,
                         swa_block_step=block_step,
                         logical_start=start,
+                        on_digest_snapshot=digest_capture,
                     )
                 confirmed_pages = self._match_pages(store, task)
             cache._log_as_result(
@@ -1841,8 +1939,40 @@ class SPAGCacheCoordinator(SPACacheCoordinator):
                 result=confirmed_pages,
                 started=started,
             )
+            if task.trace_recorder is not None and transfer_page_ids:
+                task.trace_recorder.record(
+                    "AS_WRITE",
+                    phase="complete",
+                    task_id=id(task),
+                    hash_ids=task.trace_recorder.hash_ids(
+                        task.block_hash_ids[transfer_start:]
+                    ),
+                    data_id_list=transfer_page_ids,
+                    swa_id_list=transfer_swa_ids,
+                    start_transfer_block_index=transfer_start,
+                    md5_before_write=digest_capture.value(),
+                    status=(
+                        "ok"
+                        if confirmed_pages >= task.requested_blocks
+                        else "partial"
+                    ),
+                )
             return confirmed_pages
         except Exception as exc:
+            if task.trace_recorder is not None and transfer_page_ids:
+                task.trace_recorder.record(
+                    "AS_WRITE",
+                    phase="complete",
+                    task_id=id(task),
+                    hash_ids=task.trace_recorder.hash_ids(
+                        task.block_hash_ids[transfer_start:]
+                    ),
+                    data_id_list=[],
+                    swa_id_list=[],
+                    start_transfer_block_index=transfer_start,
+                    status="error",
+                    error=str(exc),
+                )
             cache._log_as_failure(
                 "write",
                 rid=task.rid,
@@ -1864,6 +1994,12 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
 
     write_thread_name = "as_kda_writer"
 
+    @staticmethod
+    def _trace_write_skip(cache, req, reason: str, **fields) -> None:
+        """Record why no KDA write was submitted, so the trace is not silent."""
+        recorder = cache.get_as_trace_recorder(req)
+        if recorder is not None:
+            recorder.record("AS_WRITE", status="skipped", reason=reason, **fields)
 
     def capture_finished(
         self, cache, req, is_insert: bool
@@ -1935,6 +2071,9 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 or mamba_data.value is None
                 or len(snapshot) < cache_len
             ):
+                self._trace_write_skip(
+                    cache, req, "no_aligned_checkpoint", cache_len=cache_len
+                )
                 self.enqueue_dummy(cache, req.rid)
                 return
 
@@ -1950,10 +2089,21 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             if mamba_data.metadata.get(_KDA_PENDING_HASH) is not None or (
                 endpoint_hash == mamba_data.metadata.get(_KDA_PUBLISHED_HASH)
             ):
+                self._trace_write_skip(
+                    cache,
+                    req,
+                    "write_pending"
+                    if mamba_data.metadata.get(_KDA_PENDING_HASH) is not None
+                    else "already_published",
+                    cache_len=cache_len,
+                )
                 self.enqueue_dummy(cache, req.rid)
                 return
             write_key = (cache_len, endpoint_hash)
             if getattr(req, "_as_kda_last_submitted_write", None) == write_key:
+                self._trace_write_skip(
+                    cache, req, "already_submitted", cache_len=cache_len
+                )
                 self.enqueue_dummy(cache, req.rid)
                 return
             checkpoint_slot = self.prepare_checkpoint_slot(mamba_data.value)
@@ -1985,6 +2135,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 request=req,
                 write_key=write_key,
                 release_after_write=release_staging,
+                trace_recorder=cache.get_as_trace_recorder(req),
             )
             task.release = _acquire_node_release(cache, node)
             mamba_data.metadata[_KDA_PENDING_HASH] = endpoint_hash
@@ -2016,6 +2167,9 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
     def do_write(self, cache, task: _KDAWriteTask) -> int:
         """Write KDA pages and recurrent state through the composite store."""
         started = time.perf_counter()
+        transfer_hashes = ()
+        transfer_page_ids = ()
+        checkpoint_slot = None
         try:
             page_ids = task.page_ids.materialize()
             # Record the producer fence here (writer thread, right before the
@@ -2024,14 +2178,35 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             producer_ready = self.record_device_event(
                 cache.device, self._producer_stream(cache)
             )
+            checkpoint_slot = task.checkpoint_slot.materialize()
+            digest_capture = (
+                task.trace_recorder.new_digest_capture()
+                if task.trace_recorder is not None
+                else None
+            )
             written = cache.ascli.write(
                 task.block_hash_ids,
                 page_ids,
-                {"checkpoint": task.checkpoint_slot.materialize()},
+                {"checkpoint": checkpoint_slot},
                 timeout=1.0,
                 params=task.params,
                 producer_ready=producer_ready,
+                on_digest_snapshot=digest_capture,
             )
+            transfer_hashes = task.block_hash_ids
+            transfer_page_ids = page_ids
+            if task.trace_recorder is not None:
+                task.trace_recorder.record(
+                    "AS_WRITE",
+                    phase="complete",
+                    task_id=id(task),
+                    hash_ids=task.trace_recorder.hash_ids(transfer_hashes),
+                    data_id_list=transfer_page_ids,
+                    checkpoint_slots={"checkpoint": checkpoint_slot},
+                    start_transfer_block_index=0,
+                    md5_before_write=digest_capture.value(),
+                    status="ok",
+                )
             cache._log_as_result(
                 "write",
                 rid=task.rid,
@@ -2041,6 +2216,22 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             )
             return written
         except Exception as exc:
+            if task.trace_recorder is not None:
+                task.trace_recorder.record(
+                    "AS_WRITE",
+                    phase="complete",
+                    task_id=id(task),
+                    hash_ids=task.trace_recorder.hash_ids(task.block_hash_ids),
+                    data_id_list=[],
+                    checkpoint_slots=(
+                        {"checkpoint": checkpoint_slot}
+                        if checkpoint_slot is not None
+                        else {}
+                    ),
+                    start_transfer_block_index=0,
+                    status="error",
+                    error=str(exc),
+                )
             cache._log_as_failure(
                 "write",
                 rid=task.rid,
@@ -2080,7 +2271,9 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
         if cache.ascli is None or load_info is None or req is None:
             return empty, anchor
 
-        loaded = self._read_blocks(cache, load_info)
+        loaded = self._read_blocks(
+            cache, load_info, cache.get_as_trace_recorder(req)
+        )
         if loaded is None:
             return empty, anchor
         loaded_indices, value_transaction, checkpoint_allocation = loaded
@@ -2095,7 +2288,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             checkpoint_allocation,
         )
 
-    def _read_blocks(self, cache, load_info):
+    def _read_blocks(self, cache, load_info, recorder=None):
         block_count = int(load_info["block_count"])
         rid = load_info.get("rid", "-")
         started = time.perf_counter()
@@ -2170,6 +2363,9 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             state_id = int(host_ids[0])
             if cache._as_min(1) == 0:
                 return None
+            digest_capture = (
+                recorder.new_digest_capture() if recorder is not None else None
+            )
             read_error = None
             try:
                 read_count = cache.ascli.read(
@@ -2178,6 +2374,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                     {"checkpoint": state_id},
                     timeout=5.0,
                     remote_addrs=load_info.get("remote_addrs") or None,
+                    on_digest_snapshot=digest_capture,
                 )
             except Exception as exc:
                 read_error = exc
@@ -2204,6 +2401,18 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
 
             if read_count != block_count:
                 return None
+            if recorder is not None:
+                recorder.record(
+                    "AS_READ",
+                    phase="complete",
+                    hash_ids=recorder.hash_ids(load_info["hashes"]),
+                    data_id_list=page_ids,
+                    checkpoint_slots={"checkpoint": state_id},
+                    actual_blocks=read_count,
+                    start_transfer_block_index=load_info["start_block"],
+                    md5_after_read=digest_capture.value(),
+                    status="ok",
+                )
             keep_transaction = True
             return alloc_indices, value_transaction, checkpoint_allocation
         finally:

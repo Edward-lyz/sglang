@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator
@@ -67,19 +68,33 @@ class SchedulerStageMetricsRecorder:
     _trace_stage: str | None = None
     _last_wall_ns: int | None = None
     _wall_ns: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    _owner_thread_id: int | None = None
 
     def start(self, wall_ns: int) -> None:
         if not self.enabled:
             return
+        self._owner_thread_id = threading.get_ident()
         self._current_stage = SCHEDULER_STAGE_OTHER
         self._last_wall_ns = wall_ns
         self._wall_ns.clear()
+
+    def is_off_thread(self) -> bool:
+        """Whether the caller is not the thread that called ``start``.
+
+        The clock state is unsynchronized; a concurrent sampler (the prefill
+        forward thread) interleaves read-subtract-store and yields negative time.
+        """
+        return (
+            self._owner_thread_id is not None
+            and threading.get_ident() != self._owner_thread_id
+        )
 
     def enter(self, stage: str) -> str | None:
         if (
             not self.enabled
             or self._last_wall_ns is None
             or self._current_stage == stage
+            or self.is_off_thread()
         ):
             return None
         self._sample(time.monotonic_ns())
@@ -97,6 +112,9 @@ class SchedulerStageMetricsRecorder:
     def record(self, stage: str) -> Iterator[None]:
         if stage not in _SCHEDULER_STAGE_CATEGORY_SET:
             raise ValueError(f"Unknown scheduler stage: {stage}")
+        if self.is_off_thread():
+            yield
+            return
         previous_stage = self.enter(stage)
         previous_trace_stage = self._trace_stage
         trace_stage_changed = previous_trace_stage != stage
@@ -143,7 +161,7 @@ def scheduler_stage_method(stage: str) -> Callable[[_F], _F]:
         @wraps(func)
         def wrapper(self, *args, **kwargs):
             recorder = self.scheduler_stage_metrics
-            if recorder is None:
+            if recorder is None or recorder.is_off_thread():
                 return profiled_func(self, *args, **kwargs)
 
             previous_stage = recorder.enter(stage)

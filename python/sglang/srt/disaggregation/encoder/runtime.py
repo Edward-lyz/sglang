@@ -26,6 +26,9 @@ import zmq.asyncio
 
 import sglang.srt.disaggregation.encoder.server as server_module
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.encode_collector import (
+    EncoderMetricsCollector as FactoryEncoderMetricsCollector,
+)
 from sglang.srt.disaggregation.encoder.server import (
     ENCODER_MAX_BATCH_SIZE,
     ENCODER_MAX_BATCH_SIZE_EXPLICIT,
@@ -1161,6 +1164,14 @@ async def send_staged_embedding(
             buffer_address=request["buffer_address"],
         )
         metrics = enc.metrics_collector
+        if metrics is not None:
+            # /send takes the embedding /encode staged for req_id; a miss
+            # means it was released (timeout/abort) before prefill asked.
+            nbytes = int(request.get("embedding_size") or 0)
+            if sent:
+                metrics.record_cache_hit(nbytes, source="transfer")
+            else:
+                metrics.record_cache_miss(nbytes, source="transfer")
         if not sent:
             return False
 
@@ -1595,6 +1606,7 @@ async def run_dp_worker(
         if get_observability().extra_metric_labels:
             labels.update(get_observability().extra_metric_labels)
         server_module.encoder_metrics_collector = EncoderMetricsCollector(labels)
+        enc.attach_metrics(FactoryEncoderMetricsCollector(labels))
         enc.dp_rank = dp_rank
 
     max_batch_size, coalesce_same_turn = _resolve_encoder_batch_policy(
@@ -1797,6 +1809,8 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
         tp_processes.append(process)
 
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
+    if get_observability().enable_metrics:
+        encoder.attach_metrics(FactoryEncoderMetricsCollector(labels))
     max_batch_size, coalesce_same_turn = _resolve_encoder_batch_policy(
         encoder.model_type,
         ENCODER_MAX_BATCH_SIZE,

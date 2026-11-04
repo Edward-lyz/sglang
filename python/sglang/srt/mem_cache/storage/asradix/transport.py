@@ -611,6 +611,7 @@ class _BufferPageIO:
         self,
         block_hash_ids: Sequence[int],
         page_ids: Sequence[int],
+        force: bool = False,
     ) -> Optional[list]:
         """Hash the HBM pages a transfer touches, grouped per logical block.
 
@@ -618,7 +619,7 @@ class _BufferPageIO:
         a D2H copy per layer per page, and a corruption that spares both ends of
         the layer range is not a case worth paying for by default.
         """
-        if not cache_digest_enabled() or not block_hash_ids:
+        if not (cache_digest_enabled() or force) or not block_hash_ids:
             return None
         try:
             blocks = self._logical_blocks(block_hash_ids, page_ids)
@@ -739,6 +740,28 @@ class _BufferPageIO:
             action, self._snapshot_digests(block_hash_ids, page_ids), len(block_hash_ids)
         )
 
+    @staticmethod
+    def _publish_digest(
+        callback: Optional[Callable[[dict], None]],
+        action: str,
+        snapshot: Optional[list],
+        transferred: int,
+    ) -> None:
+        """Publish the already-captured digest without re-reading HBM buffers."""
+        if callback is not None and snapshot:
+            try:
+                callback(
+                    {
+                        "kind": "page_buffers",
+                        "action": action,
+                        "transferred": int(transferred),
+                        "components": snapshot,
+                    }
+                )
+            except Exception as exc:
+                cache_digest_logger.warning(
+                    "AS %s digest callback failed: %s", action, exc
+                )
 
     def match(self, block_hash_ids: Sequence[int], timeout: float = 1.0) -> int:
         """Return the matched page prefix length."""
@@ -771,6 +794,7 @@ class _BufferPageIO:
         swa_ids: Optional[Sequence[int]] = None,
         swa_block_step: Optional[int] = None,
         logical_start: Optional[int] = None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Write page blocks through the typed SDK buffers."""
         from attentionstore_sdk.sdk import BlockBatch, WriteRequest
@@ -790,7 +814,9 @@ class _BufferPageIO:
             self._logical_blocks(block_hash_ids, page_ids)
             # Snapshot before the SDK call: the D2H gather happens inside write(),
             # so this is the source content actually handed to the Agent.
-            snapshot = self._snapshot_digests(block_hash_ids, page_ids)
+            snapshot = self._snapshot_digests(
+                block_hash_ids, page_ids, force=on_digest_snapshot is not None
+            )
             swa_snapshot = self._swa_digests(
                 block_hash_ids, swa_ids, swa_block_step, True
             )
@@ -809,14 +835,18 @@ class _BufferPageIO:
                     swa_block_step=swa_block_step,
                 )
             )
-            self._emit_digests("write", snapshot, written)
+            if cache_digest_enabled():
+                self._emit_digests("write", snapshot, written)
             self._emit_digests("write-swa", swa_snapshot, written)
+            self._publish_digest(on_digest_snapshot, "write", snapshot, written)
             self._debug_recheck_after_sync(
                 block_hash_ids, page_ids, "write hash=%s" % (block_hash_ids[:1],)
             )
             return written
         blocks = self._logical_blocks(block_hash_ids, page_ids)
-        snapshot = self._snapshot_digests(block_hash_ids, page_ids)
+        snapshot = self._snapshot_digests(
+            block_hash_ids, page_ids, force=on_digest_snapshot is not None
+        )
         written = self._sdk.write(
             WriteRequest(
                 blocks=BlockBatch(
@@ -832,7 +862,9 @@ class _BufferPageIO:
                 swa_block_step=swa_block_step,
             )
         )
-        self._emit_digests("write", snapshot, written)
+        if cache_digest_enabled():
+            self._emit_digests("write", snapshot, written)
+        self._publish_digest(on_digest_snapshot, "write", snapshot, written)
         self._debug_recheck_after_sync(
             block_hash_ids, page_ids, "write hash=%s" % (block_hash_ids[:1],)
         )
@@ -847,6 +879,7 @@ class _BufferPageIO:
         logical_start: Optional[int] = None,
         swa_ids: Optional[Sequence[int]] = None,
         swa_block_step: Optional[int] = None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Read page blocks through the typed SDK buffers."""
         from attentionstore_sdk.sdk import BlockBatch, ReadRequest
@@ -871,13 +904,13 @@ class _BufferPageIO:
                     swa_block_step=swa_block_step,
                 )
             )
-            self._emit_digests(
-                "read",
-                self._snapshot_digests(
-                    *self._read_prefix(block_hash_ids, page_ids, read)
-                ),
-                read,
+            snapshot = self._snapshot_digests(
+                *self._read_prefix(block_hash_ids, page_ids, read),
+                force=on_digest_snapshot is not None,
             )
+            if cache_digest_enabled():
+                self._emit_digests("read", snapshot, read)
+            self._publish_digest(on_digest_snapshot, "read", snapshot, read)
             if read >= len(block_hash_ids):
                 # The SWA window only lands on the final requested block, so a
                 # short read leaves it untouched and hashing it says nothing.
@@ -911,11 +944,13 @@ class _BufferPageIO:
                 swa_block_step=swa_block_step,
             )
         )
-        self._emit_digests(
-            "read",
-            self._snapshot_digests(*self._read_prefix(block_hash_ids, page_ids, read)),
-            read,
+        snapshot = self._snapshot_digests(
+            *self._read_prefix(block_hash_ids, page_ids, read),
+            force=on_digest_snapshot is not None,
         )
+        if cache_digest_enabled():
+            self._emit_digests("read", snapshot, read)
+        self._publish_digest(on_digest_snapshot, "read", snapshot, read)
         rp_hashes, rp_pages = self._read_prefix(block_hash_ids, page_ids, read)
         self._debug_recheck_after_sync(
             rp_hashes, rp_pages, "read hash=%s" % (rp_hashes[:1],)
@@ -974,8 +1009,8 @@ class _SpagDigestPageIO(_BufferPageIO):
         self._digest_segments = tuple(digest_segments)
         self._swa_digest = swa_digest
 
-    def _snapshot_digests(self, block_hash_ids, page_ids):
-        if not cache_digest_enabled() or not block_hash_ids:
+    def _snapshot_digests(self, block_hash_ids, page_ids, force: bool = False):
+        if not (cache_digest_enabled() or force) or not block_hash_ids:
             return None
         segments = self._digest_segments
         if not segments:
@@ -1123,6 +1158,7 @@ class CheckpointedPageStore:
         checkpoint_slot: Mapping[str, int] | int,
         timeout: float = 1.0,
         remote_addrs=None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Read pages and their terminal checkpoint as one unit."""
         if not block_hash_ids:
@@ -1132,6 +1168,7 @@ class CheckpointedPageStore:
             page_ids,
             timeout=timeout,
             remote_addrs=remote_addrs,
+            on_digest_snapshot=on_digest_snapshot,
         )
         if page_count != len(block_hash_ids):
             return page_count
@@ -1140,6 +1177,7 @@ class CheckpointedPageStore:
             checkpoint_slot,
             timeout=timeout,
             remote_addrs=remote_addrs,
+            on_digest_snapshot=on_digest_snapshot,
         )
         return page_count if state_count == 1 else 0
 
@@ -1151,6 +1189,7 @@ class CheckpointedPageStore:
         timeout: float = 1.0,
         params: Optional[dict] = None,
         producer_ready=None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Write pages and their terminal checkpoint as one unit."""
         if not block_hash_ids:
@@ -1158,13 +1197,20 @@ class CheckpointedPageStore:
         wait_for_producer = getattr(self.checkpoint_store, "wait_for_producer", None)
         if wait_for_producer is not None:
             wait_for_producer(producer_ready, timeout=timeout)
-        self.page_store.write(block_hash_ids, page_ids, timeout=timeout, params=params)
+        self.page_store.write(
+            block_hash_ids,
+            page_ids,
+            timeout=timeout,
+            params=params,
+            on_digest_snapshot=on_digest_snapshot,
+        )
         checkpoint_result = self.checkpoint_store.write(
             int(block_hash_ids[-1]),
             checkpoint_slot,
             timeout=timeout,
             params=params,
             producer_ready=producer_ready,
+            on_digest_snapshot=on_digest_snapshot,
         )
         return len(block_hash_ids) if checkpoint_result == 1 else -1
 

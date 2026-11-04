@@ -422,6 +422,18 @@ async def handle_epd_transfer_request(request: dict):
     the rows it is holding for ``task_id`` there and acks. Wire-compatible with
     ``factory_transport.build_epd_transfer_payload`` / ``epd_transfer_error``.
     """
+    start = time.perf_counter()
+    response = await _epd_transfer(request)
+    metrics = getattr(encoder, "metrics_collector", None)
+    if metrics is not None:
+        metrics.transfer_endpoint.on_request_end(
+            str(response.status_code), time.perf_counter() - start
+        )
+    return response
+
+
+async def _epd_transfer(request: dict) -> ORJSONResponse:
+    """Run one /epd/transfer request and build its ack response."""
     task_id = request.get("task_id")
     req_id = request.get("req_id")
     ack = {"req_id": req_id, "task_id": task_id, "part_idx": request.get("part_idx", 0)}
@@ -442,12 +454,32 @@ async def handle_epd_transfer_request(request: dict):
                 "message": "session_id and buffer_address are required",
             },
         )
+    from sglang.srt.disaggregation.encode_health import (
+        record_transfer_attempt,
+        record_transfer_success,
+    )
+
+    # Tracked per prefill session: one dead peer must not mark the whole
+    # encoder unhealthy, but every peer failing points at local RDMA.
+    record_transfer_attempt(session_id)
     try:
-        await encoder.transfer_task_embedding(
+        transfer_ms, digest = await encoder.transfer_task_embedding(
             task_id, session_id, buffer_address, byte_size
         )
-        return ORJSONResponse(content={**ack, "status_code": 200, "message": "success"})
+        record_transfer_success(session_id)
+        return ORJSONResponse(
+            content={
+                **ack,
+                "status_code": 200,
+                "message": "success",
+                "transfer_cost_ms": round(transfer_ms, 3),
+                "embed_digest": digest,
+            }
+        )
     except MMError as e:
+        if int(e.code) in (int(HTTPStatus.NOT_FOUND), int(HTTPStatus.BAD_REQUEST)):
+            # Expired hold or a bad descriptor; the transfer path itself is fine.
+            record_transfer_success(session_id)
         return ORJSONResponse(
             status_code=int(e.code),
             content={**ack, "status_code": int(e.code), "message": str(e)},

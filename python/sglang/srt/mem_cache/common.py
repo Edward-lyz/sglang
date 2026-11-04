@@ -42,6 +42,8 @@ class RetractionBackup(NamedTuple):
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
     return (kv_indices[::page_size] // page_size).cpu().numpy()
+
+
 def kv_to_page_indices_pinned(
     kv_indices: torch.Tensor,
     page_size: int,
@@ -331,6 +333,13 @@ def _release_uncommitted_chunk_tail_swa_slots(
     req.as_swa_kv_slots = []
 
 
+def seal_as_trace(req: Req) -> None:
+    """Let a fired AS trace finalize once its pending AS writes retire."""
+    context = getattr(req, "as_trace_context", None)
+    if context is not None:
+        context.seal_registered()
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
@@ -344,6 +353,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.kv.mamba_pool_idx.unsqueeze(-1)
             )
             req.kv.mamba_pool_idx = None
+        seal_as_trace(req)
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
@@ -352,6 +362,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
         kv_len_to_handle=effective_kv_committed_len,
     )
+    seal_as_trace(req)
+
     # After cache_finished_req, so a write submitted there has already advanced
     # as_written_count and keeps ownership of its slots.
     _release_uncommitted_chunk_tail_swa_slots(req, tree_cache)

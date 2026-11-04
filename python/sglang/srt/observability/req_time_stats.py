@@ -615,6 +615,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
 
+    # zmq transport (api server -> scheduler), get by time.perf_counter()
+    dispatch_to_scheduler_time: float = 0.0
+    arrive_scheduler_time: float = 0.0
+
     # prefill node, get by time.perf_counter()
     prefill_bootstrap_queue_entry_time: float = 0.0
     prefill_transfer_queue_entry_time: float = 0.0
@@ -1052,6 +1056,33 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
+
+    def get_request_first_token_forward_time(self) -> float:
+        """get_request_first_token_forward_time"""
+        if self.disagg_mode == DisaggregationMode.NULL:
+            return self.completion_time - self.wait_queue_entry_time
+        elif self.disagg_mode == DisaggregationMode.PREFILL:
+            return self.completion_time - self.prefill_bootstrap_queue_entry_time
+        elif self.disagg_mode == DisaggregationMode.DECODE:
+            return self.completion_time - self.decode_transfer_queue_entry_time
+        return 0.0
+
+    def get_request_waiting_time(self) -> float:
+        """get_request_waiting_time"""
+        if self.disagg_mode == DisaggregationMode.NULL:
+            return self.forward_entry_time - self.wait_queue_entry_time
+        elif self.disagg_mode == DisaggregationMode.PREFILL:
+            return self.forward_entry_time - self.prefill_bootstrap_queue_entry_time
+        elif self.disagg_mode == DisaggregationMode.DECODE:
+            return self.forward_entry_time - self.decode_transfer_queue_entry_time
+        return 0.0
+
+    def get_request_zmq_time(self) -> float:
+        """Time spent on the zmq transport from api server to scheduler."""
+        # Avoid pushing uninitialized values into metrics
+        if self.dispatch_to_scheduler_time <= 0.0 or self.arrive_scheduler_time <= 0.0:
+            return 0.0
+        return max(0.0, self.arrive_scheduler_time - self.dispatch_to_scheduler_time)
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
