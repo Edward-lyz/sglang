@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """DetokenizerManager is a process that detokenizes the token ids."""
-
 import dataclasses
 import logging
 import os
@@ -231,6 +230,29 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         bs = len(recv_obj.rids)
         generated_token_nums = []
 
+        # `decode_status` is keyed by (rid, http_worker_ipc) rather than by rid alone.
+        # There is exactly one detokenizer process per instance, while
+        # `--tokenizer-worker-num N` gives N independent http workers that do not
+        # coordinate rids with each other. Including the worker's ipc name in the key
+        # keeps two requests that share an rid but come from different workers fully
+        # isolated: they can neither collide in the lookup below nor interleave their
+        # tokens. `http_worker_ipcs` is Optional (io_struct.BaseBatchReq), and it is
+        # all-None in single-worker mode, where the key degenerates to the rid.
+        http_worker_ipcs = recv_obj.http_worker_ipcs or [None] * bs
+        status_keys = [(recv_obj.rids[i], http_worker_ipcs[i]) for i in range(bs)]
+
+        # Check for duplicate rids
+        if len(set(status_keys)) != len(status_keys):
+            logger.warning(
+                f"Found duplicate (rid, http_worker_ipc) keys in batch: {recv_obj.rids}. "
+                "These requests share one decode status and their outputs may interleave."
+            )
+        elif len(set(recv_obj.rids)) != len(recv_obj.rids):
+            logger.warning(
+                f"Found duplicate rids from different http workers in batch: {recv_obj.rids}. "
+                "They are isolated by the composite decode status key."
+            )
+
         # Initialize decode status
         read_ids, surr_ids = [], []
         token_num = 0
@@ -257,7 +279,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     )
                     token_num = len(s.decode_ids) - s.read_offset
             else:
-                s = self.decode_status[rid]
+                s = self.decode_status[key]
+                token_num = len(recv_obj.decode_ids[i])
                 s.decode_ids.extend(recv_obj.decode_ids[i])
 
             generated_token_nums.append(token_num)
@@ -325,16 +348,34 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     read_offset=recv_obj.read_offsets[i],
                 )
             else:
-                try:
-                    s = self.decode_status[rid]
-                except KeyError:
-                    raise RuntimeError(
-                        f"Decode status not found for request {rid}. "
+                s = self.decode_status.get(key, None)
+                if s is None:
+                    # Degrade instead of raising: `event_loop` has no per-request
+                    # exception isolation, so raising here takes down the whole
+                    # instance via SIGQUIT. The status can be missing when it was
+                    # evicted by LimitedCapacityDict during the loop above.
+                    # The fallback status is intentionally not stored back, so the
+                    # next batch re-initializes it in the loop above and the request
+                    # self-heals. The cost is that this chunk carries a `sent_offset`
+                    # of 0, so the client may see already-sent text repeated once,
+                    # and `decoded_text` only holds what the scheduler sent, so the
+                    # text may be incomplete.
+                    logger.warning(
+                        f"Decode status not found for request {key}. "
                         "It may be due to the request being evicted from the decode status due to memory pressure. "
                         "Please increase the maximum number of requests by setting "
                         "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
                         f"The current value is {DETOKENIZER_MAX_STATES}. "
+                        f"The current len decode_status of is {len(self.decode_status)}. "
+                        "Falling back to a freshly built decode status for this request; "
+                        "its output text may be inaccurate. "
                         "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
+                    )
+                    s = DecodeStatus(
+                        decoded_text=recv_obj.decoded_texts[i],
+                        decode_ids=list(recv_obj.decode_ids[i]),
+                        surr_offset=0,
+                        read_offset=recv_obj.read_offsets[i],
                     )
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:

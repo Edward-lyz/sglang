@@ -1239,12 +1239,44 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
         )
 
+    def _duplicate_rid_error(self, rid: str) -> ValueError:
+        return ValueError(
+            f"Duplicate request ID detected: {rid}. Another request with the same rid "
+            "is still in flight in this API server worker, so this one is rejected. "
+            "Please make sure request ids are unique."
+        )
+
     def _send_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        # Reject duplicate rids before touching any state. This whole function runs
+        # without awaiting, so the check, the send and the `rid_to_state` write are
+        # atomic with respect to the event loop: two concurrent requests sharing an
+        # rid cannot both get through. Registering after `send_pyobj` (below) is
+        # deliberate, so a send failure never leaves a stale entry that would make
+        # the rid permanently unusable.
+        #
+        # Known gap, accepted as not worth fixing given how rare it is: on a
+        # *streaming* request the rejection does not fully spare the earlier request.
+        # The HTTP layer builds the StreamingResponse before the generator runs
+        # (http_server.generate_request / OpenAIServing*._handle_streaming_request),
+        # so the `background=create_abort_task(obj)` task is already attached by the
+        # time this ValueError is raised from inside the generator. The generator
+        # turns it into an error SSE chunk and returns normally, which lets the
+        # background task run: after its 2s sleep it calls `abort_request(obj.rid)`,
+        # and that rid now resolves to the *earlier* request's state, so the
+        # scheduler aborts it (matched by rid prefix). Observable effect: the
+        # duplicate gets an error chunk, and the earlier request's stream is
+        # truncated with `finish_reason={"type": "abort"}`. It escapes unharmed only
+        # if it finished within those 2s, since its state is deleted on completion
+        # and the abort then no-ops. Needs a client explicitly reusing an rid on a
+        # streaming request; the non-streaming path attaches no background task and
+        # is unaffected.
+        if obj.rid in self.rid_to_state:
+            raise self._duplicate_rid_error(obj.rid)
         if self._should_reject_missing_bootstrap_room(tokenized_obj):
             return self._reject_missing_bootstrap_room(obj, created_time)
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
@@ -1270,6 +1302,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         created_time: Optional[float] = None,
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        # Same rationale as in `_send_one_request`, including the streaming caveat
+        # documented there: no await below, so this check is atomic. `seen_rids`
+        # additionally catches duplicates inside the batch itself. Note that a single
+        # duplicate rejects the whole batch, and because nothing has been sent or
+        # registered yet, no partial state is left behind.
+        seen_rids = set()
+        for tokenized_obj in tokenized_objs:
+            rid = tokenized_obj.rid
+            if rid in self.rid_to_state or rid in seen_rids:
+                raise self._duplicate_rid_error(rid)
+            seen_rids.add(rid)
+
         if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
@@ -2378,7 +2422,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        state = self.rid_to_state.get(recv_obj.rid, None)
+        if state is None:
+            # This runs inside the receive loop, so a KeyError here would break the
+            # whole loop. The state can legitimately be gone already (e.g. the request
+            # finished, or a duplicate rid was rejected at the entrance).
+            logger.info(
+                f"Abort request {recv_obj.rid} has no request state, skipping. "
+                "It may have already finished or been cleaned up."
+            )
+            return
         state.finished = True
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
