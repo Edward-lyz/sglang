@@ -141,17 +141,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.device = model_runner.device
 
-        # Workspace allocation
+        # Workspace allocation is deferred to the first trtllm-gen kernel
+        # launch (see the workspace_buffer property below), so constructing the
+        # backend does not commit the zero workspace on ranks that never launch
+        # these kernels. Until this flag is set (i.e. during super().__init__),
+        # the workspace_buffer property proxies the FlashInfer parent buffer.
         self.workspace_size = workspace_size_bytes
-        # Allocate buffers
-        self.workspace_buffer = get_buffer(
-            "trtllm_mha_zero_workspace",
-            lambda: torch.zeros(
-                self.workspace_size,
-                dtype=torch.uint8,
-                device=model_runner.device,
-            ),
-        )
+        self._trtllm_mha_workspace_buffer: Optional[torch.Tensor] = None
+        self._use_lazy_trtllm_workspace = True
+        if not envs.SGLANG_LAZY_ATTN_WORKSPACE.get():
+            # Eagerly materialize the zero workspace (pre-lazy behavior).
+            _ = self.workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -205,6 +205,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+
+    @property
+    def workspace_buffer(self) -> torch.Tensor:
+        """Zero-init workspace for the trtllm-gen MHA kernels (lazy)."""
+        if not getattr(self, "_use_lazy_trtllm_workspace", False):
+            # Reads during FlashInferAttnBackend.__init__ must see the
+            # FlashInfer workspace, never the zero-init trtllm one; preserve
+            # that behavior.
+            return self._flashinfer_workspace()
+        if self._trtllm_mha_workspace_buffer is None:
+            self._trtllm_mha_workspace_buffer = get_buffer(
+                "trtllm_mha_zero_workspace",
+                lambda: torch.zeros(
+                    self.workspace_size,
+                    dtype=torch.uint8,
+                    device=self.device,
+                ),
+            )
+        return self._trtllm_mha_workspace_buffer
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {

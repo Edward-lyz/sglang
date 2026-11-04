@@ -232,16 +232,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         )
         self.page_size = model_runner.page_size
 
-        # Allocate buffers
-        # different from flashinfer zero_init_global_workspace_buffer
-        self.workspace_buffer = get_buffer(
-            "flashinfer_mla_workspace",
-            lambda: torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            ),
-        )
+        # Workspace allocation is deferred to first use (see
+        # _flashinfer_workspace below); the wrappers capture it, so they are
+        # constructed lazily as well. Backends that fully override the forward
+        # paths (e.g. trtllm_mla) never commit this buffer.
+        self._workspace_buffer: Optional[torch.Tensor] = None
 
         max_bs = model_runner.req_to_token_pool.size
         if kv_indptr_buf is None:
@@ -268,25 +263,20 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.fmha_backend = "auto"
 
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=self.fmha_backend
-        )
-
-        if not self.skip_prefill:
-            self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer,
-                backend="auto",
-            )
-
-            # FlashinferMLA backend uses mla wrapper for target verify
-            self.prefill_wrapper_verify = BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer,
-                backend="auto",
-            )
-
-        self.decode_wrapper = BatchMLAPagedAttentionWrapper(
-            self.workspace_buffer, backend="auto"
-        )
+        self._prefill_wrapper_ragged: Optional[
+            BatchPrefillWithRaggedKVCacheWrapper
+        ] = None
+        self._prefill_wrapper_paged: Optional[BatchMLAPagedAttentionWrapper] = None
+        self._prefill_wrapper_verify: Optional[BatchMLAPagedAttentionWrapper] = None
+        self._decode_wrapper: Optional[BatchMLAPagedAttentionWrapper] = None
+        if not envs.SGLANG_LAZY_ATTN_WORKSPACE.get():
+            # Eagerly materialize the workspace and wrappers (pre-lazy behavior).
+            self._flashinfer_workspace()
+            _ = self.prefill_wrapper_ragged
+            if not self.skip_prefill:
+                _ = self.prefill_wrapper_paged
+                _ = self.prefill_wrapper_verify
+            _ = self.decode_wrapper
 
         # Create indices updater
         if not skip_prefill:
@@ -304,6 +294,69 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
+
+    def _flashinfer_workspace(self) -> torch.Tensor:
+        """FlashInfer float workspace, allocated on first use.
+
+        Named accessor (instead of the workspace_buffer property) so that
+        subclasses overriding workspace_buffer (e.g. trtllm_mla's zero-init
+        workspace) never leak their buffer into the FlashInfer wrappers.
+        """
+        if self._workspace_buffer is None:
+            # different from flashinfer zero_init_global_workspace_buffer
+            self._workspace_buffer = get_buffer(
+                "flashinfer_mla_workspace",
+                lambda: torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=self.device,
+                ),
+            )
+        return self._workspace_buffer
+
+    @property
+    def workspace_buffer(self) -> torch.Tensor:
+        """workspace_buffer"""
+        return self._flashinfer_workspace()
+
+    @property
+    def prefill_wrapper_ragged(self) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """prefill_wrapper_ragged"""
+        if self._prefill_wrapper_ragged is None:
+            self._prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+                self._flashinfer_workspace(), "NHD", backend=self.fmha_backend
+            )
+        return self._prefill_wrapper_ragged
+
+    @property
+    def prefill_wrapper_paged(self) -> BatchMLAPagedAttentionWrapper:
+        """prefill_wrapper_paged"""
+        if self._prefill_wrapper_paged is None:
+            self._prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
+                self._flashinfer_workspace(),
+                backend="auto",
+            )
+        return self._prefill_wrapper_paged
+
+    @property
+    def prefill_wrapper_verify(self) -> BatchMLAPagedAttentionWrapper:
+        """prefill_wrapper_verify"""
+        # FlashinferMLA backend uses mla wrapper for target verify
+        if self._prefill_wrapper_verify is None:
+            self._prefill_wrapper_verify = BatchMLAPagedAttentionWrapper(
+                self._flashinfer_workspace(),
+                backend="auto",
+            )
+        return self._prefill_wrapper_verify
+
+    @property
+    def decode_wrapper(self) -> BatchMLAPagedAttentionWrapper:
+        """decode_wrapper"""
+        if self._decode_wrapper is None:
+            self._decode_wrapper = BatchMLAPagedAttentionWrapper(
+                self._flashinfer_workspace(), backend="auto"
+            )
+        return self._decode_wrapper
 
     def init_forward_metadata_out_graph(
         self,
@@ -812,6 +865,13 @@ class FlashInferMLAIndicesUpdaterDecode:
 
 
 class FlashInferMLAIndicesUpdaterPrefill:
+    @property
+    def prefill_wrapper_ragged(self) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """prefill_wrapper_ragged"""
+        # Resolved lazily so that constructing the updater does not force the
+        # backend to build its (workspace-backed) ragged wrapper.
+        return self.attn_backend.prefill_wrapper_ragged
+
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_local_heads = (

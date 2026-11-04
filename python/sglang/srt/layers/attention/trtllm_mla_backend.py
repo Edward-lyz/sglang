@@ -222,28 +222,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
-        # Workspace allocation
+        # Workspace allocation is deferred to the first trtllm-gen / cute-dsl
+        # kernel launch (see the workspace_buffer property below): subclasses
+        # such as tokenspeed_mla override the kernels with their own workspace,
+        # so eager allocation would strand DEFAULT_WORKSPACE_SIZE_MB MB on
+        # those ranks. Until this flag is set (i.e. during super().__init__),
+        # the workspace_buffer property proxies the FlashInfer parent buffer.
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        if self.backend == "cute-dsl":
-            # Separate buffer from trtllm-gen (see note above); safe to share
-            # among cute-dsl instances.
-            global global_cute_dsl_workspace_buffer
-            if global_cute_dsl_workspace_buffer is None:
-                global_cute_dsl_workspace_buffer = torch.zeros(
-                    self.workspace_size,
-                    dtype=torch.int8,
-                    device=model_runner.device,
-                )
-            self.workspace_buffer = global_cute_dsl_workspace_buffer
-        else:
-            self.workspace_buffer = get_buffer(
-                "trtllm_mla_zero_workspace",
-                lambda: torch.zeros(
-                    self.workspace_size,
-                    dtype=torch.int8,
-                    device=model_runner.device,
-                ),
-            )
+        self._trtllm_workspace_buffer: Optional[torch.Tensor] = None
+        self._use_lazy_trtllm_workspace = True
+        if not envs.SGLANG_LAZY_ATTN_WORKSPACE.get():
+            # Eagerly materialize the zero workspace (pre-lazy behavior).
+            _ = self.workspace_buffer
 
         self._multi_ctas_kv_counter_buffer = (
             make_persistent_multi_ctas_kv_counter_buffer(

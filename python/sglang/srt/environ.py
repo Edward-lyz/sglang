@@ -647,6 +647,10 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Defer attention-backend workspace buffers (FlashInfer / trtllm-gen
+    # zero-init) and the wrappers capturing them to first use instead of
+    # allocating in __init__. Disable to restore eager allocation.
+    SGLANG_LAZY_ATTN_WORKSPACE = EnvBool(False)
     # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
