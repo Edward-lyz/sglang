@@ -201,6 +201,24 @@ class FileDeleteResponse(BaseModel):
     deleted: bool
 
 
+class KVTransferParams(BaseModel):
+    """
+    Parameters for KV transfer.
+    """
+    as_block_hashs: Optional[List[int]] = None
+    as_kv_cache_params: Optional[dict] = None
+    max_hit_host_ip: Optional[List[str]] = None
+    max_hit_token_len: Optional[List[int]] = None
+
+
+class KVCacheParams(BaseModel):
+    """
+    Parameters for KV cache.
+    """
+    need_caching: bool = False
+    expire_at: int = 0
+
+
 class BatchRequest(BaseModel):
     input_file_id: (
         str  # The ID of an uploaded file that contains requests for the new batch
@@ -300,6 +318,11 @@ class CompletionRequest(BaseModel):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
+    # For AttentionStore (AS) secondary cache
+    kv_transfer_params: Optional[KVTransferParams] = None
+    kv_cache_params: Optional[KVCacheParams] = None
+
+    # For data parallel rank routing
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -614,6 +637,11 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
+    # For AttentionStore (AS) secondary cache
+    kv_transfer_params: Optional[KVTransferParams] = None
+    kv_cache_params: Optional[KVCacheParams] = None
+
+    # For data parallel rank routing
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 

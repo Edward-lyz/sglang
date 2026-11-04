@@ -123,6 +123,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
+                    logger.warning(error_message)
                     release_kv_cache(req, self.tree_cache)
                     prepare_abort(
                         req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR

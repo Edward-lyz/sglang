@@ -1751,6 +1751,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        index_topk_pattern: Optional[List[str]] = None,
     ):
         assert (
             kv_lora_rank % self.quant_block_size == 0
@@ -1782,6 +1783,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        self.indexer_layer_mapping = None
+        self.indexer_layer_num = self.layer_num
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
@@ -1794,6 +1797,14 @@ class NSATokenToKVPool(MLATokenToKVPool):
             if self.custom_mem_pool
             else nullcontext()
         ):
+            if index_topk_pattern is not None and envs.SGLANG_INDEXER_CACHE_OPT.get():
+                self.indexer_layer_mapping = {}
+                counter = 0
+                for layer_id, pattern in enumerate(index_topk_pattern):
+                    if pattern != "shared":
+                        self.indexer_layer_mapping[layer_id] = counter
+                        counter += 1
+                self.indexer_layer_num = counter
             self.index_k_with_scale_buffer = [
                 torch.zeros(
                     # Layout:
@@ -1812,14 +1823,21 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=device,
                 )
-                for _ in range(layer_num)
+                for _ in range(self.indexer_layer_num)
             ]
         self._finalize_allocation_log(size)
+    
+    def _get_index_buf_by_layer(self, layer_id: int):
+        if envs.SGLANG_INDEXER_CACHE_OPT.get() and self.indexer_layer_mapping:
+            cache_index = self.indexer_layer_mapping[layer_id]
+        else:
+            cache_index = layer_id
+        return self.index_k_with_scale_buffer[cache_index]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return self._get_index_buf_by_layer(layer_id - self.start_layer)
 
     def get_index_k_continuous(
         self,
@@ -1827,7 +1845,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf_by_layer(layer_id - self.start_layer)
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -1838,7 +1856,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf_by_layer(layer_id - self.start_layer)
         return index_buf_accessor.GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -1860,7 +1878,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                  k_fp8: (seq_len, index_head_dim), uint8
                  k_scale: (seq_len, 4), uint8
         """
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf_by_layer(layer_id - self.start_layer)
         return index_buf_accessor.GetKAndS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -1872,20 +1890,20 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf_by_layer(layer_id - self.start_layer)
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
     def get_state_buf_infos(self):
         data_ptrs = [
-            self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.layer_num)
+            self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.indexer_layer_num)
         ]
         data_lens = [
-            self.index_k_with_scale_buffer[i].nbytes for i in range(self.layer_num)
+            self.index_k_with_scale_buffer[i].nbytes for i in range(self.indexer_layer_num)
         ]
         item_lens = [
-            self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
+            self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.indexer_layer_num)
         ]
         return data_ptrs, data_lens, item_lens
 

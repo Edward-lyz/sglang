@@ -128,7 +128,21 @@ class OpenAIServingCompletion(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            # AttentionStore parameters (populated below from kv_transfer_params)
+            as_kv_cache_params=None,
+            as_max_hit_host_ip=None,
+            as_max_hit_token_len=None,
         )
+
+        # Convert kv_cache_params and kv_transfer_params to as_* flat fields
+        if request.kv_transfer_params is not None:
+            kv_cache_dict = request.kv_cache_params.dict() if request.kv_cache_params else {}
+            adapted_request.as_kv_cache_params = {
+                key: str(value) if value is not None else ""
+                for key, value in kv_cache_dict.items()
+            }
+            adapted_request.as_max_hit_host_ip = request.kv_transfer_params.max_hit_host_ip
+            adapted_request.as_max_hit_token_len = request.kv_transfer_params.max_hit_token_len
 
         return adapted_request, request
 

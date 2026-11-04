@@ -668,6 +668,12 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # AttentionStore (AS) parameters
+        self.as_block_hashs = None
+        self.as_kv_cache_params = None
+        self.as_max_hit_host_ip: list = []
+        self.as_max_hit_token_len: list = []
+        self.ever_read_as: bool = False
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is

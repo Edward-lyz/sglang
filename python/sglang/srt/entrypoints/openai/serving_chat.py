@@ -315,10 +315,19 @@ class OpenAIServingChat(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            # AttentionStore parameters (populated below from kv_transfer_params)
+            as_kv_cache_params=None,
+            as_max_hit_host_ip=None,
+            as_max_hit_token_len=None,
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
         )
+        if request.kv_transfer_params is not None:
+            adapted_request.as_kv_cache_params = {
+                key: str(value) if value is not None else ""
+                for key, value in kv_cache_dict.items()
+            }
 
         return adapted_request, request
 

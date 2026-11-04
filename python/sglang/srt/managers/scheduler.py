@@ -314,6 +314,7 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_asradix_cache = server_args.enable_asradix_cache
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
 
         # Distributed rank info
@@ -332,12 +333,6 @@ class Scheduler(
 
         # Init model configs
         self.init_model_config()
-
-        # Init metrics stats
-        self.init_metrics(tp_rank, pp_rank, dp_rank)
-
-        # Init inter-process communication
-        self.init_ipc_channels(port_args)
 
         # Init PD-multiplexing context
         if self.enable_pdmux:
@@ -665,7 +660,6 @@ class Scheduler(
 
                 self.tree_cache = SWAChunkCache(params)
         else:
-
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
@@ -679,6 +673,15 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
+            elif self.enable_asradix_cache:
+                from sglang.srt.mem_cache.asradix_cache import AsRadixCache
+
+                self.tree_cache = AsRadixCache(
+                    params=params,
+                    server_args=server_args,
+                    tp_rank=self.tp_rank,
+                )
+                self._init_attention_store(server_args)
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -718,6 +721,207 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+    def _init_attention_store(self, server_args):
+        """Initialize AttentionStore SDK and inject into AsRadixCache.
+
+        Detects attention type (MLA/DSA/MHA) and computes per-shard byte sizes
+        for the SDK, following the v4 branch initialization pattern.
+        """
+        import os
+
+
+        try:
+            from attentionstore_sdk.sdk import AttentionStoreSDK, AttentionType
+        except ImportError:
+            logger.warning(
+                "attentionstore_sdk not installed. AS features will be disabled."
+            )
+            return
+
+        POD_NAME = os.getenv("POD_NAME")
+        MODEL_ID = os.getenv("MODEL_ID")
+        if POD_NAME is None or MODEL_ID is None:
+            raise ValueError("enable_asradix_cache but POD_NAME or MODEL_ID not set.")
+
+        # ---- Detect attention type and compute SDK params ----
+        from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        target_indexer_layer_ids = None
+        bytes_per_element = torch.tensor(
+            [], dtype=self.token_to_kv_pool_allocator.dtype
+        ).element_size()
+        kv_lora_plus_head_dim = kv_cache.get_key_buffer(0).size(-1)
+        v_bytes_per_shard_layer_per_block = 0
+
+        if self.model_config.attention_arch == AttentionArch.MLA:
+            # MLA: tp_rank=0 since MLA is TP-independent for KV cache
+            as_tp_rank = 0
+            as_tp_rank_num = 1
+
+            k_bytes_per_shard_layer_per_block = (
+                self.page_size * kv_lora_plus_head_dim * bytes_per_element
+            )
+            v_bytes_per_shard_layer_per_block = 0
+
+            if is_deepseek_nsa(self.model_config.hf_config):
+                # DSA (NSA): MLA-based key + index_k_with_scale_buffer as V
+                attention_type = AttentionType.DSA
+                attention_type_str = "DSA"
+                if indexer_layer_mapping is not None:
+                    target_indexer_layer_ids = [
+                        layer_id
+                        for layer_id, _ in sorted(
+                            indexer_layer_mapping.items(),
+                            key=lambda item: item[1],
+                        )
+                    ]
+                    if not target_indexer_layer_ids:
+                        raise ValueError(
+                            "DSA indexer cache optimization produced no indexer layers"
+                        )
+                # Compute V bytes from index_k_with_scale_buffer layout:
+                # buffer shape is (num_pages, page_size * (index_head_dim + scale_dim))
+                # so buf[0].nbytes already includes page_size factor
+                first_indexer_layer_id = (
+                    target_indexer_layer_ids[0]
+                    if target_indexer_layer_ids is not None
+                    else 0
+                )
+                index_k_buf = kv_cache.get_index_k_with_scale_buffer(
+                    first_indexer_layer_id
+                )
+                v_bytes_per_shard_layer_per_block = index_k_buf[0].nbytes
+            else:
+                attention_type = AttentionType.MLA
+                attention_type_str = "MLA"
+        else:
+            # MHA: TP-sharded, separate K and V buffers
+            as_tp_rank = self.tp_rank
+            as_tp_rank_num = server_args.tp_size
+            attention_type = AttentionType.MHA
+            attention_type_str = "MHA"
+            k_bytes_per_shard_layer_per_block = (
+                self.page_size * kv_lora_plus_head_dim * bytes_per_element
+            )
+            v_bytes_per_shard_layer_per_block = k_bytes_per_shard_layer_per_block
+
+        # ---- Compute layers (target + draft) ----
+        target_layers = self.model_config.num_hidden_layers
+        target_layer_ids = list(range(target_layers))
+
+        draft_layer_ids = []
+        draft_kv_cache = None
+        if self.draft_worker is not None and self.spec_algorithm.is_eagle():
+            draft_layers, draft_kv_cache = self._get_draft_kv_info()
+            if draft_layers > 0:
+                draft_layer_ids = list(
+                    range(target_layers, target_layers + draft_layers)
+                )
+                logger.info(
+                    f"EAGLE draft detected: {draft_layers} draft layers, "
+                    f"total AS layers = {target_layers + draft_layers}"
+                )
+
+        total_layers = target_layers + len(draft_layer_ids)
+        sdk_indexer_layer_ids = None
+        if attention_type_str == "DSA" and target_indexer_layer_ids is not None:
+            # Draft pools expose their own V/indexer buffer and therefore remain
+            # regular logical V layers after the compact target indexer layers.
+            sdk_indexer_layer_ids = target_indexer_layer_ids + draft_layer_ids
+        model_name = MODEL_ID + ":" + str(as_tp_rank_num)
+        dp_rank = 0 if self.dp_rank is None else self.dp_rank
+
+        # ---- Initialize AS SDK ----
+        self.ascli = None
+        try:
+            self.ascli = AttentionStoreSDK(
+                attention_type=attention_type,
+                layer_num=total_layers,
+                namespace=model_name,
+                pod_name=POD_NAME,
+                model_version="v1",
+                shard_id=as_tp_rank,
+                shard_num=as_tp_rank_num,
+                block_token_size=self.page_size,
+                k_bytes_per_shard_layer_per_block=k_bytes_per_shard_layer_per_block,
+                v_bytes_per_shard_layer_per_block=v_bytes_per_shard_layer_per_block,
+                device_id=self.gpu_id,
+                dp_id=dp_rank,
+                enable_as_kv_rw=True,
+                gpu_count=self.server_args.per_node_gpu_num,
+                indexer_layer_ids=sdk_indexer_layer_ids,
+            )
+            self.tree_cache.ref_ascli(self.ascli)
+            logger.info(
+                f"AttentionStoreSDK registered: model_name={model_name}, "
+                f"POD_NAME={POD_NAME}, as_shard_id={as_tp_rank}, "
+                f"as_shard_num={as_tp_rank_num}, attn_tp_rank={self.tp_rank}, "
+                f"gpu_id={self.gpu_id}, layers={total_layers}, "
+                f"page_size={self.page_size}, "
+                f"k_bytes={k_bytes_per_shard_layer_per_block}, "
+                f"v_bytes={v_bytes_per_shard_layer_per_block}, "
+                f"dp_rank={dp_rank}, "
+                f"attention_type={attention_type_str}, "
+                f"indexer_layers={sdk_indexer_layer_ids}, "
+                f"per_node_gpu_num={self.server_args.per_node_gpu_num}"
+            )
+        except Exception as e:
+            logger.error(f"AttentionStore SDK init failed: {e}")
+            return
+
+        # ---- Initialize buffer pointers for target layers ----
+        try:
+            self.tree_cache.init_buffer_ptrs(
+                target_layer_ids,
+                attention_type_str,
+                indexer_layer_ids=target_indexer_layer_ids,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize AS buffer pointers: {e}")
+            return
+
+        # ---- Extend with draft KV pool if EAGLE is enabled ----
+        if draft_kv_cache is not None and draft_layer_ids:
+            try:
+                self.tree_cache.extend_with_draft_pool(draft_kv_cache, draft_layer_ids)
+            except Exception as e:
+                logger.error(
+                    f"Failed to extend AS buffer pointers with draft pool: {e}"
+                )
+
+        logger.info(
+            f"AttentionStore fully initialized: target_layers={target_layers}, "
+            f"draft_layers={len(draft_layer_ids)}, total_layers={total_layers}, "
+            f"attention_type={attention_type_str}"
+        )
+
+    def _get_draft_kv_info(self):
+        """Get draft model's layer count and KV cache for EAGLE integration.
+
+        Returns:
+            (num_draft_layers, draft_kv_cache) or (0, None) if unavailable.
+        """
+        try:
+            if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
+                if self.server_args.enable_multi_layer_eagle:
+                    draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+                else:
+                    draft_runner = self.draft_worker.draft_worker.draft_runner
+            else:
+                draft_runner = self.draft_worker.model_runner
+            num_layers = (
+                draft_runner.model_config.num_nextn_predict_layers
+                if draft_runner.model_config.num_nextn_predict_layers is not None
+                else draft_runner.model_config.num_hidden_layers
+            )
+            return (
+                num_layers,
+                draft_runner.token_to_kv_pool,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to get draft KV info: {e}")
+            return 0, None
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
@@ -1263,7 +1467,6 @@ class Scheduler(
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:
-
                 status_code = (
                     HTTPStatus.BAD_REQUEST
                     if error_code == 400
@@ -1280,6 +1483,9 @@ class Scheduler(
                     trace_set_proc_propagate_context(req.rid, req.trace_context)
                     trace_slice_start("", req.rid, anonymous=True)
 
+            f = lambda r: isinstance(
+                r, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+            )
         return recv_reqs
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
@@ -1512,6 +1718,12 @@ class Scheduler(
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+
+        logger.info(
+            f"A new req {req.rid} has been received. "
+            f"Prompt len: {len(req.origin_input_ids)}. "
+            f"Sampling params: {req.sampling_params}."
+        )
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -1961,6 +2173,8 @@ class Scheduler(
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
+        elif self.enable_asradix_cache:
+            self.tree_cache.check_ascache_events()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)

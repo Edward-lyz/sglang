@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
@@ -44,7 +45,8 @@ _is_npu = is_npu()
 
 
 class ModelRunnerKVCacheMixin:
-    def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
+    def get_cell_size_per_token(self: ModelRunner, num_layers: int, index_num_layers: Optional[int] = None) -> int:
+        """get_cell_size_per_token"""
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             cell_size = (
@@ -77,7 +79,11 @@ class ModelRunnerKVCacheMixin:
                 element_size = torch._utils._element_size(
                     NSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                cell_size += (
+                    indexer_size_per_token
+                    * (index_num_layers if index_num_layers else num_layers)
+                    * element_size
+                )
         else:
             if self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)
@@ -114,6 +120,11 @@ class ModelRunnerKVCacheMixin:
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):
+        self.index_topk_pattern = getattr(self.model_config.hf_config, "indexer_types", None)
+        self.index_layer_num = None
+        if self.index_topk_pattern and envs.SGLANG_INDEXER_CACHE_OPT.get():
+            self.index_layer_num = len([ pattern for pattern in self.index_topk_pattern if pattern != "shared"])
+        
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -138,7 +149,7 @@ class ModelRunnerKVCacheMixin:
         else:
             num_layers = self.num_effective_layers
 
-        cell_size = self.get_cell_size_per_token(num_layers)
+        cell_size = self.get_cell_size_per_token(num_layers, self.index_layer_num)
 
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
@@ -548,6 +559,9 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                index_topk_pattern=(
+                    None if self.is_draft_worker else getattr(self.model_config.hf_config, "indexer_types", None)
+                )
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model

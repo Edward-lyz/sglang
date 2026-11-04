@@ -917,14 +917,16 @@ class MambaRadixCache(BasePrefixCache):
         value: List[torch.Tensor] = []
         best_value_len = 0
         best_last_node = node
-        while len(key) > 0 and child_key in node.children.keys():
+        cur_offset = 0
+        remaining = len(key)
+        while remaining > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             # update best_value_len and best_last_node if needed
             if node.mamba_value is not None:
                 best_value_len = len(value)
                 best_last_node = node
 
-            prefix_len = self.key_match_fn(child.key, key)
+            prefix_len = self.key_match_fn(child.key, key, offset=cur_offset)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -933,10 +935,11 @@ class MambaRadixCache(BasePrefixCache):
             else:
                 value.append(child.value)
                 node = child
-                key = key[prefix_len:]
+                cur_offset += prefix_len
+                remaining -= prefix_len
 
-                if len(key):
-                    child_key = self.get_child_key_fn(key)
+                if remaining > 0:
+                    child_key = self.get_child_key_fn(key, offset=cur_offset)
         # handle best_value_len and best_last_node, for the case that last node is fully matched
         if node.mamba_value is not None:
             best_value_len = len(value)
@@ -1078,29 +1081,32 @@ class MambaRadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        cur_offset = 0
+        remaining = len(key)
+        while remaining > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
             self.full_lru_list.reset_node_mru(node)
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
-            prefix_len = self.key_match_fn(node.key, key)
+            prefix_len = self.key_match_fn(node.key, key, offset=cur_offset)
             total_prefix_length += prefix_len
-            key = key[prefix_len:]
+            cur_offset += prefix_len
+            remaining -= prefix_len
             value = value[prefix_len:]
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 
-            if len(key):
-                child_key = self.get_child_key_fn(key)
+            if remaining > 0:
+                child_key = self.get_child_key_fn(key, offset=cur_offset)
 
         mamba_value_exist = False
-        if len(key):
+        if remaining > 0:
             new_node = TreeNode()
             new_node.parent = node
-            new_node.key = key
+            new_node.key = key[cur_offset:]
             new_node.value = value.clone()
             new_node.mamba_value = mamba_value
             self.full_lru_list.insert_mru(new_node)

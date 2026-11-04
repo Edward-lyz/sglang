@@ -237,6 +237,48 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
+    def cp_batch_all_gather_into_tensor(self, pairs, stream=None):
+        """Fuse many allgathers into ONE NCCL group launch (single kernel burst
+        vs N), removing the per-call launch/sync gaps between per-layer collectives.
+        pairs: list of (output_tensor, input_tensor). Issues on `stream`, no event
+        sync, so scatter on the SDK streams still overlaps."""
+        if self.disabled or not pairs:
+            return
+        stream = self._resolve_stream(stream)
+
+        # Validate first so exceptions cannot leave an NCCL group open.
+        for output_tensor, input_tensor in pairs:
+            assert input_tensor.device == self.device, (
+                f"this nccl communicator is created to work on {self.device}, "
+                f"but the input tensor is on {input_tensor.device}"
+            )
+            assert output_tensor.device == self.device, (
+                f"this nccl communicator is created to work on {self.device}, "
+                f"but the output tensor is on {output_tensor.device}"
+            )
+            assert output_tensor.dtype == input_tensor.dtype, (
+                f"all-gather input/output dtypes must match, got "
+                f"{input_tensor.dtype} and {output_tensor.dtype}"
+            )
+            assert output_tensor.numel() == input_tensor.numel() * self.world_size, (
+                f"all-gather output must contain world_size ({self.world_size}) "
+                f"copies of the input"
+            )
+
+        self.nccl.ncclGroupStart()
+        try:
+            for output_tensor, input_tensor in pairs:
+                self.nccl.ncclAllGather(
+                    buffer_type(input_tensor.data_ptr()),
+                    buffer_type(output_tensor.data_ptr()),
+                    input_tensor.numel(),
+                    ncclDataTypeEnum.from_torch(input_tensor.dtype),
+                    self.comm,
+                    cudaStream_t(stream.cuda_stream),
+                )
+        finally:
+            self.nccl.ncclGroupEnd()
+
     def reduce_scatter(
         self,
         output_tensor: torch.Tensor,
@@ -376,7 +418,8 @@ class PyNcclCommunicator:
 
         self.stream = stream
         self.disabled = not enable
-        yield
-
-        self.disabled = old_disable
-        self.stream = old_stream
+        try:
+            yield
+        finally:
+            self.disabled = old_disable
+            self.stream = old_stream

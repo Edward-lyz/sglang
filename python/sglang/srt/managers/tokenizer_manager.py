@@ -947,7 +947,30 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 routing_key=obj.routing_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
+                # AttentionStore parameters
+                as_kv_cache_params=obj.as_kv_cache_params,
+                as_max_hit_host_ip=obj.as_max_hit_host_ip,
+                as_max_hit_token_len=obj.as_max_hit_token_len,
             )
+
+            # Generate as_block_hashs from input_ids
+            if self.server_args.enable_asradix_cache:
+                try:
+                    from attentionstore_sdk.sdk import Tokens
+                except ImportError:
+                    logger.warning(
+                        "attentionstore_sdk not available, skipping as_block_hashs generation"
+                    )
+                else:
+                    try:
+                        tokenized_obj.as_block_hashs = Tokens(
+                            input_ids, self.server_args.page_size
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "failed to generate as_block_hashs, skipping AS matching: %s",
+                            e,
+                        )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text,

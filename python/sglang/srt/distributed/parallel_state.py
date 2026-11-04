@@ -21,6 +21,7 @@ If you only need to use the distributed environment without model/pipeline
  parallelism, you can skip the model parallel initialization and destruction
  steps.
 """
+
 import contextlib
 import gc
 import logging
@@ -79,7 +80,7 @@ class P2PWork:
 
 
 def _split_tensor_dict(
-    tensor_dict: Dict[str, Union[torch.Tensor, Any]]
+    tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
@@ -760,6 +761,19 @@ class GroupCoordinator:
             self.all_gather_into_tensor(output, input)
         else:
             pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
+
+    def cp_batch_all_gather_into_tensor_async(self, pairs, stream=None):
+        """Fuse a list of (output, input) allgathers into one NCCL group launch on
+        `stream`. Falls back to sequential allgathers if pynccl is unavailable."""
+        assert (
+            stream is not None
+        ), "cp_batch_all_gather_into_tensor_async requires an explicit stream."
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            for output, input in pairs:
+                self.all_gather_into_tensor(output, input)
+        else:
+            pynccl_comm.cp_batch_all_gather_into_tensor(pairs, stream=stream)
 
     def all_gather(
         self,

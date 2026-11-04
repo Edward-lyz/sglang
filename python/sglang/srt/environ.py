@@ -152,6 +152,7 @@ class ToolStrictLevel(IntEnum):
 
 class Envs:
     # fmt: off
+    SGLANG_INDEXER_CACHE_OPT = EnvBool(False)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)

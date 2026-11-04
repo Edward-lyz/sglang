@@ -530,6 +530,10 @@ class ServerArgs:
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
 
+    # AttentionStore (AS) secondary cache
+    enable_asradix_cache: bool = False
+    per_node_gpu_num: int = 8
+
     # Hierarchical sparse attention
     hierarchical_sparse_attention_extra_config: Optional[str] = None
 
@@ -1208,6 +1212,7 @@ class ServerArgs:
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
                 index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+                index_topk_pattern = getattr(hf_config, "indexer_types", None)
                 if self.enable_two_batch_overlap and (
                     index_topk_freq > 1
                     or (indexer_types is not None and "shared" in indexer_types)
@@ -1231,19 +1236,21 @@ class ServerArgs:
                             self.moe_dense_tp_size = 1
                             self.moe_a2a_backend = "deepep"
                             self.ep_size = self.tp_size
-                            self.kv_cache_dtype = "bf16"
+                            # self.kv_cache_dtype = "bf16"
                             logger.warning(
                                 f"For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, kv_cache_dtype == bf16, batch_size == 1"
                             )
                         else:
                             self.enable_dp_attention = True
                             self.moe_dense_tp_size = 1
-                            assert (
-                                self.dp_size == 1
-                            ), "For round-robin split mode, dp attention is not supported."
-                        assert (
-                            self.tp_size == 8
-                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                            #assert (
+                            #    self.dp_size == 1
+                            #), "For round-robin split mode, dp attention is not supported."
+                        #assert (
+                        #    self.tp_size == 8
+                        #), "Current multi-machine CP support suffers from "
+                        #    "precision issues. So context parallel only "
+                        #    "support Single machine(tp_size == 8)"
 
                         logger.warning(
                             f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
@@ -2623,6 +2630,30 @@ class ServerArgs:
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
+
+        if self.enable_asradix_cache and self.disable_radix_cache:
+            raise ValueError(
+                "AttentionStore (asradix_cache) requires radix cache to be enabled. "
+                "Please do not use --disable-radix-cache together with --enable-asradix-cache."
+            )
+
+        if self.enable_asradix_cache and self.enable_hierarchical_cache:
+            raise ValueError(
+                "HiCache and AttentionStore cannot be enabled simultaneously. "
+                "Please use only one of them."
+            )
+
+        if self.enable_asradix_cache and self.disaggregation_mode == "decode":
+            raise ValueError(
+                "AttentionStore (asradix_cache) is not supported on disaggregation decode instances. "
+                "Please disable --enable-asradix-cache for decode (D) instances."
+            )
+
+            if self.page_size <= 1:
+                raise ValueError(
+                    "AS KV R/W requires page_size > 1. "
+                    f"Current page_size is {self.page_size}."
+                )
 
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
@@ -4236,6 +4267,19 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+
+        # AttentionStore (AS) secondary cache
+        parser.add_argument(
+            "--enable-asradix-cache",
+            action="store_true",
+            help="Enable AttentionStore secondary cache for KV cache.",
+        )
+        parser.add_argument(
+            "--per-node-gpu-num",
+            type=int,
+            default=ServerArgs.per_node_gpu_num,
+            help="Number of GPUs per node, used for AttentionStore SDK initialization.",
         )
 
         # Hierarchical sparse attention

@@ -43,9 +43,9 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_page_size1,
     _key_match_paged,
     get_child_key,
+    page_align_keys,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -426,14 +426,10 @@ class SWARadixCache(BasePrefixCache):
         prev_prefix_len = params.prev_prefix_len
         swa_evicted_seqlen = params.swa_evicted_seqlen
 
-        key.token_ids = self.key_convert_fn(key.token_ids)
-
         if value is None:
-            value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
+            value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        if self.is_eagle:
-            # Make sure the value len equal to the EAGLE bigram key len
-            value = value[: len(key)]
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
 
         prefix_len = self._insert_helper(
             self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
@@ -483,7 +479,11 @@ class SWARadixCache(BasePrefixCache):
         if is_insert:
             self.insert(
                 InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
+                    key=RadixKey(
+                        token_ids[:page_aligned_token_len],
+                        req.extra_key,
+                        is_bigram=self.is_eagle,
+                    ),
                     value=page_aligned_kv_indices,
                     prev_prefix_len=old_prefix_len,
                     swa_evicted_seqlen=req.swa_evicted_seqlen,
@@ -545,7 +545,9 @@ class SWARadixCache(BasePrefixCache):
         # Note: the insert function already frees the overlapped kv_indices
         result = self.insert(
             InsertParams(
-                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                key=RadixKey(
+                    page_aligned_token_ids, req.extra_key, is_bigram=self.is_eagle
+                ),
                 value=page_aligned_kv_indices,
                 prev_prefix_len=old_prefix_len,
             )
@@ -554,7 +556,11 @@ class SWARadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(
+                    page_aligned_token_ids, req.extra_key, is_bigram=self.is_eagle
+                )
+            )
         )
         (new_indices, new_last_node) = (
             match_result.device_indices,
@@ -831,7 +837,9 @@ class SWARadixCache(BasePrefixCache):
         match_len_since_tombstone = float("inf")
         best_value_len = 0
         best_last_node = node
-        while len(key) > 0 and child_key in node.children.keys():
+        cur_offset = 0
+        remaining = len(key)
+        while remaining > 0 and child_key in node.children.keys():
             child = node.children[child_key]
 
             if child.swa_tombstone:
@@ -842,7 +850,7 @@ class SWARadixCache(BasePrefixCache):
                 # reset match_len_since_tombstone if we hit a tombstone node
                 match_len_since_tombstone = 0
 
-            prefix_len = self.key_match_fn(child.key, key)
+            prefix_len = self.key_match_fn(child.key, key, offset=cur_offset)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -855,10 +863,11 @@ class SWARadixCache(BasePrefixCache):
                 if not child.swa_tombstone:
                     match_len_since_tombstone += len(child.value)
                 node = child
-                key = key[prefix_len:]
+                cur_offset += prefix_len
+                remaining -= prefix_len
 
-                if len(key):
-                    child_key = self.get_child_key_fn(key)
+                if remaining > 0:
+                    child_key = self.get_child_key_fn(key, offset=cur_offset)
 
         # handle best_value_len and best_last_node, for the case that last node is fully matched
         if match_len_since_tombstone >= self.sliding_window_size:
@@ -870,7 +879,7 @@ class SWARadixCache(BasePrefixCache):
     def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:
         """Preprocess the key before matching."""
         key = params.key
-        key.token_ids = self.key_convert_fn(key.token_ids)
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
 
         if self.disable or len(key) == 0:
             return None
@@ -878,6 +887,9 @@ class SWARadixCache(BasePrefixCache):
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
+
+        if len(key) == 0:
+            return None
 
         return key
 
@@ -915,6 +927,41 @@ class SWARadixCache(BasePrefixCache):
             last_device_node=last_node,
             last_host_node=last_node,
         )
+
+    def _compact_single_child_chain(self, node: TreeNode) -> None:
+        while len(node.children) == 1:
+            child = next(iter(node.children.values()))
+            if len(child.children) == 0:
+                break
+            sum_gc_full_lock_ref = sum(
+                gc.full_lock_ref for gc in child.children.values()
+            )
+            if child.full_lock_ref > sum_gc_full_lock_ref:
+                break
+            if (
+                child.swa_tombstone != node.swa_tombstone
+                or child.full_lock_ref != node.full_lock_ref
+                or child.swa_lock_ref != node.swa_lock_ref
+            ):
+                break
+
+            if node.key.is_bigram:
+                # Bigram nodes share a boundary token; skip the duplicate.
+                merged_tokens = node.key.token_ids + child.key.token_ids[1:]
+            else:
+                merged_tokens = node.key.token_ids + child.key.token_ids
+            node.key = RadixKey(merged_tokens, node.key.extra_key, node.key.is_bigram)
+            node.value = torch.cat([node.value, child.value])
+            node.children = child.children
+            for grandchild in node.children.values():
+                grandchild.parent = node
+
+            if child.swa_uuid is not None:
+                node.swa_uuid = child.swa_uuid
+
+            self.full_lru_list.remove_node(child)
+            if not child.swa_tombstone:
+                self.swa_lru_list.remove_node(child)
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
@@ -973,13 +1020,15 @@ class SWARadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        cur_offset = 0
+        remaining = len(key)
+        while remaining > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:
                 self.swa_lru_list.reset_node_mru(node)
-            prefix_len = self.key_match_fn(node.key, key)
+            prefix_len = self.key_match_fn(node.key, key, offset=cur_offset)
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -1030,13 +1079,16 @@ class SWARadixCache(BasePrefixCache):
                     self.token_to_kv_pool_allocator.free(value[:prefix_len])
 
             total_prefix_length += prefix_len
-            key = key[prefix_len:]
+            cur_offset += prefix_len
+            remaining -= prefix_len
             value = value[prefix_len:]
 
-            if len(key):
-                child_key = self.get_child_key_fn(key)
+            if remaining > 0:
+                child_key = self.get_child_key_fn(key, offset=cur_offset)
 
-        if len(key):
+        if remaining > 0:
+            # Materialize the un-walked suffix once; tail below slices it further.
+            key = key[cur_offset:]
             if (
                 swa_evicted_seqlen > total_prefix_length
                 and swa_evicted_seqlen < total_prefix_length + len(key)

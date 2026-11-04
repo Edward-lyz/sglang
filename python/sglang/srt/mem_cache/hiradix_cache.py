@@ -1126,7 +1126,7 @@ class HiRadixCache(RadixCache):
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        key, _ = self.maybe_bigram_convert(key)
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=empty_value,
@@ -1210,11 +1210,14 @@ class HiRadixCache(RadixCache):
         child_key = self.get_child_key_fn(key)
 
         matched_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        cur_offset = 0
+        remaining = len(key)
+        while remaining > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
-            prefix_len = self.key_match_fn(node.key, key)
-            key = key[prefix_len:]
+            prefix_len = self.key_match_fn(node.key, key, offset=cur_offset)
+            cur_offset += prefix_len
+            remaining -= prefix_len
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
@@ -1223,13 +1226,13 @@ class HiRadixCache(RadixCache):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 
-            if len(key):
-                child_key = self.get_child_key_fn(key)
+            if remaining > 0:
+                child_key = self.get_child_key_fn(key, offset=cur_offset)
 
-        if len(key):
+        if remaining > 0:
             new_node = TreeNode(priority=node.priority)
             new_node.parent = node
-            new_node.key = key
+            new_node.key = key[cur_offset:]
             new_node.value = None
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
@@ -1244,11 +1247,13 @@ class HiRadixCache(RadixCache):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         value = []
+        cur_offset = 0
+        remaining = len(key)
 
-        while len(key) > 0 and child_key in node.children.keys():
+        while remaining > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
-            prefix_len = self.key_match_fn(child.key, key)
+            prefix_len = self.key_match_fn(child.key, key, offset=cur_offset)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:
@@ -1259,10 +1264,11 @@ class HiRadixCache(RadixCache):
                 if not child.evicted:
                     value.append(child.value)
                 node = child
-                key = key[prefix_len:]
+                cur_offset += prefix_len
+                remaining -= prefix_len
 
-                if len(key):
-                    child_key = self.get_child_key_fn(key)
+                if remaining > 0:
+                    child_key = self.get_child_key_fn(key, offset=cur_offset)
 
         return value, node
 
@@ -1301,7 +1307,7 @@ class HiRadixCache(RadixCache):
 
         if priority is None:
             priority = 0
-        key, value = self.maybe_bigram_convert(key, value)
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
 
         if len(key) == 0:
             return InsertResult(prefix_len=0)
@@ -1313,12 +1319,14 @@ class HiRadixCache(RadixCache):
         node = self.root_node
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
+        cur_offset = 0
+        remaining = len(key)
 
-        while len(key) > 0 and child_key in node.children.keys():
+        while remaining > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             node.priority = max(node.priority, priority)
-            prefix_len = self.key_match_fn(node.key, key)
+            prefix_len = self.key_match_fn(node.key, key, offset=cur_offset)
 
             if prefix_len == len(node.key):
                 if node.evicted:
@@ -1350,16 +1358,17 @@ class HiRadixCache(RadixCache):
                     total_prefix_length += prefix_len
                 node = new_node
 
-            key = key[prefix_len:]
+            cur_offset += prefix_len
+            remaining -= prefix_len
             value = value[prefix_len:]
 
-            if len(key):
-                child_key = self.get_child_key_fn(key)
+            if remaining > 0:
+                child_key = self.get_child_key_fn(key, offset=cur_offset)
 
-        if len(key):
+        if remaining > 0:
             new_node = TreeNode(priority=priority)
             new_node.parent = node
-            new_node.key = key
+            new_node.key = key[cur_offset:]
             new_node.value = value.clone()
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)

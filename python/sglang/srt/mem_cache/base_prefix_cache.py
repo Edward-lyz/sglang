@@ -217,6 +217,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_mamba(self) -> bool:
         return False
 
+    def needs_req_in_match(self) -> bool:
+        """Whether to pass req in MatchPrefixParams. Override in subclass if needed."""
+        return False
+
     def is_chunk_cache(self) -> bool:
         return False
 

@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -465,6 +466,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
+        if not isinstance(tree_cache, MambaRadixCache):
+            logger.warning(
+                f"Current cache type {type(tree_cache).__name__}, kv cache has been released for request {req.rid}"
+            )
+            return
         assert (
             tree_cache.supports_mamba()
         ), "Only MambaRadixCache allow freeing before alloc"
