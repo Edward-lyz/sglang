@@ -1055,11 +1055,14 @@ class KimiK3MoE(nn.Module):
 
         if routed_input is None:
             routed_input, _ = self.routed_expert_down_proj(hidden_states)
+        l2_join = self._prefetch_expert_weights_l2()
         expert_output = (
             self._forward_mega_experts(routed_input, topk_output)
             if self._use_mega_moe
             else self.experts(routed_input, topk_output)
         )
+        if l2_join is not None:
+            torch.cuda.current_stream().wait_stream(l2_join)
         latent = self._reduce_latent(expert_output)
         # up_proj is replicated, so the routed output is now fully reduced.
         out, _ = self.routed_expert_up_proj(latent)
@@ -1076,6 +1079,48 @@ class KimiK3MoE(nn.Module):
                 return _DeferredAdd3(out, shared_output, prefix_sum)
             return _add3(out, shared_output, prefix_sum)
         return out if prefix_sum is None else out + prefix_sum
+
+    def _prefetch_expert_weights_l2(self) -> Optional[torch.cuda.Stream]:
+        """SGLANG_K3_L2_PREFETCH_W13_MB: while the DeepEP dispatch waits on the
+        network (HBM otherwise idle), stream the leading local experts'
+        gate_up weights (+ their scales) into L2 from a side stream. The
+        masked GEMM1 walks experts in index order and is weight-bandwidth
+        bound, so its first experts then read from L2. Returns the stream the
+        caller joins after the experts (graph capture needs the join)."""
+        budget = envs.SGLANG_K3_L2_PREFETCH_W13_MB.get() << 20
+        if budget <= 0 or self._use_mega_moe:
+            return None
+        weights = getattr(self, "_l2_prefetch_w13", None)
+        if weights is None:
+            from sglang.kernels.ops.kimi_k3 import l2_prefetch
+
+            weights = []
+            for name in ("w13_weight", "w13_weight_scale_inv", "w13_weight_scale"):
+                w = getattr(self.experts, name, None)
+                if not isinstance(w, torch.Tensor) or w.dim() < 2 or not w.is_contiguous():
+                    continue
+                if name == "w13_weight":
+                    per_expert = w[0].numel() * w.element_size()
+                    w = w[: max(1, min(w.shape[0], budget // per_expert))]
+                if l2_prefetch.covered(w):
+                    weights.append(w)
+            self._l2_prefetch_w13 = weights
+            self._l2_stream = torch.cuda.Stream()
+            if weights and self.layer_idx == 1:
+                logger.info(
+                    "K3 L2 prefetch of routed gate_up weights active (%d experts, %.1f MiB)",
+                    weights[0].shape[0],
+                    sum(t.numel() * t.element_size() for t in weights) / 2**20,
+                )
+        if not weights:
+            return None
+        from sglang.kernels.ops.kimi_k3 import l2_prefetch
+
+        self._l2_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._l2_stream):
+            for w in weights:
+                l2_prefetch.l2_prefetch(w)
+        return self._l2_stream
 
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
         topk_output = self.topk(hidden_states, router_logits)
