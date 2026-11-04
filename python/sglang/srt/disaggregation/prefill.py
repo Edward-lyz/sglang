@@ -690,6 +690,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+    # Grad mode is thread-local: the worker does not inherit the scheduler's
+    # no_grad, and the CP extend path calls model.model() past its no_grad.
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
