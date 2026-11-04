@@ -1773,6 +1773,10 @@ def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
     return x.repeat(1, n)
 
 
+
+
+
+
 def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
     return x.unflatten(-1, (n, -1)).mean(dim=-2)
 
@@ -2281,12 +2285,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
     m, k = x_flat.shape
     mix = hc_fn.shape[0]
     assert hc_fn.shape[1] == k
-    num_slices = _num_slices_for(k)
     mix_pad = max(16, triton.next_power_of_2(mix))
-    part_mix = torch.empty(
-        (num_slices, m, mix), dtype=torch.float32, device=x_flat.device
-    )
-    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=x_flat.device)
     mixes = torch.empty((m, mix), dtype=torch.float32, device=x_flat.device)
     if m == 0:
         return mixes
@@ -2398,10 +2397,7 @@ def hc_mix_stats_sinkhorn(
     if m == 0:
         return pre, post, comb
 
-    num_slices = _num_slices_for(k)
     mix_pad = max(16, triton.next_power_of_2(mix))
-    part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
-    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
     block_m = _block_m_for(m)
     part_mix, part_sq, num_slices = _hc_mix_partials(
         x_flat, hc_fn, m, k, mix, mix_pad, block_m

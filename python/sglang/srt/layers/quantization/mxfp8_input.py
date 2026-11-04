@@ -14,3 +14,14 @@ class Mxfp8SwizzledInput(NamedTuple):
 
     data: torch.Tensor
     scales: torch.Tensor
+
+
+class Mxfp8DeepGemmInput(NamedTuple):
+    """E4M3 activations and per-32 UE8M0 scales in DeepGEMM's layout: int32 packed
+    [M, ceil4(K/32)/4], MN-major with the token dim aligned to 4.
+
+    Only the DeepGEMM MXFP8 backend of a block-FP8-as-MXFP8 linear accepts it.
+    """
+
+    data: torch.Tensor
+    scales: torch.Tensor

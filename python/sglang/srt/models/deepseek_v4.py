@@ -161,6 +161,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import (
@@ -565,6 +566,16 @@ def make_hc_mixing_params(
         nn.Parameter(torch.empty(3, dtype=torch.float32)),
         nn.Parameter(torch.empty(3, dtype=torch.float32)),
     )
+
+
+def _hc_mean(x: torch.Tensor) -> torch.Tensor:
+    """``x.mean(dim=1)`` over the hyper-connection axis (DSpark aux hidden states)."""
+    if envs.SGLANG_OPT_HC_MEAN_TRITON.get():
+        from sglang.kernels.ops.layernorm.hc_mean import can_hc_mean, hc_mean
+
+        if can_hc_mean(x):
+            return hc_mean(x)
+    return x.mean(dim=1)
 
 
 def make_hc_head_params(
@@ -1231,6 +1242,7 @@ class MQALayer(MqaAttentionBase):
                 or getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
             )
         )
+
     def _compute_q_a_maybe_fused(self, x, qkv_a=None):
         # Returns (q_lora_normed_bf16, q_for_wqb). When the fusion is enabled and the
         # shape is supported, q_for_wqb is a prequantized Mxfp8SwizzledInput and the
@@ -1248,6 +1260,8 @@ class MQALayer(MqaAttentionBase):
                 return fused  # (q_normed_bf16, Mxfp8SwizzledInput)
         q_lora = self._compute_q_a(x, qkv_a=qkv_a)
         return q_lora, q_lora
+
+
     def _compute_q_b(
         self,
         q: torch.Tensor,
@@ -2496,7 +2510,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        # Let the attention-side Triton fusion (SGLANG_FUSE_MHC_PRE_INPUT) win over the
+        # tilelang mhc_pre path: when it is enabled for the input_layernorm side, fall
+        # through to the fused sinkhorn+combine+rmsnorm gate below instead of returning
+        # here. The FFN/MoE side (norm != input_layernorm) keeps the tilelang path.
+        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and not (
+            norm is not None
+            and norm is self.input_layernorm
+            and envs.SGLANG_FUSE_MHC_PRE_INPUT.get()
+        ):
             from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
             norm_kwargs = {}
@@ -2557,6 +2579,40 @@ class DeepseekV4DecoderLayer(nn.Module):
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+        # Fused Reuse-layer *attention-input* glue (sinkhorn + hc_combine + input RMSNorm)
+        # in ONE Triton launch. OFF by default (SGLANG_FUSE_MHC_PRE_INPUT). Restricted to the
+        # attention side (norm is self.input_layernorm): the FFN/MoE side also calls hc_pre
+        # with norm=self.post_attention_layernorm, but its `y` is the MoE all-reduce input and
+        # must live in the symmetric-memory pool (see the use_symmetric_memory block below),
+        # which this kernel does not allocate -- so it must NOT hijack that path. Only the
+        # DSV4.1-Flash decode geometry is handled; any other shape/dtype raises
+        # NotImplementedError and falls through to the original path untouched.
+        if (
+            norm is not None
+            and norm is self.input_layernorm
+            and envs.SGLANG_FUSE_MHC_PRE_INPUT.get()
+        ):
+            try:
+                from sglang.kernels.ops.layernorm.mhc_input_fuse import (
+                    fused_mhc_pre_input_norm,
+                )
+
+                x_flat_bf = x.flatten(1).to(torch.bfloat16).contiguous()
+                normed, post_f, comb_f = fused_mhc_pre_input_norm(
+                    mixes,
+                    x_flat_bf,
+                    hc_scale,
+                    hc_base,
+                    norm.weight,
+                    rms_eps=self.rms_norm_eps,
+                    hc_eps=self.hc_eps,
+                    sinkhorn_iters=self.hc_sinkhorn_iters,
+                    hc_mult=self.hc_mult,
+                    hidden=x.shape[-1],
+                )
+                return normed, post_f, comb_f, True
+            except NotImplementedError:
+                pass
 
         pre, post, comb = _get_mhc_ops().hc_split_sinkhorn(
             mixes,
@@ -2875,7 +2931,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             if (
                 x.is_cuda
                 and get_platform().is_blackwell
-                and tiny
+                and 0 < x.shape[0]
                 and self.hc_mult == 4
                 and x_flat.shape[1] == 20480
                 and x.dtype == norm.weight.dtype == torch.bfloat16
@@ -2886,6 +2942,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             ):
                 from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
 
+                if not tiny:
+                    from sglang.srt.utils.community_opt import log_community_opt_once
+
+                    log_community_opt_once(
+                        "#42245 hc_combine_norm_any_rows",
+                        "fused combine+RMSNorm beyond 8 rows enabled (rows=%d)",
+                        x.shape[0],
+                    )
+                # One fused form for every row count (per-row reduction order is
+                # fixed regardless of the grid split).
                 y = hc_combine_norm(
                     x_flat, apply_pre, norm.weight, norm.variance_epsilon
                 )
@@ -2988,37 +3054,202 @@ class DeepseekV4DecoderLayer(nn.Module):
             else None
         )
 
+    def _mega_mhc_attn_boundary(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        attn_pre: torch.Tensor,
+        attn_post: torch.Tensor,
+        attn_comb: torch.Tensor,
+    ):
+        """The attn->FFN mHC boundary in one ``deep_gemm.mega_mhc`` launch.
 
+        Collapses ``hc_post`` + the FFN-input combine/RMSNorm + the FFN
+        ``hc_mix_stats`` (pre-norm GEMM and sinkhorn). Returns
+        ``(new_residual, moe_input, ffn_pre, ffn_post, ffn_comb)`` or ``None``
+        to keep the unfused sequence."""
+        if not envs.SGLANG_OPT_DEEPGEMM_MEGA_MHC.get():
+            return None
+        if not (_is_cuda and get_platform().is_blackwell):
+            return None
+        norm = self.post_attention_layernorm
+        if norm.cast_x_before_out_mul or norm.variance_size_override is not None:
+            return None
+
+        from sglang.kernels.ops.layernorm.mega_mhc import mega_mhc_boundary
+
+        norm_weight = (
+            self._post_attention_layernorm_weight_bf16
+            if self._post_attention_layernorm_weight_bf16 is not None
+            else norm.weight.data
+        )
+        return mega_mhc_boundary(
+            x,
+            residual,
+            attn_pre,
+            attn_post,
+            attn_comb,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            hc_mult=self.hc_mult,
+            hc_norm_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+            hc_post_mult=_MHC_POST_MULT_VALUE,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm.variance_epsilon,
+            label="attn->FFN",
+        )
+
+    def _mega_mhc_ffn_boundary(
+        self,
+        moe_out: torch.Tensor,
+        residual: torch.Tensor,
+        ffn_pre: torch.Tensor,
+        ffn_post: torch.Tensor,
+        ffn_comb: torch.Tensor,
+        fp8_out: bool = False,
+    ):
+        """The FFN->next-attn mHC boundary in one ``deep_gemm.mega_mhc`` launch.
+
+        The mirror of :meth:`_mega_mhc_attn_boundary` for the other sublayer
+        boundary: collapses the previous FFN's ``hc_post`` + this layer's
+        attention-input combine/RMSNorm + the attention ``hc_mix_stats``.
+        Returns ``(new_residual, attn_input, attn_pre, attn_post, attn_comb)``
+        or ``None`` to keep the unfused sequence.
+
+        It consumes *this* layer's attention mixes and ``input_layernorm``, so it
+        runs at the start of the layer that reads the boundary, not at the end of
+        the layer that produced ``moe_out`` -- the producing layer hands those
+        operands over as ``deferred``."""
+        if not envs.SGLANG_OPT_DEEPGEMM_MEGA_MHC.get():
+            return None
+        if not (_is_cuda and get_platform().is_blackwell):
+            return None
+        norm = self.input_layernorm
+        if norm.cast_x_before_out_mul or norm.variance_size_override is not None:
+            return None
+
+        from sglang.kernels.ops.layernorm.mega_mhc import mega_mhc_boundary
+
+        norm_weight = (
+            self._input_layernorm_weight_bf16
+            if self._input_layernorm_weight_bf16 is not None
+            else norm.weight.data
+        )
+        return mega_mhc_boundary(
+            moe_out,
+            residual,
+            ffn_pre,
+            ffn_post,
+            ffn_comb,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            hc_mult=self.hc_mult,
+            hc_norm_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+            hc_post_mult=_MHC_POST_MULT_VALUE,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm.variance_epsilon,
+            label="FFN->attn",
+            fp8_out=fp8_out,
+        )
 
     def forward_hc_pre_from_prev(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
         prev_pre: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        deferred: Optional[Tuple[torch.Tensor, ...]] = None,
+        aux_out: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple]]:
         """Layer forward where attention consumes the previous FFN's pre-mix and
-        the FFN consumes this attention's. Returns (hidden_states, ffn_pre)."""
-        stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
-        residual = hidden_states
-        x = self._hc_combine(
-            hidden_states, prev_pre, self.input_layernorm, stats_stream
+        the FFN consumes this attention's.
+
+        Returns ``(hidden_states, ffn_pre, deferred)``. When the attn->FFN
+        boundary fuses, the FFN boundary's closing ``hc_post`` is handed on in
+        ``deferred`` so the next layer can fold it into its fused attention
+        boundary; ``hidden_states`` is then ``None``.
+
+        ``aux_out`` (DSPARK capture) receives the mean over the hc copies of this
+        layer's input residual, from the fused boundary when it opens."""
+        stats_stream = self._get_hc_stats_stream(
+            hidden_states if deferred is None else deferred[0], forward_batch
         )
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            x = self.self_attn(
-                x=x, positions=positions, forward_batch=forward_batch, x_quant=None
+        opened = None
+        attn_x_quant = None
+        if deferred is not None:
+            fp8_in = self._mega_mhc_attn_input_fp8_ok(forward_batch)
+            opened = self._mega_mhc_ffn_boundary(*deferred, fp8_out=fp8_in)
+            if opened is not None and fp8_in:
+                attn_x_quant, opened = opened[5], opened[:5]
+            if opened is None:
+                # Fused FFN boundary unavailable: close it the unfused way.
+                moe_out, prev_residual, d_pre, d_post, d_comb = deferred
+                hidden_states = self.hc_post(moe_out, prev_residual, d_post, d_comb)
+                prev_pre = d_pre
+        if opened is not None:
+            residual, x, attn_pre, attn_post, attn_comb = opened
+            if aux_out is not None:
+                from sglang.srt.utils.community_opt import log_community_opt_once
+
+                log_community_opt_once(
+                    "vllm#55575 dspark_aux_from_mega_mhc",
+                    "DSPARK aux hidden state read from the fused mega_mhc "
+                    "residual (layer=%d, tokens=%d)",
+                    self.layer_id,
+                    residual.shape[0],
+                )
+                aux_out.append(_hc_mean(residual))
+            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                x = self.self_attn(
+                    x=x,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    x_quant=attn_x_quant,
+                )
+        else:
+            residual = hidden_states
+            if aux_out is not None:
+                aux_out.append(_hc_mean(hidden_states))
+            x = self._hc_combine(
+                hidden_states, prev_pre, self.input_layernorm, stats_stream
             )
-        attn_pre, attn_post, attn_comb = self._hc_mix_stats(
-            hidden_states,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            stats_stream,
+            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                x = self.self_attn(
+                    x=x, positions=positions, forward_batch=forward_batch, x_quant=None
+                )
+            attn_pre, attn_post, attn_comb = self._hc_mix_stats(
+                hidden_states,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                stats_stream,
+            )
+            if stats_stream is not None:
+                torch.cuda.current_stream().wait_stream(stats_stream)
+        fused = self._mega_mhc_attn_boundary(
+            x, residual, attn_pre, attn_post, attn_comb
         )
-        if stats_stream is not None:
-            torch.cuda.current_stream().wait_stream(stats_stream)
+        if fused is not None:
+            attn_residual, moe_input, ffn_pre, ffn_post, ffn_comb = fused
+            moe_out = self._run_moe_ffn_dp_sync(
+                moe_input,
+                forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+            )
+            return (
+                None,
+                ffn_pre,
+                (moe_out, attn_residual, ffn_pre, ffn_post, ffn_comb),
+            )
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
@@ -3038,7 +3269,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
-        return hidden_states, ffn_pre
+        return hidden_states, ffn_pre, None
 
     def _run_moe_ffn_dp_sync(
         self,
@@ -3715,6 +3946,7 @@ class DeepseekV4Model(nn.Module):
                 hash_ids = self.engram_hasher(
                     forward_batch.input_ids[:total], forward_batch
                 )
+                prompt_hash_ids = hash_ids
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -3752,10 +3984,90 @@ class DeepseekV4Model(nn.Module):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
+        # vllm#59923: stage every engram layer's wkv input with one exchange. Only
+        # rank-invariant conditions here: every rank must join the same collectives.
+        staged_wkv = None
+        if (
+            self.engram_exchange is not None
+            and hash_ids is not None
+            and not is_in_breakable_cuda_graph()
+            and not is_in_tc_piecewise_cuda_graph()
+            and (
+                self.late_layer_start is None
+                or max(self.engram_layout.layer_ids) < self.late_layer_start
+            )
+        ):
+            staged_wkv = self.engram_exchange.stage(
+                prompt_hash_ids if cp_extend else hash_ids,
+                forward_batch,
+                cp_rows=hidden_states.shape[0] if cp_extend else None,
+            )
         saved_full = None
-        prev_pre = None
+        prev_pre = initial_prev_pre
+        deferred = None
+        aux_from_mega_mhc = (
+            capture_dspark and envs.SGLANG_OPT_DSV41_DSPARK_AUX_FROM_MEGA_MHC.get()
+        )
         for i in range(self.start_layer, self.end_layer):
+            # engram mutates the inter-layer residual, the DSPARK aux capture
+            # reads it and the late-layer tail slices it -- all before this
+            # layer's forward, so a deferred FFN boundary must be closed first.
+            # Closing writes FULL-row hidden_states/prev_pre; the tail block
+            # below then slices exactly those with tail.rows(), which is the
+            # same order the unfused path had (hc_post on full rows at the end
+            # of the previous layer, then slice). The assert keeps that ordering
+            # from regressing silently if these blocks move or the predicate
+            # drifts -- a slice-before-close would otherwise hit tail.rows(None).
+            capture_aux = capture_dspark and i in self.dspark_layers_to_capture
+            # vllm#55575: the layer itself reads the aux from the residual its fused
+            # FFN->attn boundary produces (or from the closed hidden_states), so the
+            # boundary stays fused. Rows sliced by the late-layer tail keep the
+            # materialize-then-slice order below.
+            aux_in_layer = (
+                capture_aux
+                and aux_from_mega_mhc
+                and not (tail is not None and i < self.late_layer_start)
+            )
+            # The trimmed cut layer (vLLM #59894) closes the boundary itself in
+            # write_kv, the way its own forward would.
+            needs_materialized_residual = (
+                self.layers[i].engram is not None
+                or (capture_aux and not aux_in_layer)
+                or (
+                    tail is not None
+                    and i == self.late_layer_start
+                    and i != self.decoder_replay_trim_cut
+                )
+            )
+            if deferred is not None and needs_materialized_residual:
+                hidden_states = self.layers[i].hc_post(
+                    deferred[0], deferred[1], deferred[3], deferred[4]
+                )
+                prev_pre = deferred[2]
+                deferred = None
+            assert not (needs_materialized_residual and deferred is not None), (
+                "mHC: the deferred FFN boundary must be closed before engram / "
+                "DSPARK aux capture / late-layer-tail touch the inter-layer residual"
+            )
             if tail is not None and i == self.late_layer_start:
+                if i == self.decoder_replay_trim_cut:
+                    # vLLM #59894: later steps read the cut layer's KV at every
+                    # row, so write it for the whole extend first; the rest of
+                    # the layer then runs on the tail like the layers after it.
+                    hidden_states, prev_pre = self.layers[i].write_kv(
+                        positions, hidden_states, prev_pre, deferred, forward_batch
+                    )
+                    deferred = None
+                    attn_backend.mark_cut_kv_written(i)
+                    from sglang.srt.utils.community_opt import log_community_opt_once
+
+                    log_community_opt_once(
+                        "vllm#59894 decoder_replay_trim_cut",
+                        "layer %d wrote KV for %d rows, then runs on %d tail rows",
+                        i,
+                        hidden_states.shape[0],
+                        tail.token_indices.shape[0] + tail.pad_rows,
+                    )
                 # Past the last kv_source layer a layer only owes its window KV,
                 # and decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -3770,7 +4082,16 @@ class DeepseekV4Model(nn.Module):
                     hash_ids = tail.rows(hash_ids)
             engram = self.layers[i].engram
             if engram is not None:
-                before_engram = hidden_states
+                # [MEM-R6] `before_engram` is only read by the multimodal restore below.
+                # Binding it unconditionally pins a whole [T, hc_mult, hidden] activation
+                # (320 MiB at a 65532-token chunk / cp8) from the first engram layer to
+                # the end of the layer loop, where it stacks on the compressor and mhc
+                # working sets. Language-only runs never read it.
+                keep_before_engram = (
+                    self.config.model_type == "deepseek_v41"
+                    and self.config.vision_n_layers > 0
+                )
+                before_engram = hidden_states if keep_before_engram else None
                 if i == 14 and prefetched_engram_kv is not None:
                     main_stream = torch.cuda.current_stream()
                     main_stream.wait_stream(self.engram_prefetch_stream)
@@ -3785,36 +4106,64 @@ class DeepseekV4Model(nn.Module):
                         hash_ids[:, engram.layer_hash_index],
                         forward_batch,
                         cp_all_tokens=cp_extend,
+                        wkv_input=(
+                            staged_wkv[engram.layer_hash_index]
+                            if staged_wkv is not None
+                            else None
+                        ),
                     )
-                if (
-                    self.config.model_type == "deepseek_v41"
-                    and self.config.vision_n_layers > 0
-                ):
-                    hidden_states = torch.where(
-                        (input_ids == self.config.image_token_id)[:, None, None],
-                        before_engram,
-                        hidden_states,
-                    )
-            if capture_dspark and i in self.dspark_layers_to_capture:
+                # Only multimodal placeholders become image_token_id, so a text-only
+                # batch skips this full-residual where (#41704). before_engram is only
+                # bound for vision-capable models (MEM-R6), so gate on that first.
+                if keep_before_engram:
+                    from sglang.srt.utils.community_opt import log_community_opt_once
+
+                    if forward_batch.contains_mm_inputs():
+                        log_community_opt_once(
+                            "#41704 image_where_applied",
+                            "multimodal batch keeps the post-engram image-token where",
+                        )
+                        hidden_states = torch.where(
+                            (input_ids == self.config.image_token_id)[:, None, None],
+                            before_engram,
+                            hidden_states,
+                        )
+                    else:
+                        log_community_opt_once(
+                            "#41704 skip_image_where",
+                            "text-only batch skips the post-engram image-token where",
+                        )
+                before_engram = None
+            if capture_aux and not aux_in_layer:
                 # The draft head reads the attention input of its target layers.
                 aux = hidden_states
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
-                dspark_aux_hidden_states.append(aux.mean(dim=1))
+                dspark_aux_hidden_states.append(_hc_mean(aux))
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                hidden_states, prev_pre = self.layers[i].forward_hc_pre_from_prev(
+                hidden_states, prev_pre, deferred = self.layers[
+                    i
+                ].forward_hc_pre_from_prev(
                     positions=positions,
                     hidden_states=hidden_states,
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
                     prev_pre=prev_pre,
+                    deferred=deferred,
+                    aux_out=dspark_aux_hidden_states if aux_in_layer else None,
                 )
+        if deferred is not None:
+            # No next layer to fold the last FFN boundary into: close it here.
+            hidden_states = self.layers[self.end_layer - 1].hc_post(
+                deferred[0], deferred[1], deferred[3], deferred[4]
+            )
+            prev_pre = deferred[2]
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return hidden_states, prev_pre, tail
@@ -4063,7 +4412,7 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+                    dspark_aux_hidden_states.append(_hc_mean(completed))
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
@@ -4086,7 +4435,17 @@ class DeepseekV4Model(nn.Module):
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
             hidden_states = hc_combine(
-                pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
+                # The kernel widens every load to fp32 itself, so the bf16 tensor gives the
+                # same values without a 126 MB fp32 copy first.
+                (
+                    pre_hc_head
+                    if envs.SGLANG_OPT_HC_HEAD_COMBINE_NO_CAST.get()
+                    and pre_hc_head.dtype == torch.bfloat16
+                    else pre_hc_head.float()
+                ),
+                last_pre,
+                self.hc_mult,
+                hidden_states.dtype,
             )
         else:
             hidden_states = self.hc_head(
@@ -4629,6 +4988,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 num_built,
                 type(self).__name__,
             )
+
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.encoder_only:
             return

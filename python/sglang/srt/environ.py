@@ -585,6 +585,12 @@ class Envs:
     # MegaMoE gate: image-token mask (input_ids == image_token_id) once per forward
     # instead of per MoE layer (exact).
     SGLANG_OPT_MEGA_GATE_IMAGE_MASK_ONCE = EnvBool(False)
+    # DSV4 final hc_combine reads the bf16 pre-head tensor directly (the kernel widens
+    # per load) instead of materialising a fp32 copy first (exact).
+    SGLANG_OPT_HC_HEAD_COMBINE_NO_CAST = EnvBool(True)
+    # DSV4 DSpark aux hidden = mean over the hc axis via a single-pass Triton kernel
+    # (bf16 [rows, hc, hidden]; 29 us -> 6 us at 1536 rows, bit-identical in tests).
+    SGLANG_OPT_HC_MEAN_TRITON = EnvBool(True)
     # DSV4 fused attention-o decode: cast positions to int32 once per forward
     # instead of one copy kernel per layer (exact).
     SGLANG_OPT_FUSED_O_POSITIONS_I32_ONCE = EnvBool(False)
@@ -1676,6 +1682,11 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    # Fuse the Reuse-layer attention-input glue (sinkhorn + hc_combine + input RMSNorm)
+    # into ONE Triton launch (returns the post-norm activation, norm_fused=True drop-in).
+    # OFF by default: the fused path must first pass the live decode CUDA-graph boot gate
+    # on the target build (see record_kernel_opt/deepseekv4.1_flash_decode_kernel_mhc_0922).
+    SGLANG_FUSE_MHC_PRE_INPUT = EnvBool(False)
     # Fuse the MLA q-path RMSNorm (op56 q_a_rmsnorm, q_lora_rank) + the wq_b input
     # MXFP8 128x4-swizzled ue8m0 quantize (op58 q_proj_quant) into ONE Triton launch
     # that emits the normed bf16 (for the indexer) plus Mxfp8SwizzledInput for the
