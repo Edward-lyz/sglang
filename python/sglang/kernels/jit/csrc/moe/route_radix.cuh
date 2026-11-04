@@ -58,6 +58,10 @@ struct RouteRadixParams {
   int renormalize;
   int apply_scale;
   int sorted;
+  // Optional int64 copy of out_i (nullptr = off), same [M, K] layout with
+  // row stride out_i64_stride: the DeepEP dispatch consumes int64 ids.
+  int64_t* __restrict__ out_i64;
+  long long out_i64_stride;
 };
 
 inline constexpr float kNanFloor_ = -1e30f;
@@ -304,6 +308,7 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
     if (params.apply_scale) w = w * params.routed_scaling_factor;
     params.out_w[bx * params.out_w_stride + rank] = w;
     params.out_i[bx * params.out_i_stride + rank] = id;
+    if (params.out_i64 != nullptr) params.out_i64[bx * params.out_i64_stride + rank] = id;
   }
 }
 
@@ -316,6 +321,7 @@ struct RouteRadixKernel {
       const tvm::ffi::TensorView bias,
       const tvm::ffi::TensorView out_w,
       const tvm::ffi::TensorView out_i,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> out_i64,
       int64_t topk,
       double routed_scaling_factor,
       bool renormalize,
@@ -338,6 +344,9 @@ struct RouteRadixKernel {
     TensorMatcher({N_}).with_dtype<fp32_t>().with_device(device).verify(bias);
     TensorMatcher({M_, K_}).with_dtype<fp32_t>().with_device(device).verify(out_w);
     TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device).verify(out_i);
+    if (out_i64.has_value()) {
+      TensorMatcher({M_, K_}).with_dtype<int64_t>().with_device(device).verify(out_i64.value());
+    }
 
     RuntimeCheck(
         N_.unwrap() == sglang::kNumExperts_ && K_.unwrap() == sglang::kTopK_ && topk == sglang::kTopK_,
@@ -361,7 +370,9 @@ struct RouteRadixKernel {
         static_cast<float>(routed_scaling_factor),
         renormalize ? 1 : 0,
         apply_scale ? 1 : 0,
-        sorted ? 1 : 0};
+        sorted ? 1 : 0,
+        out_i64.has_value() ? static_cast<int64_t*>(out_i64.value().data_ptr()) : nullptr,
+        out_i64.has_value() ? static_cast<long long>(out_i64.value().stride(0)) : 0};
 
     if (score_dtype.is_type<fp32_t>()) {
       LaunchKernel(M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap())
