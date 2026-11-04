@@ -637,6 +637,27 @@ _FREQS_CIS_TO_COS_SIN: dict[
 # fp32 [N, 64] = [cos | sin] per shared freqs_cis, for flash_mla's fused attention-o op.
 _FUSED_O_COS_SIN: dict[Tuple[int, torch.device], torch.Tensor] = {}
 
+def _rope_table_len(config) -> int:
+    """Rows of the RoPE tables (freqs_cis / cos_sin caches).
+
+    Speculative decode (DSPARK verify / draft) and the decode over-allocation
+    run positions past the model context length for a request that is about to
+    finish on length; req_to_token already carries that headroom
+    (get_req_to_token_extra_context_len). A table of only
+    max_position_embeddings rows is then read out of bounds by every RoPE
+    kernel (no bounds check in the fused flash_mla attention-o kernel ->
+    illegal memory access). Rows are arange-indexed, so the in-range rows are
+    unchanged.
+    """
+    from sglang.srt.mem_cache.allocation_sizing import (
+        get_req_to_token_extra_context_len,
+    )
+    from sglang.srt.runtime_context import get_model
+
+    context_len = max(
+        config.max_position_embeddings, get_model().context_length or 0
+    )
+    return context_len + get_req_to_token_extra_context_len()
 
 
 def _freqs_cis_to_cos_sin(
@@ -981,7 +1002,7 @@ class MqaAttentionBase(nn.Module):
         )
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
-            seqlen=config.max_position_embeddings,
+            seqlen=_rope_table_len(config),
             original_seq_len=original_seq_len,
             base=self.rope_base,
             factor=scaling.get("factor", 1.0),
@@ -1097,7 +1118,7 @@ class MQALayer(MqaAttentionBase):
         self.rotary_emb = get_rope_wrapper(
             head_size=self.rope_head_dim,
             rotary_dim=self.rope_head_dim,
-            max_position=config.max_position_embeddings,
+            max_position=_rope_table_len(config),
             base=self.rope_base,
             rope_scaling=active_rope_scaling,
             is_neox_style=False,
