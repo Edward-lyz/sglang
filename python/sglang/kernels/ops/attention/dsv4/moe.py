@@ -37,8 +37,12 @@ def _jit_hash_topk_module():
 
 
 @cache_once
-def _jit_mega_moe_pre_dispatch_module(quant_group_size: int):
-    args = make_cpp_args(quant_group_size, is_arch_support_pdl())
+def _jit_mega_moe_pre_dispatch_module(
+    quant_group_size: int, write_shared_sf: bool, topk_idx_dtype: torch.dtype
+):
+    args = make_cpp_args(
+        quant_group_size, is_arch_support_pdl(), write_shared_sf, topk_idx_dtype
+    )
     return load_jit(
         make_name("mega_moe_pre_dispatch"),
         *args,
@@ -160,8 +164,26 @@ def mega_moe_pre_dispatch(
     buf_topk_idx: torch.Tensor,
     buf_topk_weights: torch.Tensor,
     quant_group_size: int = 32,
+    *,
+    shared_x_sf: Optional[torch.Tensor] = None,
+    shared_block_m: int = 0,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    topk_weight_scale: float = 1.0,
+    fill_padded_tail: bool = True,
 ) -> None:
-    module = _jit_mega_moe_pre_dispatch_module(quant_group_size)
+    # shared_x_sf / shared_block_m: also write the activation scales the in-kernel
+    # shared expert reads (BLOCK_M-paged layout of the consuming MegaMoE).
+    # num_token_non_padded / topk_weight_scale (vllm#57604 fold): rows at or past
+    # num_token_non_padded dispatch to expert -1 and every weight is multiplied
+    # by topk_weight_scale in fp32 -- what _mask_topk_ids_padded_region and
+    # `topk_weights * scale` did as separate kernels. topk_idx may be int32/int64.
+    # fill_padded_tail=False writes (-1, 0) only to row 0 when there are no
+    # tokens instead of the whole [num_tokens, padded_max) tail: DeepGEMM's
+    # MegaMoE reads just the first max(num_tokens, 1) topk rows.
+    module = _jit_mega_moe_pre_dispatch_module(
+        quant_group_size, shared_x_sf is not None, topk_idx.dtype
+    )
+    num_tokens = x.shape[0]
     module.run(
         x,
         topk_idx,
@@ -170,6 +192,11 @@ def mega_moe_pre_dispatch(
         buf_x_sf,
         buf_topk_idx,
         buf_topk_weights,
+        shared_x_sf,
+        shared_block_m,
+        num_token_non_padded,
+        float(topk_weight_scale),
+        -1 if fill_padded_tail else max(num_tokens, 1),
     )
 
 

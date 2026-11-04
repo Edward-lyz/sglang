@@ -1345,6 +1345,15 @@ class Envs:
     # Verification only: on the first eager fused call per process, also run the
     # unfused path and log the difference.
     SGLANG_COMMUNITY_SELFCHECK_MEGA_SHARED = EnvBool(False)
+    # vllm#57604 (idea): fold the int64->int32 topk cast, the padded-row topk
+    # mask and the routed-scaling multiply into mega_moe_pre_dispatch, and stop
+    # refilling [num_tokens, padded_max) of the dispatch topk every call
+    # (DeepGEMM reads only the first num_tokens rows). Bit-exact.
+    SGLANG_OPT_MEGA_MOE_STAGING_FOLD = EnvBool(True)
+    # vllm#60468 / #57843: before serving, run every distinct bf16_mega_gate
+    # config x fp8_fp4_mega_moe BLOCK_M (DeepGEMM's own heuristics) and every
+    # mega_mhc split count once, so no DeepGEMM JIT compile lands on a request.
+    SGLANG_OPT_DEEPGEMM_MEGA_WARMUP = EnvBool(True)
     # Fuse the MegaMoE shared-expert residual combine
     #   hidden = shared_output + routed_scaling_factor * routed_y
     # from the two elementwise kernels the path issues today (y.mul_(scale) in
@@ -1794,6 +1803,12 @@ class Envs:
     # Community #41660: fused c1/c2 compressor for eager extend (non-CP and, locally, the CP
     # global-order path) instead of the torch pair-partner chain.
     SGLANG_OPT_DSV41_FUSED_EXTEND_COMPRESS = EnvBool(True)
+    # vllm#59119: expand_prefill_causally kernel without bs/num_tokens/total_tokens
+    # specialization and BS_P2 >= 64, so prefill steps stop compiling new variants.
+    SGLANG_OPT_DSV4_EXPAND_PREFILL_NO_RESPECIALIZE = EnvBool(True)
+    # vllm#55061: the fp8 dequant gather (V4 584-byte and V4.1 fp8 pages) handles
+    # 4 rows per program instead of one (bitwise identical).
+    SGLANG_OPT_DSV41_DEQUANT_ROWS_PER_CTA = EnvBool(True)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

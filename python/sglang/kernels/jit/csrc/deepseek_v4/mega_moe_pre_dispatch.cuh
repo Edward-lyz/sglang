@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cuda_fp8.h>
+#include <limits>
+#include <type_traits>
 
 namespace sglang {
 
@@ -24,8 +26,12 @@ inline constexpr uint32_t kMaxBlockThreads = 1024;
 
 struct MegaMoEPreDispatchParams {
   const bf16_t* __restrict__ x;            // [num_tokens, hidden]
-  const int32_t* __restrict__ topk_idx;    // [num_tokens, top_k]
+  const void* __restrict__ topk_idx;       // [num_tokens, top_k], int32 or int64 (TopkIdxT)
   const float* __restrict__ topk_weights;  // [num_tokens, top_k]
+  // Optional padded-row mask (vllm#57604 fold of _mask_topk_ids_padded_region):
+  // token rows >= *num_token_non_padded_ptr (device scalar, read after the PDL
+  // wait) or >= num_token_non_padded_value (host scalar) dispatch to expert -1.
+  const int32_t* __restrict__ num_token_non_padded_ptr;
 
   fp8_e4m3_t* __restrict__ buf_x;        // [padded_max, hidden]
   int32_t* __restrict__ buf_x_sf;        // row-major int32 [P, G/4]
@@ -37,17 +43,19 @@ struct MegaMoEPreDispatchParams {
   uint64_t shared_x_sf_col_stride;
   uint32_t shared_block_m;
   uint32_t num_tokens;
-  uint32_t padded_max;
+  uint32_t pad_end;  // the (-1, 0) pad path covers rows [num_tokens, pad_end)
   uint32_t hidden;
   uint32_t num_groups;  // hidden / group_size
   uint32_t top_k;
+  uint32_t num_token_non_padded_value;  // used when the pointer is null
+  float topk_weight_scale;              // folded routed scaling (1.0 = none)
 };
 
 // kGroupSize must match sglang_per_token_group_quant_fp8_ue8m0(group_size=).
 // kMultiChunk covers rows too wide for one chunk per thread. It is a template
 // parameter rather than a runtime check because this kernel is issue-bound: the
 // loop bookkeeping alone costs ~10% on the rows that fit a single chunk.
-template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk>
+template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk, bool kWriteSharedSF, typename TopkIdxT>
 __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams __grid_constant__ params) {
   using namespace device;
@@ -137,15 +145,20 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     // Copy this token's topk row (no alignment assumptions; top_k is small).
     if (tid < params.top_k) {
       const uint32_t off = token_id * params.top_k + tid;
-      params.buf_topk_idx[off] = params.topk_idx[off];
-      params.buf_topk_weights[off] = params.topk_weights[off];
+      const uint32_t num_valid = params.num_token_non_padded_ptr != nullptr
+                                     ? static_cast<uint32_t>(params.num_token_non_padded_ptr[0])
+                                     : params.num_token_non_padded_value;
+      // Same order as the unfused path: narrow to int32, then mask padded rows.
+      const auto idx = static_cast<int32_t>(static_cast<const TopkIdxT*>(params.topk_idx)[off]);
+      params.buf_topk_idx[off] = token_id >= num_valid ? int64_t{-1} : static_cast<int64_t>(idx);
+      params.buf_topk_weights[off] = params.topk_weights[off] * params.topk_weight_scale;
     }
   } else {
-    // ---- Pad path: trailing blocks fill [num_tokens, padded_max) with (-1, 0) ----
+    // ---- Pad path: trailing blocks fill [num_tokens, pad_end) with (-1, 0) ----
     const uint32_t copy_bid = bid - params.num_tokens;
     const uint32_t pad_base = params.num_tokens * params.top_k;
     const uint32_t slot = pad_base + copy_bid * blockDim.x + tid;
-    const uint32_t total_slots = params.padded_max * params.top_k;
+    const uint32_t total_slots = params.pad_end * params.top_k;
 
     if (slot < total_slots) {
       params.buf_topk_idx[slot] = -1;
@@ -158,14 +171,20 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
 // ---- Host wrapper
 // ------------------------------------------------------------------------------------------------------------------------
 
-template <int64_t kGroupSize, bool kUsePDL>
+template <int64_t kGroupSize, bool kUsePDL, bool kWriteSharedSF, typename TopkIdxT = int32_t>
 struct MegaMoEPreDispatchKernel {
   static_assert(kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128, "unsupported group_size");
+  static_assert(std::is_same_v<TopkIdxT, int32_t> || std::is_same_v<TopkIdxT, int64_t>, "unsupported topk_idx");
   static constexpr auto kernel_one_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false>;
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, kWriteSharedSF, TopkIdxT>;
   static constexpr auto kernel_multi_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true>;
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true, kWriteSharedSF, TopkIdxT>;
 
+  // num_token_non_padded: optional scalar (CUDA int32, or CPU int32/int64);
+  //   rows at or past it get expert -1, as _mask_topk_ids_padded_region does.
+  // topk_weight_scale: multiplied into every copied topk weight in fp32.
+  // pad_end: the (-1, 0) fill covers rows [num_tokens, pad_end); negative means
+  //   padded_max (the whole buffer tail).
   static void
   run(const tvm::ffi::TensorView x,
       const tvm::ffi::TensorView topk_idx,
@@ -173,7 +192,12 @@ struct MegaMoEPreDispatchKernel {
       const tvm::ffi::TensorView buf_x,
       const tvm::ffi::TensorView buf_x_sf,
       const tvm::ffi::TensorView buf_topk_idx,
-      const tvm::ffi::TensorView buf_topk_weights) {
+      const tvm::ffi::TensorView buf_topk_weights,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> shared_x_sf,
+      const int64_t shared_block_m,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> num_token_non_padded,
+      const double topk_weight_scale,
+      const int64_t pad_end) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -189,7 +213,7 @@ struct MegaMoEPreDispatchKernel {
         .with_device(device)
         .verify(x);
     TensorMatcher({M, K})  // topk_idx
-        .with_dtype<int32_t>()
+        .with_dtype<TopkIdxT>()
         .with_device(device)
         .verify(topk_idx);
     TensorMatcher({M, K})  // topk_weights
@@ -246,14 +270,54 @@ struct MegaMoEPreDispatchKernel {
         "hidden above 8192 must be a multiple of 256 so the tail quant chunks fill whole warps");
     RuntimeCheck(block_size >= top_k, "top_k must fit into one quant CTA");
 
-    const auto pad_slots = (padded_max - num_tokens) * top_k;
+    int32_t* shared_sf_ptr = nullptr;
+    uint64_t shared_sf_stride = 0;
+    if constexpr (kWriteSharedSF) {
+      RuntimeCheck(kGroupSize == 32, "shared MegaMoE scales require group_size=32");
+      RuntimeCheck(shared_block_m > 0, "shared_block_m must be positive");
+      auto S = SymbolicSize{"shared_sf_rows"};
+      const auto sf = shared_x_sf.value();
+      TensorMatcher({S, G4}).with_strides({1, -1}).with_dtype<int32_t>().with_device(device).verify(sf);
+      const auto rows = (num_tokens + shared_block_m - 1) / shared_block_m * ((shared_block_m + 127) / 128 * 128);
+      RuntimeCheck(S.unwrap() >= rows, "shared scale buffer is too small for shared_block_m");
+      RuntimeCheck(sf.stride(1) >= S.unwrap(), "shared scale columns must not overlap");
+      shared_sf_ptr = static_cast<int32_t*>(sf.data_ptr());
+      shared_sf_stride = sf.stride(1);
+    }
+
+    const int32_t* ntn_ptr = nullptr;
+    uint32_t ntn_value = std::numeric_limits<uint32_t>::max();
+    if (num_token_non_padded.has_value()) {
+      const auto ntn = num_token_non_padded.value();
+      RuntimeCheck(ntn.numel() == 1, "num_token_non_padded should be a scalar");
+      const auto ntn_dev = ntn.device().device_type;
+      if (ntn_dev == kDLCUDA) {
+        RuntimeCheck(is_type<int32_t>(ntn.dtype()), "num_token_non_padded on CUDA must be int32");
+        ntn_ptr = static_cast<const int32_t*>(ntn.data_ptr());
+      } else if (ntn_dev == kDLCPU) {
+        if (is_type<int32_t>(ntn.dtype())) {
+          ntn_value = static_cast<uint32_t>(*static_cast<const int32_t*>(ntn.data_ptr()));
+        } else if (is_type<int64_t>(ntn.dtype())) {
+          ntn_value = static_cast<uint32_t>(static_cast<int32_t>(*static_cast<const int64_t*>(ntn.data_ptr())));
+        } else {
+          RuntimeCheck(false, "num_token_non_padded on CPU must be int32 or int64");
+        }
+      } else {
+        RuntimeCheck(false, "num_token_non_padded must be on CPU or CUDA");
+      }
+    }
+
+    const auto pad_rows = pad_end < 0 ? padded_max : static_cast<uint32_t>(pad_end);
+    RuntimeCheck(pad_rows <= padded_max, "pad_end must not exceed padded_max");
+    const auto pad_slots = pad_rows > num_tokens ? (pad_rows - num_tokens) * top_k : 0u;
     const uint32_t num_pad_blocks = pad_slots == 0 ? 0u : ((pad_slots + block_size - 1u) / block_size);
     const auto num_total_blocks = num_tokens + num_pad_blocks;
 
     const auto params = MegaMoEPreDispatchParams{
         .x = static_cast<const bf16_t*>(x.data_ptr()),
-        .topk_idx = static_cast<const int32_t*>(topk_idx.data_ptr()),
+        .topk_idx = topk_idx.data_ptr(),
         .topk_weights = static_cast<const float*>(topk_weights.data_ptr()),
+        .num_token_non_padded_ptr = ntn_ptr,
         .buf_x = static_cast<fp8_e4m3_t*>(buf_x.data_ptr()),
         .buf_x_sf = static_cast<int32_t*>(buf_x_sf.data_ptr()),
         .buf_topk_idx = static_cast<int64_t*>(buf_topk_idx.data_ptr()),
@@ -263,10 +327,12 @@ struct MegaMoEPreDispatchKernel {
         .shared_x_sf_col_stride = shared_sf_stride,
         .shared_block_m = static_cast<uint32_t>(shared_block_m),
         .num_tokens = num_tokens,
-        .padded_max = padded_max,
+        .pad_end = pad_rows,
         .hidden = hidden,
         .num_groups = num_groups,
         .top_k = top_k,
+        .num_token_non_padded_value = ntn_value,
+        .topk_weight_scale = static_cast<float>(topk_weight_scale),
     };
 
     if (num_total_blocks == 0) return;

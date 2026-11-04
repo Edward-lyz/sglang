@@ -174,6 +174,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -1102,6 +1103,34 @@ class ModelRunner:
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+        self.maybe_warmup_deepgemm_mega_kernels()
+
+    def maybe_warmup_deepgemm_mega_kernels(self) -> None:
+        """vllm#60468 / #57843: compile the DeepGEMM mega kernels before ready."""
+        warmup = getattr(self.model, "warmup_deepgemm_mega_kernels", None)
+        if (
+            warmup is None
+            or self.device != "cuda"
+            or not envs.SGLANG_OPT_DEEPGEMM_MEGA_WARMUP.get()
+        ):
+            return
+        if self.is_draft_worker and get_disagg().disaggregation_mode == "prefill":
+            # A PD-prefill DSpark draft only receives context KV; its MoE never
+            # runs there.
+            return
+        max_moe_tokens = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        max_mhc_tokens = max_moe_tokens
+        chunked = get_schedule().chunked_prefill_size
+        if is_dsa_enable_prefill_cp() and chunked and chunked > 0:
+            # CP prefill: per-rank rows are the chunk split across the CP group.
+            max_mhc_tokens = max(
+                max_mhc_tokens, -(-chunked // get_parallel().attn_cp_size)
+            )
+        warmup(
+            max_moe_tokens=max_moe_tokens,
+            # The draft's mHC boundaries use the target's mega_mhc kernels.
+            max_mhc_tokens=0 if self.is_draft_worker else max_mhc_tokens,
+        )
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
