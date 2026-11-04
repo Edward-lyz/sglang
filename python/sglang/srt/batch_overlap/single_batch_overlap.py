@@ -35,7 +35,9 @@ class SboFlags:
             # currently only cutedsl backend supports it
             and (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
-                or (get_moe_runner_backend().is_deep_gemm() and not is_blackwell())
+                or ((get_moe_runner_backend().is_deep_gemm()
+                or get_moe_runner_backend().is_deepgemm_mxfp4())
+                and not is_blackwell())
             )
         )
 

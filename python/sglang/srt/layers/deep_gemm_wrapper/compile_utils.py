@@ -93,6 +93,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 
 
 class DeepGemmKernelType(IntEnum):
+    GROUPED_GEMM_NT_F8F4BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
@@ -216,6 +217,7 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_MASKED: _GroupedFP8FP4MaskedWarmupExecutor,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -228,7 +230,8 @@ class _BaseWarmupExecutor:
             return (max_m * k + n * k + max_m * n * 2) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED or \
+            kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_MASKED:
             return (
                 num_groups * max_m * k
                 + num_groups * n * k
@@ -267,7 +270,33 @@ def _empty_block_fp8(size):
 _BLOCK_SIZE = 128
 
 
+def _empty_token_mxfp8(size):
+    *dims, k = size
+    return (
+        torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
+        torch.empty(
+            (*dims, ceil_div(k, _MX_BLOCK_SIZE)), device="cuda", dtype=torch.float8_e8m0fnu
+        ),
+    )
+
+
+def _empty_block_mxfp4(size):
+    *dims, n, k = size
+    return (
+        torch.empty(size, device="cuda", dtype=torch.float4_e2m1fn_x2),
+        torch.empty(
+            (*dims, ceil_div(n, _MX_BLOCK_SIZE), ceil_div(k, _MX_BLOCK_SIZE)),
+            device="cuda",
+            dtype=torch.float8_e8m0fnu,
+        ),
+    )
+
+
+_MX_BLOCK_SIZE = 32
+
+
 class _NormalWarmupExecutor(_BaseWarmupExecutor):
+
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((n, k))
@@ -282,6 +311,7 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
 
 
 class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
+
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
@@ -298,6 +328,7 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
 
 
 class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
+
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
@@ -308,6 +339,27 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
 
     def execute(self, m):
         deep_gemm.fp8_m_grouped_gemm_nt_masked(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            masked_m=self.masked_m,
+            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            expected_m=m,
+        )
+
+
+class _GroupedFP8FP4MaskedWarmupExecutor(_BaseWarmupExecutor):
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_mxfp8((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_mxfp4((num_groups, n, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_fp8fp4_gemm_nt_masked(
             (self.lhs_q, self.lhs_s),
             (self.rhs_q, self.rhs_s),
             self.out,

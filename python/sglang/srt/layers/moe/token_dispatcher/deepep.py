@@ -611,6 +611,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             use_nvfp4 = True
         elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
             use_fp8 = True
+        # deepep.py _dispatch_core 中
+        use_mxfp8_for_sf = self.quant_config.get("use_mxfp8_for_sf", False)
+        if use_mxfp8_for_sf:
+            use_ue8m0 = False
+        else:
+            use_ue8m0 = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and \
+            deep_gemm_wrapper.DEEPGEMM_BLACKWELL
 
         buffer = self._get_buffer()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
@@ -630,8 +637,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 return_recv_hook=self.return_recv_hook,
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                use_ue8m0=use_ue8m0,
+                use_mxfp8_for_sf=use_mxfp8_for_sf,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook

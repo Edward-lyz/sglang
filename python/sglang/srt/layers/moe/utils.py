@@ -58,6 +58,7 @@ class MoeRunnerBackend(Enum):
 
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
+    DEEP_GEMM_MXFP4 = "deep_gemm_mxfp4"
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
@@ -87,15 +88,21 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_cutedsl(self):
         return self == MoeRunnerBackend.FLASHINFER_CUTEDSL
-
     def is_flashinfer_mxfp4(self):
+        """Check if the backend is FLASHINFER_MXFP4."""
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
 
     def is_cutlass(self):
+        """Check if the backend is CUTLASS."""
         return self == MoeRunnerBackend.CUTLASS
 
     def is_marlin(self):
+        """Check if the backend is MARLIN."""
         return self == MoeRunnerBackend.MARLIN
+    
+    def is_deepgemm_mxfp4(self):
+        """Check if the backend is DEEP_GEMM_MXFP4."""
+        return self == MoeRunnerBackend.DEEP_GEMM_MXFP4
 
 
 class DeepEPMode(Enum):

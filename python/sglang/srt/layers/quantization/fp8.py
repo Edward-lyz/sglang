@@ -118,7 +118,9 @@ class Fp8Config(QuantizationConfig):
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
         use_mxfp8: bool = False,
+        moe_quant_method: Optional[str] = None,
     ) -> None:
+        super().__init__(moe_quant_method=moe_quant_method)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -179,12 +181,14 @@ class Fp8Config(QuantizationConfig):
                 "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
             )
             weight_block_size = [1, 32]
+        moe_quant_method = cls.get_from_keys_or(config, ["moe_quant_method"], None)
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             use_mxfp8=use_mxfp8,
+            moe_quant_method=moe_quant_method,
         )
 
     def get_quant_method(
@@ -688,7 +692,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_deep_gemm():
+        if moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_deepgemm_mxfp4():
             return True
         if moe_runner_backend.is_auto():
             return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (

@@ -31,6 +31,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe im
     NPUCompressedTensorsW4A16Int4DynamicMoEMethod,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config, Mxfp4MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.quark_moe import QuarkW4A4MXFp4MoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
@@ -116,7 +117,7 @@ class DeepEPMoE(FusedMoE):
             self.use_fp8_w8a8 = True
             self.fp8_dtype = torch.float8_e4m3fn
             self.use_w4afp8 = False
-        elif isinstance(quant_config, W4AFp8Config):
+        elif isinstance(quant_config, W4AFp8Config) or isinstance(quant_config, Mxfp4Config):
             self.use_w4afp8 = True
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
@@ -189,6 +190,15 @@ class DeepEPMoE(FusedMoE):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        # DEBUG: 打印调用栈和 dispatch_output 中 scale 的 dtype
+        # import traceback
+        # scale_attr = getattr(dispatch_output, 'hidden_states_scale', None)
+        # logger.warning(
+        #     "dispatch_output scale dtype: %s, scale value: %s\n%s",
+        #     scale_attr.dtype if scale_attr is not None else "N/A",
+        #     scale_attr,
+        #     "".join(traceback.format_stack()),
+        # )
         combine_input = self.run_moe_core(dispatch_output)
         hidden_states = self.dispatcher.combine(
             combine_input=combine_input,
@@ -237,7 +247,10 @@ class DeepEPMoE(FusedMoE):
             ):
                 output = self.forward_flashinfer_cutedsl(dispatch_output)
             elif self.use_w4afp8:
-                output = self.forward_cutlass_w4afp8_masked(dispatch_output)
+                if isinstance(self.quant_config, Mxfp4Config):
+                    output = self.forward_deep_gemm_mxfp4_masked(dispatch_output)
+                else:
+                    output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
 
@@ -336,6 +349,26 @@ class DeepEPMoE(FusedMoE):
         assert (
             envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ), "W4AFP8 does not support FP8 dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
+        return self.quant_method.apply_deepep_ll(
+            layer=self,
+            dispatch_output=dispatch_output,
+        )
+    
+    def forward_deep_gemm_mxfp4_masked(
+        self,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ):
+        """
+        Forward pass for deep gemm with mxfp4 masked quantization.
+        
+        Args:
+            dispatch_output: DeepEPLLDispatchOutput object containing dispatch information.
+        """
+        assert self.moe_runner_config.activation == "silu"
+        assert isinstance(self.quant_method, Mxfp4MoEMethod)
+        # assert (
+        #     envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+        # ), "W4AFP8 does not support FP8 dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
         return self.quant_method.apply_deepep_ll(
             layer=self,
             dispatch_output=dispatch_output,

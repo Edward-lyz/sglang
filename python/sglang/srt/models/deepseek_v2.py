@@ -104,6 +104,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
@@ -409,7 +410,12 @@ class DeepseekV2MoE(nn.Module):
             # so we scale with 1 / self.moe_ep_size in ep mode which will make it equalation as in tp mode
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
-
+        
+        # TODO, moe use different quant config
+        if hasattr(quant_config, "moe_quant_method") and quant_config.moe_quant_method == "mxfp4":
+            moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
+        else:
+            moe_quant_config = quant_config
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
@@ -419,7 +425,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_id,
-            quant_config=quant_config,
+            quant_config=moe_quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             routing_method_type=getattr(
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3

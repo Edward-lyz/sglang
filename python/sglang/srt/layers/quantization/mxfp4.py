@@ -19,6 +19,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, List, Optional
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+
 import torch
 from torch.nn.parameter import Parameter
 
@@ -53,6 +56,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.layers.quantization.mxfp4_tensor import swizzle_sf_triton
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
 _is_sm90_supported = is_cuda() and is_sm90_supported()
@@ -73,6 +77,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
+        DeepEPLLDispatchOutput,
     )
 
 _is_hip = is_hip()
@@ -268,6 +273,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
+        self.use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
+    
+    @staticmethod
+    def is_deepgemm_moe_runner_backend_enabled() -> bool:
+        """Check if MoE will actually use DeepGEMM runner for FP8."""
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_deepgemm_mxfp4():
+            return True
+        if moe_runner_backend.is_auto():
+            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
+                get_moe_a2a_backend().is_deepep()
+            )
+        return False
 
     def create_weights(
         self,
@@ -279,6 +300,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
         self.num_experts = num_experts
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
@@ -343,8 +365,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        scale_weight_attrs = {**extra_weight_attrs, "quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+        set_weight_attrs(w13_weight_scale, scale_weight_attrs)
 
         w13_weight_bias = torch.nn.Parameter(
             torch.zeros(
@@ -379,8 +402,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, scale_weight_attrs)
 
         w2_weight_bias = torch.nn.Parameter(
             torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
@@ -388,6 +411,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_bias", w2_weight_bias)
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+        self.workspace = torch.zeros((4 * 1024 * 1024,), dtype=torch.uint8, device=w2_weight_scale.device)
 
     def process_weights_after_loading(self, layer):
         if self.use_flashinfer:
@@ -600,6 +624,58 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             return
+        
+        if self.use_deepgemm:
+            # Shuffle scaling factors for transposed mma output
+            gemm1_scales_mxfp4_shuffled = []
+            gemm2_scales_mxfp4_shuffled = []
+            w13_weight_scale_inv = layer.w13_weight_scale_inv.data
+            w2_weight_scale_inv = layer.w2_weight_scale_inv.data
+            sf_block_size = 32
+            for i in range(self.num_experts):
+                gemm1_scales_mxfp4_shuffled.append(
+                    swizzle_sf_triton(
+                        w13_weight_scale_inv[i].view(torch.uint8)
+                    )
+                )
+                gemm2_scales_mxfp4_shuffled.append(
+                    swizzle_sf_triton(
+                        w2_weight_scale_inv[i].view(torch.uint8)
+                    )
+                )
+
+            w13_weight_scale_inv = (
+                torch.stack(gemm1_scales_mxfp4_shuffled)
+                .reshape(
+                    self.num_experts,
+                    2 * self.intermediate_size_per_partition,
+                    self.hidden_size // sf_block_size,
+                )
+                .view(torch.float8_e8m0fnu)
+            )
+
+            w2_weight_scale_inv = (
+                torch.stack(gemm2_scales_mxfp4_shuffled)
+                .reshape(
+                    self.num_experts,
+                    self.hidden_size,
+                    self.intermediate_size_per_partition // sf_block_size,
+                )
+                .view(torch.float8_e8m0fnu)
+            )
+            layer.w13_weight_scale_inv = Parameter(w13_weight_scale_inv, requires_grad=False)
+            layer.w2_weight_scale_inv = Parameter(w2_weight_scale_inv, requires_grad=False)
+
+            w13_weight = layer.w13_weight.data.view(torch.float4_e2m1fn_x2)
+            w2_weight = layer.w2_weight.data.view(torch.float4_e2m1fn_x2)
+            layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+            layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+
+            # mxfp4.py 的 process_weights_after_loading 中
+            layer.dispatcher.set_quant_config({
+                "use_mxfp8_for_sf": True,
+            })
+            return
 
         if self.use_triton_kernels:
 
@@ -664,6 +740,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             else MoeRunnerBackend.TRITON
         )
         self.runner = MoeRunner(backend, moe_runner_config)
+        # self.moe_runner_config = moe_runner_config
+        # moe_runner_backend = get_moe_runner_backend()
+
+        # if moe_runner_backend.is_auto():
+        #     if self.is_deepgemm_moe_runner_backend_enabled():
+        #         moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+        #     else:
+        #         moe_runner_backend = MoeRunnerBackend.TRITON
+        # if (
+        #     moe_runner_backend.is_deep_gemm()
+        #     or moe_runner_backend.is_deepgemm_mxfp4()
+        #     or moe_runner_backend.is_triton()
+        #     or moe_runner_backend.is_flashinfer_trtllm()
+        # ):
+        #     self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        # else:
+        #     # TODO(cwan): refactor other backends
+        #     pass
 
     def apply(
         self,
@@ -822,6 +916,41 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         return self.runner.run(dispatch_output, quant_info)
 
+    def apply_deepep_ll(
+        self,
+        layer: DeepEPMoE,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ) -> torch.Tensor:
+        """Apply deep ep ll operation.
+        
+        Args:
+            layer: DeepEPMoE layer instance.
+            dispatch_output: DeepEPLLDispatchOutput instance containing dispatch information.
+        
+        Returns:
+            torch.Tensor: Processed hidden states.
+        """
+        from sglang.srt.layers.moe.deep_gemm_mxfp4_moe import (
+            deep_gemm_mxfp4_moe_deepep_ll,
+        )
+
+        hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
+            dispatch_output
+        )
+
+        output = deep_gemm_mxfp4_moe_deepep_ll(
+            hidden_states,
+            hidden_states_scale,
+            layer.w13_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight,
+            layer.w2_weight_scale_inv,
+            masked_m,
+            expected_m,
+            self.workspace,
+        )
+
+        return output
 
 class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
     def create_weights(
