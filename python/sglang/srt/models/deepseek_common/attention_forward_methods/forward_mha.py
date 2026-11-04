@@ -293,10 +293,18 @@ class DeepseekMHAForwardMixin:
         if has_extend_prefix:
             attn_output, lse = attn_output
             forward_batch.set_attn_attend_prefix_cache(True)
-            attn_output = self._chunked_prefix_attn_mha(
-                q=q,
-                accum_output=attn_output,
-                accum_lse=lse,
+
+            # Fix: DP/attn_tp padding tokens (from ceil_align in
+            # prepare_mlp_sync_batch) sit beyond the real extend tokens.
+            # The attention kernel only writes valid positions via
+            # cum_seq_lens_q, leaving padding positions with LSE = -inf.
+            # merge_state_v2(-inf, -inf) => NaN ((-inf) - (-inf) = NaN).
+            # Slice to valid tokens only so merge never sees padding LSE.
+            valid_tokens = sum(forward_batch.extend_seq_lens_cpu)
+            attn_output[:valid_tokens] = self._chunked_prefix_attn_mha(
+                q=q[:valid_tokens],
+                accum_output=attn_output[:valid_tokens],
+                accum_lse=lse[:valid_tokens],
                 forward_batch=forward_batch,
             )
 
