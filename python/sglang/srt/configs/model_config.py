@@ -157,6 +157,15 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
+        # GLM-5.1 MXFP4 MoE reuses the DeepSeek-style FP4 expert layout while
+        # the rest of the checkpoint is advertised as FP8.
+        self.is_fp4_experts: bool = False
+        if envs.SGLANG_GLM51_MXFP4_MODE.get():
+            self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
+        n_group = getattr(self.hf_config, "n_group", None)
+        if self.is_fp4_experts and n_group is not None:
+            self.hf_config.topk_group = n_group
+
         # Check model type
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None

@@ -94,7 +94,7 @@ logger = logging.getLogger(__name__)
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none():
+    if a2a_backend.is_none() or a2a_backend.is_megamoe():
         return StandardDispatcher(moe_runner_config)
     elif a2a_backend.is_deepep() or a2a_backend.is_mooncake():
         return MaybeTboDeepEPDispatcher(
@@ -698,8 +698,10 @@ class FusedMoE(torch.nn.Module):
             else loaded_weight
         )
 
-        if shard_id not in ("w1", "w2", "w3"):
-            raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
+        if shard_id not in ("w1", "w2", "w3", "w13"):
+            raise ValueError(
+                f"shard_id must be ['w1','w2','w3','w13'] but got {shard_id}."
+            )
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
         if self.use_flashinfer_trtllm_moe and (
@@ -708,13 +710,15 @@ class FusedMoE(torch.nn.Module):
             or isinstance(self.quant_method, UnquantizedFusedMoEMethod)
             or isinstance(self.quant_method, CompressedTensorsMxInt4MoEMethod)
         ):
-            shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
+            shard_id = {"w1": "w3", "w3": "w1", "w2": "w2", "w13": "w13"}[
+                shard_id
+            ]
 
         WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
         # Fetch the dim to shard the parameter/loaded weight
         # based on the shard id. This will be whatever
         # dimension intermediate_size is used.
-        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0, "w13": 0}
 
         expert_data = param.data[expert_id]
 

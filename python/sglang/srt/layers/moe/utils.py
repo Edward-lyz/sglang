@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class MoeA2ABackend(Enum):
+    """All-to-all backend choices for MoE dispatch."""
 
     NONE = "none"
     DEEPEP = "deepep"
@@ -25,6 +26,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    MEGAMOE = "megamoe"
 
     @classmethod
     def _missing_(cls, value):
@@ -52,6 +54,10 @@ class MoeA2ABackend(Enum):
 
     def is_mori(self):
         return self == MoeA2ABackend.MORI
+
+    def is_megamoe(self):
+        """Return whether this backend selects Mega-MoE."""
+        return self == MoeA2ABackend.MEGAMOE
 
 
 class MoeRunnerBackend(Enum):

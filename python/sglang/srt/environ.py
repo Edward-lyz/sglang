@@ -317,6 +317,10 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    # Set False when using FP4-to-FP8 converted DeepSeek V4 / GLM checkpoint.
+    SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    # Enable DSV4-compatible MXFP4 expert handling for GLM-5.1 MoE.
+    SGLANG_GLM51_MXFP4_MODE = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
@@ -389,6 +393,14 @@ class Envs:
     SGLANG_SUPPORT_CUTLASS_BLOCK_FP8 = EnvBool(False)
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
+
+    # DeepGEMM Mega-MoE
+    SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
+    SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
+    SGLANG_OPT_MEGA_MOE_KEEP_NEW_SF_ONLY = EnvBool(False)
     SGLANG_OPT_MEGA_MOE_FUSED_TAIL = EnvBool(False)
 
     # Deterministic inference

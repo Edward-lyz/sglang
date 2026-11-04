@@ -195,6 +195,17 @@ class BypassedTopKOutput(NamedTuple):
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
 
+    def to_standard(self, layer_id: Optional[int] = None) -> "StandardTopKOutput":
+        """Materialize bypassed routing data into the standard top-k format."""
+        return select_experts(
+            hidden_states=self.hidden_states,
+            router_logits=self.router_logits,
+            topk_config=self.topk_config,
+            layer_id=layer_id,
+            num_token_non_padded=self.num_token_non_padded,
+            expert_location_dispatch_info=self.expert_location_dispatch_info,
+        )
+
 
 # -------------------------------- TopK ---------------------------------------
 

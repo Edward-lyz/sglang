@@ -264,6 +264,49 @@ class DeepseekV2WeightLoaderMixin:
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
                             continue
+                        # GLM-5.1 FP8+MXFP4 MoE checkpoints store routed experts as
+                        # fused tensors named experts.w13_weight / experts.w2_weight
+                        # plus matching *_scale_inv tensors. Route each global
+                        # expert through FusedMoE so EP ranks keep only local experts.
+                        fused_glm_mxfp4_shard_id = None
+                        if name.endswith(".mlp.experts.w13_weight") or name.endswith(
+                            ".mlp.experts.w13_weight_scale_inv"
+                        ):
+                            fused_glm_mxfp4_shard_id = "w13"
+                        elif name.endswith(".mlp.experts.w2_weight") or name.endswith(
+                            ".mlp.experts.w2_weight_scale_inv"
+                        ):
+                            fused_glm_mxfp4_shard_id = "w2"
+                        if fused_glm_mxfp4_shard_id is not None and name in params_dict:
+                            param = params_dict[name]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            num_experts = min(
+                                getattr(
+                                    self.config,
+                                    "n_routed_experts",
+                                    loaded_weight.shape[0],
+                                ),
+                                loaded_weight.shape[0],
+                            )
+                            for expert_id in range(num_experts):
+                                maybe_executor_submit(
+                                    executor=executor,
+                                    futures=futures,
+                                    use_async=use_async_loading,
+                                    func=weight_loader,
+                                    func_args=(
+                                        param,
+                                        loaded_weight[expert_id],
+                                        name,
+                                    ),
+                                    func_kwargs={
+                                        "shard_id": fused_glm_mxfp4_shard_id,
+                                        "expert_id": expert_id,
+                                    },
+                                )
+                            continue
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
