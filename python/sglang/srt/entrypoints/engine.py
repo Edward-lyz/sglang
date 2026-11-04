@@ -32,6 +32,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import (
     Any,
     AsyncIterator,
@@ -839,6 +840,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 )
             )
 
+            parallel_launch = numa_utils.use_parallel_scheduler_launch(server_args)
+            parallel_procs = []
+
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=False)
@@ -851,10 +855,25 @@ class Engine(EngineScoreMixin, EngineBase):
                         server_args, tp_rank
                     )
 
-                    with maybe_reindex_device_id(gpu_id) as gpu_id:
-                        proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
+                    if parallel_launch:
+                        proc = _make_scheduler_process(
+                            run_scheduler_process_func,
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            attn_cp_rank,
+                            moe_dp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            writer,
+                            bind_numa_in_child=True,
+                        )
+                        parallel_procs.append(proc)
+                    else:
+                        with maybe_reindex_device_id(gpu_id) as gpu_id:
+                            proc = _make_scheduler_process(
+                                run_scheduler_process_func,
                                 server_args,
                                 port_args,
                                 gpu_id,
@@ -863,18 +882,19 @@ class Engine(EngineScoreMixin, EngineBase):
                                 moe_dp_rank,
                                 moe_ep_rank,
                                 pp_rank,
-                                None,
                                 writer,
-                            ),
-                        )
-                        with (
-                            memory_saver_adapter.configure_subprocess(),
-                            numa_utils.configure_subprocess(server_args, gpu_id),
-                        ):
-                            proc.start()
+                            )
+                            with (
+                                memory_saver_adapter.configure_subprocess(),
+                                numa_utils.configure_subprocess(server_args, gpu_id),
+                            ):
+                                proc.start()
 
                     scheduler_procs.append(proc)
                     scheduler_pipe_readers.append(reader)
+
+            if parallel_launch:
+                _start_scheduler_procs_in_parallel(parallel_procs)
         else:
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
@@ -1639,6 +1659,60 @@ def _wait_for_scheduler_ready(
                     raise _scheduler_died_error(j, scheduler_procs[j])
 
     return scheduler_infos
+
+
+def _make_scheduler_process(
+    target,
+    server_args,
+    port_args,
+    gpu_id,
+    tp_rank,
+    attn_cp_rank,
+    moe_dp_rank,
+    moe_ep_rank,
+    pp_rank,
+    pipe_writer,
+    bind_numa_in_child=False,
+):
+    kwargs = {}
+    if bind_numa_in_child:
+        # Only passed on the parallel-launch path so an overridden target
+        # (Engine.run_scheduler_process_func) that predates this parameter keeps
+        # working when the feature is off.
+        kwargs["bind_numa_in_child"] = True
+    return mp.Process(
+        target=target,
+        args=(
+            server_args,
+            port_args,
+            gpu_id,
+            tp_rank,
+            attn_cp_rank,
+            moe_dp_rank,
+            moe_ep_rank,
+            pp_rank,
+            None,
+            pipe_writer,
+        ),
+        kwargs=kwargs,
+    )
+
+
+def _start_scheduler_procs_in_parallel(procs):
+    # Children bind their own NUMA node and spawn's spawning_popen is
+    # thread-local (spawn is enforced by use_parallel_scheduler_launch), so
+    # concurrent start() is safe. Wait for all starts to settle, then on any
+    # failure terminate the ones that came up so they do not linger on GPUs.
+    if not procs:
+        return
+    with ThreadPoolExecutor(max_workers=min(len(procs), 32)) as executor:
+        futures = [executor.submit(proc.start) for proc in procs]
+    errors = [f.exception() for f in futures if f.exception() is not None]
+    if errors:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+        raise errors[0]
 
 
 def _calculate_rank_ranges(

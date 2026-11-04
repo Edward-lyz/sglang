@@ -177,6 +177,85 @@ def numa_bind_to_node(node: int):
     libnuma.numa_set_preferred(ctypes.c_int(node))
 
 
+def use_parallel_scheduler_launch(server_args: ServerArgs) -> bool:
+    """Whether scheduler processes are spawned concurrently, with each child
+    binding its own NUMA node instead of the serial numactl-wrapped spawn.
+
+    Disabled when a launch feature that mutates process-global state per child
+    is active (data-parallel controller, memory saver, one-visible-device
+    remap), since those cannot run under a concurrent spawn. Also requires the
+    "spawn" start method: under "fork", concurrent start() from worker threads
+    could deadlock a child on locks (logging/import) held at fork time.
+    """
+    return (
+        envs.SGLANG_PARALLEL_SCHEDULER_LAUNCH.get()
+        and multiprocessing.get_start_method(allow_none=False) == "spawn"
+        and server_args.dp_size <= 1
+        and server_args.ep_join_mode != "scale"
+        and not server_args.enable_memory_saver
+        and not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get()
+    )
+
+
+def bind_current_process_to_gpu_numa(server_args: ServerArgs, gpu_id: int) -> None:
+    """Hard-bind the calling process (CPU + memory) to gpu_id's NUMA node.
+
+    In-process equivalent of the numactl wrapper in configure_subprocess, for
+    the parallel launch where children cannot share the global multiprocessing
+    executable. Reuses the same node lookup and uses hard membind (MPOL_BIND) to
+    match numactl --cpunodebind/--membind, so the binding equals the serial
+    path; host memory must therefore be node-sufficient. Run before large host
+    allocations to keep them node-local.
+    """
+    node = get_numa_node_if_available(server_args, gpu_id)
+    if node is None:
+        return
+    libnuma = get_libnuma()
+    if libnuma is None or libnuma.numa_available() < 0:
+        logger.warning("numa not available, skip binding process for GPU %d", gpu_id)
+        return
+
+    node_cpus = _node_cpus(node)
+    original_cpus = os.sched_getaffinity(0)
+    target_cpus = (node_cpus & original_cpus) if node_cpus else None
+    if node_cpus and not target_cpus:
+        # May raise when SGLANG_CRASH_ON_NUMA_BIND_FAILURE is set; kept out of the
+        # try below so the configured fail-fast is not downgraded to a warning.
+        _handle_numa_bind_failure(node, original_cpus, gpu_id=gpu_id)
+        return
+
+    try:
+        if target_cpus:
+            os.sched_setaffinity(0, target_cpus)
+        _numa_set_membind(libnuma, node)
+    except Exception:
+        # Roll back so we never leave CPU bound but memory unbound.
+        os.sched_setaffinity(0, original_cpus)
+        logger.warning(
+            "NUMA bind for GPU %d node %d failed; leaving process unbound",
+            gpu_id,
+            node,
+            exc_info=True,
+        )
+        return
+    logger.debug("Bound process for GPU %d to NUMA node %d", gpu_id, node)
+
+
+def _numa_set_membind(libnuma, node: int) -> None:
+    libnuma.numa_allocate_nodemask.restype = ctypes.POINTER(_Bitmask)
+    libnuma.numa_bitmask_setbit.argtypes = [ctypes.POINTER(_Bitmask), ctypes.c_uint]
+    libnuma.numa_set_membind.argtypes = [ctypes.POINTER(_Bitmask)]
+    libnuma.numa_bitmask_free.argtypes = [ctypes.POINTER(_Bitmask)]
+    mask = libnuma.numa_allocate_nodemask()
+    if not mask:
+        raise MemoryError("numa_allocate_nodemask returned NULL")
+    try:
+        libnuma.numa_bitmask_setbit(mask, node)
+        libnuma.numa_set_membind(mask)
+    finally:
+        libnuma.numa_bitmask_free(mask)
+
+
 class _Bitmask(ctypes.Structure):
     _fields_ = [("size", ctypes.c_ulong), ("maskp", ctypes.POINTER(ctypes.c_ulong))]
 
