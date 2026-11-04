@@ -52,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
+from sglang.srt.layers.engram_peer import EngramPeerTable, peer_instances
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
@@ -735,7 +736,18 @@ class EngramEmbedding(nn.Module):
         # (col_offsets[c] is column c's first row), so each column of a lookup
         # comes from exactly one rank. The row-range lookup below stays valid.
         self.cols_per_rank = 0
-        if (
+        # [luno-5437] rows sharded over every instance sharing the node (engram_peer).
+        self.peer: Optional[EngramPeerTable] = None
+        if peer_instances():
+            assert not envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get(), (
+                "SGLANG_DSV41_ENGRAM_PEER_INSTANCES and the engram host table are exclusive"
+            )
+            self.peer = EngramPeerTable(num_embeddings, dim, FP8_BLOCK_SIZE, layer_id)
+            self.row_start, row_end = (
+                self.peer.row_start,
+                self.peer.row_start + self.peer.rows,
+            )
+        elif (
             col_offsets is not None
             and envs.SGLANG_OPT_DSV41_ENGRAM_PACKED_A2A.get()
             and not envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
@@ -749,7 +761,10 @@ class EngramEmbedding(nn.Module):
             row_end = col_offsets[(tp_rank + 1) * self.cols_per_rank]
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
-        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        if self.peer is not None:
+            self.weight = nn.Parameter(self.peer.weight, requires_grad=False)
+            self.scale = nn.Parameter(self.peer.scale, requires_grad=False)
+        elif envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
             self.weight = nn.Parameter(
@@ -818,6 +833,8 @@ class EngramEmbedding(nn.Module):
         the table ended up backed."""
         if self.host_table is not None:
             self.host_table.finish_load(label)
+        if self.peer is not None:
+            self.peer.connect()
 
     def forward(
         self,
@@ -826,6 +843,9 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
+        if self.peer is not None:
+            # Every rank reads the rows of its own tokens from the owner GPUs.
+            return self._peer_lookup(indices)
         if self._shared:
             if indices.shape[0] == 0:
                 return self._empty(indices)
@@ -890,6 +910,27 @@ class EngramEmbedding(nn.Module):
         if self.tp_size > 1 and get_attention_dp_size() > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
+    def _peer_lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        if indices.numel() == 0:
+            return self._empty(indices)
+        assert self.peer.ready, "engram peer table used before finish_load"
+        ids = indices.reshape(-1, 1, indices.shape[-1]).contiguous()
+        packed = torch.empty(
+            (*ids.shape, self.dim + self.dim // FP8_BLOCK_SIZE),
+            dtype=torch.uint8,
+            device=ids.device,
+        )
+        engram_peer_gather_packed(
+            self.peer.bases, self.peer.starts_dev, ids, packed, 0, self.dim
+        )
+        values, _ = engram_unpack(
+            packed.unsqueeze(0),
+            ids.shape[0],
+            ids.shape[0],
+            fill=_peer_unpack_fill(1, packed.shape[-1], packed.device),
+            out_bf16=True,
+        )
+        return values.view(*indices.shape, self.dim)
 
     def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
         """Lookup when every TP rank holds the same indices: the device and
@@ -1107,9 +1148,15 @@ class EngramPackedExchange:
     @classmethod
     def create(cls, engrams: list[Engram]) -> Optional[EngramPackedExchange]:
         """Returns None if not applicable."""
-        if not engrams or not envs.SGLANG_OPT_DSV41_ENGRAM_PACKED_A2A.get():
+        if not engrams:
             return None
         engrams = sorted(engrams, key=lambda e: e.layer_hash_index)
+        if all(e.embed.peer is not None for e in engrams):
+            if [e.layer_hash_index for e in engrams] != list(range(len(engrams))):
+                return None
+            return EngramPeerExchange(engrams)
+        if not envs.SGLANG_OPT_DSV41_ENGRAM_PACKED_A2A.get():
+            return None
         if (
             torch.version.cuda is None
             or not torch.cuda.is_available()
@@ -1224,6 +1271,87 @@ class EngramPackedExchange:
             slot,
             n_rows,
             sent,
+        )
+        return {
+            e.layer_hash_index: (
+                Mxfp8SwizzledInput(values[i], scales[i]) if mxfp8 else values[i]
+            )
+            for i, e in enumerate(self.engrams)
+        }
+
+
+_peer_fill_cache: dict = {}
+
+
+def _peer_unpack_fill(layers: int, width: int, device) -> torch.Tensor:
+    """A never-used fill (every row is real) for engram_unpack: with HAS_FILL the
+    kernel's source address goes through a select, which keeps Triton (3.7) from
+    emitting 16-byte loads on the 8-byte aligned (DIM + DIM // 32)-byte rows; the
+    no-fill specialization faults with "misaligned address"."""
+    key = (layers, width, str(device))
+    if key not in _peer_fill_cache:
+        _peer_fill_cache[key] = torch.zeros(
+            layers, width, dtype=torch.uint8, device=device
+        )
+    return _peer_fill_cache[key]
+
+
+class EngramPeerExchange(EngramPackedExchange):
+    """[luno-5437] EngramPackedExchange for peer-sharded tables (engram_peer): each
+    rank gathers the packed rows of its own tokens straight from the owner GPUs
+    (local or over NVLink) and unpacks them like the all-to-all path, so wkv sees
+    the same MXFP8 / bf16 input with no collective."""
+
+    def stage(
+        self,
+        hash_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        cp_rows: Optional[int] = None,
+    ) -> Optional[dict]:
+        if not all(e.embed.peer.ready for e in self.engrams):
+            return None
+        layers = len(self.engrams)
+        if cp_rows is not None:
+            # Whole-prompt ids: keep this interleave rank's tokens and pad to the
+            # local row count with id 0, like the per-layer path (the all-to-all
+            # path fills those rows with row 0 too).
+            parallel = get_parallel()
+            local = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
+            ids = local.new_zeros((cp_rows, *local.shape[1:]))
+            ids[: local.shape[0]] = local
+        else:
+            ids = hash_ids
+        assert ids.shape[1] == layers, ids.shape
+        ids = ids.contiguous()
+        n_rows = ids.shape[0]
+        dim = self.engrams[0].embed.dim
+        packed = torch.empty(
+            (*ids.shape, dim + dim // FP8_BLOCK_SIZE),
+            dtype=torch.uint8,
+            device=ids.device,
+        )
+        for i, e in enumerate(self.engrams):
+            engram_peer_gather_packed(
+                e.embed.peer.bases, e.embed.peer.starts_dev, ids, packed, i, dim
+            )
+        mxfp8 = self.wkv_takes_mxfp8()
+        values, scales = engram_unpack(
+            packed.unsqueeze(0),
+            n_rows,
+            n_rows,
+            fill=_peer_unpack_fill(layers, packed.shape[-1], packed.device),
+            out_bf16=not mxfp8,
+        )
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "luno-5437 engram_peer_gather",
+            "mode=%s wkv_input=%s layers=%d rows=%d shards=%d",
+            "prefill-cp" if cp_rows is not None else "local",
+            "mxfp8" if mxfp8 else "bf16",
+            layers,
+            n_rows,
+            self.engrams[0].embed.peer.num_shards,
         )
         return {
             e.layer_hash_index: (

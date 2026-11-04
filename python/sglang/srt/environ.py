@@ -1883,6 +1883,21 @@ class Envs:
     # wkv outputs are bit-identical to the bf16 lookup path. Not used with the
     # host table.
     SGLANG_OPT_DSV41_ENGRAM_PACKED_A2A = EnvBool(True)
+    # [luno-5437] Share the HBM engram tables across N same-node instances (fake-dp
+    # replicas, or independent servers launched with every GPU visible): the rows are
+    # sharded over all N * tp GPUs, published via CUDA IPC, and each rank gathers the
+    # rows its own tokens need straight from the owner GPU over NVLink -- no
+    # all-to-all / all-reduce. Saves (1 - 1/N) of the per-GPU table (cp4, N=2:
+    # 47.3 -> 23.6 GiB). 0/1 = off. The instances depend on each other's memory: all
+    # must stay up together.
+    SGLANG_DSV41_ENGRAM_PEER_INSTANCES = EnvInt(0)
+    # This instance's index in [0, N); -1 derives it as current_device // tp_size.
+    SGLANG_DSV41_ENGRAM_PEER_INDEX = EnvInt(-1)
+    # Rendezvous directory for the IPC handles (one file per layer and shard); the
+    # tag separates unrelated groups sharing the directory.
+    SGLANG_DSV41_ENGRAM_PEER_DIR = EnvStr("/dev/shm/sglang_engram_peer")
+    SGLANG_DSV41_ENGRAM_PEER_TAG = EnvStr("default")
+    SGLANG_DSV41_ENGRAM_PEER_TIMEOUT = EnvInt(3600)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # Community #41660: fused c1/c2 compressor for eager extend (non-CP and, locally, the CP
