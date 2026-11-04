@@ -1906,6 +1906,10 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
     SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
+    # [luno-5437] PD prefill: prune the DeepSeek-V4 (MoE) DSpark draft to what the
+    # ctx-KV commit reads (main_proj / main_norm / per-stage wkv + kv_norm) right
+    # after loading, so the KV pool gets the freed HBM.
+    SGLANG_DSV41_PD_PREFILL_DRAFT_PRUNE = EnvBool(False)
     # Pin and map the host table with cudaHostRegister. False leaves the plain
     # mapping to the platform (Grace-Blackwell ATS reaches it directly).
     SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
