@@ -216,7 +216,11 @@ class TestEncoderMetaRegistry(CustomTestCase):
             }
             with (
                 patch.object(http_server, "dp_dispatcher", None),
-                patch.object(http_server, "encoder", SimpleNamespace(send=send)),
+                patch.object(
+                    http_server,
+                    "encoder",
+                    SimpleNamespace(send=send, metrics_collector=None),
+                ),
                 patch.object(
                     encoder_server.meta_registry,
                     "note_send_done",
@@ -232,7 +236,9 @@ class TestEncoderMetaRegistry(CustomTestCase):
 
     def test_dp_send_counts_the_normalized_destination(self):
         async def run():
-            encoder = SimpleNamespace(send=AsyncMock(return_value=True))
+            encoder = SimpleNamespace(
+                send=AsyncMock(return_value=True), metrics_collector=None
+            )
             note_send_done = AsyncMock()
             request = {
                 "req_id": "req",
@@ -528,6 +534,7 @@ class TestEncoderDelivery(CustomTestCase):
         encoder = MMEncoder.__new__(MMEncoder)
         encoder.mm_cache = MultiModalStaticCache(1024 * 1024)
         encoder.mm_cache_lock = asyncio.Lock()
+        encoder.device = torch.device("cpu")
         item = SimpleNamespace(hash=123, set_pad_value=lambda: None)
         encoder._build_model_mm_items = Mock(return_value=[item])
         ctx = SimpleNamespace(
@@ -615,6 +622,51 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
+    def test_mooncake_prefix_cache_reuses_and_records_hits(self):
+        async def run():
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            get_feature_fn = Mock(return_value=torch.ones((2, 4), device=device))
+            encoder, ctx = self._make_prefix_cache_encoder_and_context(get_feature_fn)
+            encoder.device = device
+            encoder.metrics_collector = Mock()
+            community_metrics = Mock()
+
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.get_mm",
+                    return_value=SimpleNamespace(enable_prefix_mm_cache=True),
+                ),
+                patch.object(
+                    encoder_server, "encoder_metrics_collector", community_metrics
+                ),
+            ):
+                first = await encoder._compute_direct_embedding(ctx, keep_on_gpu=True)
+                second = await encoder._compute_direct_embedding(ctx, keep_on_gpu=True)
+
+            get_feature_fn.assert_called_once()
+            # Mooncake pushes from device memory; the cache keeps a host copy.
+            self.assertEqual(second.device.type, device.type)
+            torch.testing.assert_close(first, second)
+            cached = encoder.mm_cache.get([123])
+            self.assertEqual(cached.embedding.device.type, "cpu")
+            # Community encoder_cache_* series share the same gate.
+            self.assertEqual(
+                community_metrics.record_cache_tokens.call_args_list,
+                [
+                    unittest.mock.call(0, 2, modality="image"),
+                    unittest.mock.call(2, 2, modality="image"),
+                ],
+            )
+            self.assertEqual(
+                community_metrics.record_cache_files.call_args_list,
+                [
+                    unittest.mock.call(0, 1, modality="image"),
+                    unittest.mock.call(1, 1, modality="image"),
+                ],
+            )
+
+        asyncio.run(run())
+
     def test_background_task_failure_is_observed(self):
         async def run():
             encoder = MMEncoder.__new__(MMEncoder)
@@ -651,6 +703,7 @@ class TestEncoderDelivery(CustomTestCase):
             encoder = SimpleNamespace(
                 send=AsyncMock(side_effect=RuntimeError("transfer failed")),
                 release_request=AsyncMock(),
+                metrics_collector=None,
             )
             request = {
                 "req_id": "req",
@@ -674,6 +727,7 @@ class TestEncoderDelivery(CustomTestCase):
             encoder = SimpleNamespace(
                 send=AsyncMock(side_effect=ValueError("transfer failed")),
                 release_request=AsyncMock(side_effect=RuntimeError("cleanup failed")),
+                metrics_collector=None,
             )
             request = {
                 "req_id": "req",
@@ -699,6 +753,7 @@ class TestEncoderDelivery(CustomTestCase):
             encoder = SimpleNamespace(
                 send=AsyncMock(side_effect=asyncio.CancelledError()),
                 release_request=AsyncMock(),
+                metrics_collector=None,
             )
             request = {
                 "req_id": "req",
@@ -730,6 +785,7 @@ class TestEncoderDelivery(CustomTestCase):
             encoder = SimpleNamespace(
                 send=AsyncMock(return_value=True),
                 release_request=AsyncMock(),
+                metrics_collector=None,
             )
 
             note_send_done = AsyncMock()
@@ -749,6 +805,37 @@ class TestEncoderDelivery(CustomTestCase):
                 )
             )
             encoder.release_request.assert_awaited_once_with("req")
+
+        asyncio.run(run())
+
+    def test_staged_send_records_transfer_cache_hit_and_miss(self):
+        async def run():
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 1,
+                "session_id": "session",
+                "buffer_address": 2,
+                "embedding_size": 4096,
+            }
+            metrics = Mock()
+            encoder = SimpleNamespace(
+                send=AsyncMock(side_effect=[True, False]),
+                release_request=AsyncMock(),
+                metrics_collector=metrics,
+            )
+
+            self.assertTrue(
+                await send_staged_embedding(
+                    encoder, request, release_without_count=True
+                )
+            )
+            # False: the staged embedding was released before prefill asked.
+            self.assertFalse(
+                await send_staged_embedding(
+                    encoder, request, release_without_count=True
+                )
+            )
 
         asyncio.run(run())
 

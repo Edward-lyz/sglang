@@ -333,6 +333,10 @@ class GenerateReqInput:
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
+    # Encoder results produced by an external (factory) encoder pool. When set,
+    # the embedding is received through the descriptor it carries instead of
+    # dispatching a fresh /encode. Left None for every non-EPD request.
+    task_results: Optional[List[Dict[str, Any]]] = None
     # Snapshot of encoder URLs at the time tokenizer-side computed
     # ``num_items_assigned``.
     encoder_urls: Optional[List[str]] = None
@@ -1074,6 +1078,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
+    # External encoder results forwarded to the scheduler so the waiting
+    # request can receive embeddings from the descriptor's transport.
+    task_results: Optional[List[Dict[str, Any]]] = None
     # Encoder URL snapshot frozen at tokenizer-side dispatch time so that
     # encoder_idx assignments stay consistent in the scheduler subprocess.
     # Internal IPC only.

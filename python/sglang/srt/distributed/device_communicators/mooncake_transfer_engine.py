@@ -312,6 +312,34 @@ def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
     return _mooncake_transfer_engine
 
 
+_mooncake_embedding_engine: Optional[MooncakeTransferEngine] = None
+
+
+def init_mooncake_embedding_engine(
+    hostname: str,
+    gpu_id: Optional[int] = None,
+    ib_device: Optional[str] = None,
+) -> MooncakeTransferEngine:
+    """Initialize the MooncakeTransferEngine dedicated to embedding transfer.
+
+    Kept separate from the KV-transfer engine so encoder embeddings can run on
+    their own IB device, and so the session id advertised to the encoder pool
+    identifies the embedding segment rather than the KV one.
+    """
+    global _mooncake_embedding_engine
+    if _mooncake_embedding_engine is not None:
+        return _mooncake_embedding_engine
+    _mooncake_embedding_engine = MooncakeTransferEngine(
+        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
+    )
+    return _mooncake_embedding_engine
+
+
+def get_mooncake_embedding_engine() -> Optional[MooncakeTransferEngine]:
+    """Return the embedding MooncakeTransferEngine if initialized, else None."""
+    return _mooncake_embedding_engine
+
+
 def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
     """
     Need MooncakeTransferEngine when:
@@ -364,3 +392,13 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
                     "installation to 0.3.11 or above."
                 ) from e
             set_transfer_engine(_mooncake_transfer_engine.engine)
+
+    # The embedding engine is independent of the KV-transfer engine above: an
+    # EPD prefill pulls encoder embeddings over its own IB device, and the
+    # session id it advertises to the encoder pool must belong to that engine.
+    if envs.SGLANG_EMBEDDING_IB_DEVICE.get() and get_disagg().language_only:
+        init_mooncake_embedding_engine(
+            hostname=get_local_ip_auto(),
+            gpu_id=gpu_id,
+            ib_device=envs.SGLANG_EMBEDDING_IB_DEVICE.get(),
+        )

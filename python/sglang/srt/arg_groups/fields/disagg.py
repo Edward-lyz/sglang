@@ -152,6 +152,22 @@ class Disagg(msgspec.Struct):
         bool,
         "When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
     ] = False
+    vit_server_url: A[
+        Optional[str],
+        "URL of the factory vit-server for fetching encoding tasks (厂内 EPD "
+        "producer protocol: POST /fetch_task, POST /submit_result). When set, an "
+        "--encoder-only server polls this vit-server for work instead of waiting "
+        "for direct /encode dispatches.",
+    ] = None
+    require_encoder_task_results: A[
+        bool,
+        "Reject multimodal requests that carry no encoder task_results instead of "
+        "encoding them locally. Set this on the EPD decode server: it has no vision "
+        "tower, so it expands image placeholders straight from the task_results "
+        "metadata (each descriptor's embedding_len == the image's full span length) "
+        "so its origin_input_ids length matches the prefill node for KV/state "
+        "transfer, without downloading the image or running the encoder.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # PD-Multiplexing

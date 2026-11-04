@@ -7,9 +7,24 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.layers.attention.vision import (
+    VisionAiterAttention,
+    VisionAscendAttention,
     VisionAttention,
     VisionAttentionMetadata,
+    VisionFlash3Attention,
+    VisionFlash4Attention,
+    VisionTritonAttention,
     prepare_vision_attention_metadata,
+)
+
+# Attention backends that bound attention by forward_metadata.cu_seqlens. The
+# others (sdpa, amx, xpu, flashinfer_cudnn) would attend across a packed batch.
+_VARLEN_BACKENDS = (
+    VisionAiterAttention,
+    VisionAscendAttention,
+    VisionFlash3Attention,
+    VisionFlash4Attention,
+    VisionTritonAttention,
 )
 
 
@@ -81,7 +96,7 @@ class Attention(VisionAttention):
                 x,
                 position_embeddings=(cos, sin),
                 forward_metadata=metadata,
-                max_seqlen=x.shape[0],
+                max_seqlen=metadata.max_seqlen,
             )
             .squeeze(0)
         )
@@ -142,6 +157,38 @@ class ViT(nn.Module):
         for block in self.blocks:
             x = block(x, cos, sin, metadata)
         return self.norm(x)
+
+    def forward_batch(self, patches, grids):
+        """Encode several images in one varlen pass; returns one output per image.
+
+        Attention stays per image (one cu_seqlens segment each, bidirectional
+        within the image only), so this matches calling ``forward`` per image;
+        every other op is row-wise, so concatenating the patch rows only turns
+        many small GEMMs and kernel launches into a few large ones. Backends
+        that ignore cu_seqlens fall back to one forward per image.
+        """
+        if len(grids) == 1 or not isinstance(
+            self.blocks[0].attn.qkv_backend, _VARLEN_BACKENDS
+        ):
+            return [self.forward(p, *grid) for p, grid in zip(patches, grids)]
+        x = self.patch_embed(torch.cat(patches))
+        cos, sin = (
+            torch.cat(parts).to(x.device)
+            for parts in zip(
+                *(
+                    get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
+                    for n_h, n_w in grids
+                )
+            )
+        )
+        lengths = [n_h * n_w for n_h, n_w in grids]
+        cu_seqlens = torch.tensor([0, *lengths], dtype=torch.int32).cumsum(0)
+        metadata = prepare_vision_attention_metadata(
+            cu_seqlens.to(torch.int32), x.device, max_seqlen=max(lengths)
+        )
+        for block in self.blocks:
+            x = block(x, cos, sin, metadata)
+        return list(self.norm(x).split(lengths))
 
 
 class Aligner(nn.Module):

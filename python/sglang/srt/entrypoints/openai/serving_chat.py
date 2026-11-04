@@ -6,7 +6,7 @@ import logging
 import math
 import time
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict, defaultdict, deque
 from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -96,6 +96,7 @@ from sglang.srt.function_call.utils import (
     normalize_json_schema_types,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.multimodal.task_id import compute_media_task_id
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -205,6 +206,193 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_max_dynamic_patch = min(img_vals) if img_vals else None
     vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
     return img_max_dynamic_patch, vid_max_dynamic_patch
+def _media_part_url(part) -> Optional[str]:
+    """Extract the media URL from an image_url/video_url content part.
+
+    Parts may be pydantic objects (``part.image_url.url``) or plain dicts
+    (``part["image_url"]["url"]``), so read both shapes defensively.
+    """
+    part_type = (
+        part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+    )
+    if part_type == "image_url":
+        media = part.get("image_url") if isinstance(part, dict) else getattr(part, "image_url", None)
+    elif part_type == "video_url":
+        media = part.get("video_url") if isinstance(part, dict) else getattr(part, "video_url", None)
+    else:
+        return None
+    if media is None:
+        return None
+    return media.get("url") if isinstance(media, dict) else getattr(media, "url", None)
+
+
+def _extract_ordered_task_ids(
+    request: ChatCompletionRequest, model_id: str
+) -> Optional[List[Optional[str]]]:
+    """Expected task_id for each image/video media item, in content order.
+
+    A video's task_id includes its sample_fps; without one in the request the
+    id cannot be recomputed, so that slot is None (matched by modality later).
+    """
+    sample_fps = getattr(request, "sample_fps", None)
+    task_ids: List[Optional[str]] = []
+    for msg in request.messages or []:
+        content = getattr(msg, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            part_type = (
+                part.get("type")
+                if isinstance(part, dict)
+                else getattr(part, "type", None)
+            )
+            url = _media_part_url(part)
+            if part_type == "image_url":
+                if url:
+                    task_ids.append(compute_media_task_id(model_id, url))
+            elif part_type == "video_url":
+                if url:
+                    task_ids.append(
+                        compute_media_task_id(model_id, url, sample_fps)
+                        if sample_fps is not None
+                        else None
+                    )
+    return task_ids
+
+
+def _reorder_task_results_by_content(
+    request: ChatCompletionRequest,
+    task_results: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Reorder task_results to align with the media order in request content.
+
+    IC does not populate a per-item ``index`` (every item defaults to 0), so
+    the receiver must recover the placeholder order itself. Match each
+    task_result to the media position in the prompt by recomputing its
+    ``task_id`` (md5(model_id + media_url)); on any mismatch keep the original
+    order rather than risk misaligning embeddings.
+    """
+    model_ids = {
+        task_result.get("model_id")
+        or (task_result.get("encoder_addr") or {}).get("model_id")
+        for task_result in task_results
+    }
+    model_ids.discard(None)
+    model_ids.discard("")
+    if len(model_ids) != 1:
+        logger.warning(
+            "Skip task_results reorder: expected one model_id, got %s", model_ids
+        )
+        return task_results
+
+    model_id = next(iter(model_ids))
+    ordered_task_ids = _extract_ordered_task_ids(request, model_id)
+
+    # Videos whose task_id is unknown (no sample_fps) take the video
+    # task_results in their given order; images are still placed by task_id,
+    # so a mixed image+video request no longer keeps IC order wholesale.
+    video_ids = iter(
+        task_result.get("task_id")
+        for task_result in task_results
+        if _is_video_task_result(task_result)
+    )
+    if any(task_id is None for task_id in ordered_task_ids):
+        if sum(task_id is None for task_id in ordered_task_ids) > 1:
+            logger.warning(
+                "Several videos without sample_fps: their relative order "
+                "follows the task_results order"
+            )
+        ordered_task_ids = [
+            task_id if task_id is not None else next(video_ids, None)
+            for task_id in ordered_task_ids
+        ]
+
+    result_task_ids = [task_result.get("task_id") for task_result in task_results]
+    if Counter(ordered_task_ids) != Counter(result_task_ids):
+        logger.warning("Skip task_results reorder: task_id multiset mismatch")
+        return task_results
+
+    task_id_to_positions = defaultdict(deque)
+    for position, task_id in enumerate(ordered_task_ids):
+        task_id_to_positions[task_id].append(position)
+
+    ranked_results = [
+        (task_id_to_positions[task_result["task_id"]].popleft(), task_result)
+        for task_result in task_results
+    ]
+    ranked_results.sort(key=lambda item: item[0])
+    return [task_result for _, task_result in ranked_results]
+
+
+def _is_video_task_result(task_result: Dict[str, Any]) -> bool:
+    addr = task_result.get("encoder_addr") or {}
+    return (addr.get("modality") or task_result.get("modality")) == "video"
+
+
+def _video_frames_as_images(task_results: List[Dict[str, Any]]):
+    """Retag frame-sampled video task_results as image results for V4.1.
+
+    The encoder ships a video as one task_result whose embedding concatenates
+    one image span per sampled frame (K3 video protocol, one frame per chunk).
+    V4.1 has no video modality, so prefill and decode treat those rows as images
+    in prompt order; the per-frame grids already line up with the per-frame
+    placeholders emitted by ``_expand_dsv41_video_parts``.
+    """
+    out = []
+    for task_result in task_results:
+        if _is_video_task_result(task_result):
+            task_result = dict(task_result)
+            addr = dict(task_result.get("encoder_addr") or {})
+            addr["modality"] = "image"
+            task_result["encoder_addr"] = addr
+            task_result["modality"] = "image"
+        out.append(task_result)
+    return out
+
+
+def _expand_dsv41_video_parts(
+    messages: List[Dict[str, Any]], task_results: Optional[List[Dict[str, Any]]]
+) -> None:
+    """Replace each ``video_url`` part with per-frame ``MM:SS`` + image parts.
+
+    ``task_results`` must be in content order; the n-th video part takes the
+    n-th video task_result's ``chunk_timestamps``. Mutates ``messages``.
+    """
+    video_results = [tr for tr in task_results or [] if _is_video_task_result(tr)]
+    cursor = 0
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        new_content = []
+        for part in content:
+            if not (isinstance(part, dict) and part.get("type") == "video_url"):
+                new_content.append(part)
+                continue
+            if cursor >= len(video_results):
+                raise ValueError(
+                    "DeepSeek-V4.1 video input requires an encoder task_result "
+                    "with chunk_timestamps for every video"
+                )
+            addr = video_results[cursor].get("encoder_addr") or {}
+            cursor += 1
+            stamps = addr.get("chunk_timestamps") or []
+            grids = addr.get("img_grid_thw") or []
+            if not stamps or len(stamps) != len(grids):
+                raise ValueError(
+                    f"video task_result has {len(stamps)} chunk_timestamps for "
+                    f"{len(grids)} frame grids"
+                )
+            video = part.get("video_url")
+            url = video.get("url") if isinstance(video, dict) else video
+            for stamp in stamps:
+                new_content.append({"type": "text", "text": stamp})
+                new_content.append({"type": "image_url", "image_url": {"url": url}})
+        msg["content"] = new_content
+    if cursor != len(video_results):
+        raise ValueError(
+            f"{len(video_results)} video task_results for {cursor} video parts"
+        )
 
 
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
@@ -369,6 +557,27 @@ class OpenAIServingChat(OpenAIServingBase):
         self._chat_template_cache: OrderedDict[
             bytes, tuple[str, tuple[int, ...], str]
         ] = OrderedDict()
+        self._segment_tokenize_cache = None
+        if envs.SGLANG_OPT_TOKENIZE_SEGMENT_CACHE_MB.get() > 0:
+            from sglang.srt.entrypoints.openai.tokenize_cache import (
+                SegmentTokenizeCache,
+            )
+
+            # One int64 id per cached token; size the budget in tokens.
+            cache = SegmentTokenizeCache(
+                self.tokenizer_manager.tokenizer,
+                max_tokens=envs.SGLANG_OPT_TOKENIZE_SEGMENT_CACHE_MB.get()
+                * 1024
+                * 1024
+                // 8,
+            )
+            self._segment_tokenize_cache = cache if cache.enabled else None
+
+    def _encode_rendered_prompt(self, text: str) -> List[int]:
+        """Token ids of a Python-encoder prompt, through the segment cache if on."""
+        if self._segment_tokenize_cache is not None:
+            return self._segment_tokenize_cache.encode(text)
+        return self.tokenizer_manager.tokenizer.encode(text)
 
     def _handle_last_assistant_message(
         self,
@@ -1149,6 +1358,17 @@ class OpenAIServingChat(OpenAIServingBase):
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
+        # IC returns task_results with a non-informative ``index`` (all 0), so
+        # realign them to the media order in the request content before they
+        # travel to the tokenizer; the receiver then reads them in list order.
+        ordered_task_results = request.task_results
+        if ordered_task_results:
+            ordered_task_results = _reorder_task_results_by_content(
+                request, ordered_task_results
+            )
+            if self.chat_encoding_spec == "dsv41":
+                ordered_task_results = _video_frames_as_images(ordered_task_results)
+
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
         # Build sampling parameters
@@ -1221,6 +1441,7 @@ class OpenAIServingChat(OpenAIServingBase):
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
+            task_results=ordered_task_results,
             return_prompt_token_ids=(
                 request.return_prompt_token_ids
                 or request.return_token_ids
@@ -1433,6 +1654,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 for msg in messages:
                     if msg.get("content") is None:
                         msg["content"] = ""
+                if request.task_results and any(
+                    _is_video_task_result(tr) for tr in request.task_results
+                ):
+                    # Same content order the handler hands to the receiver.
+                    _expand_dsv41_video_parts(
+                        messages,
+                        _reorder_task_results_by_content(request, request.task_results),
+                    )
             else:
                 # dsv4/dsv32 are text-only and consume string content; flatten
                 # OpenAI parts-list content here so the encoder sees a plain string.
@@ -1501,7 +1730,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_effort=v4_reasoning_effort,
                     reasoning_effort_profile=reasoning_effort_profile,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_rendered_prompt(real_input)
             elif is_dsv41:
                 if request.task is not None:
                     encoding_dsv41.attach_task_to_last_user_message(
@@ -1526,12 +1755,12 @@ class OpenAIServingChat(OpenAIServingBase):
                             self.tokenizer_manager.model_config.hf_config.image_token_id
                         ),
                     )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_rendered_prompt(real_input)
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_rendered_prompt(real_input)
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:

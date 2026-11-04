@@ -386,6 +386,11 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     precomputed_embeddings: Optional[MultimodalDataValue] = None
     # Keep precomputed_embeddings on GPU after use (EPD pool/GPU receive path)
     keep_device_embedding: bool = False
+    # EPD with SGLANG_ENCODER_TP0_ONLY_RECEIVE: only attn-tp rank 0 holds
+    # precomputed_embeddings, and the other ranks get the rows through a
+    # broadcast inside the forward pass. Set identically on every rank so they
+    # agree on whether to broadcast.
+    tp0_only_embedding: bool = False
 
     # Processor-owned tensors/arrays/scalars/transports. msgspec rejects a
     # precise union with multiple custom types, but accepts Ext-decoded values
@@ -691,6 +696,39 @@ class MultimodalInputs:
     vision_position_ids: Optional[torch.Tensor] = None
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
+
+    # EPD: pinned-pool addresses backing zero-copy precomputed-embedding views
+    # on the rank that pulled them. See release_pool_buffers().
+    pool_buffer_addrs: Optional[List[int]] = None
+
+    def release_pool_buffers(self):
+        """Return pinned-pool pages once prefill has consumed the embeddings.
+
+        The rows are a zero-copy view into the pool, so they cannot outlive the
+        pages; clearing the views here is what makes returning them safe.
+        Idempotent, and a no-op on a rank that never pulled.
+        """
+        addrs = self.pool_buffer_addrs
+        if not addrs:
+            return
+        self.pool_buffer_addrs = None
+        for item in self.mm_items:
+            item.precomputed_embeddings = None
+
+        from sglang.srt.disaggregation.encoder.factory_transport import (
+            EmbeddingLandingPool,
+        )
+
+        pool = EmbeddingLandingPool.get_instance_if_exists()
+        if pool is None:
+            return
+        for address in addrs:
+            try:
+                pool.release(address)
+            except Exception as error:
+                logger.warning(
+                    "release_pool_buffers: failed to free addr=%s: %s", address, error
+                )
 
     def release_features(self):
         """Release feature tensors to free GPU memory."""
@@ -2095,6 +2133,7 @@ class Req(ReqDllmMixin):
         # Session requests share historical multimodal inputs with their prior
         # request. The session owns and releases those features when it closes.
         if self.multimodal_inputs is not None and self.session is None:
+            self.multimodal_inputs.release_pool_buffers()
             self.multimodal_inputs.release_features()
         self.multimodal_inputs = None
         self.grammar = None

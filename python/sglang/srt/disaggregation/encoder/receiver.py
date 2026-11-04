@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import itertools
 import logging
 import random
@@ -35,6 +36,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.mm_schedule import tp0_only_broadcast_group
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
@@ -682,6 +684,8 @@ class MultiModalEmbeddingData(EmbeddingData):
             for i, e in enumerate(self.embedding_list):
                 if e is not None:
                     groups[self.modality_list[i]].append(e)
+            if envs.SGLANG_OPT_MM_EMBED_VIEW_CONCAT.get():
+                return {mod: concat_rows(tensors) for mod, tensors in groups.items()}
             return {mod: torch.cat(tensors, dim=0) for mod, tensors in groups.items()}
         return self.embedding_list
 
@@ -775,6 +779,38 @@ def _aggregate_embedding_part(current, recv_obj, model_type):
         )
     current.add(recv_obj)
     return current
+
+
+def concat_rows(tensors):
+    """One view over parts that already sit back to back in the same buffer.
+
+    The pull lands a request's parts consecutively in one pinned slot, so
+    torch.cat would copy every row again and hand the consumer a pageable
+    buffer; a view keeps the later H2D a DMA. Falls back to torch.cat whenever
+    the parts are not an exact contiguous run.
+    """
+    if len(tensors) == 1:
+        return tensors[0]
+    head = tensors[0]
+    if not head.is_contiguous():
+        return torch.cat(tensors, dim=0)
+    rows = head.shape[0]
+    expected = head.storage_offset() + rows * head.stride(0)
+    for part in tensors[1:]:
+        if (
+            part.dtype != head.dtype
+            or part.shape[1:] != head.shape[1:]
+            or not part.is_contiguous()
+            or part.untyped_storage().data_ptr()
+            != head.untyped_storage().data_ptr()
+            or part.storage_offset() != expected
+        ):
+            return torch.cat(tensors, dim=0)
+        rows += part.shape[0]
+        expected += part.shape[0] * head.stride(0)
+    return head.as_strided(
+        (rows,) + tuple(head.shape[1:]), head.stride(), head.storage_offset()
+    )
 
 
 class WaitingMMRequestStatus(IntEnum):
@@ -871,6 +907,62 @@ def calculate_modality_num_parts(modalities, num_items_assigned):
     return total_num_parts, modality_num_parts
 
 
+def _task_result_embedding(result):
+    """Inline embedding of one task result, if the caller supplied one."""
+    if isinstance(result, dict):
+        return result.get("embedding")
+    return getattr(result, "embedding", None)
+
+
+def _stable_task_hash(task_id) -> int:
+    """Rank-independent item hash derived from an encoder task id.
+
+    The task id is the ``md5(model_id + url)`` hex digest the serving path
+    assigns (multimodal/task_id.py), so read it the way the reference encoder
+    does -- ``int(task_id, 16)`` -- to keep the same hash, and hence the same
+    pad value, across the receive path and the local processor path.
+    ``MultimodalDataItem`` masks the value to 64 bits. A non-hex fallback id
+    (a req_id used when no task id was sent) is hashed instead.
+    """
+    try:
+        return int(str(task_id), 16)
+    except ValueError:
+        digest = hashlib.blake2b(str(task_id).encode(), digest_size=8).digest()
+        return int.from_bytes(digest, "big")
+
+
+# Pinned pool regions whose RDMA write may still be landing after their request
+# is gone. Drained on scheduler ticks; the factory buffer manager keeps the same
+# queue for the same reason -- a cancelled Future does not stop a transfer the
+# encoder already started.
+_deferred_pool_releases: List[tuple] = []
+
+
+def _defer_pool_release(futures, pool, address: int) -> None:
+    """Hold a pool region until every transfer that may write to it finishes."""
+    futures = [future for future in futures if not future.done()]
+    if not futures:
+        pool.release(address)
+        return
+    _deferred_pool_releases.append((futures, pool, address))
+
+
+def drain_deferred_pool_releases() -> None:
+    """Return the regions whose in-flight transfers have since completed."""
+    if not _deferred_pool_releases:
+        return
+    still_pending = []
+    for futures, pool, address in _deferred_pool_releases:
+        if any(not future.done() for future in futures):
+            still_pending.append((futures, pool, address))
+            continue
+        try:
+            pool.release(address)
+        except Exception:
+            logger.exception("Failed to release a deferred EPD pool region")
+    _deferred_pool_releases[:] = still_pending
+
+
 class WaitingMMRequestBase(ABC):
     """One in-flight multimodal request on a scheduler rank, waiting for
     encoder embeddings. Owns the shared machinery: the ZMQ receive loop,
@@ -891,6 +983,7 @@ class WaitingMMRequestBase(ABC):
         zmq_context=None,
         embedding_port=None,
         registration_runner: Optional[_ReceiveRegistrationRunner] = None,
+        tp0_only: bool = False,
     ):
         self.rid = rid
         self.recv_req = recv_req
@@ -903,7 +996,19 @@ class WaitingMMRequestBase(ABC):
         self.host_name = host_name
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
-        self.zmq_context = zmq_context or zmq.Context()
+        # Encoder results produced by an external encoder pool, if any. When
+        # present the encode has already run, so this request only receives.
+        self.external_task_results = getattr(recv_req, "task_results", None)
+        # Only attn-tp rank 0 receives; the rows reach the other ranks through
+        # a broadcast in the forward pass.
+        self.tp0_only = tp0_only
+        if zmq_context is not None or not envs.SGLANG_EPD_LAZY_ZMQ_CONTEXT.get():
+            self.zmq_context = zmq_context or zmq.Context()
+        else:
+            # Only a per-request PULL socket needs a context of its own; with a
+            # shared scheduler port there is no socket, so skip the per-request
+            # context entirely (it costs main-thread time on every arrival).
+            self.zmq_context = zmq.Context() if embedding_port is None else None
         if embedding_port is None:
             self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
                 self.zmq_context, zmq.PULL, host=host_name
@@ -1073,10 +1178,58 @@ class WaitingMMRequestBase(ABC):
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
+        self._apply_external_item_hashes(mm_inputs)
         self._bind_pool_slot_to_mm_inputs(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = array("q", mm_inputs.input_ids)
         self.status = WaitingMMRequestStatus.SUCCESS
+
+    def _apply_external_item_hashes(self, mm_inputs) -> None:
+        """Pin item identity and broadcast shape to the encoder's metadata.
+
+        pad_value is derived from item.hash, and it has to agree across TP
+        ranks: a rank that only has metadata cannot hash the embedding rows.
+        The encoder's task id already identifies the encode uniquely, so use
+        it on every rank instead of hashing whatever each rank happens to hold.
+        """
+        if not self.external_task_results or mm_inputs is None:
+            return
+        from sglang.srt.disaggregation.encoder.internal_protocol import (
+            task_results_to_descriptors,
+        )
+
+        descriptors = task_results_to_descriptors(self.external_task_results)
+        if self.tp0_only:
+            self._mark_tp0_only_embedding(mm_inputs, descriptors)
+        task_ids = [d["task_id"] or d["req_id"] for d in descriptors]
+        if len(task_ids) != len(mm_inputs.mm_items):
+            # One task result may cover several items; hashing per item would
+            # then need a split rule the protocol does not define.
+            return
+        for item, task_id in zip(mm_inputs.mm_items, task_ids):
+            if item is not None and item.hash is None:
+                item.hash = _stable_task_hash(task_id)
+
+    def _mark_tp0_only_embedding(self, mm_inputs, descriptors) -> None:
+        """Record that the rows live on rank 0 only, plus the broadcast shape.
+
+        Both are needed on every rank: the flag so all ranks take the broadcast
+        path, and embedding_dim so a rank without the rows can still size the
+        destination tensor.
+        """
+        if mm_inputs is None:
+            return
+        dim = int(descriptors[0]["embedding_dim"])
+        if dim <= 0:
+            raise ValueError(
+                "tp0-only receive needs embedding_dim in the descriptor; "
+                f"got {dim}"
+            )
+        for item in mm_inputs.mm_items:
+            if item is None:
+                continue
+            item.tp0_only_embedding = True
+            item.model_specific_data["embedding_dim"] = dim
 
     def _fail_assemble(self, e: Exception) -> None:
         logger.exception("Failed to assemble multimodal inputs for rid=%s", self.rid)
@@ -1101,6 +1254,7 @@ class WaitingMMRequestBase(ABC):
         return True
 
     def _cleanup_gpu_buffer(self):
+        """Return the staged GPU slot, if this request ever took one."""
         if self._pool_slot_id is not None and self.embedding_pool is not None:
             self.embedding_pool.release(self._pool_slot_id)
             self._pool_slot_id = None
@@ -1120,10 +1274,372 @@ class WaitingMMRequestBase(ABC):
             finalizer()  # at-most-once; a later GC call becomes a no-op
 
 
+class WaitingMetadataOnlyRequest(WaitingMMRequestBase):
+    """A TP rank that never receives embedding bytes.
+
+    With ``SGLANG_ENCODER_TP0_ONLY_RECEIVE`` only attn-tp rank 0 pulls from the
+    encoder; the rows reach the other ranks through a broadcast inside the
+    forward pass. Those ranks still need the same input_ids, offsets and
+    pad_values, all of which are derivable from the descriptors alone -- so
+    assembly here uses zero-filled placeholders of the announced shape and
+    drops them again before the request is published.
+    """
+
+    def __init__(self, *args, dtype=None, **kwargs):
+        """``dtype`` is the placeholder dtype; no rows are ever received here."""
+        super().__init__(*args, **kwargs)
+        self.dtype = dtype or torch.bfloat16
+
+    def send_encode_request(self) -> None:
+        """Assemble from the descriptors alone; there is nothing to request."""
+        # Nothing to register and nothing to pull: assemble straight from the
+        # descriptors so this rank reaches SUCCESS on the same tick as rank 0
+        # would at the earliest.
+        try:
+            self.recv_embedding_data = self._metadata_only_embedding_data()
+        except Exception as error:
+            self._fail_and_release(
+                f"Failed to rebuild EPD metadata: {error}",
+                int(HTTPStatus.INTERNAL_SERVER_ERROR),
+            )
+
+    def _metadata_only_embedding_data(self):
+        """Aggregate zero-filled parts of the announced shape, per descriptor."""
+        from sglang.srt.disaggregation.encoder.internal_protocol import (
+            task_result_to_embedding_data,
+            task_results_to_descriptors,
+        )
+
+        descriptors = task_results_to_descriptors(self.external_task_results)
+        merged = None
+        for result, descriptor in zip(self.external_task_results, descriptors):
+            rows = int(descriptor["embedding_len"])
+            dim = int(descriptor["embedding_dim"])
+            if rows <= 0 or dim <= 0:
+                raise ValueError(
+                    "descriptor must announce embedding_len/embedding_dim for a "
+                    f"metadata-only rank, got {rows}x{dim}"
+                )
+            part = task_result_to_embedding_data(
+                result,
+                torch.zeros((rows, dim), dtype=self.dtype),
+                part_idx=descriptor["part_idx"],
+                num_parts=descriptor["num_parts"],
+                req_id=self.rid,
+            )
+            merged = _aggregate_embedding_part(merged, part, self.model_type)
+        return merged
+
+    def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
+        """Unreachable: this rank registers no receive path."""
+        raise AssertionError("a metadata-only rank never receives embedding parts")
+
+    def _prepare_embedding_buffer(self) -> bool:
+        """No buffer is needed; the parts are placeholders built in memory."""
+        return True
+
+    def _finish_assemble(self, recv_embedding) -> None:
+        """Publish the layout, then drop the placeholder rows it was derived from."""
+        super()._finish_assemble(recv_embedding)
+        # The placeholders exist only to derive the prompt layout; keeping them
+        # would make this rank look like it already had the real rows.
+        for item in self.recv_req.mm_inputs.mm_items:
+            if item is not None:
+                item.precomputed_embeddings = None
+
+
+class WaitingFactoryPullRequest(WaitingMMRequestBase):
+    """Pull this request's embeddings from the factory encoder pool.
+
+    The factory encoder serves no push endpoints, so instead of registering a
+    receive URL this rank asks each encoder for its item (see
+    ``factory_transport``). Both transports report completion through
+    ``transport.poll()`` on the scheduler tick, so nothing here blocks the loop.
+
+    ZMQ replies carry the rows; ``/epd/transfer`` lands them in our own buffer,
+    in which case only the geometry from the descriptors is used to view them.
+    """
+
+    def __init__(
+        self,
+        *args,
+        dtype=None,
+        embeddings_engine=None,
+        gpu_id=0,
+        **kwargs,
+    ):
+        """Nothing is pulled yet: the transport is created on the first tick."""
+        super().__init__(*args, **kwargs)
+        self.dtype = dtype or torch.bfloat16
+        self.embeddings_engine = embeddings_engine
+        self.gpu_id = gpu_id
+        self.transport = None
+        self.pull_targets = []
+        self.descriptors = []
+        self.parts_by_task = {}
+        self.byte_offset_by_task = {}
+        self.landing_pool = None
+        self.landing_address = None
+        self.landing_bytes = 0
+        self._settled_tasks = set()
+        self._task_embeddings = {}
+
+    def send_encode_request(self) -> None:
+        """Start the pulls, or leave the request pending if the pool is full."""
+        self._try_start_pulls()
+
+    def _try_start_pulls(self) -> None:
+        """Start the pulls once, turning any protocol error into a failed request."""
+        if self.transport is not None or self.status != WaitingMMRequestStatus.PENDING:
+            return
+        try:
+            self._start_pulls()
+        except Exception as error:
+            logger.exception("Failed to start EPD pull for rid=%s", self.rid)
+            self._fail_and_release(
+                f"Failed to start EPD pull: {error}",
+                int(HTTPStatus.INTERNAL_SERVER_ERROR),
+            )
+
+    def _start_pulls(self) -> bool:
+        """Send one pull per distinct task; False means the pool was full.
+
+        The mooncake path needs its landing buffer registered before the encoder
+        is asked to write, so the allocation happens here rather than at
+        assembly time.
+        """
+        from sglang.srt.disaggregation.encoder.factory_transport import (
+            EmbeddingLandingPool,
+            FactoryMooncakeTransport,
+            FactoryZmqTransport,
+            descriptor_to_pull_target,
+        )
+        from sglang.srt.disaggregation.encoder.internal_protocol import (
+            MOONCAKE_TRANSFER_TYPE,
+            ZMQ_TRANSFER_TYPE,
+            task_results_to_descriptors,
+        )
+
+        self.descriptors = task_results_to_descriptors(self.external_task_results)
+        # One pull per distinct task_id, matching the factory receiver: task_id
+        # is md5(model_id + media_uri), so the same image repeated in a prompt
+        # is one encode and must be one transfer, fanned out at assembly.
+        self.parts_by_task = {}
+        self.pull_targets = []
+        for descriptor in self.descriptors:
+            target = descriptor_to_pull_target(descriptor, self.recv_req.rid)
+            existing = self.parts_by_task.get(target.task_id)
+            if existing is None:
+                self.parts_by_task[target.task_id] = [target.part_idx]
+                self.pull_targets.append(target)
+                continue
+            previous = next(
+                t for t in self.pull_targets if t.task_id == target.task_id
+            )
+            if (
+                previous.endpoint != target.endpoint
+                or previous.transfer_type != target.transfer_type
+                or previous.shape != target.shape
+            ):
+                raise ValueError(
+                    f"task {target.task_id} was described twice with different "
+                    "endpoint/transport/shape"
+                )
+            existing.append(target.part_idx)
+        transfer_type = self.descriptors[0]["transfer_type"]
+
+        if transfer_type == ZMQ_TRANSFER_TYPE:
+            self.transport = FactoryZmqTransport()
+            for target in self.pull_targets:
+                self.transport.send(target)
+            return True
+
+        # task_results_to_descriptors() already rejected anything else.
+        assert transfer_type == MOONCAKE_TRANSFER_TYPE, transfer_type
+
+        # Mooncake writes straight into our buffer, so it has to exist -- and be
+        # registered with the engine -- before the encoder is asked to send.
+        buffer_address = self._allocate_landing_buffer()
+        if buffer_address is None:
+            # Pool full: stay pending and try again on a later tick. Doing this
+            # instead of failing is what makes the pool size a backpressure
+            # bound rather than a request-drop threshold.
+            if not self._pool_full_warned:
+                self._pool_full_warned = True
+                pool = EmbeddingLandingPool.get_instance()
+                logger.warning(
+                    "EPD landing pool full, rid=%s waits to pull %d bytes "
+                    "(used %d / %d)",
+                    self.rid,
+                    sum(t.byte_size for t in self.pull_targets),
+                    pool.used_bytes(),
+                    pool.size_bytes,
+                )
+            return False
+        self.transport = FactoryMooncakeTransport(self.landing_pool.session_id)
+        offset = 0
+        # Record where each task's rows land so assembly can slice them back out
+        # per prompt item, including for a task referenced more than once.
+        self.byte_offset_by_task = {}
+        for target in sorted(
+            self.pull_targets, key=lambda t: min(self.parts_by_task[t.task_id])
+        ):
+            self.byte_offset_by_task[target.task_id] = offset
+            self.transport.send(target, buffer_address + offset)
+            offset += target.byte_size
+        return True
+
+    def _allocate_landing_buffer(self) -> Optional[int]:
+        """Reserve pinned host memory for every task this request pulls.
+
+        Returns None while the pool is full: that is backpressure, so the caller
+        keeps the request pending and retries on a later tick instead of failing
+        it. A request too large for the pool raises, since retrying cannot help.
+        """
+        from sglang.srt.disaggregation.encoder.factory_transport import (
+            EmbeddingLandingPool,
+        )
+
+        total_bytes = sum(target.byte_size for target in self.pull_targets)
+        if total_bytes <= 0:
+            raise ValueError("descriptors announce no embedding bytes to pull")
+        pool = EmbeddingLandingPool.get_instance()
+        address = pool.acquire(total_bytes)
+        if address is None:
+            return None
+        self.landing_pool = pool
+        self.landing_address = address
+        self.landing_bytes = total_bytes
+        return address
+
+    def _try_recv_mm_data(self):
+        """Drain the transport, then reuse the base assembly once all parts are in."""
+        if self.status != WaitingMMRequestStatus.PENDING:
+            return
+        if self.transport is None:
+            # The pool was full when this request arrived; retry now.
+            self._try_start_pulls()
+            return
+        for result in self.transport.poll():
+            if not result.success:
+                self._fail_and_release(result.error_msg, result.error_code)
+                return
+            self._settled_tasks.add(result.task_id)
+            if result.embedding is not None:
+                self._task_embeddings[result.task_id] = result.embedding
+
+        if len(self._settled_tasks) < len(self.pull_targets):
+            return
+        if self.recv_embedding_data is None:
+            self.recv_embedding_data = self._assemble_parts()
+        super()._try_recv_mm_data()
+
+    def _assemble_parts(self):
+        """Fan each pulled embedding out to every prompt item that cites it.
+
+        A task pulled once may be referenced by several items (the same image
+        repeated), so parts are built per descriptor and read from the task's
+        rows -- a ZMQ tensor, or a slice of the RDMA landing buffer.
+        """
+        from sglang.srt.disaggregation.encoder.internal_protocol import (
+            task_result_to_embedding_data,
+        )
+
+        merged = None
+        for result, descriptor in zip(self.external_task_results, self.descriptors):
+            task_id = str(descriptor["task_id"] or descriptor["req_id"])
+            part = task_result_to_embedding_data(
+                result,
+                self._task_rows(task_id, descriptor),
+                part_idx=descriptor["part_idx"],
+                num_parts=descriptor["num_parts"],
+                req_id=self.rid,
+            )
+            merged = _aggregate_embedding_part(merged, part, self.model_type)
+        return merged
+
+    def _task_rows(self, task_id: str, descriptor):
+        """The rows pulled for ``task_id``, as a [rows, dim] tensor."""
+        from sglang.srt.disaggregation.encoder.factory_transport import (
+            parse_torch_dtype,
+        )
+
+        embedding = self._task_embeddings.get(task_id)
+        if embedding is not None:
+            return embedding
+        rows = int(descriptor["embedding_len"])
+        dim = int(descriptor["embedding_dim"])
+        dtype = parse_torch_dtype(descriptor["embedding_dtype"])
+        itemsize = torch.empty(0, dtype=dtype).element_size()
+        address = self.landing_address + self.byte_offset_by_task[task_id]
+        # Zero-copy view of this task's region in the pinned pool. No clone, so
+        # the pool bounds how much host memory in-flight embeddings hold; the
+        # region stays reserved until release_resources().
+        return self.landing_pool.view(address, rows * dim * itemsize, dtype).reshape(
+            rows, dim
+        )
+
+    def _finish_assemble(self, recv_embedding) -> None:
+        """Publish the layout, then hand the pinned region to the mm_inputs."""
+        super()._finish_assemble(recv_embedding)
+        self._hand_pool_region_to(self.recv_req.mm_inputs)
+
+    def _hand_pool_region_to(self, mm_inputs) -> None:
+        """Transfer the pinned region's ownership to the assembled mm_inputs.
+
+        The rows are a zero-copy view into the pool, so the region has to stay
+        reserved until prefill has consumed them -- which happens long after this
+        waiting request is gone. release_pool_buffers() is the explicit hand-back
+        on the scheduler's finish path; the finalizer is a backstop so a path
+        that forgets to call it delays the release instead of leaking it.
+        """
+        if mm_inputs is None or self.landing_pool is None:
+            return
+        pool, address = self.landing_pool, self.landing_address
+        mm_inputs.pool_buffer_addrs = [address]
+        weakref.finalize(mm_inputs, pool.release, address)
+        # Ownership moved: our own release path must not free it too.
+        self.landing_pool = None
+        self.landing_address = None
+
+    def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
+        """Unreachable: pulls carry their own rows, nothing is pushed here."""
+        raise AssertionError("factory pulls never receive pushed embedding parts")
+
+    def _prepare_embedding_buffer(self) -> bool:
+        """No shared buffer: each item's rows already have their own tensor."""
+        # _task_rows already produced per-item tensors, either ZMQ payloads or
+        # views into the pinned pool, so the base class must not re-view a
+        # buffer of its own.
+        self.embeddings_buffer = None
+        return True
+
+    def _view_dtype(self):
+        """Dtype the pulled rows are viewed with."""
+        return self.dtype
+
+    def release_resources(self):
+        """Defer the pool release while a transfer may still be writing.
+
+        ``Future.cancel()`` cannot stop a call that already reached the encoder,
+        and the encoder RDMA-writes regardless. Returning the region now would
+        hand it to another request while those writes are still landing.
+        """
+        inflight = self.transport.cleanup() if self.transport is not None else []
+        if self.landing_pool is not None and self.landing_address is not None:
+            _defer_pool_release(inflight, self.landing_pool, self.landing_address)
+            self.landing_pool = None
+            self.landing_address = None
+        super().release_resources()
+
+
 # For zmq_to_scheduler: embedding parts arrive as ZMQ payload frames and
 # are optionally staged into the GPU EmbeddingPool.
 class WaitingZmqRequest(WaitingMMRequestBase):
+    """Register a receive URL with the encoder and take pushed ZMQ parts."""
+
     def _start_registration(self, coroutine) -> None:
+        """Run the registration off the scheduler loop, or fail the request."""
         if self.registration_runner is None:
             coroutine.close()
             self._fail_and_release(
@@ -1136,6 +1652,7 @@ class WaitingZmqRequest(WaitingMMRequestBase):
         self.registration_future.add_done_callback(self._on_registration_done)
 
     def _on_registration_done(self, future) -> None:
+        """Record a registration failure for the next scheduler tick to settle."""
         if future.cancelled():
             return
         error = future.exception()
@@ -1154,7 +1671,10 @@ class WaitingZmqRequest(WaitingMMRequestBase):
             )
 
     def send_encode_request(self):
+        """Tell every encoder shard where to push this request's parts."""
+
         async def _send_single_request(session, url, payload):
+            """POST one registration payload, surfacing the transport error."""
             try:
                 async with session.post(url, json=payload) as response:
                     response.raise_for_status()
@@ -1170,41 +1690,17 @@ class WaitingZmqRequest(WaitingMMRequestBase):
                 )
             ) as session:
                 tasks = []
-                logger.info(f"{self.num_items_assigned = } ")
-
-                # Calculate part_idx_offset similar to encode() method
-                modalities = list(self.num_items_assigned.keys())
-                _, modality_num_parts = calculate_modality_num_parts(
-                    modalities, self.num_items_assigned
-                )
-
-                part_idx_offset = 0
-                for modality in modalities:
-                    assigned_nums = self.num_items_assigned[modality]
-                    num_parts = modality_num_parts[modality]
-                    cum_idx = 0
-                    for idx, assigned_num in enumerate(assigned_nums):
-                        if assigned_num == 0:
-                            continue
-                        part_idx = part_idx_offset + cum_idx
-                        part_req_id = create_part_req_id(req_id, part_idx)
-                        encoder_url = self.encoder_urls[idx]
-                        target_url = f"{encoder_url}/scheduler_receive_url"
-                        payload = {
-                            "req_id": part_req_id,
-                            "receive_count": receive_count,
-                            "receive_url": NetworkAddress(
-                                host_name, embedding_port
-                            ).to_host_port_str(),
-                            "modality": modality.name,
-                        }
-                        logger.info(
-                            f"Preparing to send to {target_url} with part_req_id={part_req_id}"
-                        )
-                        task = _send_single_request(session, target_url, payload)
-                        tasks.append(task)
-                        cum_idx += 1
-                    part_idx_offset += num_parts
+                receive_url = NetworkAddress(
+                    host_name, embedding_port
+                ).to_host_port_str()
+                for target_url, payload in self._registration_targets(
+                    req_id, receive_count, receive_url
+                ):
+                    logger.info(
+                        f"Preparing to send to {target_url} with "
+                        f"part_req_id={payload['req_id']}"
+                    )
+                    tasks.append(_send_single_request(session, target_url, payload))
 
                 if not tasks:
                     logger.info("No tasks to send.")
@@ -1239,6 +1735,43 @@ class WaitingZmqRequest(WaitingMMRequestBase):
                 self.embedding_port,
             )
         )
+
+    def _registration_targets(self, req_id, receive_count, receive_url):
+        """Build the (url, payload) pairs telling encoders where to push.
+
+        With an external encoder pool the parts are already described by
+        ``task_results``, so routing comes from each descriptor instead of the
+        local ``num_items_assigned`` split.
+        """
+        logger.info(f"{self.num_items_assigned = } ")
+        modalities = list(self.num_items_assigned.keys())
+        _, modality_num_parts = calculate_modality_num_parts(
+            modalities, self.num_items_assigned
+        )
+        targets = []
+        part_idx_offset = 0
+        for modality in modalities:
+            assigned_nums = self.num_items_assigned[modality]
+            cum_idx = 0
+            for idx, assigned_num in enumerate(assigned_nums):
+                if assigned_num == 0:
+                    continue
+                targets.append(
+                    (
+                        f"{self.encoder_urls[idx]}/scheduler_receive_url",
+                        {
+                            "req_id": create_part_req_id(
+                                req_id, part_idx_offset + cum_idx
+                            ),
+                            "receive_count": receive_count,
+                            "receive_url": receive_url,
+                            "modality": modality.name,
+                        },
+                    )
+                )
+                cum_idx += 1
+            part_idx_offset += modality_num_parts[modality]
+        return targets
 
     def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
         """ZMQ transport carries the embedding bytes as frame 1. Clone so we
@@ -1425,19 +1958,19 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         self._record_receive_error(*error)
         return False
 
-    async def _pull_meta_and_receive_embedding(self):
-        """Pull per-part sizes, allocate the landing buffer, then drive /send.
+    def _encode_requests(self):
+        """Per-part (part_idx, req_id, encoder_url) map for the RDMA receive.
 
-        The tokenizer owns /encode; part_idx numbering matches it because both
-        derive it from the num_items_assigned frozen onto the request.
+        Without ``task_results`` the map is derived from the tokenizer's
+        ``num_items_assigned`` split, which is also what /encode used. With an
+        external encoder pool each descriptor already names its encoder, so no
+        assignment has to be reconstructed.
         """
         modalities = list(self.num_items_assigned.keys())
         _, modality_num_parts = calculate_modality_num_parts(
             modalities, self.num_items_assigned
         )
         encode_requests = []
-
-        total_num_parts = sum(modality_num_parts.values())
         part_idx_offset = 0
         for modality in modalities:
             assigned_nums = self.num_items_assigned[modality]
@@ -1448,13 +1981,27 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                 part_idx = part_idx_offset + cum_idx
                 encode_requests.append(
                     {
-                        "encoder_idx": idx,
                         "part_idx": part_idx,
                         "req_id": create_part_req_id(self.recv_req.rid, part_idx),
+                        "encoder_url": self.encoder_urls[idx],
                     }
                 )
                 cum_idx += 1
             part_idx_offset += modality_num_parts[modality]
+        return encode_requests
+
+    async def _pull_meta_and_receive_embedding(self):
+        """Pull per-part sizes, allocate the landing buffer, then drive /send.
+
+        The tokenizer owns /encode; part_idx numbering matches it because both
+        derive it from the num_items_assigned frozen onto the request. With an
+        external encoder pool the parts come from ``task_results`` instead.
+        """
+        encode_requests = self._encode_requests()
+        total_num_parts = len(encode_requests)
+        encoder_url_by_part = {
+            r["part_idx"]: r["encoder_url"] for r in encode_requests
+        }
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
@@ -1462,7 +2009,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
             # Phase 1: pull per-part sizes, blocking until the encode publishes.
             tasks = [
                 session.post(
-                    f"{self.encoder_urls[r['encoder_idx']]}/scheduler_receive_meta_data",
+                    f"{r['encoder_url']}/scheduler_receive_meta_data",
                     json={"req_id": r["req_id"], "part_idx": r["part_idx"]},
                 )
                 for r in encode_requests
@@ -1533,9 +2080,6 @@ class WaitingRDMARequest(WaitingMMRequestBase):
 
             # Phase 2 cont: POST /send. Metadata carries no routing, so the
             # shard comes from our own part map.
-            encoder_idx_by_part = {
-                r["part_idx"]: r["encoder_idx"] for r in encode_requests
-            }
             offset = 0
             send_tasks = []
             for idx in range(total_num_parts):
@@ -1552,7 +2096,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                 )
                 send_tasks.append(
                     session.post(
-                        f"{self.encoder_urls[encoder_idx_by_part[idx]]}/send",
+                        f"{encoder_url_by_part[idx]}/send",
                         json=rj,
                     )
                 )
@@ -2050,12 +2594,23 @@ class MMReceiverBase(ABC):
     async def recv_mm_data(
         self, request_obj, mm_processor, prompt, need_wait_for_mm_inputs=True
     ):
+        """Obtain this request's mm_inputs on the tokenizer side.
+
+        Requests that already carry ``task_results`` were encoded by the factory
+        pool, so nothing is dispatched for them here.
+        """
         req_id = None
         recv_socket = None
         encode_task = None
         recv_task = None
         send_time = time.monotonic()
         try:
+            if getattr(request_obj, "task_results", None):
+                # The encoder pool already produced this result; re-dispatching
+                # /encode here would duplicate the whole vision encode.
+                return await self._recv_external_task_results(
+                    request_obj, mm_processor, prompt
+                )
             # ``self.encode_urls`` is shared by reference with the bootstrap
             # server (when running) so it always reflects the current set.
             # Snapshot once for the duration of this request to avoid races
@@ -2127,6 +2682,43 @@ class MMReceiverBase(ABC):
                 await asyncio.gather(*tasks, return_exceptions=True)
             if recv_socket is not None:
                 recv_socket.close(linger=0)
+
+    async def _recv_external_task_results(self, request_obj, mm_processor, prompt):
+        """Assemble mm_inputs from encoder results already delivered here.
+
+        Only ``zmq_to_tokenizer`` reaches this path, and only when the caller
+        inlined the embedding with its result. A descriptor-only result must be
+        received on the rank that owns the landing buffer, so it is rejected
+        with the transports it asked for rather than silently re-encoded.
+        """
+        from sglang.srt.disaggregation.encoder.internal_protocol import (
+            task_result_to_embedding_data,
+            task_results_to_descriptors,
+        )
+
+        results = request_obj.task_results
+        if any(_task_result_embedding(r) is None for r in results):
+            descriptors = task_results_to_descriptors(results)
+            raise RuntimeError(
+                "task_results carry no inline embedding; descriptor transport "
+                f"{descriptors[0]['transfer_type']!r} must be received on the "
+                "scheduler rank that owns the landing buffer"
+            )
+
+        merged = None
+        for part_idx, result in enumerate(results):
+            part = task_result_to_embedding_data(
+                result,
+                _task_result_embedding(result),
+                part_idx=part_idx,
+                num_parts=len(results),
+            )
+            merged = _aggregate_embedding_part(merged, part, self.model_type)
+        return mm_processor.get_mm_data(
+            prompt,
+            merged.get_embedding(is_concat=True),
+            **merged.get_mm_extra_meta(),
+        )
 
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
         """zmq_to_tokenizer receive: embedding parts arrive as 2-frame ZMQ
@@ -2241,7 +2833,10 @@ class MMReceiverBase(ABC):
             # reset the flag so the scheduler does not wait for embeddings that will
             # never arrive.  A warning is emitted so the user can diagnose why
             # disaggregation is not happening for this request.
-            if mm_data:
+            # A request carrying task_results is fetched from the factory
+            # encoder pool by the scheduler, so having no push encoders
+            # registered here is expected and not a fallback.
+            if mm_data and not getattr(obj, "task_results", None):
                 logger.warning(
                     f"No encoder URLs available for request {obj.rid}; "
                     "processing without encoder disaggregation."
@@ -2307,9 +2902,116 @@ class MMReceiverBase(ABC):
                 continue
             waiting_req.consume_parts(parts)
 
+    def _tp0_only_receive(self, recv_req) -> bool:
+        """Whether this request is received once on rank 0 and broadcast.
+
+        Restricted to requests carrying encoder task_results: a metadata-only
+        rank rebuilds the prompt layout from the descriptors, and without them
+        it has nothing to rebuild from. Single-rank TP has nothing to save.
+
+        The forward broadcast runs over ``tp0_only_broadcast_group()`` (attn-tp,
+        or attn-cp when attention CP leaves attn_tp_size at 1), so the receiver
+        splits ranks by the same group.
+        """
+        return (
+            envs.SGLANG_ENCODER_TP0_ONLY_RECEIVE.get()
+            and self.tp_size > 1
+            and self.tp_group is not None
+            and tp0_only_broadcast_group() is not None
+            and bool(getattr(recv_req, "task_results", None))
+        )
+
+    def _discard_started_request(self, waiting_req) -> None:
+        """Release a request that failed to start on some rank."""
+        if waiting_req is None:
+            return
+        try:
+            waiting_req.release_resources()
+        except Exception:
+            logger.exception(
+                "Failed to release multimodal receive resources for rid=%s",
+                waiting_req.rid,
+            )
+        try:
+            waiting_req.close_recv_socket()
+        except Exception:
+            logger.exception(
+                "Failed to close multimodal receive socket for rid=%s",
+                waiting_req.rid,
+            )
+        self.waiting_by_rid.pop(waiting_req.rid, None)
+
+    def _settle_started_requests(self, started, abort_reqs) -> None:
+        """Agree on startup for a whole arrival batch with one all_gather.
+
+        Every rank must append the same requests to ``waiting_list``: the
+        status all_reduce that follows indexes into it positionally.
+        """
+        if not started:
+            return
+        local_errors = [error for _, _, error in started]
+        rank_errors = (
+            [local_errors]
+            if self.tp_size <= 1
+            else self.tp_group.all_gather_object(local_errors)
+        )
+        for index, (recv_req, waiting_req, _) in enumerate(started):
+            failed = [
+                (rank, errors[index])
+                for rank, errors in enumerate(rank_errors)
+                if errors[index] is not None
+            ]
+            if not failed:
+                self.waiting_list.append(waiting_req)
+                continue
+            details = "; ".join(f"rank {rank}: {error}" for rank, error in failed)
+            error_msg = f"Failed to start multimodal receive ({details})"
+            logger.error(error_msg)
+            self._discard_started_request(waiting_req)
+            abort_reqs.append(
+                (
+                    self.create_req(recv_req),
+                    error_msg,
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            )
+
+    def _poll_pending_embeddings(self) -> None:
+        """Re-check in-flight embedding pulls until the budget runs out.
+
+        The next re-check would otherwise happen at the next loop top, which
+        the main loop reaches only after the current forward returns, so a
+        request that is one short poll away from ready loses a whole forward.
+        """
+        budget_s = envs.SGLANG_EPD_PULL_WAIT_MS.get() / 1000.0
+        if budget_s <= 0:
+            return
+        deadline = time.monotonic() + budget_s
+        while True:
+            pending = [
+                waiting_req
+                for waiting_req in self.waiting_list
+                if waiting_req.status == WaitingMMRequestStatus.PENDING
+            ]
+            if not pending:
+                return
+            self._drain_scheduler_embeddings()
+            for waiting_req in pending:
+                waiting_req._try_recv_mm_data()
+            if all(
+                waiting_req.status != WaitingMMRequestStatus.PENDING
+                for waiting_req in pending
+            ):
+                return
+            if time.monotonic() >= deadline:
+                return
+            # Yields the GIL so the forward thread keeps launching kernels.
+            time.sleep(0.0005)
+
     def _process_waiting_requests(self, recv_reqs, waiting_cls, **extra_kwargs):
         new_recv_reqs = []
         abort_reqs = []
+        started_this_round = []
         for recv_req in recv_reqs:
             if isinstance(recv_req, EncoderDispatchErrorReq):
                 waiting_req = self.waiting_by_rid.get(recv_req.rid)
@@ -2335,24 +3037,49 @@ class MMReceiverBase(ABC):
                 # tokenizer never set encoder_urls (legacy / static path).
                 encode_urls = recv_req.encoder_urls or list(self.encode_urls)
 
+                req_cls = waiting_cls
+                req_kwargs = extra_kwargs
+                receive_count = self.tp_size
+                if getattr(recv_req, "task_results", None):
+                    # The factory encoder pool serves no push endpoints, so this
+                    # request is fetched rather than waited for.
+                    req_cls = WaitingFactoryPullRequest
+                    req_kwargs = {
+                        "dtype": getattr(self, "dtype", None),
+                        "embeddings_engine": getattr(self, "embeddings_engine", None),
+                        "gpu_id": self.gpu_id,
+                        "embedding_pool": self.embedding_pool,
+                    }
+                if self._tp0_only_receive(recv_req):
+                    # Rank 0 is the only receiver, so the encoder must not wait
+                    # for tp_size takers before freeing the embedding.
+                    receive_count = 1
+                    req_kwargs = {**req_kwargs, "tp0_only": True}
+                    if tp0_only_broadcast_group()[1] != 0:
+                        req_cls = WaitingMetadataOnlyRequest
+                        req_kwargs = {
+                            "dtype": getattr(self, "dtype", None),
+                            "tp0_only": True,
+                        }
+
                 waiting_req = None
                 local_error = None
                 try:
-                    waiting_req = waiting_cls(
+                    waiting_req = req_cls(
                         rid=recv_req.rid,
                         recv_req=recv_req,
                         mm_processor=self.mm_processor,
                         encoder_urls=encode_urls,
                         model_type=self.model_type,
                         host_name=self.hostname,
-                        receive_count=self.tp_size,
+                        receive_count=receive_count,
                         zmq_context=(
                             None
                             if self.scheduler_recv_socket is not None
                             else self.scheduler_context
                         ),
                         embedding_port=self.scheduler_embedding_port,
-                        **extra_kwargs,
+                        **req_kwargs,
                     )
                     self.waiting_by_rid[waiting_req.rid] = waiting_req
                     waiting_req.send_encode_request()
@@ -2364,6 +3091,12 @@ class MMReceiverBase(ABC):
 
                 # The status all-reduce below requires every TP rank to append
                 # exactly the same requests. Agree on startup before appending.
+                if envs.SGLANG_EPD_BATCH_START_SYNC.get():
+                    # One all_gather for the whole arrival batch instead of one
+                    # per request: the main thread holds the GIL for each of
+                    # these, which stalls the forward thread's kernel launches.
+                    started_this_round.append((recv_req, waiting_req, local_error))
+                    continue
                 rank_errors = (
                     [local_error]
                     if self.tp_size <= 1
@@ -2408,10 +3141,14 @@ class MMReceiverBase(ABC):
             else:
                 new_recv_reqs.append(recv_req)
 
+        self._settle_started_requests(started_this_round, abort_reqs)
+
         if len(self.waiting_list) == 0:
             return new_recv_reqs, abort_reqs
 
         self._drain_scheduler_embeddings()
+        drain_deferred_pool_releases()
+        self._poll_pending_embeddings()
         current_time = time.time()
         local_status = []
         for waiting_req in self.waiting_list:

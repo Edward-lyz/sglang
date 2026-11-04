@@ -236,11 +236,13 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         receiver = SimpleNamespace(
             waiting_list=[owner, other],
             waiting_by_rid={owner.rid: owner, other.rid: other},
+            scheduler=None,
             scheduler_recv_socket=None,
             wait_timeout=float("inf"),
             tp_group=SimpleNamespace(cpu_group=object()),
             _drain_scheduler_embeddings=lambda: None,
             _sync_fail_info_across_tp=lambda request: None,
+            _report_receiver_metrics=lambda: None,
             create_req=lambda request: request,
         )
         dispatch_error = EncoderDispatchErrorReq(
@@ -374,11 +376,13 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         receiver = SimpleNamespace(
             waiting_list=[waiting_req],
             waiting_by_rid={waiting_req.rid: waiting_req},
+            scheduler=None,
             scheduler_recv_socket=None,
             wait_timeout=float("inf"),
             tp_group=SimpleNamespace(cpu_group=object()),
             _drain_scheduler_embeddings=lambda: None,
             _sync_fail_info_across_tp=lambda request: None,
+            _report_receiver_metrics=lambda: None,
             create_req=lambda request: request,
         )
 

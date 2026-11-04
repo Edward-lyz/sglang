@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -39,6 +40,53 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+
+def _strip_mm_inputs(mm_inputs):
+    """Copy of ``mm_inputs`` with the embedding rows and pool ownership removed."""
+    items = getattr(mm_inputs, "mm_items", None)
+    if not items or not any(
+        getattr(item, "precomputed_embeddings", None) is not None for item in items
+    ):
+        return mm_inputs
+    stripped = copy.copy(mm_inputs)
+    new_items = []
+    for item in items:
+        if getattr(item, "precomputed_embeddings", None) is not None:
+            item = copy.copy(item)
+            item.precomputed_embeddings = None
+        new_items.append(item)
+    stripped.mm_items = new_items
+    if getattr(stripped, "pool_buffer_addrs", None) is not None:
+        # The pinned-pool pages belong to this stage's process.
+        stripped.pool_buffer_addrs = None
+    return stripped
+
+
+def strip_mm_embeddings_for_next_stage(data):
+    """Drop precomputed multimodal embeddings from requests sent down the PP chain.
+
+    Only the first stage embeds tokens, so later stages need the multimodal
+    metadata (offsets, hashes, pad values) but never the rows. EPD rows are
+    zero-copy views of the pinned landing pool: pickling one would serialize
+    the whole pool storage. The originals are left intact for this stage.
+    """
+    if not isinstance(data, list):
+        return data
+    out = None
+    for i, req in enumerate(data):
+        mm_inputs = getattr(req, "mm_inputs", None)
+        if mm_inputs is None:
+            continue
+        stripped = _strip_mm_inputs(mm_inputs)
+        if stripped is mm_inputs:
+            continue
+        if out is None:
+            out = list(data)
+        req = copy.copy(req)
+        req.mm_inputs = stripped
+        out[i] = req
+    return data if out is None else out
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -206,6 +254,7 @@ class SchedulerPPMixin:
 
         """
         self.init_pp_loop_state()
+
         # NOTE(AttentionStore): this loop does NOT call retire_ascache_writes().
         # Every other event loop does, and that call is what releases the KV and
         # chunk-tail-SWA slots owned by completed AS write tasks. Reaching this
@@ -741,6 +790,7 @@ class SchedulerPPMixin:
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            data = strip_mm_embeddings_for_next_stage(data)
             dp_offset = (
                 self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
             )

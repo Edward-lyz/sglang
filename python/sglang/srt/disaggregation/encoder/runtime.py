@@ -1160,6 +1160,7 @@ async def send_staged_embedding(
             session_id=request["session_id"],
             buffer_address=request["buffer_address"],
         )
+        metrics = enc.metrics_collector
         if not sent:
             return False
 

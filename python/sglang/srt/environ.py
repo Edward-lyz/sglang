@@ -362,6 +362,11 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Budget (MB of int64 ids) of the per-tokenizer-worker segment tokenize cache;
+    # 0 disables it. Reuses the ids of a multi-turn prompt's unchanged history.
+    SGLANG_OPT_TOKENIZE_SEGMENT_CACHE_MB = EnvInt(0)
+    # One line per prefilled request: cached length and media-item hash ids.
+    SGLANG_LOG_MM_CACHE_TRACE = EnvBool(False)
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
     # ===================================================================
@@ -1247,6 +1252,7 @@ class Envs:
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+
     # ===================================================================
     # MHC (mixed hidden-state compute) layernorm kernel
     # ===================================================================
@@ -1377,6 +1383,12 @@ class Envs:
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
+    # Pad multimodal placeholder ids in the int64 array instead of a tensor round trip.
+    SGLANG_OPT_MM_PAD_INPUT_IDS_ARRAY = EnvBool(False)
+    # Copy each image's pinned embedding straight into the device broadcast
+    # buffer. The default concatenates them on the host first, which copies
+    # every row twice and leaves the H2D reading pageable memory.
+    SGLANG_OPT_MM_EMBED_DIRECT_H2D = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
@@ -1461,6 +1473,85 @@ class Envs:
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
     SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
+    # Factory (厂内) EPD: port the encoder's PullZmqServer binds so prefill can
+    # DEALER-pull embeddings it advertised via task_results.encoder_addr. 0
+    # disables the factory pull path (encoder stays on the New EPD push flow).
+    SGLANG_ENCODER_PULL_ZMQ_PORT = EnvInt(0)
+    # Token budget for factory fetch admission: free_tokens = budget - in-flight
+    # pipeline tokens; the workflow only fetches new tasks while free_tokens is
+    # above its admit threshold. Mirrors the K3 encoder's pipeline budget.
+    SGLANG_ENCODER_WORKFLOW_TOKEN_BUDGET = EnvInt(2097152)
+    # TTL (seconds) for a factory embedding held awaiting a pull. A hold whose
+    # prefill never pulls (died / timed out) is evicted after this, so
+    # task_embeddings cannot grow without bound. Only refs==0 holds are evicted.
+    SGLANG_ENCODER_TASK_EMB_TTL_S = EnvFloat(300.0)
+    # Size cap (GiB) for the factory embedding hold cache. Holds are retained
+    # after a pull so sibling requests sharing a task_id can pull them too;
+    # capacity is reclaimed by LRU eviction of unreferenced (refs==0) holds once
+    # this cap is exceeded. In-flight holds are never evicted. 0 disables the
+    # cap (TTL-only reclaim).
+    SGLANG_ENCODER_TASK_EMB_CACHE_GB = EnvFloat(8.0)
+    # Page size (KB) of the pre-registered factory hold pool sized by the cap
+    # above; a hold rounds up to whole pages.
+    SGLANG_ENCODER_TASK_HOLD_PAGE_KB = EnvInt(256)
+    # Factory image tasks in flight at the same time are coalesced into one
+    # fused encode of at most this many tasks (1 = one encode per task). A
+    # batch closes after WAIT_MS, or at once when full; at most INFLIGHT fused
+    # batches run concurrently so loading the next overlaps the current forward.
+    SGLANG_ENCODER_FACTORY_BATCH_SIZE = EnvInt(1)
+    SGLANG_ENCODER_FACTORY_BATCH_WAIT_MS = EnvFloat(2.0)
+    SGLANG_ENCODER_FACTORY_BATCH_INFLIGHT = EnvInt(2)
+    # Run the vision forward on a dedicated thread instead of the event loop,
+    # so media loading, pulls and vit-server polling keep running during it.
+    # Only honoured with tp_size == 1 (TP ranks must issue collectives in order).
+    SGLANG_ENCODER_FORWARD_IN_THREAD = EnvBool(False)
+    # Return a digest (mean/std/min/max/first8/last8) of every embedding the
+    # factory /epd/transfer writes, in its ack, to spot corrupted transfers.
+    SGLANG_EMBED_DIGEST = EnvBool(False)
+    # Factory video tasks on image-only vision towers (DeepSeek-V4.1): frames are
+    # sampled at the task's sample_fps (this default when absent), capped to
+    # MAX_FRAMES spread over the clip, and downscaled to FRAME_MAX_PIXELS before
+    # each is encoded as an image.
+    SGLANG_ENCODER_VIDEO_DEFAULT_FPS = EnvFloat(1.0)
+    SGLANG_ENCODER_VIDEO_MAX_FRAMES = EnvInt(32)
+    SGLANG_ENCODER_VIDEO_FRAME_MAX_PIXELS = EnvInt(295936)
+    # Decode factory videos with NVDEC (PyNvVideoCodec) as K3 does, falling
+    # back to decord; needs NVIDIA_DRIVER_CAPABILITIES to include "video". Off by
+    # default: sampling 32 frames was no faster than decord on bzz2 (720p 60 s:
+    # 555 vs 330 ms; 1080p 120 s: 1.9 vs 1.8 s).
+    SGLANG_ENCODER_VIDEO_GPU_DECODE = EnvBool(False)
+    # Receive each embedding once on attn-tp rank 0 and broadcast it inside the
+    # forward pass, instead of every TP rank pulling its own copy. Saves
+    # (tp_size - 1) transfers and landing buffers per request.
+    SGLANG_ENCODER_TP0_ONLY_RECEIVE = EnvBool(False)
+    # A multimodal request whose encoder task_results are missing, empty, failed
+    # or malformed is encoded locally instead of rejected with 400. Applied
+    # identically on prefill and decode. 0 restores the strict 400.
+    SGLANG_EPD_LOCAL_FALLBACK = EnvBool(True)
+    # IB device for the Mooncake engine dedicated to encoder embedding transfer.
+    # Set it to run the embedding pulls on their own device and to advertise that
+    # engine's session id to the encoder pool; empty keeps EPD off mooncake.
+    SGLANG_EMBEDDING_IB_DEVICE = EnvStr("")
+    # CPU pinned landing-buffer pool for mooncake EPD pulls. Pinned host memory
+    # rather than device memory: it leaves HBM to the KV cache and makes the H2D
+    # copy at consume time a DMA.
+    SGLANG_EPD_PINNED_POOL_GB = EnvFloat(2.0)
+    SGLANG_EPD_PINNED_PAGE_SIZE_MB = EnvInt(2)
+    # Budget for polling a just-started embedding pull inside the same scheduler
+    # loop. Without it the pull is only re-checked at the next loop top, which
+    # the main loop reaches after the current forward returns, so every
+    # multimodal request waits one forward (measured 0.15-0.24s). 0 disables.
+    SGLANG_EPD_PULL_WAIT_MS = EnvFloat(0.0)
+    # Agree on multimodal receive startup once per arrival batch instead of
+    # once per request: each all_gather is main-thread GIL time that stalls
+    # the forward thread's kernel launches.
+    SGLANG_EPD_BATCH_START_SYNC = EnvBool(False)
+    # Skip the per-request zmq context when the embeddings land on the shared
+    # scheduler port, i.e. when the request creates no socket of its own.
+    SGLANG_EPD_LAZY_ZMQ_CONTEXT = EnvBool(False)
+    # Return one view over a request's embedding parts when they already sit
+    # back to back in the pinned slot, instead of copying them with torch.cat.
+    SGLANG_OPT_MM_EMBED_VIEW_CONCAT = EnvBool(False)
 
     # ===================================================================
     # Native gRPC server
@@ -1523,6 +1614,10 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # DeepSeek-V4.1 ViT: images of one get_image_feature call run in varlen
+    # groups of at most this many patch rows (attention stays per image).
+    # 0 keeps one forward per image.
+    SGLANG_DSV41_VIT_BATCH_MAX_PATCHES = EnvInt(0)
     # DeepSeek-V4.1 two-level indexer on DeepGEMM's paged sparse MQA logits for the
     # index-source layers after the candidate source (decode). Needs a DeepGEMM
     # with fp8_fp4_paged_sparse_mqa_logits on SM100; off = the torch masks.
@@ -1823,9 +1918,13 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
+
     # Optional AttentionStore host scheduling and native transport features.
     # Deferred allocation preserves the all-rank publication gates.
     SGLANG_AS_DEFER_ALLOCATION_GATE = EnvBool(False)
+    # Rehash only the blocks multimodal padding rewrote, reusing the tokenizer's
+    # hashes for the unchanged head (needs an SDK with Tokens.resume).
+    SGLANG_OPT_AS_BLOCK_HASH_RESUME = EnvBool(False)
     SGLANG_HTTP_REUSE_PORT = EnvBool(False)
     SGLANG_ADMISSION_DIAG_DIR = EnvStr("")
     SGLANG_ENABLE_REQUEST_OOB_BROADCAST = EnvBool(False)
