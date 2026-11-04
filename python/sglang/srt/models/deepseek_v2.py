@@ -109,6 +109,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
+    sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -279,11 +280,26 @@ class DeepseekV2MLP(nn.Module):
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
-        )
+        if envs.SGLANG_OPT_USE_SHARED_EXPERT_SILU_QUANT_FUSED.get():
+            x, x_scale = sglang_per_token_group_quant_fp8(
+                gate_up,
+                128,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                fuse_silu_and_mul=True,
+                enable_v2=True,
+            )
+            x, _ = self.down_proj(
+                (x, x_scale),
+                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+            )
+        else:
+            x = self.act_fn(gate_up)
+            x, _ = self.down_proj(
+                x,
+                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+            )
         return x
 
 

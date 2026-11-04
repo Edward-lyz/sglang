@@ -446,7 +446,10 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
+    # Pre-quantized FP8 activations come from fused RMSNorm+quant or fused
+    # SiLU+mul+quant. The scale layout is prepared for DeepGEMM, so we should
+    # not quantize the input a second time.
+    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
 
     if input_scale is not None:
         assert shape_supported, (
@@ -474,13 +477,18 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d,
-        block_size[1],
-        column_major_scales=True,
-        scale_tma_aligned=True,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
+    if input_scale is not None:
+        assert input.dtype == fp8_dtype
+        q_input = input_2d
+        x_scale = input_scale
+    else:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            block_size[1],
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
 
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
