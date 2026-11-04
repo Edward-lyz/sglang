@@ -1800,6 +1800,7 @@ class NativeSparseAttnBackend(
         page_table_1,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
+        from flash_mla import dsv4_flash_mla_with_kvcache
 
         cache_seqlens = metadata.nsa_cache_seqlens_int32
 
@@ -1816,6 +1817,24 @@ class NativeSparseAttnBackend(
         assert (
             indices.shape[-1] == self.nsa_index_topk
         )  # requirement of FlashMLA decode kernel
+
+        if self.num_q_heads == 64:
+            o, _ = dsv4_flash_mla_with_kvcache(
+                q=q_all,
+                k_cache=kv_cache,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
+                num_splits=metadata.flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+                indices=indices,
+                # doc says it is not used, but if pass in None then error
+                block_table=torch.empty(
+                    (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+                ),
+                is_fp8_kvcache=True,
+            )
+            return o
 
         o, _ = flash_mla_with_kvcache(
             q=q_all,
@@ -2100,17 +2119,30 @@ class NativeSparseAttnBackend(
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
         from sgl_kernel.flash_mla import get_mla_metadata
+        from flash_mla import dsv4_get_mla_metadata
 
-        flashmla_metadata, num_splits = get_mla_metadata(
-            cache_seqlens=cache_seqlens,
-            # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
-            #      but the name looks like need seq_len_q?
-            num_q_tokens_per_head_k=seq_len_q * self.num_q_heads // 1,
-            num_heads_k=1,
-            num_heads_q=self.num_q_heads,
-            is_fp8_kvcache=True,
-            topk=self.nsa_index_topk,
-        )
+        if self.num_q_heads == 64:
+            flashmla_metadata, num_splits = dsv4_get_mla_metadata(
+                cache_seqlens=cache_seqlens,
+                # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
+                #      but the name looks like need seq_len_q?
+                num_q_tokens_per_head_k=seq_len_q * self.num_q_heads // 1,
+                num_heads_k=1,
+                num_heads_q=self.num_q_heads,
+                is_fp8_kvcache=True,
+                topk=self.nsa_index_topk,
+            )
+        else:
+            flashmla_metadata, num_splits = get_mla_metadata(
+                cache_seqlens=cache_seqlens,
+                # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
+                #      but the name looks like need seq_len_q?
+                num_q_tokens_per_head_k=seq_len_q * self.num_q_heads // 1,
+                num_heads_k=1,
+                num_heads_q=self.num_q_heads,
+                is_fp8_kvcache=True,
+                topk=self.nsa_index_topk,
+            )
 
         return NSAFlashMLAMetadata(
             flashmla_metadata=flashmla_metadata,
