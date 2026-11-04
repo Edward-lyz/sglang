@@ -480,6 +480,20 @@ class Envs:
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
 
+    # nsa
+    SGLANG_NSA_THRESHOLD_MIN_KVLEN = EnvInt(0)
+
+    # optimization switches
+    SGLANG_OPT_USE_RMSNORM_QUANT_FUSED = EnvBool(False)
+    SGLANG_OPT_USE_SHARED_EXPERT_SILU_QUANT_FUSED = EnvBool(False)
+
+    # Plugin system
+    SGLANG_PLATFORM = EnvStr("")
+    SGLANG_PLUGINS = EnvStr("")
+
+    # msit
+    AIAK_ENABLE_MSIT_TRACE = EnvBool(False)
+    AIAK_MSIT_TRACE_DIR = EnvStr("/workspace/wdump/")
 
 envs = Envs()
 EnvField._allow_set_name = False
