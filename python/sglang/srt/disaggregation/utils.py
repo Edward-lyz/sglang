@@ -227,8 +227,7 @@ def _poll_with_failure_injection(pollers) -> List[int]:
 
 def _is_fake_transfer(req: Req) -> bool:
     return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-        req.bootstrap_host is None
-        and get_disagg().disaggregation_transfer_backend == "fake"
+        get_disagg().disaggregation_transfer_backend == "fake"
     )
 
 

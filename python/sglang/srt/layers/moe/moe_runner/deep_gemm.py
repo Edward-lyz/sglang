@@ -790,7 +790,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
                 gateup_output,
                 masked_m,
-                group_size=scale_block_size,
+                # FP4-expert down GEMM consumes recipe_a-granularity (1x128)
+                # scales, not the fp8 weight-block size; quantise to match.
+                group_size=(
+                    scale_block_size
+                    if (recipe_a is None or use_mxfp8)
+                    else recipe_a[1]
+                ),
                 topk=self.config.top_k,
                 swiglu_limit=swiglu_limit_arg,
                 swizzle=self.use_swizzle,
@@ -1571,6 +1577,31 @@ def _varlen_deep_gemm_silu_mul_quant(
     # DSV4-specific activations (clamped swiglu, swizzled gate|up layout) stay
     # on the DSV4 JIT kernel; it is the only implementation carrying them.
     if swiglu_limit is not None or swizzle:
+        if group_size != 128 or G % 4 != 0:
+            # DSV4 fused JIT activation only supports group 128 with
+            # G % 4 == 0. For 32-block fp8 / fp4-expert checkpoints
+            # (group 32, or group 128 with G=18) fall back to a
+            # graph-safe two-step: clamped swiglu then masked group
+            # quant. Same math as the fused kernel (one extra bf16
+            # pass, no PDL); shapes stay fixed so graph capture is ok.
+            assert swiglu_limit is not None and not swizzle, (
+                "swizzled gate|up layout has no non-128-group fallback"
+            )
+            x = torch.empty(
+                (E, N, D), device=hidden_states_device, dtype=gateup_output.dtype
+            )
+            silu_and_mul_clamp(
+                gateup_output.reshape(E * N, -1), x.view(E * N, D), float(swiglu_limit)
+            )
+            expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
+            return per_token_group_quant(
+                x,
+                group_size=group_size,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                masked_m=masked_m,
+                expected_m=expected_m,
+                column_major_scales=True,
+            )
         assert N % 4 == 0 and G % 4 == 0 and D // 8 >= E, (
             "DSV4 JIT activation requires N % 4 == 0, G % 4 == 0 and "
             f"D // 8 >= num_experts, got N={N} G={G} D={D} E={E}"
