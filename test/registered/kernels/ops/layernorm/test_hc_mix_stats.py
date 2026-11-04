@@ -3,6 +3,7 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.ops.layernorm import mhc as _mhc
 from sglang.kernels.ops.layernorm.mhc import hc_mix_stats
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -36,8 +37,14 @@ def test_hc_mix_stats_matches_reference(m: int, k: int, dtype: torch.dtype):
     assert got.shape == (m, 24) and got.dtype == torch.float32
     scale = ref.abs().max().clamp(min=1e-6)
     err_kernel = (got.double() - ref).abs().max() / scale
-    # Bound FP32 accumulation error relative to the independent FP64 result.
-    assert err_kernel < 1e-4
+    # The Triton split-K producer accumulates with tf32x3 (~fp32); the optional
+    # deep_gemm.tf32_hc_prenorm_gemm producer accumulates with single-pass tf32,
+    # matching the accuracy class of DeepSeek's own mega_mhc kernel. Bound the
+    # error against the independent FP64 result per active producer.
+    deepgemm_active = _mhc._mhc_deepgemm_eligible(x_flat, hc_fn)
+    tol = 3e-4 if deepgemm_active else 1e-4
+    assert err_kernel < tol
+
 
 
 if __name__ == "__main__":
