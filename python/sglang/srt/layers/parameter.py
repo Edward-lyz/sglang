@@ -220,6 +220,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                         self.output_dim, start_idx, shard_size
                     )
 
+        if param_data.shape != loaded_weight.shape:
+            if isinstance(self, ChannelQuantScaleParameter) and loaded_weight.ndim == 1:
+                loaded_weight = loaded_weight.unsqueeze(-1)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -267,6 +270,12 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 loaded_weight = loaded_weight.narrow(
                     self.output_dim, shard_id * shard_size, shard_size
                 )
+
+        # Channel scales for a fused QKV parameter are stored as a flat
+        # vector in the checkpoint, while the parameter uses [channels, 1]
+        # to preserve the output-channel broadcast dimension.
+        if isinstance(self, ChannelQuantScaleParameter) and loaded_weight.ndim == 1:
+            loaded_weight = loaded_weight.unsqueeze(-1)
 
         assert (
             param_data.shape == loaded_weight.shape
@@ -361,7 +370,43 @@ class ChannelQuantScaleParameter(_ColumnvLLMParameter):
     channel-wise quantization. Equivalent to _ColumnvLLMParameter.
     """
 
-    pass
+    def load_column_parallel_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+        use_presharded_weights: bool = False,
+    ):
+        if not use_presharded_weights:
+            shard_size = self.data.shape[self.output_dim]
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim, tp_rank * shard_size, shard_size
+            )
+        if loaded_weight.ndim == 1:
+            loaded_weight = loaded_weight.unsqueeze(-1)
+        if loaded_weight.ndim == 0:
+            loaded_weight = loaded_weight.reshape(1, 1)
+        assert self.data.shape == loaded_weight.shape, (
+            f"{self.data.shape=}, {loaded_weight.shape=}"
+        )
+        self.data.copy_(loaded_weight)
+
+    def load_row_parallel_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        tp_rank: Optional[int] = None,
+        use_presharded_weights: bool = False,
+    ):
+        # Row-parallel projections shard the input (K) dimension.  A
+        # per-output-channel scale is consequently replicated, not sharded.
+        del tp_rank, use_presharded_weights
+        if loaded_weight.ndim == 1:
+            loaded_weight = loaded_weight.unsqueeze(-1)
+        if loaded_weight.ndim == 0:
+            loaded_weight = loaded_weight.reshape(1, 1)
+        assert self.data.shape == loaded_weight.shape, (
+            f"{self.data.shape=}, {loaded_weight.shape=}"
+        )
+        self.data.copy_(loaded_weight)
 
 
 class BlockQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter):

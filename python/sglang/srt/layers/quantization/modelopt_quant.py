@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -23,7 +24,11 @@ from sglang.srt.layers.moe.utils import (
     is_flashinfer_cutedsl_v1_path,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
+from sglang.srt.layers.parameter import (
+    ChannelQuantScaleParameter,
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -113,6 +118,65 @@ except ImportError:
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
+
+
+def _k3_attn_moe_fp8_enabled() -> bool:
+    return os.getenv("SGLANG_K3_ATTN_MOE_FP8", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _is_k3_attn_fp8_target(prefix: str) -> bool:
+    """Match attention projections serialized as FP8 in the K3 checkpoint."""
+    if ".self_attn." not in prefix:
+        return False
+    tail = prefix.rsplit(".", 1)[-1]
+    return tail in {
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        # K3 serializes q/k/v separately but uses QKVParallelLinear at runtime.
+        "qkv_proj",
+        "o_proj",
+        "g_proj",
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "fused_qkvg_proj",
+        "fused_qkv_a_proj_with_mqa",
+    }
+
+
+def _is_k3_moe_fp8_target(prefix: str) -> bool:
+    """Match the explicitly FP8-serialized K3 MoE projection tensors."""
+    if ".shared_experts." in prefix:
+        return prefix.rsplit(".", 1)[-1] in {"gate_proj", "up_proj", "down_proj"}
+    if ".routed_expert_" in prefix:
+        return prefix.rsplit(".", 1)[-1] in {
+            "routed_expert_up_proj",
+            "routed_expert_down_proj",
+        }
+    return False
+
+
+def _is_k3_named_fp8_target(prefix: str) -> bool:
+    if _is_k3_attn_fp8_target(prefix) or _is_k3_moe_fp8_target(prefix):
+        return True
+    # K3 v3 additionally serializes layer-0 dense MLP in FP8.  The runtime
+    # uses a fused gate_up_proj module, so recognize that fused prefix as the
+    # two independently selected checkpoint targets.
+    if ".layers.0.mlp." in prefix and prefix.rsplit(".", 1)[-1] in {
+        "gate_up_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    }:
+        return True
+    return False
 
 
 def _sglang_fp4_gemm_fake(
@@ -292,11 +356,20 @@ class ModelOptQuantConfig(QuantizationConfig):
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
+            if (
+                _k3_attn_moe_fp8_enabled()
+                and not _is_k3_named_fp8_target(prefix)
+            ):
+                # Keep non-target BF16 projections, embeddings, and LM head
+                # on the unquantized loader for the K3 attention+MoE FP8 path.
+                return UnquantizedLinearMethod()
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
-            return Linear(self)
+            method = Linear(self)
+            method.k3_named_target = _is_k3_named_fp8_target(prefix)
+            return method
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
         elif isinstance(layer, FusedMoE):
@@ -507,6 +580,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             is_sm100_supported() or is_sm120_supported()
         ) and is_flashinfer_available()
         self.use_marlin = False
+        self.k3_named_target = False
         if is_cuda():
             self.use_marlin = (
                 envs.SGLANG_FORCE_FP8_MARLIN.get() or can_auto_enable_marlin_fp8()
@@ -553,18 +627,53 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         )
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            # Register weight and input scales
-            for scale_name in ["weight_scale", "input_scale"]:
-                scale = _make_per_tensor_scale_parameter(
-                    (len(output_partition_sizes),),
+            if _k3_attn_moe_fp8_enabled() and self.k3_named_target:
+                # K3 v3 stores one FP32 scale per output channel for every
+                # serialized attention projection, including projections that
+                # SGLang fuses at runtime. The normal ModelOpt path expects
+                # one scalar per fused shard and cannot load this layout.
+                weight_scale = ChannelQuantScaleParameter(
+                    data=torch.empty(
+                        (output_size_per_partition, 1), dtype=torch.float32
+                    ),
+                    output_dim=0,
                     weight_loader=weight_loader,
-                    fill_value=torch.finfo(torch.float32).min,
-                    needs_scalar_to_array=True,
                 )
-                layer.register_parameter(scale_name, scale)
+                weight_scale.data.fill_(torch.finfo(torch.float32).min)
+                layer.register_parameter("weight_scale", weight_scale)
+            else:
+                # Legacy ModelOpt checkpoints use one scalar per logical shard.
+                for scale_name in ["weight_scale", "input_scale"]:
+                    scale = _make_per_tensor_scale_parameter(
+                        (len(output_partition_sizes),),
+                        weight_loader=weight_loader,
+                        fill_value=torch.finfo(torch.float32).min,
+                        needs_scalar_to_array=True,
+                    )
+                    layer.register_parameter(scale_name, scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Requantizes weights after loading using the maximum scale."""
+        if _k3_attn_moe_fp8_enabled() and self.k3_named_target:
+            # The checkpoint is already quantized with per-channel scales;
+            # preserve the exact encoded values. Flat-AG K3 sharding keeps
+            # the physical checkpoint layout (N, K) so it can slice and
+            # all-gather raw FP8 bytes. The apply path transposes the full
+            # gathered view only when GEMM consumes it.
+            if not getattr(layer, "_k3_moe_flat_ag_fp8", False):
+                layer.weight = Parameter(layer.weight.t(), requires_grad=False)
+            layer.weight_scale = Parameter(
+                layer.weight_scale.data, requires_grad=False
+            )
+            layer.input_scale = None
+            # The per-channel path does not use FlashInfer's static
+            # per-tensor BMM dispatch. Keep the attribute explicit because
+            # LinearBase callers may inspect it during forward.
+            layer.use_flashinfer_bmm = False
+            if self.use_marlin:
+                prepare_fp8_layer_for_marlin(layer, size_k_first=True)
+            return
+
         max_w_scale, quantized_weight = requantize_with_max_scale(
             layer.weight, layer.weight_scale, layer.logical_widths
         )
@@ -595,17 +704,22 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+        weight = layer.weight
+        if getattr(layer, "_k3_moe_flat_ag_fp8", False):
+            # Flat-AG stores and reconstructs the physical (N, K) FP8
+            # checkpoint layout. ModelOpt GEMM expects (K, N).
+            weight = weight.t()
         if self.enable_flashinfer_bmm and layer.input_scale is not None:
             return apply_fp8_linear_bmm_flashinfer(
                 input=x,
-                weight=layer.weight,
+                weight=weight,
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
             )
         return apply_fp8_linear(
             input=x,
-            weight=layer.weight,
+            weight=weight,
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
