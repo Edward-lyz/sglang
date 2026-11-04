@@ -389,6 +389,7 @@ class Envs:
     SGLANG_SUPPORT_CUTLASS_BLOCK_FP8 = EnvBool(False)
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
+    SGLANG_OPT_MEGA_MOE_FUSED_TAIL = EnvBool(False)
 
     # Deterministic inference
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
