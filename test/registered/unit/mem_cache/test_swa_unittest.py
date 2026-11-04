@@ -1,3 +1,5 @@
+"""Unit tests for the SWA allocator, SWA radix cache and their free paths."""
+
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -1388,6 +1390,38 @@ class TestSWAPageRepsFree(CustomTestCase):
                 touched = -(num_tokens // -ps) * ps
                 self.assertTrue(torch.all(mapping[indices[:touched]] == 0))
                 self.assertTrue(torch.all(mapping[indices[touched:]] > 0))
+
+    def test_segment_batch_matches_per_segment_frees_for_partial_tails(self):
+        """A segment batch frees the same SWA pages as one free per segment, also
+        when segment lengths are not page multiples (prefill rows of any ISL)."""
+        ps = self.PS
+        lens = (ps + 1, 2 * ps - 1, 2 * ps)
+        results = []
+        for batched in (False, True):
+            allocator = self._allocator()
+            rows = [_swa_alloc(allocator, 2 * ps) for _ in lens]
+            mapping = allocator.full_to_swa_index_mapping
+            expected = torch.unique(
+                torch.cat([mapping[r[:n]] // ps for r, n in zip(rows, lens)])
+            )
+            before = allocator.swa_attn_allocator.free_pages.numel()
+            if batched:
+                allocator.free_group_begin()
+                allocator.begin_swa_segment_batch()
+            for r, n in zip(rows, lens):
+                allocator.free_swa_segment(r[:n], start_pos=0)
+            if batched:
+                allocator.end_swa_segment_batch()
+                allocator.free_group_end()
+            free_pages = allocator.swa_attn_allocator.free_pages
+            freed = torch.sort(free_pages[: free_pages.numel() - before])[0]
+            self.assertTrue(torch.equal(freed, expected))
+            for r, n in zip(rows, lens):
+                touched = -(n // -ps) * ps
+                self.assertTrue(torch.all(mapping[r[:touched]] == 0))
+                self.assertTrue(torch.all(mapping[r[touched:]] > 0))
+            results.append((freed.tolist(), self._sizes(allocator)))
+        self.assertEqual(results[0], results[1])
 
     def test_node_frees_take_the_page_path_through_the_tree(self):
         """Tree values are page-aligned copies of a kv row, so SWA eviction and

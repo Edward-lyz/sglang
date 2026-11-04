@@ -1,3 +1,5 @@
+"""Token-to-KV allocators for hybrid full + sliding-window-attention pools."""
+
 import logging
 
 import torch

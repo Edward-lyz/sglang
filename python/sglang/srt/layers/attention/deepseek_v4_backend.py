@@ -1212,6 +1212,8 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
+    """DeepSeek-V4 attention backend: SWA, compressed and indexed sparse attention."""
+
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
@@ -2765,6 +2767,7 @@ class DeepseekV4AttnBackend(
         *,
         num_qo_tokens: int,
     ) -> SparsePrefillChunkCache:
+        """Per-forward SWA chunk cache shared by every sparse-prefill layer."""
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
         # The chunk cache gathers the W-1 positions before the chunk; under the

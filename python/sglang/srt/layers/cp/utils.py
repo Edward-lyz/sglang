@@ -37,6 +37,7 @@ from sglang.srt.layers.cp.zigzag import (
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.runtime_context import get_parallel, uses_mla_backend
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -165,6 +166,7 @@ def prepare_cp_forward(forward_batch) -> None:
             extend_seqs_len=extend_lens_cpu,
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
+
         # CP together with DP>1: every DP group must pad each rank to the SAME
         # physical length so full-TP-group all-gathers (MoE / engram / input-id
         # gather) see rank-invariant sizes. The per-DP-group physical length is
@@ -339,6 +341,13 @@ def cp_shard_model_inputs(
         logical_tokens = (
             metadata.per_rank_logical_token or metadata.per_rank_actual_token
         )
+        # Pinned staging: a pageable new_tensor() here is a blocking H2D copy, i.e. one
+        # stream sync per prefill forward that drains the host's launch lead.
+        forward_batch.num_token_non_padded = async_h2d(
+            [logical_tokens[get_parallel().attn_cp_rank]],
+            dtype=num_token_non_padded_backup.dtype,
+            device=num_token_non_padded_backup.device,
+        ).view(num_token_non_padded_backup.shape)
 
     try:
         # [MEM-R3] Everything that needs the full-order inputs has already been sharded
