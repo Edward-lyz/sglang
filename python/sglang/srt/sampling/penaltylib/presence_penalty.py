@@ -1,6 +1,9 @@
 import torch
 
-from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
+from sglang.srt.sampling.penaltylib.orchestrator import (
+    _BatchedPenalizer,
+    host_to_device,
+)
 
 
 class BatchedPresencePenalizer(_BatchedPenalizer):
@@ -21,15 +24,13 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
             device=self.orchestrator.device,
         )
 
-        self.presence_penalties = (
-            torch.tensor(
-                data=[
-                    req.sampling_params.presence_penalty
-                    for req in self.orchestrator.reqs()
-                ],
-                dtype=torch.float32,
-                device=self.orchestrator.device,
-            )
+        self.presence_penalties = host_to_device(
+            [
+                req.sampling_params.presence_penalty
+                for req in self.orchestrator.reqs()
+            ],
+            dtype=torch.float32,
+            device=self.orchestrator.device,
         ).unsqueeze_(1)
 
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):

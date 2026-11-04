@@ -114,3 +114,42 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def free(self, free_index: torch.Tensor):
         raise NotImplementedError()
+
+    @staticmethod
+    def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
+        """Take ownership before a caller can mutate a deferred tensor view."""
+        return free_index.clone()
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Free ``kv_row[start_pos : start_pos + n]`` of one request.
+
+        In page units the segment is ``[start_pos // ps, ceil(end / ps))``:
+        ``start_pos`` sits on a page boundary, the end may fall mid-page, and
+        the whole last page is released. Subclasses use that to skip the
+        data-dependent dedup in ``free()``. Default: plain ``free()``.
+        """
+        assert (
+            start_pos % self.page_size == 0
+        ), f"segment start {start_pos} is not page-aligned"
+        self.free(free_index)
+
+    def free_segments(self, segments):
+        """Free several ``(free_index, start_pos)`` segments of one request's
+        kv row.
+
+        Each segment covers the pages ``[start_pos // ps, ceil(end / ps))``.
+        Starts sit on page boundaries, ends may fall mid-page, and the page
+        ranges of consecutive segments do not overlap -- so in page units the
+        segments are aligned and disjoint, and every page is released once.
+        """
+        ps = self.page_size
+        prev_end = None
+        for free_index, start_pos in segments:
+            n = free_index.numel()
+            if n == 0:
+                continue
+            assert (
+                prev_end is None or start_pos // ps > (prev_end - 1) // ps
+            ), f"segment at {start_pos} shares a page with the one ending at {prev_end}"
+            prev_end = start_pos + n
+            self.free_segment(free_index, start_pos=start_pos)

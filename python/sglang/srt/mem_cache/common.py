@@ -180,6 +180,18 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     req.kv = None
 
 
+def use_segment_free() -> bool:
+    """Whether kv-row frees may take the sync-free ``free_segment`` path.
+
+    Scoped to the PD decode node: there the only kv-row frees are the chunk
+    cache's finished-request release and the overallocated tail below, and both
+    starts are page-aligned. The prefill node keeps ``free()`` -- its radix-cache
+    callers have not been converted, and their grouped frees rely on the
+    group-end ``torch.unique`` to dedup pages shared between calls.
+    """
+    return get_server_args().disaggregation_mode == "decode"
+
+
 def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
@@ -194,14 +206,25 @@ def _release_overallocated_kv_indices(
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
 
-    if page_size > 1:
-        start_p = ceil_align(start_p, page_size)
+    allocator = tree_cache.token_to_kv_pool_allocator
+    # A segment free releases whole pages, including a partial last page, so the
+    # start must be aligned to the *allocator* page -- `page_size * dcp_size`
+    # under DCP, not `server_args.page_size`. Aligning to the narrower grid would
+    # hand back a page that `cache_finished_req` already released for the
+    # committed prefix, and nothing dedups across calls on the segment path.
+    segment_free = use_segment_free()
+    align = allocator.page_size if segment_free else page_size
+    if align > 1:
+        start_p = ceil_align(start_p, align)
 
     if start_p < end_p:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
-        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+        if segment_free:
+            allocator.free_segment(indices_to_free, start_pos=start_p)
+        else:
+            allocator.free(indices_to_free)
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
