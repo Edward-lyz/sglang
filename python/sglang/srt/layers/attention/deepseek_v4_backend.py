@@ -381,6 +381,8 @@ def _low_ratio_compression_metadata(
 def _low_ratio_pair_divisor(device: torch.device) -> torch.Tensor:
     """The [2, 1] (1, 2) ratio column broadcast by the paired low-ratio metadata."""
     return torch.tensor([[1], [2]], dtype=torch.int64, device=device)
+
+
 def _low_ratio_compression_metadata_pair(
     seq_lens_casual: torch.Tensor, raw_out_loc: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -393,6 +395,8 @@ def _low_ratio_compression_metadata_pair(
     out_loc = torch.where(completes_group, raw_out_loc.to(torch.int64) // ratio, -1)
     clamp1 = (seq // ratio).clamp_min(1).to(torch.int32)
     return out_loc, clamp1
+
+
 def _low_ratio_sparse_buffers_pair(
     clamp1: Tuple[torch.Tensor, torch.Tensor], topk: int, is_prefill: bool
 ):
@@ -412,6 +416,8 @@ def _low_ratio_sparse_buffers_pair(
         page_indices.unbind(0),
         raw_indices.unbind(0) if raw_indices is not None else (None, None),
     )
+
+
 def _low_ratio_sparse_buffers(
     topk_lengths_clamp1: torch.Tensor, topk: int, is_prefill: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -473,6 +479,8 @@ def _finish_prefill_indexer_selection(
 
 @dataclass
 class DSV4AttnMetadata:
+    """Per-forward DSv4 attention metadata shared by every layer of one stage."""
+
     page_size: int
     page_table: torch.Tensor
     raw_out_loc: torch.Tensor
@@ -771,6 +779,7 @@ class DSV4AttnMetadata:
             setattr(self, field_name, getattr(other, field_name))
 
     def init_compression_metadata(self, num_tokens: Optional[int] = None) -> None:
+        """Per-ratio compressed-KV write slots and top-k lengths for this stage."""
         assert self.page_table.dim() == 2
         # CP pads causal metadata for per-rank partitioning, while cache-write
         # locations remain one-per-logical-token. num_tokens tracks that unpadded
@@ -817,6 +826,14 @@ class DSV4AttnMetadata:
         if self.cut_swa_page_indices is not None:
             self.cut_swa_page_indices = _pad_last_dim(self.cut_swa_page_indices)
 
+        if tuple(self.low_ratios) == (1, 2) and envs.SGLANG_OPT_PREFILL_META_BATCH.get():
+            # Both low ratios in one broadcast pass over a [2, T] ratio axis.
+            out_loc, clamp1 = _low_ratio_compression_metadata_pair(
+                self.seq_lens_casual, self.raw_out_loc
+            )
+            self.c1_out_loc, self.c2_out_loc = out_loc.unbind(0)
+            self.c1_topk_lengths_clamp1, self.c2_topk_lengths_clamp1 = clamp1.unbind(0)
+            return
         if 1 in self.low_ratios:
             self.c1_out_loc, self.c1_topk_lengths_clamp1 = (
                 _low_ratio_compression_metadata(
@@ -859,11 +876,30 @@ class DSV4AttnMetadata:
         "c2_out_loc",
     ]
 
+    def _cp_reindex_grouped(self, local_index: torch.Tensor) -> None:
+        """Row-gather every CP-reindexed field with one gather per (dtype, row shape)
+        group: stack the group, index_select the token axis, unbind contiguous rows."""
+        groups: Dict[Tuple[torch.dtype, Tuple[int, ...]], List[str]] = {}
+        for field_name in self._CP_REINDEX_FIELDS + self._CP_REINDEX_OPTIONAL_FIELDS:
+            val = getattr(self, field_name)
+            if val is not None:
+                groups.setdefault((val.dtype, tuple(val.shape[1:])), []).append(
+                    field_name
+                )
+        for names in groups.values():
+            if len(names) == 1:
+                setattr(self, names[0], getattr(self, names[0])[local_index].contiguous())
+                continue
+            stacked = torch.stack([getattr(self, n) for n in names])
+            for n, row in zip(names, stacked.index_select(1, local_index).unbind(0)):
+                setattr(self, n, row)
+
     def apply_cp_reindex(
         self,
         num_tokens: Optional[int] = None,
         local_index: Optional[torch.Tensor] = None,
     ) -> None:
+        """Keep this CP rank's query rows of every per-token metadata field."""
         cp_rank = get_parallel().attn_cp_rank
         cp_size = get_parallel().attn_cp_size
         pre_global_len = self.seq_lens_casual.shape[0]
@@ -884,11 +920,15 @@ class DSV4AttnMetadata:
             assert isinstance(val, torch.Tensor), (
                 f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             )
-            setattr(self, field_name, val[idx].contiguous())
-        for field_name in self._CP_REINDEX_OPTIONAL_FIELDS:
-            val = getattr(self, field_name)
-            if val is not None:
-                setattr(self, field_name, val[idx].contiguous())
+        if local_index is not None and envs.SGLANG_OPT_PREFILL_META_BATCH.get():
+            self._cp_reindex_grouped(local_index)
+        else:
+            for field_name in self._CP_REINDEX_FIELDS:
+                setattr(self, field_name, getattr(self, field_name)[idx].contiguous())
+            for field_name in self._CP_REINDEX_OPTIONAL_FIELDS:
+                val = getattr(self, field_name)
+                if val is not None:
+                    setattr(self, field_name, val[idx].contiguous())
 
         for field_name in self._CP_REINDEX_FIELDS + self._CP_REINDEX_OPTIONAL_FIELDS:
             val = getattr(self, field_name)

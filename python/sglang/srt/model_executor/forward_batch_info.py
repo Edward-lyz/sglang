@@ -1362,6 +1362,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
+        """``tensor`` padded along dim 0 to ``size`` rows with ``value``."""
+        if tensor.shape[0] == size and envs.SGLANG_OPT_PREFILL_META_BATCH.get():
+            # Nothing to pad: skip the cat + empty-fill copy (an alias, not a copy).
+            return tensor
         if value == 0:
             return torch.cat(
                 [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])],

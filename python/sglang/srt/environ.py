@@ -753,6 +753,13 @@ class Envs:
     # Disagg prefill worker thread: run the forward under torch.inference_mode instead
     # of no_grad only (less per-op host overhead). Off by default.
     SGLANG_OPT_PREFILL_FWD_INFERENCE_MODE = EnvBool(False)
+    # register_custom_op ops: call the python impl directly in eager mode instead of
+    # through the torch.ops dispatcher (dispatcher kept while torch.compile traces).
+    SGLANG_OPT_EAGER_CUSTOM_OP_DIRECT = EnvBool(False)
+    # Prefill per-forward metadata with fewer launches: paired c1/c2 low-ratio
+    # metadata and buffers, one gather per dtype group in the CP reindex, and no
+    # cat when a forward-batch tensor needs no padding. Same values.
+    SGLANG_OPT_PREFILL_META_BATCH = EnvBool(False)
     # DSpark draft Markov step: build the step logits (base + w2 bias) and draw the
     # in-graph inline-RNG token in one kernel, so the fp32 [bs, vocab] step logits are
     # never written and re-read. Same tokens and block logits as the two-kernel path.
