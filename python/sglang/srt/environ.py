@@ -1117,6 +1117,11 @@ class Envs:
     # kernels/ops/quantization/configs/ (currently L40S), so it is a no-op on
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
+    # Blackwell block-fp8-as-MXFP8 dense linears (32x32 ue8m0 weights): run them on
+    # DeepGEMM instead of the FlashInfer kernel picked by --fp8-gemm-backend. Faster
+    # and lighter to launch at prefill sizes; shapes DeepGEMM cannot take fall back
+    # to FlashInfer. Byte-identical to the FlashInfer dense path (single_real_ep probe).
+    SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM = EnvBool(False)
 
     # ===================================================================
     # Humming quantization

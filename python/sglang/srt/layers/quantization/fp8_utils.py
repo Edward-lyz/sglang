@@ -689,7 +689,15 @@ def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
     if not (_is_cuda and get_platform().is_blackwell and is_flashinfer_available()):
         return Mxfp8DenseGemmBackend.UNSUPPORTED
     resolved = resolve_mxfp8_dense_gemm_backend()
-    return resolved if resolved.is_flashinfer() else Mxfp8DenseGemmBackend.UNSUPPORTED
+    if not resolved.is_flashinfer():
+        return Mxfp8DenseGemmBackend.UNSUPPORTED
+    if (
+        envs.SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM.get()
+        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+    ):
+        return Mxfp8DenseGemmBackend.DEEP_GEMM
+    return resolved
 
 
 def can_serve_block_fp8_as_mxfp8(
@@ -712,6 +720,8 @@ def can_serve_block_fp8_as_mxfp8(
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
     """The MXFP8 linear for the block-fp8 route, with the FlashInfer autotuner kept out
     of the kernel choice (see `flashinfer_mxfp8_blockscaled_linear`)."""
+    if backend.is_deep_gemm():
+        return _deepgemm_w8a8_mxfp8_linear_with_fallback
     if backend.is_flashinfer_trtllm():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="trtllm", pin_tactic=True
@@ -809,7 +819,8 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
             bias=bias,
         )
 
-    input_2d = input.view(-1, input.shape[-1])
+    # The token-group quant indexes rows densely; FlashInfer tolerated row views.
+    input_2d = input.contiguous().view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = sglang_per_token_group_quant_fp8(
