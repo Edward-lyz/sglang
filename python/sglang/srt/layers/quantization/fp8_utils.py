@@ -814,6 +814,70 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
+# Pre-quantized activation slot. A producer whose epilogue already emitted
+# the exact DeepGEMM input quant of a bf16 tensor (group 128, UE8M0,
+# column-major TMA-aligned scale; e.g. the K3 attention-residual kernel)
+# registers it, and every DeepGEMM block-FP8 linear that is handed that
+# tensor (or a contiguous reshape of it with the same last dim, e.g. the
+# [1, T, H, D] -> [T, H * D] flatten before an o_proj) reuses the pair instead
+# of re-quantizing it. The slot keeps the tensor alive, so a matching pointer
+# cannot belong to unrelated memory. One slot: the next registration replaces
+# it.
+_PREQUANTIZED_INPUT: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+
+
+def set_prequantized_input(
+    x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor
+) -> None:
+    """Register (q, scale) as the DeepGEMM input quant of x, reused by the
+    next DeepGEMM block-FP8 linear that is handed x."""
+    global _PREQUANTIZED_INPUT
+    _PREQUANTIZED_INPUT = (x, q, scale)
+
+
+def consumes_prequantized_input(layer: torch.nn.Module) -> bool:
+    """Whether ``layer`` is a DeepGEMM block-FP8 linear (group 128, UE8M0)
+    that picks up a registered pre-quantized input."""
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    method = getattr(layer, "quant_method", None)
+    weight = getattr(layer, "weight", None)
+    return (
+        isinstance(method, Fp8LinearMethod)
+        and method.block_quant
+        and not method.use_marlin
+        and not method.use_mxfp8
+        and method.w8a8_block_fp8_linear is deepgemm_w8a8_block_fp8_linear_with_fallback
+        and list(method.weight_block_size) == [128, 128]
+        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and not _is_musa
+        and weight is not None
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.shape[0] % 64 == 0
+        and weight.shape[1] % 128 == 0
+    )
+
+
+def _lookup_prequantized_input(
+    x: torch.Tensor,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    slot = _PREQUANTIZED_INPUT
+    if slot is None:
+        return None
+    src, q, scale = slot
+    if src is x or (
+        x.data_ptr() == src.data_ptr()
+        and x.dtype == src.dtype
+        and x.numel() == src.numel()
+        and x.shape[-1] == q.shape[-1]
+        and x.is_contiguous()
+        and src.is_contiguous()
+    ):
+        return q, scale
+    return None
+
+
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
