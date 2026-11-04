@@ -1,5 +1,9 @@
+"""Fake KV transfer connections for testing disaggregation without actual KV transfer."""
+
+from __future__ import annotations
+
 import logging
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -8,10 +12,32 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVManager,
     BaseKVReceiver,
     BaseKVSender,
+    KVArgs,
     KVPoll,
 )
+from sglang.srt.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from sglang.srt.disaggregation.utils import DisaggregationMode
 
 logger = logging.getLogger(__name__)
+
+
+class FakeKVManager(BaseKVManager):
+    """Fake KV manager for testing disaggregation without actual KV transfer."""
+
+    def __init__(
+        self,
+        args: KVArgs,
+        disaggregation_mode: DisaggregationMode,
+        server_args: ServerArgs,
+        is_mla_backend: Optional[bool] = False,
+    ):
+        self.args = args
+        self.disaggregation_mode = disaggregation_mode
+        self.server_args = server_args
+        self.is_mla_backend = is_mla_backend
+        logger.debug("FakeKVManager initialized")
 
 
 # For warmup reqs, we don't kv transfer, we use the fake sender and receiver

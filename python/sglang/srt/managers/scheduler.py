@@ -946,6 +946,10 @@ class Scheduler(
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        # Deferred flush_cache requests waiting for the pipeline to drain
+        # (see flush_cache_wrapped / resolve_pending_flush_cache).
+        self._pending_flush_cache_reqs: List[FlushCacheReqInput] = []
+        self._pending_flush_cache_deadline: Optional[float] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.num_retracted_reqs: int = 0
@@ -1304,6 +1308,8 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+                # Retry deferred flush_cache requests once the pipeline is at rest.
+                self.resolve_pending_flush_cache()
 
             # Update last_batch
             self.last_batch = batch
@@ -1371,6 +1377,8 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+                # Retry deferred flush_cache requests once the pipeline is at rest.
+                self.resolve_pending_flush_cache()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1561,6 +1569,10 @@ class Scheduler(
                 or self.dllm_manager.any_staging_reqs()
                 or not self.running_batch.is_empty()
                 or len(self.offload_tags) > 0
+                # A pending flush_cache needs the pipeline to fully drain;
+                # don't let health-check probes keep refilling it. The probe
+                # is still acknowledged via return_health_check_ipcs below.
+                or self._pending_flush_cache_reqs
             ):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)

@@ -78,7 +78,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ModelList,
     ResponsesRequest,
     ScoringRequest,
-    TokenizeRequest,
     V1RerankReqInput,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -751,7 +750,25 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def flush_cache():
     """Flush the radix cache."""
-    ret = await _global_state.tokenizer_manager.flush_cache()
+    # The scheduler refuses to flush while requests are in flight. Health
+    # checks (and other background traffic) frequently keep the batch
+    # non-empty, so retry until the scheduler goes idle.
+    MAX_RETRIES = 10
+    RETRY_INTERVAL_S = 1.0
+    ret = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        ret = await _global_state.tokenizer_manager.flush_cache()
+        if ret.success:
+            break
+        logger.info(
+            "[/flush_cache] attempt %d/%d failed (batch not empty), "
+            "retrying in %.1fs",
+            attempt,
+            MAX_RETRIES,
+            RETRY_INTERVAL_S,
+        )
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(RETRY_INTERVAL_S)
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
