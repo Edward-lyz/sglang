@@ -1109,6 +1109,40 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return output
 
+    def _dense_verify_q_indptr(
+        self,
+        forward_batch: ForwardBatch,
+        bs: int,
+        draft_token_num: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Dense [bs, draft_token_num] verify q_indptr, built once per forward
+        and shared by every MLA layer. The slot pins the forward_batch it was
+        built for, so a CUDA graph records the arange once; the capture flag in
+        the key keeps capture from reusing a tensor built by an eager warmup
+        pass on the same forward_batch."""
+        key = (
+            id(forward_batch),
+            bs,
+            draft_token_num,
+            torch.cuda.is_current_stream_capturing(),
+        )
+        cached = getattr(self, "_dense_verify_q_indptr_slot", None)
+        if cached is None or cached[0] is not forward_batch or cached[1] != key:
+            cached = (
+                forward_batch,
+                key,
+                torch.arange(
+                    0,
+                    (bs + 1) * draft_token_num,
+                    draft_token_num,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            )
+            self._dense_verify_q_indptr_slot = cached
+        return cached[2]
+
     def forward_extend(
         self,
         q: torch.Tensor,
