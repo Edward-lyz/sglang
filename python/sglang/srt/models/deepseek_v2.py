@@ -2716,7 +2716,13 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        split_graph_id: Optional[int] = None,
+        split_graph_list: Optional[List[Tuple[int, int]]] = None,
+        split_graph_tensors: Optional[
+            Dict[str, Union[torch.Tensor, List[torch.Tensor]]]
+        ] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        is_split_graph = split_graph_id is not None and split_graph_list is not None
         total_num_layers = self.end_layer - self.start_layer
         device = input_embeds.device if input_embeds is not None else input_ids.device
         zero_allocator = BumpAllocator(
@@ -2740,7 +2746,11 @@ class DeepseekV2Model(nn.Module):
             else None
         )
 
-        if self.pp_group.is_first_rank:
+        if is_split_graph and split_graph_id > 0:
+            assert split_graph_tensors is not None
+            hidden_states = split_graph_tensors["hidden_states"][: input_ids.shape[0]]
+            residual = split_graph_tensors["residual"][: input_ids.shape[0]]
+        elif self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
@@ -2751,7 +2761,9 @@ class DeepseekV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if nsa_use_prefill_cp(forward_batch):
+        if (not is_split_graph or split_graph_id == 0) and nsa_use_prefill_cp(
+            forward_batch
+        ):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -2770,7 +2782,9 @@ class DeepseekV2Model(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo:
+        if is_split_graph:
+            normal_start_layer, normal_end_layer = split_graph_list[split_graph_id]
+        elif forward_batch.can_run_tbo:
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer
@@ -2789,13 +2803,24 @@ class DeepseekV2Model(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
+                    aux_hidden_state = None
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = tensor_model_parallel_all_gather(
                             hidden_states + residual, dim=0
                         )
-                        aux_hidden_states.append(aux_hidden_state)
                     else:
-                        aux_hidden_states.append(hidden_states + residual)
+                        aux_hidden_state = hidden_states + residual
+                    if is_split_graph:
+                        assert split_graph_tensors is not None
+                        aux_hidden_states_buffer = split_graph_tensors[
+                            "aux_hidden_states"
+                        ]
+                        aux_hidden_state_index = self.layers_to_capture.index(i)
+                        aux_hidden_states_buffer[aux_hidden_state_index][
+                            : aux_hidden_state.shape[0]
+                        ].copy_(aux_hidden_state)
+                    else:
+                        aux_hidden_states.append(aux_hidden_state)
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
                     positions,
@@ -2807,6 +2832,17 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                     prev_topk_indices=topk_indices,
                 )
+
+        if is_split_graph and split_graph_id != len(split_graph_list) - 1:
+            assert split_graph_tensors is not None
+            split_graph_tensors["hidden_states"][: hidden_states.shape[0]].copy_(
+                hidden_states
+            )
+            if residual is None:
+                split_graph_tensors["residual"][: hidden_states.shape[0]].zero_()
+            else:
+                split_graph_tensors["residual"][: residual.shape[0]].copy_(residual)
+            return None
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2845,6 +2881,13 @@ class DeepseekV2Model(nn.Module):
                 torch.cuda.current_stream(),
             )
         if len(aux_hidden_states) == 0:
+            if is_split_graph and self.layers_to_capture:
+                assert split_graph_tensors is not None
+                aux_hidden_states_buffer = split_graph_tensors["aux_hidden_states"]
+                return hidden_states, [
+                    aux_hidden_state[: hidden_states.shape[0]]
+                    for aux_hidden_state in aux_hidden_states_buffer
+                ]
             return hidden_states
         return hidden_states, aux_hidden_states
 
@@ -2976,6 +3019,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        split_graph_id: Optional[int] = None,
+        split_graph_list: Optional[List[Tuple[int, int]]] = None,
+        split_graph_tensors: Optional[
+            Dict[str, Union[torch.Tensor, List[torch.Tensor]]]
+        ] = None,
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
@@ -2988,8 +3036,17 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors,
+                split_graph_id,
+                split_graph_list,
+                split_graph_tensors,
             )
+        if hidden_states is None:
+            return None
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states

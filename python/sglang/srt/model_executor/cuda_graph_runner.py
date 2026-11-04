@@ -22,7 +22,7 @@ import logging
 import os
 from contextlib import contextmanager
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
 
 import torch
 import tqdm
@@ -218,6 +218,55 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     return capture_bs, compile_bs
 
 
+def _normalize_split_graph_list(
+    split_graph_list: Optional[Sequence[Union[int, str]]],
+    num_layers: int,
+) -> Optional[list[tuple[int, int]]]:
+    if not split_graph_list:
+        return None
+
+    boundaries = []
+    for raw_boundary in split_graph_list:
+        if isinstance(raw_boundary, str):
+            boundary_items = raw_boundary.strip("[]").replace(",", " ").split()
+            boundaries.extend(int(item) for item in boundary_items)
+        else:
+            boundaries.append(int(raw_boundary))
+
+    if not boundaries:
+        return None
+
+    if boundaries[0] != 0:
+        boundaries.insert(0, 0)
+
+    if boundaries[-1] != num_layers:
+        raise ValueError(
+            "split graph boundaries must end with the model layer count "
+            f"({num_layers}), got {boundaries}."
+        )
+
+    split_pairs = list(zip(boundaries, boundaries[1:]))
+    if any(start >= end for start, end in split_pairs):
+        raise ValueError(
+            f"split graph boundaries must be strictly increasing, got {boundaries}."
+        )
+
+    if len(split_pairs) <= 1:
+        return None
+    return split_pairs
+
+
+def _graph_key(
+    bs: int,
+    stream_idx: Optional[int] = None,
+    split_graph_id: Optional[int] = None,
+):
+    graph_key = bs if stream_idx is None else f"{stream_idx}_{bs}"
+    if split_graph_id is None:
+        return graph_key
+    return f"{graph_key}_split_{split_graph_id}"
+
+
 # Reuse this memory pool across all cuda graph runners.
 global_graph_memory_pool = None
 
@@ -259,6 +308,21 @@ class CudaGraphRunner:
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
+        self.split_graph_list = _normalize_split_graph_list(
+            model_runner.server_args.split_graph_list,
+            model_runner.model_config.num_hidden_layers,
+        )
+        if self.split_graph_list is not None:
+            if self.enable_two_batch_overlap:
+                raise ValueError("split cuda graph does not support TBO yet.")
+            if self.pp_size > 1:
+                raise ValueError(
+                    "split cuda graph does not support pipeline parallel yet."
+                )
+            log_info_on_rank0(
+                logger,
+                f"Capture split cuda graph layers {self.split_graph_list}",
+            )
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -333,6 +397,19 @@ class CudaGraphRunner:
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
+
+        if (
+            model_runner.spec_algorithm.is_eagle3()
+            and model_runner.eagle_use_aux_hidden_state
+        ):
+            self.model_runner.model.set_eagle3_layers_to_capture()
+        num_split_aux_hidden_states = 0
+        if self.split_graph_list is not None:
+            inner_model = getattr(self.model_runner.model, "model", None)
+            num_split_aux_hidden_states = len(
+                getattr(inner_model, "layers_to_capture", [])
+            )
+
         self.buffers: GraphInputBuffers = GraphInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -349,16 +426,11 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            enable_split_graph=self.split_graph_list is not None,
+            num_split_aux_hidden_states=num_split_aux_hidden_states,
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
-
-        # Speculative_inference
-        if (
-            model_runner.spec_algorithm.is_eagle3()
-            and model_runner.eagle_use_aux_hidden_state
-        ):
-            self.model_runner.model.set_eagle3_layers_to_capture()
 
         # Capture
         try:
@@ -379,6 +451,7 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        split_graph_list = getattr(self, "split_graph_list", None)
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -389,9 +462,11 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
+        graph_key = _graph_key(
+            cuda_graph_bs,
+            get_current_stream_idx() if self.enable_pdmux else None,
+            0 if split_graph_list is not None else None,
+        )
 
         is_bs_supported = (
             graph_key in self.graphs
@@ -503,14 +578,31 @@ class CudaGraphRunner:
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                    # For pd_multiplexing, we need to save the graph and output buffers
-                    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-                    self.graphs[key] = graph
-                    self.output_buffers[key] = output_buffers
+                    split_graph_list = getattr(self, "split_graph_list", None)
+                    if split_graph_list is None:
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(bs, forward, stream_idx)
+                        key = _graph_key(bs, stream_idx)
+                        self.graphs[key] = graph
+                        self.output_buffers[key] = output_buffers
+                    else:
+                        for split_graph_id, _ in enumerate(split_graph_list):
+                            (
+                                graph,
+                                output_buffers,
+                            ) = self.capture_one_batch_size(
+                                bs,
+                                forward,
+                                stream_idx,
+                                split_graph_id=split_graph_id,
+                                skip_attn_backend_init=split_graph_id > 0,
+                            )
+                            key = _graph_key(bs, stream_idx, split_graph_id)
+                            self.graphs[key] = graph
+                            if split_graph_id == len(split_graph_list) - 1:
+                                self.output_buffers[key] = output_buffers
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -550,7 +642,12 @@ class CudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(
-        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+        self,
+        bs: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        split_graph_id: Optional[int] = None,
+        skip_attn_backend_init: bool = False,
     ):
         buffers: GraphInputBuffers = self.buffers
         graph = self._create_device_graph()
@@ -681,16 +778,18 @@ class CudaGraphRunner:
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-        # Attention backend
-        attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-        )
+        # Attention backend. Split CUDA graph captures multiple subgraphs for the
+        # same batch shape, so only the first subgraph should rebuild metadata.
+        if not skip_attn_backend_init:
+            attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
 
         # Run and capture
         def run_once():
@@ -711,6 +810,11 @@ class CudaGraphRunner:
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
+            split_graph_list = getattr(self, "split_graph_list", None)
+            if split_graph_list is not None:
+                kwargs["split_graph_id"] = split_graph_id
+                kwargs["split_graph_list"] = split_graph_list
+                kwargs["split_graph_tensors"] = buffers.split_graph_tensors
 
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
@@ -855,12 +959,19 @@ class CudaGraphRunner:
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{self.bs}"
+        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        split_graph_list = getattr(self, "split_graph_list", None)
+        if split_graph_list is None:
+            graph_key = _graph_key(self.bs, stream_idx)
+            self.graphs[graph_key].replay()
+            output = self.output_buffers[graph_key]
         else:
-            graph_key = self.bs
-        self.graphs[graph_key].replay()
-        output = self.output_buffers[graph_key]
+            final_graph_key = None
+            for split_graph_id, _ in enumerate(split_graph_list):
+                graph_key = _graph_key(self.bs, stream_idx, split_graph_id)
+                self.graphs[graph_key].replay()
+                final_graph_key = graph_key
+            output = self.output_buffers[final_graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

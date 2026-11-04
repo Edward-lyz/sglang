@@ -577,6 +577,7 @@ class ServerArgs:
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
+    split_graph_list: Optional[List[Union[int, str]]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
@@ -4485,6 +4486,20 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the list of batch sizes for cuda graph.",
+        )
+        parser.add_argument(
+            "--split-graph-list",
+            type=str,
+            nargs="+",
+            help=(
+                "Split the decode CUDA graph by model-layer boundaries. "
+                "Currently supports DeepSeek/GLM-DSA style decoder models only; "
+                "TBO and pipeline parallel are not supported. "
+                "The final boundary must be the model layer count; 0 can be omitted. "
+                "For an 80-layer model, `--split-graph-list 40 80` or "
+                "`--split-graph-list [40,80]` captures layers [0,40) and [40,80) "
+                "as two subgraphs."
+            ),
         )
         parser.add_argument(
             "--disable-cuda-graph",
