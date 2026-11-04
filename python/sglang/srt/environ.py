@@ -360,6 +360,11 @@ class Envs:
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
+    # Threads per HTTP worker that run the OpenAI request conversion (chat
+    # template + tokenizer encode) off the event loop; 0 keeps it inline. A
+    # long-prompt encode blocks the loop for 100ms+, stalling every stream the
+    # worker is serving; HF fast tokenizers release the GIL while encoding.
+    SGLANG_OPENAI_CONVERT_THREADS = EnvInt(0)
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
