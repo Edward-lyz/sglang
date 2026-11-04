@@ -1827,6 +1827,14 @@ class Envs:
     # non-blocking H2D, host-sized repeat_interleave) so the next batch's host prep
     # overlaps the previous forward instead of waiting for it to drain.
     SGLANG_FUSE_TAIL_META_NO_SYNC = EnvBool(False)
+    # [fusion-opt] Prefill-CP local-first SWA store (SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST)
+    # on a side stream, so its CP all-gather runs under q_norm + wq_b (DeepInfer's
+    # V4Attention issues the CP gathers before the q projection the same way).
+    SGLANG_FUSE_CP_SWA_STORE_OVERLAP = EnvBool(False)
+    # [fusion-opt] The local-first SWA store's CP all-gather on the copy engines (torch
+    # symmetric-memory low-contention all-gather) instead of NCCL, so it does not take
+    # SMs from the compute it overlaps under SGLANG_FUSE_CP_SWA_STORE_OVERLAP.
+    SGLANG_FUSE_CP_SWA_GATHER_CE = EnvBool(False)
     # [fusion-opt] TileKernels (deepseek-ai/TileKernels, TileLang JIT) activation casts
     # for the DeepGEMM MXFP8 linear route (SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM):
     # per_token_cast replaces the per-32 ue8m0 group quant in front of every such GEMM;

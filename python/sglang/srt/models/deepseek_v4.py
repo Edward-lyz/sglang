@@ -12,6 +12,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     Iterable,
     List,
     NamedTuple,
@@ -275,6 +276,17 @@ def _get_mhc_ops() -> MhcOps:
 
 
 logger = logging.getLogger(__name__)
+
+_CP_SWA_STORE_STREAMS: Dict[torch.device, torch.cuda.Stream] = {}
+
+
+def _cp_swa_store_stream(device: torch.device) -> torch.cuda.Stream:
+    """Side stream of SGLANG_FUSE_CP_SWA_STORE_OVERLAP, one per device."""
+    stream = _CP_SWA_STORE_STREAMS.get(device)
+    if stream is None:
+        stream = _CP_SWA_STORE_STREAMS[device] = torch.cuda.Stream(device=device)
+    return stream
+
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
@@ -1587,6 +1599,26 @@ class MQALayer(MqaAttentionBase):
             cp_size=parallel.attn_cp_size,
             defer=defer,
         )
+
+    def _cp_store_swa_kv_local_first_on_side_stream(
+        self, kv_local, positions, forward_batch, attn_backend
+    ) -> torch.cuda.Stream:
+        """[fusion-opt] SGLANG_FUSE_CP_SWA_STORE_OVERLAP: _cp_store_swa_kv_local_first on
+        a side stream; the caller joins it before its next collective so every rank keeps
+        the same order of collectives on the CP group."""
+        main = torch.cuda.current_stream()
+        side = _cp_swa_store_stream(kv_local.device)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            self._cp_store_swa_kv_local_first(
+                kv_local, positions, forward_batch, attn_backend
+            )
+        # main frees qkv_a right after; keep its block off the free list until the
+        # side stream's reads are done
+        kv_local.record_stream(side)
+        positions.record_stream(side)
+        return side
+
     def _compute_kv_bf16(
         self,
         x: torch.Tensor,
@@ -2143,6 +2175,16 @@ class MQALayer(MqaAttentionBase):
                 # local rows into cache-format staging pages, all-gather those (584 B V4 /
                 # 528 B V4.1 vs 1024 B per row) and copy rows into the SWA cache; bitwise the
                 # same cache bytes as the stock path below.
+                self._cp_store_swa_kv_local_first(
+                    (
+                        qkv_a[..., self.q_lora_rank :]
+                        if qkv_a is not None
+                        else self.wkv(x_linear)[0]
+                    ),
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                )
                 kv = None
             elif use_cp:
                 # every rank writes the whole chunk's window KV with the fused fp32 store
