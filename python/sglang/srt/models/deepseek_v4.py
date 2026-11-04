@@ -634,6 +634,9 @@ def hc_head_torch(
 _FREQS_CIS_TO_COS_SIN: dict[
     Tuple[int, torch.dtype, torch.device], Tuple[torch.Tensor, torch.Tensor]
 ] = {}
+# fp32 [N, 64] = [cos | sin] per shared freqs_cis, for flash_mla's fused attention-o op.
+_FUSED_O_COS_SIN: dict[Tuple[int, torch.device], torch.Tensor] = {}
+
 
 
 def _freqs_cis_to_cos_sin(
@@ -1206,10 +1209,94 @@ class MQALayer(MqaAttentionBase):
         self.use_fused_qk_norm_rope = (
             _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
+        # FlashMLA fused norm+RoPE+attn+inv-RoPE+fp8-cast (sparse prefill, sm100). Needs all 64
+        # heads on this rank so the op's wv groups line up with wo_a's groups, and a bf16 wo_a
+        # (re-quantized to per-32 ue8m0 fp8 on first use). wq_b's rows are permuted at load.
+        self.fused_o_attn = False
+        self._fused_o_ready: Optional[bool] = None
+        self._fused_o_active = False
+        self._fused_o_q_raw = False
+        if (
+            envs.SGLANG_OPT_FLASHMLA_FUSED_ATTN_O.get()
+            and _is_cuda
+            and self.is_dsv41
+            and get_platform().is_blackwell
+            and self.attn_tp_size == 1
+            and self.n_local_heads == 64
+            and self.head_dim == 512
+            and self.qk_rope_head_dim == 64
+            and not self.q_head_norm
+            and not self.wo_a_fp8
+        ):
+            from sglang.srt.layers.attention.dsv4.fused_o_attn import (
+                fused_o_attn_available,
+            )
+
+            if fused_o_attn_available():
+                self.fused_o_attn = True
+                self.wq_b.q_b_row_permute = (self.n_local_heads, self.head_dim)
+            else:
+                logger.warning(
+                    "SGLANG_OPT_FLASHMLA_FUSED_ATTN_O is set but flash_mla."
+                    "fused_norm_rope_attn_rope_cast is unavailable; layer %d stays unfused",
+                    layer_id,
+                )
 
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
+    def _wq_b(self, x):
+        """wq_b with its output restored to the plain [T, H*D] row order when the weight was
+        permuted for the fused attention op; callers that rope/consume q themselves use this."""
+        q, bias = self.wq_b(x)
+        if getattr(self.wq_b, "q_b_row_permuted", False):
+            from sglang.srt.layers.attention.dsv4.fused_o_attn import unpermute_q
+
+            q = unpermute_q(q, self.n_local_heads, self.head_dim).reshape(q.shape[0], -1)
+        return q, bias
+
+    def _resolve_fused_o(self) -> bool:
+        """Lazily builds the fp8 wo_a / cos-sin table once wq_b's permutation is known."""
+        if not self.fused_o_attn:
+            return False
+        if self._fused_o_ready is None:
+            wo_a_weight = getattr(self.wo_a, "weight", None)
+            ok = (
+                getattr(self.wq_b, "q_b_row_permuted", False)
+                and wo_a_weight is not None
+                and wo_a_weight.dtype == torch.bfloat16
+            )
+            if ok:
+                from sglang.srt.layers.attention.dsv4.fused_o_attn import (
+                    make_cos_sin_cache,
+                    prepare_wo_a,
+                )
+
+                self._wo_a_fused_w, self._wo_a_fused_sf = prepare_wo_a(
+                    wo_a_weight.data,
+                    self.n_local_groups,
+                    self.n_local_heads // self.n_local_groups,
+                    self.head_dim,
+                )
+                key = (id(self.freqs_cis), self.freqs_cis.device)
+                if key not in _FUSED_O_COS_SIN:
+                    _FUSED_O_COS_SIN[key] = make_cos_sin_cache(self.freqs_cis)
+                self._fused_o_cos_sin = _FUSED_O_COS_SIN[key]
+                if self.layer_id == 0 or self.layer_id == 2:
+                    logger.info(
+                        "fused attention-o (flash_mla norm+rope+attn+inv-rope+fp8 cast) "
+                        "enabled; first seen on layer %d",
+                        self.layer_id,
+                    )
+            else:
+                logger.warning(
+                    "fused attention-o disabled for layer %d (wq_b permuted=%s)",
+                    self.layer_id,
+                    getattr(self.wq_b, "q_b_row_permuted", False),
+                )
+            self._fused_o_ready = bool(ok)
+        return self._fused_o_ready
+
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
@@ -1292,7 +1379,11 @@ class MQALayer(MqaAttentionBase):
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(q)
+        if self._fused_o_q_raw:
+            # fused decode attention ropes q itself and wants wq_b's permuted row order
+            q, _ = self.wq_b(q)
+            return q.view(-1, self.n_local_heads, self.head_dim)
+        q, _ = self._wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
             if (
@@ -1761,6 +1852,16 @@ class MQALayer(MqaAttentionBase):
         )
 
         unified = is_unified_kv_triton()
+        # FlashMLA fused attention-o: q stays un-roped in wq_b's permuted row order and the
+        # backend's sparse prefill ropes it inside the attention launch (see forward()).
+        fused_o = (
+            self.fused_o_attn
+            and not unified
+            and not is_in_breakable_cuda_graph()
+            and attn_backend.fused_o_prefill_eligible(forward_batch, x.shape[0])
+            and self._resolve_fused_o()
+        )
+        self._fused_o_active = fused_o
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         # The kernel is token-indexed (q, kv and positions are all length M), so
         # a verify batch carrying several draft tokens per request is a shape it
@@ -1774,14 +1875,14 @@ class MQALayer(MqaAttentionBase):
             not unified and self.use_fused_qk_norm_rope
         )
 
-        if do_fused_qk_norm_rope:
+        if do_fused_qk_norm_rope and not fused_o:
             if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
                 )
-                q, _ = self.wq_b(q_for_wqb)
+                q, _ = self._wq_b(q_for_wqb)
             else:
                 q_lora = self.q_norm(q_lora)
                 q, _ = self.wq_b(q_lora)
@@ -2107,6 +2208,31 @@ class MQALayer(MqaAttentionBase):
             q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
+        # FlashMLA fused attention-o for decode: q stays un-roped in wq_b's permuted row order
+        # (_compute_q_b returns it as is) and the backend's decode attention ropes it, attends over
+        # the paged V4.1 caches, un-ropes o and casts to fp8 for wo_a's fp8 einsum (see below).
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        self._fused_o_q_raw = False
+        if (
+            self.fused_o_attn
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+                or attn_backend.fused_o_tail_extend(forward_batch)
+            )
+            and kernel_num_heads == self.n_local_heads
+            and not is_unified_kv_triton()
+            and attn_backend.fused_o_decode_eligible(forward_batch)
+            # first use builds the fp8 wo_a (allocations + DeepGEMM layout kernels): never inside a
+            # CUDA graph capture; the eager warmup run before capture does it.
+            and (self._fused_o_ready or not torch.cuda.is_current_stream_capturing())
+            and self._resolve_fused_o()
+        ):
+            self._fused_o_q_raw = True
+
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
@@ -2157,6 +2283,40 @@ class MQALayer(MqaAttentionBase):
                 q_out,
                 x_quant=x_quant,
             )
+        if self._fused_o_q_raw:
+            from sglang.srt.layers.attention.dsv4.fused_o_attn import wo_a_einsum
+
+            o_fp8, o_sf = attn_backend.forward_fused_o_decode(
+                q,
+                self.attn_mqa,
+                forward_batch,
+                self.compress_ratio,
+                attn_sink,
+                positions,
+                self._fused_o_cos_sin,
+                self.n_local_groups,
+            )
+            o = wo_a_einsum(o_fp8, o_sf, self._wo_a_fused_w, self._wo_a_fused_sf)
+            o, _ = self.wo_b(o.flatten(1))
+            return o
+
+        if self._fused_o_active and not enable_multi_stream and not low_ratio_multi_stream:
+            from sglang.srt.layers.attention.dsv4.fused_o_attn import wo_a_einsum
+
+            # q_out is None here (kernel_num_heads == n_local_heads), so q is the wq_b output.
+            o_fp8, o_sf = attn_backend.forward_fused_o_prefill(
+                q,
+                self.attn_mqa,
+                forward_batch,
+                self.compress_ratio,
+                attn_sink,
+                positions,
+                self._fused_o_cos_sin,
+                self.n_local_groups,
+            )
+            o = wo_a_einsum(o_fp8, o_sf, self._wo_a_fused_w, self._wo_a_fused_sf)
+            o, _ = self.wo_b(o.flatten(1))
+            return o
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or

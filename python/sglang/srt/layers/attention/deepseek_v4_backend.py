@@ -204,9 +204,9 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 def _create_flashmla_metadata():
     if get_platform().is_sm120 or _is_xpu:
         return None
-    import sgl_kernel.flash_mla as flash_mla
+    return _flashmla_module().get_mla_metadata()[0]
 
-    return flash_mla.get_mla_metadata()[0]
+
 def _flashmla_module():
     """FlashMLA module for the decode kernel and its scheduler metadata (they must come from the same one).
 
@@ -4521,6 +4521,24 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
+        fused_o = self._fused_o_args
+        if fused_o is not None and fused_o.mode == "prefill":
+            # q is permuted and not yet roped; the op ropes q, attends, un-ropes o and casts to
+            # per-32 ue8m0 fp8 for wo_a's fp8 einsum. Returns (out_fp8, out_sf), not o.
+            from sglang.srt.layers.attention.dsv4.fused_o_attn import fused_prefill
+
+            return fused_prefill(
+                q_flat,
+                kv,
+                combined_indices.unsqueeze(1),
+                fused_o.positions,
+                fused_o.cos_sin_cache,
+                self.softmax_scale,
+                fused_o.n_wv_group,
+                attn_sink,
+                combined_lens,
+            )
+
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,
             kv=kv,
@@ -4558,6 +4576,163 @@ class DeepseekV4AttnBackend(
             reused.shape[0],
         )
 
+    # Set only for the duration of forward_fused_o_prefill (see below).
+    _fused_o_args = None
+
+    def fused_o_prefill_eligible(
+        self, forward_batch: ForwardBatch, num_q_tokens: int
+    ) -> bool:
+        """True iff _forward_attention would take the bf16-workspace sparse prefill path for this
+        batch, i.e. the one call site that can run flash_mla's fused attention + o cast."""
+        pool = self.token_to_kv_pool
+        meta = self.forward_metadata
+        return (
+            isinstance(pool, DeepSeekV4TokenToKVPool)
+            and isinstance(getattr(meta, "core_attn_metadata", None), DSV4AttnMetadata)
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not get_platform().is_sm120
+            and not self.trtllm_attn
+            and meta.late_layer_tail is None
+            and pool.request_window is None
+            and not use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend)
+            and (
+                num_q_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            )
+        )
+
+    def forward_fused_o_prefill(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        compress_ratio: Literal[0, 1, 2, 4, 128],
+        attn_sink: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        n_wv_group: int,
+    ):
+        """Sparse prefill through flash_mla's fused norm+RoPE+attn+inv-RoPE+fp8-cast op.
+        `q` is [T, H, 512] bf16 in the permuted row order, NOT roped; the caller must have checked
+        fused_o_prefill_eligible. Returns (out_fp8, out_sf)."""
+        from types import SimpleNamespace
+
+        self._fused_o_args = SimpleNamespace(
+            mode="prefill",
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            n_wv_group=n_wv_group,
+        )
+        try:
+            result = self._forward_attention(
+                q,
+                q,
+                q,
+                layer,
+                forward_batch,
+                compress_ratio,
+                save_kv_cache=False,
+                attn_sink=attn_sink,
+            )
+        finally:
+            self._fused_o_args = None
+        assert isinstance(result, tuple), (
+            "fused-o prefill was routed to a non-fused attention path; q is un-roped and permuted"
+        )
+        return result
+
+    def fused_o_decode_eligible(self, forward_batch: ForwardBatch) -> bool:
+        """True iff _forward_attention would reach the paged-cache decode kernel for this batch.
+
+        The fused decode op reads the pool's records in place: V4 (584 B) and V4.1 (528 B / 288 B fp4 extra)
+        records are read by the FlashMLA build at 07a1089 (the first V4.1 release); later FlashMLA builds read
+        per-token V4.1 records only, which is not the layout this pool writes."""
+        pool = self.token_to_kv_pool
+        if not isinstance(pool, DeepSeekV4TokenToKVPool):
+            return False
+        return (
+            forward_batch.forward_mode.is_decode()
+            and isinstance(
+                getattr(self.forward_metadata, "core_attn_metadata", None), DSV4AttnMetadata
+            )
+            and not get_platform().is_sm120
+            and not self.trtllm_attn
+            and not getattr(pool, "uniform_fp8", False)
+        )
+
+    def forward_fused_o_decode(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        compress_ratio: Literal[0, 1, 2, 4, 128],
+        attn_sink: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        n_wv_group: int,
+    ):
+        """Decode attention through flash_mla's fused norm+RoPE+attn+inv-RoPE+fp8-cast op.
+        `q` is [T, H, 512] bf16 in the permuted row order, NOT roped; the caller must have checked
+        fused_o_decode_eligible. Returns (out_fp8, out_sf)."""
+        from types import SimpleNamespace
+
+        if not getattr(self, "_fused_decode_logged", False):
+            self._fused_decode_logged = True
+            logger.info(
+                "fused attention-o decode active (paged %s cache, extra=%s, capturing=%s)",
+                self.token_to_kv_pool.kv_layout.value,
+                compress_ratio != 0,
+                torch.cuda.is_current_stream_capturing(),
+            )
+        if positions.dtype != torch.int32 and envs.SGLANG_OPT_FUSED_O_POSITIONS_I32_ONCE.get():
+            # The fused op wants int32 positions; every layer of one forward passes the same
+            # tensor, so cast once per forward (inside the graph on capture) instead of one
+            # tiny copy kernel per layer between k_norm_rope and the attention kernel. A new
+            # forward starts when the layer id stops increasing, which refreshes the cast
+            # (the batch object and its positions buffer may be reused across steps).
+            cached = getattr(self, "_positions_i32_cache", None)
+            layer_id = layer.layer_id
+            if (
+                cached is None
+                or cached[0] is not positions
+                or cached[1] != positions.data_ptr()
+                or cached[2] >= layer_id
+                or cached[4] is not forward_batch
+            ):
+                cached = (
+                    positions,
+                    positions.data_ptr(),
+                    layer_id,
+                    positions.to(torch.int32),
+                    forward_batch,
+                )
+            else:
+                cached = (cached[0], cached[1], layer_id, cached[3], cached[4])
+            self._positions_i32_cache = cached
+            positions = cached[3]
+        self._fused_o_args = SimpleNamespace(
+            mode="decode",
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            n_wv_group=n_wv_group,
+        )
+        try:
+            result = self._forward_attention(
+                q,
+                q,
+                q,
+                layer,
+                forward_batch,
+                compress_ratio,
+                save_kv_cache=False,
+                attn_sink=attn_sink,
+            )
+        finally:
+            self._fused_o_args = None
+        assert isinstance(result, tuple), (
+            "fused-o decode was routed to a non-fused attention path; q is un-roped and permuted"
+        )
+        return result
 
     def _prepare_q8kv8_q_and_sink(
         self,

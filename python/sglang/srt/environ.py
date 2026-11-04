@@ -1848,6 +1848,11 @@ class Envs:
     # is not bit-identical to hc_post/_hc_combine/_hc_mix_stats (~1 bf16 ulp on
     # ~1e-5 of the residual, fp32-level on the mixes).
     SGLANG_OPT_DSV41_DSPARK_AUX_FROM_MEGA_MHC = EnvBool(False)
+    # DSv4.1 sm100 sparse prefill (attn_tp_size == 1, e.g. prefill CP): one FlashMLA launch does
+    # q RoPE + sparse attention + inverse RoPE + per-32 ue8m0 fp8 cast, feeding wo_a's fp8 einsum
+    # directly. Permutes wq_b rows at load and keeps an extra fp8 copy of wo_a (~33 MB/layer).
+    # Needs flash_mla.fused_norm_rope_attn_rope_cast and a DeepGEMM with (1,1,32) SF layouts.
+    SGLANG_OPT_FLASHMLA_FUSED_ATTN_O = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
