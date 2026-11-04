@@ -19,6 +19,27 @@ DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 logger = logging.getLogger(__name__)
 
+# ROOT-FIX(luno-dcp-spec-rng): dedicated CUDA generator for ALL speculative
+# draft/verify sampling draws. Seeded IDENTICALLY on every TP/DCP rank and
+# touched ONLY by spec sampling, so — because all shards of a DP-attention
+# group verify/draft the SAME requests in lockstep — every rank draws bit-
+# identical coins with ZERO communication. Replaces the per-rank
+# torch.rand/exponential_/multinomial whose per-process CUDA RNG drifted across
+# DCP shards and made them accept different tokens/lengths/bonus for the SAME
+# request -> running-batch desync -> collective deadlock (hang).
+_SPEC_SAMPLE_GENERATORS: dict = {}
+
+
+def get_spec_sample_generator(device) -> "torch.Generator":
+    """get_spec_sample_generator"""
+    key = str(device)
+    g = _SPEC_SAMPLE_GENERATORS.get(key)
+    if g is None:
+        g = torch.Generator(device=device)
+        g.manual_seed(0)
+        _SPEC_SAMPLE_GENERATORS[key] = g
+    return g
+
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
@@ -648,10 +669,11 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     threshold_acc = max(float(threshold_acc), 1e-9)
 
     device = next_token_logits.device
+    _spec_gen = get_spec_sample_generator(device)
 
     if uniform_samples is None:
         uniform_samples = torch.rand(
-            (bs, draft_token_num), dtype=torch.float32, device=device
+            (bs, draft_token_num), dtype=torch.float32, device=device, generator=_spec_gen
         )
     else:
         if uniform_samples.shape != (bs, draft_token_num):
@@ -663,7 +685,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
 
     if uniform_samples_for_final_sampling is None:
         uniform_samples_for_final_sampling = torch.rand(
-            (bs,), dtype=torch.float32, device=device
+            (bs,), dtype=torch.float32, device=device, generator=_spec_gen
         )
     else:
         if uniform_samples_for_final_sampling.shape != (bs,):

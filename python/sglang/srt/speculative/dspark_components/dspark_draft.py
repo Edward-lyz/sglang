@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import vocab_dp_static_rows
+from sglang.srt.speculative.dflash_utils import get_spec_sample_generator
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -280,7 +281,7 @@ def sample_draft_block(
             if fast_sampling:
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
-                ).exponential_(1)
+                ).exponential_(1, generator=get_spec_sample_generator(step_logits.device))
                 return SampleStepTokens.execute(
                     step_logits=step_logits,
                     temperatures=temperatures,
@@ -293,7 +294,11 @@ def sample_draft_block(
                 )
                 probs = expect(_DRAFT_PROBS, probs)
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
-                sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                sampled_tokens = torch.multinomial(
+                    probs,
+                    num_samples=1,
+                    generator=get_spec_sample_generator(probs.device),
+                ).squeeze(-1)
                 return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
 
     draft_tokens, corrected_logits = markov_head.sample_block(
