@@ -90,6 +90,7 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -116,7 +117,10 @@ from sglang.srt.layers.moe.utils import (
     is_tbo_enabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import (
+    materialize_bpreshuffle_fp8_scale,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale,
 )
@@ -124,6 +128,7 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.cp_utils import (
@@ -447,13 +452,55 @@ class MoEGate(nn.Module):
         is_deepseek_v4: bool = False,
         dsa_enable_prefill_cp: bool = False,
         mla_enable_prefill_cp: bool = False,
+        fp8_weight: bool = False,
     ):
         super().__init__()
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
-        self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+        self._fp8_weight = fp8_weight
+        quant_name = (
+            getattr(quant_config, "get_name", lambda: "")()
+            if quant_config is not None
+            else ""
         )
+        self._block_fp8_weight = bool(
+            self._fp8_weight
+            and quant_name == "fp8"
+            and getattr(quant_config, "weight_block_size", None) is not None
+        )
+        if self._fp8_weight and quant_name not in {"modelopt_fp8", "fp8"}:
+            raise ValueError(
+                "FP8 MoE router weight requires ModelOpt or block-FP8 config"
+            )
+        weight_shape = (config.n_routed_experts, config.hidden_size)
+        if self._block_fp8_weight:
+            self.quant_method = Fp8LinearMethod(quant_config)
+            self.quant_method.create_weights(
+                self,
+                input_size_per_partition=config.hidden_size,
+                output_partition_sizes=[config.n_routed_experts],
+                input_size=config.hidden_size,
+                output_size=config.n_routed_experts,
+                params_dtype=torch.bfloat16,
+                weight_loader=default_weight_loader,
+                skip_block_quant_check=True,
+            )
+            self.weight_scale = None
+        elif self._fp8_weight:
+            self.weight = ModelWeightParameter(
+                data=torch.empty(weight_shape, dtype=torch.float8_e4m3fn),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=default_weight_loader,
+            )
+            self.weight_scale = ChannelQuantScaleParameter(
+                data=torch.empty((config.n_routed_experts, 1), dtype=torch.float32),
+                output_dim=0,
+                weight_loader=default_weight_loader,
+            )
+        else:
+            self.weight = nn.Parameter(torch.empty(weight_shape))
+            self.weight_scale = None
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
@@ -489,16 +536,30 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        if self._block_fp8_weight:
+            # DeepGEMM produces BF16. Cast its small router output to FP32 so
+            # sigmoid/top-k retain the same precision contract as the BF16
+            # router path.
+            return self.quant_method.apply(self, hidden_states).float()
+
+        # ModelOpt K3 router weights use one FP32 scale per output channel.
+        # Router kernels consume BF16 weights, so dequantize only the current
+        # router matrix immediately before GEMM; non-FP8 checkpoints retain
+        # the original zero-copy BF16 path.
+        weight = self.weight
+        if self._fp8_weight:
+            weight = (weight.float() * self.weight_scale.float()).to(torch.bfloat16)
+
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
-                self.weight,
+                weight,
                 None,  # bias
                 True,  # is_vnni
             )
 
         if get_server_args().enable_deterministic_inference:
-            return F.linear(hidden_states, self.weight, None)
+            return F.linear(hidden_states, weight, None)
 
         if (
             not self.is_deepseek_v4
@@ -511,8 +572,8 @@ class MoEGate(nn.Module):
             if _is_cuda:
                 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 
-                return linear_bf16_fp32(hidden_states, self.weight)
-            return F.linear(hidden_states, self.weight, None)
+                return linear_bf16_fp32(hidden_states, weight)
+            return F.linear(hidden_states, weight, None)
         else:
             # NOTE(b8zhong): this threshold has been empirically verified
             max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
@@ -524,18 +585,18 @@ class MoEGate(nn.Module):
                 and _device_sm >= 90
             ):
                 logits = dsv3_router_gemm(
-                    hidden_states, self.weight, out_dtype=torch.float32
+                    hidden_states, weight, out_dtype=torch.float32
                 )
 
             elif _use_aiter:
-                logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+                logits = aiter_dsv3_router_gemm(hidden_states, weight)
             elif not _is_cuda:
-                logits = F.linear(hidden_states, self.weight, None)
+                logits = F.linear(hidden_states, weight, None)
             else:
                 # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
                 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 
-                logits = linear_bf16_fp32(hidden_states, self.weight)
+                logits = linear_bf16_fp32(hidden_states, weight)
 
         return logits
 

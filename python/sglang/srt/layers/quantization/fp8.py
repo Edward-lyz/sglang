@@ -225,6 +225,7 @@ class Fp8Config(QuantizationConfig):
         is_checkpoint_fp8_serialized: bool = False,
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
+        modules_to_convert: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
@@ -242,6 +243,10 @@ class Fp8Config(QuantizationConfig):
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        # Mixed checkpoints such as Kimi-K3 keep most linears in BF16.  A
+        # positive allowlist avoids allocating FP8 parameters for modules that
+        # have no serialized scale tensor.
+        self.modules_to_convert = modules_to_convert or []
         if ignored_layers_str := envs.SGLANG_FP8_IGNORED_LAYERS.get():
             self.ignored_layers.extend(
                 [
@@ -307,6 +312,9 @@ class Fp8Config(QuantizationConfig):
         ignored_layers = cls.get_from_keys_or(
             config, ["ignored_layers", "modules_to_not_convert"], None
         )
+        modules_to_convert = cls.get_from_keys_or(
+            config, ["modules_to_convert"], None
+        )
         if ignored_layers:
             # Keep both "model." and non-"model." variants for robust prefix matching.
             normalized = []
@@ -328,6 +336,7 @@ class Fp8Config(QuantizationConfig):
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
+            modules_to_convert=modules_to_convert,
             weight_block_size=weight_block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
@@ -341,6 +350,8 @@ class Fp8Config(QuantizationConfig):
         from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
+            if not self._is_module_selected(prefix):
+                return UnquantizedLinearMethod()
             if is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
@@ -413,10 +424,52 @@ class Fp8Config(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
+    @staticmethod
+    def _same_module_name(lhs: str, rhs: str) -> bool:
+        """Compare names across optional multimodal/model root prefixes."""
+        lhs = lhs.replace(".block_sparse_moe.", ".mlp.")
+        rhs = rhs.replace(".block_sparse_moe.", ".mlp.")
+        return (
+            lhs == rhs
+            or lhs.endswith("." + rhs)
+            or rhs.endswith("." + lhs)
+        )
+
+    def _is_module_selected(self, prefix: str) -> bool:
+        if not self.modules_to_convert:
+            return True
+        if any(
+            self._same_module_name(prefix, target)
+            for target in self.modules_to_convert
+        ):
+            return True
+
+        # Runtime modules may fuse independently serialized checkpoint
+        # projections. Quantize the fused module only when every constituent
+        # is present in the positive allowlist; a partially quantized fused
+        # parameter cannot have one coherent block-scale layout.
+        base, _, tail = prefix.rpartition(".")
+        source_modules = self.packed_modules_mapping.get(tail)
+        if not source_modules:
+            return False
+        return all(
+            any(
+                self._same_module_name(f"{base}.{source}", target)
+                for target in self.modules_to_convert
+            )
+            for source in source_modules
+        )
+
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         if self.ignored_layers:
             self.ignored_layers = list(
                 dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
+            )
+        if self.modules_to_convert:
+            self.modules_to_convert = list(
+                dict.fromkeys(
+                    hf_to_sglang_mapper.apply_list(self.modules_to_convert)
+                )
             )
 
 
@@ -480,7 +533,6 @@ class Fp8LinearMethod(LinearMethodBase):
         output_partition_sizes: List[int],
         skip_block_quant_check: bool = False,
     ):
-        tp_size = get_parallel().tp_size
         block_n, block_k = (
             quant_config.weight_block_size[0],
             quant_config.weight_block_size[1],
@@ -491,6 +543,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 "Skipping block quantization checks for weight partition."
             )
         else:
+            tp_size = get_parallel().tp_size
             # Required by row parallel
             if tp_size > 1 and input_size // input_size_per_partition == tp_size:
                 if input_size_per_partition % block_k != 0:

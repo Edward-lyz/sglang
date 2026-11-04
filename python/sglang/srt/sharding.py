@@ -1668,8 +1668,9 @@ def _setup_shard_weight(
         or not (is_unquantized or is_modelopt_fp8 or is_block_fp8)
     ):
         raise RuntimeError(
-            f"K3 weight sharding only supports contiguous, unquantized bf16/fp16 "
-            f"linear weights; {target_attr} has shape={tuple(weight.shape)}, "
+            f"K3 weight sharding only supports contiguous bf16/fp16, ModelOpt "
+            f"FP8, or block FP8 linear weights; {target_attr} has "
+            f"shape={tuple(weight.shape)}, "
             f"dtype={weight.dtype}, contiguous={weight.is_contiguous()}, "
             f"quant_method={type(quant_method).__name__}"
         )
@@ -1726,6 +1727,34 @@ def _setup_shard_weight(
         return None
 
     shard_rows = out_per_tp // shard_size
+
+    if is_block_fp8:
+        # Block-FP8 must be requantized to the runtime UE8M0 layout from the
+        # complete (N, K) weight and complete FP32 block-scale matrix. Keep the
+        # full parameter through post-load processing, allocate only the final
+        # row shard here, and slice the requantized weight during finalize.
+        # The packed scale remains full and replicated because every forward
+        # reconstructs the full weight with one AllGather.
+        target_mod._k3_requant_then_shard = True
+        sharded = ShardedWeight.allocate(
+            name=f"layer{layer_id}.{target_attr}",
+            full_shape=(out_per_tp, in_dim),
+            dtype=weight.dtype,
+            device=weight.device,
+            dp_size=shard_size,
+            dp_group=shard_group,
+            shard_dim=0,
+            defer_full_buf=True,
+            use_ce=True,
+        )
+        if rank0:
+            logger.info(
+                f"[K3WeightShard layer={layer_id}] requant-then-shard: "
+                f"{target_attr}.weight kept full ({out_per_tp}, {in_dim}) "
+                f"through post-load; allocated row shard "
+                f"({shard_rows}, {in_dim}); weight_scale_inv remains full"
+            )
+        return sharded
 
     # Load-time sharding: shrink weight.data to this rank's row range and
     # replace the loader so the checkpoint's other 7/8 rows are never copied
@@ -1894,10 +1923,9 @@ def finalize_layer_weight_shard_flat(
         (sharded_attr, target_path)
         for _role, sharded_attr, target_path in layer._weight_shard_targets
     ]
-    # 1. The row shard was loaded straight into `sharded.shard` by the
-    #    replaced weight_loader, and `target_mod.weight.data` shares that
-    #    storage. Anything that re-pointed weight.data in between (a merge
-    #    helper, a requant) would silently drop the loaded rows, so assert.
+    # 1. BF16/ModelOpt weights were loaded directly into the row shard. Block
+    #    FP8 instead reached this point as a fully loaded and UE8M0-requantized
+    #    matrix; slice its rank-local rows now, then release the full tensor.
     _, _, shard_rank, shard_kind = get_weight_sharding_group_info()
     for sharded_attr, target_attr in slot_target:
         sharded = getattr(layer, sharded_attr, None)
@@ -1906,6 +1934,23 @@ def finalize_layer_weight_shard_flat(
             continue
         if sharded.is_passthrough:
             sharded.full_buf.copy_(target_mod.weight.data)
+            continue
+        if getattr(target_mod, "_k3_requant_then_shard", False):
+            full_weight = target_mod.weight.data
+            shard_rows = sharded.shard.shape[0]
+            source = full_weight.narrow(
+                0, shard_rank * shard_rows, shard_rows
+            )
+            sharded.shard.copy_(source)
+            target_mod.weight.data = sharded.shard
+            if rank0:
+                logger.info(
+                    f"[K3WeightShard layer={_layer_id(layer)} "
+                    f"target={target_attr}] sliced requantized full weight "
+                    f"{tuple(full_weight.shape)} -> {tuple(sharded.shard.shape)}; "
+                    "full weight released"
+                )
+            del full_weight
             continue
         if target_mod.weight.data.data_ptr() != sharded.shard.data_ptr():
             raise RuntimeError(
