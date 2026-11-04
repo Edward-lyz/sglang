@@ -306,7 +306,6 @@ class CacheTransferPhase(str, Enum):
 
 
 class LRURefreshPhase(str, Enum):
-
     WALKDOWN = "walkdown"  # touching a node while walking through the tree
     MATCH_END = "match_end"  # end of a successful prefix match
     INSERT_END = "insert_end"  # after a new/updated leaf is committed

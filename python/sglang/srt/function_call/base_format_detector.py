@@ -7,13 +7,17 @@ import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
+from sglang.srt.entrypoints.openai.protocol import (
+    Tool,
+    ToolCallConstraint,
+    ToolChoice,
+)
 try:
     from xgrammar import StructuralTag, get_model_structural_tag
 except ImportError:
     StructuralTag = Any
     get_model_structural_tag = None
 
-from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -32,7 +36,12 @@ logger = logging.getLogger(__name__)
 class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        tools: Optional[List[Tool]] = None,
+        tool_choice: Union[Literal["required", "auto", "none"], ToolChoice] = "auto",
+        parallel_tool_calls: bool = True,
+    ):
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
         self._buffer = ""
@@ -55,6 +64,14 @@ class BaseFormatDetector(ABC):
         self.bot_token = ""
         self.eot_token = ""
         self.tool_call_separator = ", "
+
+        self.tools: List[Tool] = tools if tools is not None else []
+        self.tool_choice: Union[Literal["required", "auto", "none"], ToolChoice] = (
+            tool_choice
+        )
+        self.parallel_tool_calls: bool = parallel_tool_calls
+
+        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL
 
     def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
         """
@@ -164,9 +181,9 @@ class BaseFormatDetector(ABC):
                 # Might be partial bot_token, keep buffering
                 return StreamingParseResult()
 
-        # Build tool indices if not already built
+        # Build tool indices once; reuse on subsequent streaming calls
         if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
+            self._tool_indices = self._get_tool_indices(tools) if tools else {}
 
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 

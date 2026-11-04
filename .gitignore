@@ -286,3 +286,9 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Local AI tool state
+.gitnexus
+.claude/
+.codex/
+.agents/

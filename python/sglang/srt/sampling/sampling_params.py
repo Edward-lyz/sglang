@@ -107,6 +107,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     spaces_between_special_tokens: bool = True
     no_stop_trim: bool = False
     custom_params: Optional[Dict[str, CustomParamValue]] = None
+    # Only limits tokens inside <think>...</think>
+    thinking_budget: Optional[int] = None
+    # Must NOT include </think>; server will append end token when injecting.
+    thinking_prompt_token_ids: Optional[List[int]] = None
     stream_interval: Optional[int] = None
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None

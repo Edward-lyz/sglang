@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
-
 class SchedulerStats: ...  # type: ignore[no-redef]
 
 

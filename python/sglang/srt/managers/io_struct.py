@@ -309,6 +309,8 @@ class GenerateReqInput:
     as_kv_cache_params: Optional[Union[List[dict], dict]] = None
     as_max_hit_host_ip: Optional[Union[List[List[str]], List[str]]] = None
     as_max_hit_token_len: Optional[Union[List[List[int]], List[int]]] = None
+    # Function call continuation: token IDs to replay for grammar state recovery
+    continuation_token_ids: Optional[List[int]] = None
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
@@ -806,6 +808,7 @@ class GenerateReqInput:
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
+            continuation_token_ids=self.continuation_token_ids,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             custom_logit_processor=(
@@ -942,6 +945,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
 
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -990,6 +996,12 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     as_kv_cache_params: Optional[dict] = None  # From request
     as_max_hit_host_ip: Optional[List[str]] = None  # From request
     as_max_hit_token_len: Optional[List[int]] = None  # From request
+    # Function call continuation: token IDs to replay for grammar state recovery
+    continuation_token_ids: Optional[List[int]] = None
+
+    # Return scheduler-finalized prompt token IDs without enqueueing generation.
+    tokenize_only: bool = False
+
 
 class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized requests
@@ -1004,6 +1016,15 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
 
     def __iter__(self):
         return iter(self.batch)
+
+
+class TokenizeReqOutput(BaseReq, kw_only=True):
+    """Scheduler-finalized prompt token IDs for a tokenize-only request."""
+
+    input_ids: List[int]
+    input_ids_unpadded: List[int]
+    error_message: Optional[str] = None
+    status_code: int = 200
 
 
 @dataclass

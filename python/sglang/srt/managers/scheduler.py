@@ -138,6 +138,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TokenizeReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -1807,6 +1808,7 @@ class Scheduler(
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
+            send_tokenize_output=self._send_tokenize_req_output,
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
         )
@@ -2129,10 +2131,37 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _build_tokenize_req_output(
+        self,
+        req: Req,
+        error_message: Optional[str] = None,
+        status_code: HTTPStatus = HTTPStatus.OK,
+    ) -> TokenizeReqOutput:
+        output = TokenizeReqOutput(
+            rid=req.rid,
+            http_worker_ipc=req.http_worker_ipc,
+            input_ids=list(req.origin_input_ids),
+            input_ids_unpadded=list(req.origin_input_ids_unpadded),
+            error_message=error_message,
+            status_code=int(status_code),
+        )
+        if req.multimodal_inputs is not None:
+            req.multimodal_inputs.release_features()
+            req.multimodal_inputs = None
+        return output
+
+    def _send_tokenize_req_output(
+        self, req: Req, error_message: str, status_code: HTTPStatus
+    ) -> None:
+        self.ipc_channels.send_to_tokenizer.send_output(
+            self._build_tokenize_req_output(req, error_message, status_code)
+        )
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        is_tokenize_only = recv_req.tokenize_only
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -2197,6 +2226,9 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+            req.continuation_token_ids = recv_req.continuation_token_ids
+            req.init_continuation_reasoning_state(self.model_config.think_end_ids)
+            req.init_thinking_budget()
 
             # Unpack AttentionStore parameters to Req
             if self.enable_asradix_cache:
@@ -2204,7 +2236,10 @@ class Scheduler(
                 req.as_kv_cache_params = recv_req.as_kv_cache_params
                 req.as_max_hit_host_ip = recv_req.as_max_hit_host_ip or []
                 req.as_max_hit_token_len = recv_req.as_max_hit_token_len or []
-            if self.disaggregation_mode != DisaggregationMode.NULL:
+            if (
+                not is_tokenize_only
+                and self.disaggregation_mode != DisaggregationMode.NULL
+            ):
                 # Invalid request for disaggregated mode
                 if (
                     recv_req.bootstrap_room is None
@@ -2238,6 +2273,12 @@ class Scheduler(
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
             if isinstance(req.finished_reason, FINISH_ABORT):
+                if is_tokenize_only:
+                    return self._build_tokenize_req_output(
+                        req,
+                        req.finished_reason.message,
+                        req.finished_reason.status_code or HTTPStatus.BAD_REQUEST,
+                    )
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
@@ -2260,6 +2301,10 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)
+            if is_tokenize_only:
+                return self._build_tokenize_req_output(
+                    req, error_msg, HTTPStatus.BAD_REQUEST
+                )
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
@@ -2269,6 +2314,10 @@ class Scheduler(
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
+                if is_tokenize_only:
+                    return self._build_tokenize_req_output(
+                        req, error_msg, HTTPStatus.BAD_REQUEST
+                    )
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -2283,6 +2332,10 @@ class Scheduler(
                 "return_sampling_mask with disaggregation requires "
                 "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
             )
+            if is_tokenize_only:
+                return self._build_tokenize_req_output(
+                    req, error_msg, HTTPStatus.BAD_REQUEST
+                )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
@@ -2294,6 +2347,10 @@ class Scheduler(
                 "is valid but can return huge masks in the tail, blowing up "
                 "metadata, so we need a safety cap."
             )
+            if is_tokenize_only:
+                return self._build_tokenize_req_output(
+                    req, error_msg, HTTPStatus.BAD_REQUEST
+                )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
@@ -2306,6 +2363,10 @@ class Scheduler(
             error_msg = (
                 "return_sampling_mask is not supported with speculative decoding."
             )
+            if is_tokenize_only:
+                return self._build_tokenize_req_output(
+                    req, error_msg, HTTPStatus.BAD_REQUEST
+                )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
@@ -2318,6 +2379,10 @@ class Scheduler(
                 "return_sampling_mask is not supported with the ascend "
                 "sampling backend."
             )
+            if is_tokenize_only:
+                return self._build_tokenize_req_output(
+                    req, error_msg, HTTPStatus.BAD_REQUEST
+                )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
@@ -2343,12 +2408,16 @@ class Scheduler(
             self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                    )
+                error_msg = (
+                    "Multimodal prompt is too long after expanding multimodal tokens. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => "
+                    f"{len(req.origin_input_ids)} >= {self.max_req_input_len}."
                 )
+                if is_tokenize_only:
+                    return self._build_tokenize_req_output(
+                        req, error_msg, HTTPStatus.BAD_REQUEST
+                    )
+                req.set_finish_with_abort(error_msg=error_msg)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
@@ -2363,9 +2432,16 @@ class Scheduler(
             self.server_args.allow_auto_truncate,
         )
         if error_msg:
+            if is_tokenize_only:
+                return self._build_tokenize_req_output(
+                    req, error_msg, HTTPStatus.BAD_REQUEST
+                )
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        if is_tokenize_only:
+            return self._build_tokenize_req_output(req)
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored

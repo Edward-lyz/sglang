@@ -321,7 +321,9 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        _global_state.tokenizer_manager,
+        fast_api_app.state.openai_serving_chat,
+        fast_api_app.state.openai_serving_completion,
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
@@ -865,12 +867,34 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
+        generator = _global_state.tokenizer_manager.generate_request(obj, request)
+
+        # Kick-start the generator before the StreamingResponse is returned:
+        # afterwards HTTP 200 is committed and failures can only be reported
+        # in-band. Pre-generation failures (validation errors, scheduler
+        # aborts) must surface as a real HTTP status, same as the non-stream
+        # branch below.
+        first_out = None
+        try:
+            first_out = await generator.__anext__()
+            _raise_stream_abort(first_out)
+        except StopAsyncIteration:
+            pass
+        except ValueError as e:
+            # A client disconnect also surfaces here. It's a client-side
+            # cancellation, not a server error or bad input -- log it and
+            # return an empty stream instead of a 400.
+            if request is not None and await request.is_disconnected():
+                logger.info(f"[http_server] Client disconnected: {e}")
+            else:
+                logger.error(f"[http_server] Error: {e}")
+                return _create_error_response(e)
 
         async def stream_results() -> AsyncIterator[bytes]:
+            if first_out is not None:
+                yield b"data: " + dumps_json(first_out) + b"\n\n"
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+                async for out in generator:
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
@@ -1898,6 +1922,34 @@ async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
 
 
 @app.post(
+    "/v1/chat/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_chat_tokenize(request: ChatCompletionRequest, raw_request: Request):
+    """Return the prompt token IDs used by the matching chat request."""
+    return await raw_request.app.state.openai_serving_tokenize.handle_chat_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/completions/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_completions_tokenize(
+    request: CompletionRequest, raw_request: Request
+):
+    """Return the prompt token IDs used by the matching completion request."""
+    return (
+        await raw_request.app.state.openai_serving_tokenize.handle_completions_request(
+            request, raw_request
+        )
+    )
+
+
+@app.post(
     "/v1/tokenize",
     response_class=ORJSONResponse,
     dependencies=[Depends(validate_json_request)],
@@ -2214,6 +2266,27 @@ def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
     )
+
+
+def _raise_stream_abort(out: dict) -> None:
+    """Raise if `out` is a scheduler abort carrying an explicit HTTP status code.
+
+    TokenizerManager._handle_abort_finish_reason only raises for non-stream
+    requests; streaming aborts are yielded as ordinary outputs. Callers that
+    have not committed HTTP 200 yet use this to get the same exception -- and
+    therefore the same HTTP status -- as the non-stream path.
+    """
+    finish_reason = out["meta_info"].get("finish_reason")
+    if not isinstance(finish_reason, dict) or finish_reason.get("type") != "abort":
+        return
+    status_code = finish_reason.get("status_code")
+    if not isinstance(status_code, HTTPStatus):
+        return
+
+    message = finish_reason.get("message", "Generation aborted.")
+    if status_code == HTTPStatus.BAD_REQUEST:
+        raise ValueError(message)
+    raise HTTPException(status_code=int(status_code), detail=message)
 
 
 # FIXME: In theory we should configure ADMIN_FORCE for some entrypoints, but doing so

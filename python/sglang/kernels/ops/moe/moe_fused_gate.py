@@ -14,7 +14,6 @@ from sglang.kernels.ops.moe import moe_route_radix
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-
 _SCORING_FUNC_MAP = {
     "sigmoid": 0,
     "sqrtsoftplus": 1,

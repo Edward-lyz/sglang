@@ -1,6 +1,10 @@
+"""Utilities shared by function-call and streaming output parsers."""
+
+import copy
+import re
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
@@ -107,6 +111,66 @@ def _normalize_type_list(raw_items: List[Any]) -> List[Any]:
     return normalized_items
 
 
+_SCHEMA_MAP_KEYWORDS = (
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+)
+_SCHEMA_LIST_KEYWORDS = ("anyOf", "oneOf", "allOf", "prefixItems")
+_SCHEMA_KEYWORDS = (
+    "items",
+    "additionalProperties",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contains",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+)
+
+
+def _walk_subschemas(schema: Any) -> Iterator[dict]:
+    """
+    Yield every schema object reachable from ``schema``, outermost first.
+
+    Only positions JSON Schema defines as subschemas are followed, so
+    data-carrying keywords (``const``, ``enum``, ``default``, ``examples``) are
+    never mistaken for schemas and their contents are left alone. Boolean
+    subschemas (``items: false``) and other scalars are skipped.
+
+    Callers may rewrite keywords on a yielded node; adding or removing
+    subschema containers mid-walk is not supported.
+    """
+    if isinstance(schema, list):
+        for item in schema:
+            yield from _walk_subschemas(item)
+        return
+    if not isinstance(schema, dict):
+        return
+
+    yield schema
+
+    for key in _SCHEMA_MAP_KEYWORDS:
+        nested = schema.get(key)
+        if isinstance(nested, dict):
+            for value in nested.values():
+                yield from _walk_subschemas(value)
+
+    for key in _SCHEMA_LIST_KEYWORDS:
+        nested = schema.get(key)
+        if isinstance(nested, list):
+            for value in nested:
+                yield from _walk_subschemas(value)
+
+    for key in _SCHEMA_KEYWORDS:
+        if key in schema:
+            yield from _walk_subschemas(schema[key])
+
+
 def normalize_json_schema_types(schema: Any) -> None:
     """
     Walk a JSON Schema in place and rewrite non-standard ``"type"`` values
@@ -123,52 +187,170 @@ def normalize_json_schema_types(schema: Any) -> None:
     reaches the model as ``"string"``. ``$ref`` values are not resolved;
     callers pass tree-shaped schemas (HTTP JSON input is always a tree).
     """
-    if isinstance(schema, list):
-        for item in schema:
-            normalize_json_schema_types(item)
-        return
-    if not isinstance(schema, dict):
-        return
-
-    if "type" in schema:
-        t = schema["type"]
+    for node in _walk_subschemas(schema):
+        t = node.get("type")
         if isinstance(t, str):
-            schema["type"] = _normalize_single_type(t)
+            node["type"] = _normalize_single_type(t)
         elif isinstance(t, list):
-            schema["type"] = _normalize_type_list(t)
+            node["type"] = _normalize_type_list(t)
 
-    for key in (
-        "properties",
-        "patternProperties",
-        "$defs",
-        "definitions",
-        "dependentSchemas",
-    ):
-        nested = schema.get(key)
-        if isinstance(nested, dict):
-            for v in nested.values():
-                normalize_json_schema_types(v)
 
-    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
-        nested = schema.get(key)
-        if isinstance(nested, list):
-            for v in nested:
-                normalize_json_schema_types(v)
+# Draft 2020-12 constrains ``$id`` to ``^[^#]*#?$``: a non-empty fragment is a
+# schema error, not a warning. ``$anchor`` is the replacement for the draft-07
+# plain-name form, and it carries the same ``#name`` reference syntax.
+_ANCHOR_RE = re.compile(r"^[A-Za-z_][-A-Za-z0-9._]*$")
 
-    for key in (
-        "items",
-        "additionalProperties",
-        "not",
-        "if",
-        "then",
-        "else",
-        "contains",
-        "propertyNames",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-    ):
-        if key in schema:
-            normalize_json_schema_types(schema[key])
+
+def normalize_json_schema_ids(schema: Any) -> None:
+    """
+    Walk a JSON Schema in place and move the fragment out of every ``$id``.
+
+    Two draft-07 idioms survive in the wild and make
+    ``Draft202012Validator.check_schema`` reject an otherwise usable tool
+    definition outright (the request never reaches grammar compilation):
+
+    - ``{"$id": "#user"}`` — a plain-name anchor. Re-expressed as
+      ``{"$anchor": "user"}``, which keeps a matching ``{"$ref": "#user"}``
+      resolvable; dropping the identifier instead would leave a dangling ref.
+    - ``{"$id": "https://x/user#/definitions/name"}`` — a pointer fragment. It
+      has no 2020-12 equivalent, so only the base URI is kept.
+
+    An ``$id`` that ends up empty is removed rather than left as ``""``. An
+    existing ``$anchor`` is never overwritten. Mutates the input in place.
+    """
+    for node in _walk_subschemas(schema):
+        identifier = node.get("$id")
+        if not isinstance(identifier, str):
+            continue
+        base, _, fragment = identifier.partition("#")
+        if not fragment:
+            continue
+        if base:
+            node["$id"] = base
+        else:
+            del node["$id"]
+        if "$anchor" not in node and _ANCHOR_RE.match(fragment):
+            node["$anchor"] = fragment
+
+
+def _resolve_json_pointer(root: Any, pointer: str) -> Any:
+    """
+    Resolve an RFC 6901 JSON pointer (the part after ``#``) against ``root``.
+
+    Returns the referenced node, or ``None`` if the pointer does not resolve
+    (missing key, out-of-range index, or a scalar encountered mid-path).
+    """
+    if pointer in ("", "/"):
+        return root
+    node = root
+    for raw_token in pointer.lstrip("/").split("/"):
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict):
+            if token not in node:
+                return None
+            node = node[token]
+        elif isinstance(node, list):
+            try:
+                idx = int(token)
+            except ValueError:
+                return None
+            if not 0 <= idx < len(node):
+                return None
+            node = node[idx]
+        else:
+            return None
+    return node
+
+
+def _has_local_ref(node: Any) -> bool:
+    """True if any ``$ref`` pointing inside the document (``#...``) remains."""
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#"):
+            return True
+        return any(_has_local_ref(v) for v in node.values())
+    if isinstance(node, list):
+        return any(_has_local_ref(item) for item in node)
+    return False
+
+
+# Identifier keywords that only matter for cross-document / anchor-based $ref
+# resolution. Once a schema is flattened into a self-contained tree they carry
+# no meaning, and a non-empty-fragment ``$id`` (draft-07 anchor style, e.g.
+# ``"#user"``) is outright rejected by the JSON Schema 2020-12 metaschema, so
+# they are dropped during expansion.
+_DROPPED_IDENTIFIER_KEYWORDS = frozenset({"$id", "$anchor"})
+
+
+def _expand_refs_node(node: Any, root: Any, active: frozenset) -> Any:
+    """
+    Return a copy of ``node`` with local ``$ref`` pointers inlined and
+    identifier keywords (``$id`` / ``$anchor``) dropped.
+
+    ``active`` is the set of ``$ref`` strings currently being expanded on this
+    branch; a ref already in it is a cycle and is left in place so expansion
+    stays finite.
+    """
+    if isinstance(node, list):
+        return [_expand_refs_node(item, root, active) for item in node]
+    if not isinstance(node, dict):
+        return node
+
+    ref = node.get("$ref")
+    is_local_ref = isinstance(ref, str) and ref.startswith("#")
+
+    if is_local_ref and ref not in active:
+        target = _resolve_json_pointer(root, ref[1:])
+        if isinstance(target, dict):
+            expanded = _expand_refs_node(copy.deepcopy(target), root, active | {ref})
+            result = dict(expanded)
+            # JSON Schema 2020-12 permits keywords beside ``$ref``; a sibling
+            # (e.g. an overriding ``description``) wins over the target's value.
+            for key, value in node.items():
+                if key == "$ref" or key in _DROPPED_IDENTIFIER_KEYWORDS:
+                    continue
+                result[key] = _expand_refs_node(value, root, active)
+            return result
+        # Unresolved / non-object target: fall through and keep the ``$ref``.
+
+    return {
+        key: (value if key == "$ref" else _expand_refs_node(value, root, active))
+        for key, value in node.items()
+        if key not in _DROPPED_IDENTIFIER_KEYWORDS
+    }
+
+
+def expand_json_schema_refs(schema: Any) -> Any:
+    """
+    Inline local ``$ref`` pointers so a tool ``parameters`` schema becomes
+    self-contained.
+
+    Each ``{"$ref": "#/$defs/Name"}`` (or ``#/definitions/Name``, or any deeper
+    RFC 6901 pointer into the document) is replaced by a copy of the referenced
+    subschema, recursively. Refs on a cyclic branch (recursive schemas) and
+    external refs (``$ref`` values not starting with ``#``) are left untouched
+    so the result stays finite and valid. The ``$defs`` / ``definitions``
+    containers are dropped once nothing points into them anymore, and identifier
+    keywords (``$id`` / ``$anchor``) are dropped throughout — they are
+    meaningless in a flattened tree and a fragment-bearing ``$id`` would
+    otherwise be rejected by the 2020-12 metaschema.
+
+    Returns a new tree; the input is not mutated. Intended for tree-shaped HTTP
+    JSON input, gated behind ``SGLANG_ENABLE_TOOL_SCHEMA_REF_EXPANSION``.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    expanded = _expand_refs_node(schema, schema, frozenset())
+
+    remainder = {
+        key: value
+        for key, value in expanded.items()
+        if key not in ("$defs", "definitions")
+    }
+    if not _has_local_ref(remainder):
+        return remainder
+    return expanded
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
@@ -425,3 +607,175 @@ def get_json_schema_constraint(
         return json_schema
 
     return None
+
+
+# Canonical streaming input boundaries shared by live parsing and continuation replay.
+_MARKER_ATTRS = (
+    "bot_token",
+    "eot_token",
+    "bot",
+    "suffix",
+    "tool_call_separator",
+    "invoke_end_token",
+    "tool_call_begin",
+    "tool_call_end",
+    "tool_call_start_token",
+    "tool_call_end_token",
+    "tool_call_argument_begin_token",
+    "tool_call_prefix",
+    "tool_call_function_end_token",
+    "function_end_token",
+    "parameter_prefix",
+    "parameter_end_token",
+    "tool_sep_token",
+    "arg_key_start_token",
+    "arg_key_end_token",
+    "arg_value_start_token",
+    "arg_value_end_token",
+    "arg_val_sep_token",
+    "arg_key_end",
+    "arg_value_end",
+    "think_start_token",
+    "think_end_token",
+    "tool_start_token",
+    "_tool_start_token",
+    "_tool_end_token",
+    "TEXT_START_TOKEN",
+    "TEXT_END_TOKEN",
+    "ACTION_START_TOKEN",
+)
+
+
+def collect_streaming_markers(detector, tokenizer=None) -> list[str]:
+    """Collect known delimiters without importing any model-specific parser.
+
+    Single-character delimiters do not need protection from partial input and
+    would unnecessarily turn ordinary JSON punctuation into separate chunks.
+    Tokenizer metadata is accepted only as a concrete list/tuple of strings;
+    this also avoids treating attributes synthesized by mocks as token lists.
+    """
+    markers = {
+        value
+        for attr in _MARKER_ATTRS
+        if isinstance(value := getattr(detector, attr, None), str) and len(value) > 1
+    }
+    think_start = getattr(detector, "think_start_token", None)
+    self_label = getattr(detector, "think_start_self_label", None)
+    if isinstance(think_start, str) and isinstance(self_label, str):
+        if think_start and self_label:
+            markers.add(think_start + self_label)
+
+    for tokens in (
+        getattr(detector, "think_excluded_tokens", None),
+        getattr(tokenizer, "all_special_tokens", None),
+    ):
+        if isinstance(tokens, (list, tuple)):
+            markers.update(
+                token for token in tokens if isinstance(token, str) and len(token) > 1
+            )
+    return sorted(markers, key=lambda marker: (-len(marker), marker))
+
+
+class StreamingInputBuffer:
+    """Emit canonical ordinary-text blocks and atomic structural markers.
+
+    The emitted sequence depends only on the text, never on the boundaries of
+    ``feed`` calls. Ordinary text is emitted in fixed-size blocks, with a short
+    block emitted before each marker. An incomplete block or ambiguous marker
+    prefix remains buffered across request suspension and history replay.
+
+    ``finish`` flushes a true terminal EOF. It must not be called merely because
+    a resumable request reached its output-token limit.
+    """
+
+    def __init__(self, markers: Iterable[str] = (), block_size: int = 32):
+        """Initialize the buffer with structural markers and a plain-text block size."""
+        if not isinstance(block_size, int) or block_size <= 0:
+            raise ValueError("block_size must be a positive integer")
+        self._block_size = block_size
+        self._plain = ""
+        self._pending_marker = ""
+        self._markers_by_start: dict[str, list[str]] = {}
+        for marker in sorted(set(markers), key=lambda value: (-len(value), value)):
+            if marker:
+                self._markers_by_start.setdefault(marker[0], []).append(marker)
+        self._marker_start = (
+            re.compile("[" + re.escape("".join(self._markers_by_start)) + "]")
+            if self._markers_by_start
+            else None
+        )
+
+    def feed(self, text: str) -> list[str]:
+        """Consume live text and return complete canonical streaming chunks."""
+        if not text:
+            return []
+        return self._consume(text, final=False)
+
+    def finish(self) -> list[str]:
+        """Flush buffered text at the true end of the stream."""
+        return self._consume("", final=True)
+
+    def _append_plain(self, text: str, start: int, end: int, output: list[str]):
+        """Append plain text to fixed-size chunks while preserving any remainder."""
+        if self._plain and start < end:
+            take = min(self._block_size - len(self._plain), end - start)
+            self._plain += text[start : start + take]
+            start += take
+            if len(self._plain) == self._block_size:
+                output.append(self._plain)
+                self._plain = ""
+        while end - start >= self._block_size:
+            output.append(text[start : start + self._block_size])
+            start += self._block_size
+        if start < end:
+            self._plain = text[start:end]
+
+    def _flush_plain(self, output: list[str]):
+        """Flush the buffered plain-text remainder into the output."""
+        if self._plain:
+            output.append(self._plain)
+            self._plain = ""
+
+    def _consume(self, text: str, final: bool) -> list[str]:
+        """Consume text while keeping structural markers atomic across feed calls."""
+        # Only an unresolved marker prefix is prepended, so copying never grows
+        # with the full replay history. Ordinary-text slices are block-sized.
+        if self._pending_marker:
+            text = self._pending_marker + text
+            self._pending_marker = ""
+        output: list[str] = []
+        plain_start = pos = 0
+        while self._marker_start is not None:
+            candidate = self._marker_start.search(text, pos)
+            if candidate is None:
+                break
+            pos = candidate.start()
+            matched = None
+            incomplete = False
+            remaining = len(text) - pos
+            for marker in self._markers_by_start[text[pos]]:
+                if remaining < len(marker):
+                    if not final and marker.startswith(text[pos:]):
+                        incomplete = True
+                        break
+                elif text.startswith(marker, pos):
+                    matched = marker
+                    break
+
+            if incomplete:
+                self._append_plain(text, plain_start, pos, output)
+                self._pending_marker = text[pos:]
+                return output
+            if matched is not None:
+                self._append_plain(text, plain_start, pos, output)
+                self._flush_plain(output)
+                output.append(matched)
+                pos += len(matched)
+                plain_start = pos
+            else:
+                pos += 1
+
+        self._append_plain(text, plain_start, len(text), output)
+        if final:
+            self._flush_plain(output)
+        return output

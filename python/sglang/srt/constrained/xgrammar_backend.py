@@ -104,8 +104,16 @@ class XGrammarGrammar(BaseGrammarObject):
                 self.accepted_tokens.append(token)
 
     def rollback(self, k: int):
-        self.matcher.rollback(k)
-        self.accepted_tokens = self.accepted_tokens[:-k]
+        # Speculative decoding may traverse grammar states for draft-token
+        # branches that were not committed to xgrammar history. In that case
+        # xgrammar raises when asked to rollback more tokens than it has saved.
+        # Bound rollback by the tokens accepted through this wrapper so
+        # reasoning-parser can remain enabled while EAGLE3 explores branches.
+        rollback_tokens = min(k, len(self.accepted_tokens))
+        if rollback_tokens <= 0:
+            return
+        self.matcher.rollback(rollback_tokens)
+        self.accepted_tokens = self.accepted_tokens[:-rollback_tokens]
 
     def is_terminated(self):
         return self.matcher.is_terminated()

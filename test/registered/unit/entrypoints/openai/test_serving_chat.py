@@ -17,7 +17,7 @@ from http import HTTPStatus
 from typing import Optional
 from unittest.mock import Mock, patch
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
@@ -196,6 +197,256 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertTrue(adapted.return_prompt_token_ids)
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
         conv_mock.assert_not_called()
+
+    def test_kimi_k3_keeps_adjacent_image_placeholders_adjacent(self):
+        image_data = []
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "image-1"}},
+                {"type": "image_url", "image_url": {"url": "image-2"}},
+                {"type": "text", "text": "Compare them."},
+            ],
+        }
+
+        flattened = self.chat._flatten_kimi_k3_content(message, image_data, [], [])
+
+        self.assertEqual(
+            flattened["content"],
+            [
+                {"type": "image_url", "image_url": {"url": "image-1"}},
+                {"type": "image_url", "image_url": {"url": "image-2"}},
+                {"type": "text", "text": "Compare them."},
+            ],
+        )
+        self.assertEqual([item.url for item in image_data], ["image-1", "image-2"])
+
+    def test_kimi_k3_routes_structural_prompt_ids_without_decode_reencode(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 99, 8]
+        self.tm.tokenizer.decode.return_value = "decoded prompt"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "image-1"}},
+                        {
+                            "type": "text",
+                            "text": "<|media_pad|> Describe it.",
+                        },
+                    ],
+                }
+            ],
+        )
+
+        adapted, _ = self.chat._convert_to_internal_request(
+            request, self.fastapi_request
+        )
+
+        self.assertEqual(adapted.input_ids, [7, 99, 8])
+        self.assertIsNone(adapted.text)
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertEqual(call.kwargs["image_prompts"], ["<|media_pad|>"])
+        content = call.args[0][0]["content"]
+        self.assertEqual(content[0]["type"], "image_url")
+        self.assertEqual(content[0]["image_url"]["url"], "image-1")
+        self.assertEqual(
+            content[1],
+            {
+                "type": "text",
+                "text": "<|media_pad|> Describe it.",
+            },
+        )
+
+    def _kimi_k3_render_call(self, **request_kwargs):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(model="x", **request_kwargs)
+        self.chat._process_messages(request, is_multimodal=False)
+        return self.tm.tokenizer.apply_chat_template.call_args
+
+    def test_kimi_k3_forwards_only_client_sent_tool_choice_none(self):
+        """The reference API renders the tool-choice block for a client-sent
+        tool_choice="none" even without tools, but not for the protocol's
+        injected default; forwarding both (or neither) shifts prompt_tokens."""
+        messages = [{"role": "user", "content": "Hi"}]
+
+        explicit = self._kimi_k3_render_call(messages=messages, tool_choice="none")
+        self.assertEqual(explicit.kwargs["tool_choice"], "none")
+
+        default = self._kimi_k3_render_call(messages=messages)
+        self.assertNotIn("tool_choice", default.kwargs)
+
+        spoofed = self._kimi_k3_render_call(
+            messages=messages, tool_choice_explicit=True
+        )
+        self.assertNotIn("tool_choice", spoofed.kwargs)
+
+    def test_kimi_k3_passes_raw_tool_call_arguments_to_renderer(self):
+        """K3 renders history arguments from their source text, so the raw
+        string (including whitespace-only) must reach the tokenizer unparsed."""
+        for arguments in ('{"a": [1, 2]}', " ", "{bad"):
+            with self.subTest(arguments=arguments):
+                call = self._kimi_k3_render_call(
+                    messages=[
+                        {"role": "user", "content": "Hi"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "f_1",
+                                    "type": "function",
+                                    "function": {"name": "f", "arguments": arguments},
+                                }
+                            ],
+                        },
+                        {"role": "tool", "tool_call_id": "f_1", "content": "ok"},
+                    ]
+                )
+                function = call.args[0][1]["tool_calls"][0]["function"]
+                self.assertEqual(function["arguments"], arguments)
+
+    def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        ret = [
+            {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "chatcmpl-kimi-k3-usage",
+                    "prompt_tokens": 2075,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "image_tokens": 2035,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.basic_req, ret, created=123)
+
+        self.assertEqual(response.usage.prompt_tokens, 2072)
+        self.assertEqual(response.usage.total_tokens, 2073)
+        self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 2035)
+
+    def test_usage_always_carries_token_details(self):
+        """usage must always expose both *_tokens_details objects with int members.
+
+        The Kimi/OpenAI streaming spec treats
+        ``prompt_tokens_details.cached_tokens`` and
+        ``completion_tokens_details.reasoning_tokens`` as required integers: a
+        request with no cache hit and no reasoning must report 0 rather than
+        omitting the key or sending null.
+        """
+        ret = [
+            {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "chatcmpl-usage-details",
+                    "prompt_tokens": 7,
+                    "completion_tokens": 1,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        usage = self.chat._build_chat_response(
+            self.basic_req, ret, created=123
+        ).usage.model_dump()
+
+        self.assertEqual(usage["prompt_tokens_details"]["cached_tokens"], 0)
+        self.assertEqual(usage["completion_tokens_details"]["reasoning_tokens"], 0)
+
+    def test_kimi_k3_tool_call_id_uses_underscore_separator(self):
+        """K3 tool_call ids must match ``^[A-Za-z_][A-Za-z0-9_]*_\\d+$``.
+
+        K3's reference API rejects the colon-separated K2 form
+        (``get_weather:0``); the separator must be an underscore. K2 keeps its
+        model-native ``functions.<name>:<idx>`` form.
+        """
+        call_item = ToolCallItem(tool_index=1, name="get_weather", parameters="{}")
+
+        self.chat.tool_call_parser = "kimi_k3"
+        k3_id = self.chat._process_tool_call_id(call_item, history_tool_calls_cnt=2)
+        self.assertEqual(k3_id, "get_weather_3")
+        self.assertRegex(k3_id, r"^[A-Za-z_][A-Za-z0-9_]*_\d+$")
+
+        self.chat.tool_call_parser = "kimi_k2"
+        self.assertEqual(
+            self.chat._process_tool_call_id(call_item, history_tool_calls_cnt=2),
+            "functions.get_weather:3",
+        )
+
+    def test_kimi_k3_tool_call_id_continues_from_max_history_suffix(self):
+        """K3 global index continues from the max history id suffix (across
+        function names), not the history count, so compacted histories with
+        sparse ids (``get_weather_2``/``get_weather_1``) don't collide."""
+
+        def _history(ids):
+            messages = [{"role": "user", "content": "hi"}]
+            for tc_id in ids:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": tc_id,
+                                "type": "function",
+                                "function": {"name": "get_weather", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc_id, "content": "ok"}
+                )
+            messages.append({"role": "user", "content": "again"})
+            return ChatCompletionRequest(model="x", messages=messages)
+
+        self.chat.tool_call_parser = "kimi_k3"
+        sparse = _history(["get_weather_2", "get_weather_1"])
+        next_idx = self.chat._get_history_tool_calls_cnt(sparse)
+        self.assertEqual(next_idx, 3)
+        for tool_index, name, expected in [
+            (0, "get_current_time", "get_current_time_3"),
+            (0, "get_weather", "get_weather_3"),
+            (1, "get_weather", "get_weather_4"),
+        ]:
+            call_item = ToolCallItem(tool_index=tool_index, name=name, parameters="")
+            self.assertEqual(
+                self.chat._process_tool_call_id(call_item, next_idx), expected
+            )
+
+        # Non-conforming (client-generated) ids fall back to the history count.
+        self.assertEqual(
+            self.chat._get_history_tool_calls_cnt(_history(["call_abc", "call-x"])),
+            2,
+        )
+
+        # K2 keeps counting history tool calls.
+        self.chat.tool_call_parser = "kimi_k2"
+        self.assertEqual(self.chat._get_history_tool_calls_cnt(sparse), 2)
+
+    def test_kimi_k3_rejects_internal_placeholder_in_user_text(self):
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<|kimi_image_placeholder|> Describe it.",
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "reserved for Kimi-K3 image input"):
+            self.chat._flatten_kimi_k3_content(message, [], [], [])
 
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
@@ -1338,31 +1589,33 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertIn("<｜Assistant｜>", out)
 
-    def test_streaming_abort_yields_error(self):
-        """Test that an abort finish reason during streaming correctly yields an error and stops."""
-        err_msg = "Aborted by scheduler"
-        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
+    @staticmethod
+    def _stream_out(text, finish_reason):
+        return {
+            "text": text,
+            "meta_info": {
+                "id": "chatcmpl-test",
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "cached_tokens": 0,
+                "finish_reason": finish_reason,
+                "output_token_logprobs": None,
+                "output_top_logprobs": None,
+            },
+            "index": 0,
+        }
 
-        async def _mock_generate_abort():
-            yield {
-                "text": "Partial ",
-                "meta_info": {
-                    "id": "chatcmpl-test",
-                    "prompt_tokens": 10,
-                    "completion_tokens": 2,
-                    "cached_tokens": 0,
-                    "finish_reason": {
-                        "type": "abort",
-                        "status_code": err_code,
-                        "message": err_msg,
-                    },
-                    "output_token_logprobs": None,
-                    "output_top_logprobs": None,
-                },
-                "index": 0,
-            }
+    def _run_stream_over(self, outs):
+        """Run _generate_chat_stream over `outs` and return the emitted chunks.
 
-        self.tm.generate_request.return_value = _mock_generate_abort()
+        Exceptions propagate so callers can assert on the pre-stream raise.
+        """
+
+        async def _mock_generate():
+            for out in outs:
+                yield out
+
+        self.tm.generate_request.return_value = _mock_generate()
 
         req = ChatCompletionRequest(
             model="x",
@@ -1375,7 +1628,6 @@ class ServingChatTestCase(unittest.TestCase):
         with patch(
             "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
         ) as conv_mock:
-            # Create a mock conversation object
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
@@ -1384,19 +1636,65 @@ class ServingChatTestCase(unittest.TestCase):
                 req, self.fastapi_request
             )
 
-            async def run_stream():
-                chunks = []
-                try:
-                    async for chunk in self.chat._generate_chat_stream(
-                        adapted_request, req, self.fastapi_request
-                    ):
-                        chunks.append(chunk)
-                except Exception as e:
-                    print(f"Error during stream iteration: {e}")
-                return chunks
+        return self._run_chat_stream(adapted_request, req)
 
-        loop = get_or_create_event_loop()
-        chunks = loop.run_until_complete(run_stream())
+    def test_streaming_abort_before_first_chunk_raises(self):
+        """A scheduler abort landing before any SSE chunk must raise, not yield.
+
+        Regression: the stream path emitted the abort as an in-band
+        `data: {"error": ...}` chunk, which forced HTTP 200 even though the
+        non-stream path returned the real status for the same failure. Raising
+        keeps the status choosable by the kick-start in
+        _handle_streaming_request.
+        """
+        outs = [
+            self._stream_out(
+                "",
+                {
+                    "type": "abort",
+                    "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "message": "Aborted by scheduler",
+                },
+            )
+        ]
+
+        with self.assertRaises(HTTPException) as ctx:
+            self._run_stream_over(outs)
+
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertEqual(ctx.exception.detail, "Aborted by scheduler")
+
+    def test_streaming_bad_request_abort_before_first_chunk_raises_value_error(self):
+        """A 400 abort raises ValueError, the exception the kick-start maps to
+        HTTP 400 -- the same body the non-stream path produces."""
+        outs = [
+            self._stream_out(
+                "",
+                {
+                    "type": "abort",
+                    "status_code": HTTPStatus.BAD_REQUEST,
+                    "message": "Prompt is too long",
+                },
+            )
+        ]
+
+        with self.assertRaisesRegex(ValueError, "Prompt is too long"):
+            self._run_stream_over(outs)
+
+    def test_streaming_abort_after_first_chunk_yields_error(self):
+        """Once a chunk is out HTTP 200 is committed, so a mid-stream abort can
+        only be reported in-band; the stream must then stop."""
+        err_msg = "Aborted by scheduler"
+        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
+        outs = [
+            self._stream_out("Partial ", None),
+            self._stream_out(
+                "Partial ",
+                {"type": "abort", "status_code": err_code, "message": err_msg},
+            ),
+        ]
+
+        chunks = self._run_stream_over(outs)
 
         error_chunk_data = None
         for c in chunks:
@@ -1407,13 +1705,22 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
         self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
 
-        # Ensure the stream stops after the abort error
-        # The last chunk should be "data: [DONE]\n\n"
+        # The error chunk terminates the stream, followed only by [DONE].
         self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.assertIn("error", chunks[-2])
 
-        # Check that there is an error chunk and a DONE chunk
-        self.assertEqual(len(chunks), 2)
-        self.assertIn("error", chunks[0])
+    def test_streaming_graceful_abort_is_not_an_error(self):
+        """An abort without a status_code (e.g. /abort_request) is a normal
+        finish, not an error -- it must not raise or emit an error chunk."""
+        outs = [
+            self._stream_out("Partial ", None),
+            self._stream_out("Partial ", {"type": "abort"}),
+        ]
+
+        chunks = self._run_stream_over(outs)
+
+        self.assertFalse([c for c in chunks if "error" in c])
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():
@@ -1610,6 +1917,206 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertFalse(
             empty_logprob_chunks,
             "empty-delta logprobs chunk emitted without a parser; would break client chunk-shape assumptions",
+        )
+
+    def _run_live_stream(self, req, outs):
+        """Drive the live `_generate_chat_stream` over `outs`, cumulative mode.
+
+        `server_args` is a bare Mock, whose attributes are truthy; pin
+        incremental_streaming_output to the production default so `text` and
+        `output_ids` are treated as cumulative.
+        """
+        self.tm.server_args.incremental_streaming_output = False
+
+        async def _mock_generate():
+            for out in outs:
+                yield out
+
+        self.tm.generate_request.return_value = _mock_generate()
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+            return self._parse_chunks(self._run_chat_stream(adapted_request, req))
+
+    @staticmethod
+    def _stream_out_with_ids(text, output_ids, finish_reason, **meta):
+        out = ServingChatTestCase._stream_out(text, finish_reason)
+        out["output_ids"] = output_ids
+        out["meta_info"].update(meta)
+        return out
+
+    @staticmethod
+    def _increment_frames(parsed):
+        return [
+            c
+            for c in parsed
+            if c["choices"]
+            and (
+                c["choices"][0]["delta"].get("content")
+                or c["choices"][0]["delta"].get("reasoning_content")
+                or c["choices"][0]["delta"].get("tool_calls")
+            )
+        ]
+
+    def test_streaming_internal_content_carries_token_ids_without_tools(self):
+        """stream_options.include_internal_content must expose per-chunk token ids.
+
+        Two ways this silently returned nothing: `StreamOptions` had no such
+        field so pydantic dropped it (HTTP 200, no data), and token-id capture
+        was gated on `request.tools`, so a plain chat request got none even once
+        the flag existed. Every increment frame must carry a non-empty
+        `delta.internal_content.token_ids`, and the ids must partition the
+        output exactly once -- no chunk repeating or swallowing another's.
+        """
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            stream_options={"include_internal_content": True},
+        )
+        outs = [
+            self._stream_out_with_ids("Hello", [11, 12], None),
+            self._stream_out_with_ids(
+                "Hello world", [11, 12, 13], {"type": "stop", "matched": None}
+            ),
+        ]
+
+        parsed = self._run_live_stream(req, outs)
+
+        increments = self._increment_frames(parsed)
+        self.assertEqual(
+            [c["choices"][0]["delta"]["content"] for c in increments],
+            ["Hello", " world"],
+        )
+        for frame in increments:
+            internal = frame["choices"][0]["delta"].get("internal_content")
+            self.assertIsInstance(
+                internal, dict, "increment frame missing delta.internal_content"
+            )
+            self.assertTrue(internal["token_ids"], "internal_content.token_ids empty")
+        self.assertEqual(
+            [
+                c["choices"][0]["delta"]["internal_content"]["token_ids"]
+                for c in increments
+            ],
+            [[11, 12], [13]],
+        )
+        # The role frame is not an increment and must stay clean.
+        self.assertNotIn("internal_content", parsed[0]["choices"][0]["delta"])
+
+    def test_streaming_internal_content_absent_unless_requested(self):
+        """Without the flag the wire shape must be unchanged.
+
+        Guards the negative branch: attaching internal_content unconditionally
+        would add a key to every delta for every existing client, and would
+        also put a non-empty delta on the finish frame.
+        """
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+        )
+        outs = [
+            self._stream_out_with_ids(
+                "Hello", [11, 12], {"type": "stop", "matched": None}
+            )
+        ]
+
+        parsed = self._run_live_stream(req, outs)
+
+        self.assertTrue(self._increment_frames(parsed))
+        for chunk in parsed:
+            for choice in chunk["choices"]:
+                self.assertNotIn("internal_content", choice["delta"])
+
+    def test_streaming_logprobs_survive_reasoning_frame_on_live_path(self):
+        """Logprobs must not be dropped when the reasoning frame carries the step.
+
+        The live `_generate_chat_stream` attached logprobs only on the regular
+        content frame while advancing the per-index logprob cursor every step,
+        so a step consumed by the reasoning branch lost its logprobs for good.
+        (The near-identical `_generate_stream_content` helper, which the other
+        logprobs cases exercise, is not on this path.)
+        """
+        self.chat.reasoning_parser = "qwen3"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+            separate_reasoning=True,
+        )
+        outs = [
+            self._stream_out_with_ids(
+                "thinking",
+                [11, 12],
+                {"type": "stop", "matched": None},
+                output_token_logprobs=[(0.1, 11, "think"), (0.2, 12, "ing")],
+                output_top_logprobs=[],
+                output_token_logprobs_length=2,
+            )
+        ]
+
+        with patch.object(self.chat, "_process_reasoning_stream") as proc_mock:
+            proc_mock.return_value = ("Let me think", "")
+            parsed = self._run_live_stream(req, outs)
+
+        carried = [
+            c
+            for c in parsed
+            if c["choices"] and c["choices"][0].get("logprobs") is not None
+        ]
+        self.assertTrue(
+            carried,
+            "logprobs dropped: no frame carried them once the reasoning branch "
+            "consumed the step",
+        )
+        self.assertEqual(
+            [e["token"] for e in carried[0]["choices"][0]["logprobs"]["content"]],
+            ["think", "ing"],
+        )
+
+    def test_top_logprobs_keeps_candidates_that_share_token_text(self):
+        """top_logprobs must keep one entry per candidate id.
+
+        Candidates were collapsed into a `{token_text: logprob}` dict, so ids
+        that detokenize to the same text overwrote each other and
+        `len(top_logprobs)` came out below the requested `top_logprobs`.
+        """
+        entries = self.chat._process_logprobs_tokens(
+            token_logprobs=[(-0.1, 11, "hi")],
+            top_logprobs=[[(-0.1, 11, "hi"), (-2.5, 99, "hi")]],
+        )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(
+            [(c.token, c.logprob) for c in entries[0].top_logprobs],
+            [("hi", -0.1), ("hi", -2.5)],
+        )
+
+    def test_top_logprobs_read_from_each_token_own_position(self):
+        """Each token's candidates must come from its own position.
+
+        Streaming passed use_token_index=False, so every token in a multi-token
+        chunk reported position 0's candidates -- reachable with
+        stream_interval > 1 or speculative decoding -- and a None at position 0
+        raised AttributeError.
+        """
+        entries = self.chat._process_logprobs_tokens(
+            token_logprobs=[(-0.1, 11, "a"), (-0.2, 12, "b")],
+            top_logprobs=[[(-0.1, 11, "a")], [(-0.2, 12, "b")]],
+        )
+
+        self.assertEqual(
+            [[c.token for c in e.top_logprobs] for e in entries], [["a"], ["b"]]
         )
 
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
@@ -1820,11 +2327,15 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
 
     def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
-        """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
+        """With cache reporting off, continuous_usage_stats must not leak cached tokens.
+
+        The details object itself is still required by the streaming spec, so the
+        leak shows up as a non-zero cached_tokens rather than a missing key.
+        """
         self.tm.server_args.enable_cache_report = False
         usages = self._collect_continuous_usage(cached_tokens=6)
         self.assertTrue(usages, "continuous_usage_stats attached no usage")
-        self.assertIsNone(usages[0].get("prompt_tokens_details"))
+        self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 0)
 
     # ------------- incremental streaming output tests -------------
     def test_incremental_streaming_output_delta(self):

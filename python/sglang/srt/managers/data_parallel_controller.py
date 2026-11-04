@@ -314,7 +314,12 @@ class DataParallelController:
         self.dp_budget.update_budget(self.load_snapshot_reader.read_all())
 
     def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
-        if refresh_load_budget and self.refresh_load_budget_on_dispatch:
+        is_tokenize_only = getattr(req, "tokenize_only", False)
+        if (
+            not is_tokenize_only
+            and refresh_load_budget
+            and self.refresh_load_budget_on_dispatch
+        ):
             self.refresh_load_budget()
 
         time_stats = DPControllerReqTimeStats.new_from_obj(
@@ -323,7 +328,13 @@ class DataParallelController:
 
         time_stats.set_dp_dispatch_time()
         req.time_stats = wrap_as_pickle(time_stats)
-        self.dispatching(req)
+        if is_tokenize_only:
+            # A tokenize-only request never enters a scheduler queue, so it must
+            # not consume or follow generation load budget. Round-robin still
+            # honors routed_dp_rank and active elastic workers.
+            self.round_robin_scheduler(req)
+        else:
+            self.dispatching(req)
         req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
 
@@ -338,6 +349,10 @@ class DataParallelController:
             self.refresh_load_budget()
         for req in batch_req:
             self.dispatching_with_trace(req, refresh_load_budget=False)
+        if not req.rid.startswith("HEALTH_CHECK"):
+            logger.info(
+                f"[trace] DP-controller received req {req.rid} from tokenizer and routed it to scheduler"
+            )
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(

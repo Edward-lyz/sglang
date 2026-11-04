@@ -13,6 +13,7 @@
 # ==============================================================================
 """Tests for OpenAI API protocol models"""
 
+import json
 import unittest
 from typing import List, Optional
 
@@ -437,6 +438,31 @@ class TestChatCompletionRequest(unittest.TestCase):
         strict = json_format.strict
         self.assertEqual(name, "VoiceNote")
         self.assertEqual(strict, True)
+
+    def test_json_schema_without_name_is_accepted(self):
+        """A json_schema response_format that omits `name` must not be rejected.
+
+        OpenAI marks `json_schema.name` as required, and declaring it as a
+        required pydantic field made FastAPI reject the whole request with 400
+        before it ever reached the engine. Nothing on the constrained-decoding
+        path reads `name` (only `schema` and `strict`), so the constraint must
+        still be built from the schema alone.
+        """
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}},
+            },
+        )
+        self.assertIsNone(request.response_format.json_schema.name)
+        self.assertEqual(
+            request.response_format.json_schema.schema_, {"type": "object"}
+        )
+
+        params = request.to_sampling_params([], {}, None)
+        self.assertEqual(json.loads(params["json_schema"]), {"type": "object"})
 
 
 class TestModelSerialization(unittest.TestCase):

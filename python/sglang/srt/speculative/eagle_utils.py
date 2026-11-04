@@ -868,6 +868,26 @@ def eagle_sample(
             spec_steps=verify_input.max_tree_depth - 1,
         )
 
+    # Thinking-budget injection: once a req's thinking budget is exhausted,
+    # overwrite the sampled tokens with the predefined inject sequence and
+    # force those positions to be accepted (advance=True commits the cursor).
+    # accept_lens (num_correct_drafts + 1) is intentionally left unchanged,
+    # matching the pre-refactor internal verify() behavior.
+    for i, req in enumerate(batch.reqs):
+        start = i * verify_input.draft_token_num
+        count = req.inject_thinking_prompt_tokens(
+            predict,
+            start_idx=start,
+            max_count=verify_input.draft_token_num,
+            advance=True,
+        )
+        if count <= 0:
+            continue
+        accept_index[i].fill_(-1)
+        accept_index[i, :count] = torch.arange(
+            start, start + count, dtype=accept_index.dtype, device=device
+        )
+
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).

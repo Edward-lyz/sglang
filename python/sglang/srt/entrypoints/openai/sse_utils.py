@@ -16,13 +16,15 @@ class StreamDelta(msgspec.Struct, omit_defaults=True):
     OpenAI Python SDK's ChoiceDelta does not declare reasoning_content; it is
     surfaced via pydantic `extra`. With omit_defaults=True, defaulting to
     None would drop the key entirely from the SSE payload, making
-    `data.reasoning_content` raise AttributeError on the client. Keep it
-    required (no default) so it is always serialized as null or a string.
+    `data.reasoning_content` raise AttributeError on the client. Keep
+    content/reasoning_content required (no default) so omit_defaults can never
+    drop them; the caller coerces None -> "" so they always serialize as a
+    string.
     """
 
+    content: Optional[str]
     reasoning_content: Optional[str]
     role: Optional[str] = None
-    content: Optional[str] = None
 
 
 class StreamChoice(msgspec.Struct):
@@ -80,7 +82,11 @@ def build_sse_content(
     Returns:
         SSE-formatted string "data: {...}\\n\\n"
     """
-    delta = StreamDelta(role=role, content=content, reasoning_content=reasoning_content)
+    delta = StreamDelta(
+        role=role,
+        content=content if content is not None else "",
+        reasoning_content=reasoning_content if reasoning_content is not None else "",
+    )
     choice = StreamChoice(
         index=index,
         delta=delta,

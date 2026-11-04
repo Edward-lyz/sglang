@@ -778,11 +778,36 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
+            if not is_spec and (
+                getattr(req, "thinking_budget", None) == 0
+                and req.thinking_prompt_token_ids
+                and req.thinking_inject_index < len(req.thinking_prompt_token_ids)
+            ):
+                injected = req.thinking_prompt_token_ids[req.thinking_inject_index]
+                next_token_id = [injected]
+                req.thinking_inject_index += 1
+                if req.thinking_inject_index >= len(req.thinking_prompt_token_ids):
+                    req.thinking_budget = -1  # -1 means thinking is finished/disabled
+                if batch.enable_overlap:
+                    if batch.output_ids is not None:
+                        future_idx = -batch.output_ids[i]
+                        self.future_map.token_ids_buf[future_idx] = injected
+                else:
+                    if batch.output_ids is not None:
+                        batch.output_ids[i] = injected
+
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)
+            req.update_thinking_state(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()
+            if req.grammar is not None and not is_spec:
+                # Normal decode advances the grammar for its single token here
+                # (spec already did in _resolve_spec_v2_tokens). Advance before the
+                # finish check so a grammar abort wins over the EOS that an errored
+                # grammar's EOS-only mask forces; otherwise it reports a clean stop.
+                self._accept_grammar_tokens(req, next_token_id)
             req.update_finish_state(new_accept_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
@@ -815,10 +840,6 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.grammar is not None:
-                if not is_spec:
-                    # Normal decode advances the grammar for its single token
-                    # here; spec already advanced it in _resolve_spec_v2_tokens.
-                    self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)

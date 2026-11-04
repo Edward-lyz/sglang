@@ -1112,8 +1112,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         decode_req.req.req_pool_idx
                     ]
-                    .cpu()
-                    .numpy()
                 ]
 
             def _swa_payload():
@@ -1219,6 +1217,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+
+        if preallocated_reqs:
+            rids = [
+                r.req.rid
+                for r in preallocated_reqs
+                if not r.req.rid.startswith("HEALTH_CHECK")
+            ]
+            if rids:
+                logger.info(f"[trace] decode bootstrap completed: {rids}")
+
+        if failed_reqs:
+            rids = [
+                r.req.rid
+                for r in failed_reqs
+                if not r.req.rid.startswith("HEALTH_CHECK")
+            ]
+            if rids:
+                logger.info(f"[trace] reqs were aborted during bootstrap: {rids}")
 
         return preallocated_reqs, failed_reqs
 
@@ -1779,6 +1795,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         else:
             committed_output_id = output_id[0].item()
         decode_req.req.output_ids.append(committed_output_id)
+        if not replayed_boundary:
+            think_end_ids = self.scheduler.model_config.think_end_ids
+            if decode_req.req.require_reasoning and think_end_ids:
+                # Count the prefill handoff token once on the decode side.
+                decode_req.req.update_reasoning_tokens(
+                    committed_output_id, think_end_ids
+                )
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that

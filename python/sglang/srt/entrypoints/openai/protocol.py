@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -64,6 +65,8 @@ from sglang.utils import convert_json_schema_to_str
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
+
+AIAK_DISABLE_THINKING: bool = os.getenv("AIAK_DISABLE_THINKING", "0") == "1"
 
 
 class ModelCard(BaseModel):
@@ -194,26 +197,49 @@ class PromptTokensDetails(BaseModel):
         return data
 
 
+class CompletionTokensDetails(BaseModel):
+    """Details about completion tokens."""
+
+    reasoning_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
 
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
     continuous_usage_stats: Optional[bool] = False
+    # Moonshot/Kimi streaming spec: attach engine-internal per-chunk data to
+    # every increment frame as `delta.internal_content`. Currently the only
+    # documented member is `token_ids` (the output token ids of that chunk).
+    include_internal_content: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
-    name: str
+    # OpenAI marks `name` as required, but nothing in the constrained-decoding
+    # path reads it (only `schema` and `strict`), so a missing name should not
+    # fail the request.
+    name: Optional[str] = None
     description: Optional[str] = None
     # use alias to workaround pydantic conflict
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    strict: Optional[bool] = False
+    strict: Optional[bool] = None
+
+    @field_validator("strict", mode="before")
+    @classmethod
+    def validate_strict_is_bool(cls, value):
+        # Reject non-boolean strict (e.g. "yes"), which pydantic would otherwise
+        # coerce into True.
+        if value is not None and not isinstance(value, bool):
+            raise ValueError("json_schema.strict must be a boolean")
+        return value
 
 
 class ResponseFormat(BaseModel):
@@ -268,6 +294,27 @@ class FileDeleteResponse(BaseModel):
     deleted: bool
 
 
+class KVTransferParams(BaseModel):
+    """
+    Parameters for KV transfer.
+    """
+
+    # AttentionStore 定位 Prefix Cache 使用的 Block Hash
+    as_block_hashs: Optional[List[int]] = None
+    as_kv_cache_params: Optional[dict] = None
+    max_hit_host_ip: Optional[List[str]] = None
+    max_hit_token_len: Optional[List[int]] = None
+
+
+class KVCacheParams(BaseModel):
+    """
+    Parameters for KV cache.
+    """
+
+    need_caching: bool = False
+    expire_at: int = 0
+
+
 class BatchRequest(BaseModel):
     input_file_id: (
         str  # The ID of an uploaded file that contains requests for the new batch
@@ -302,15 +349,15 @@ class BatchResponse(BaseModel):
 
 def _migrate_deprecated_dp_rank(values: dict) -> dict:
     if isinstance(values, dict) and values.get("data_parallel_rank") is not None:
-        import warnings
-
-        warnings.warn(
-            "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
         if values.get("routed_dp_rank") is None:
             values["routed_dp_rank"] = values["data_parallel_rank"]
+    return values
+
+
+def _migrate_deprecated_prefill_dp_rank(values: dict) -> dict:
+    if isinstance(values, dict) and values.get("peer_data_parallel_rank") is not None:
+        if values.get("disagg_prefill_dp_rank") is None:
+            values["disagg_prefill_dp_rank"] = values["peer_data_parallel_rank"]
     return values
 
 
@@ -363,6 +410,10 @@ class CompletionRequest(BaseModel):
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
+    # Thinking budget (only limits <think>...</think>)
+    thinking_budget: Optional[int] = None
+    # Must NOT include </think>; server will append end token when injecting.
+    thinking_prompt_token_ids: Optional[List[int]] = None
 
     images_config: Optional[Dict] = None
 
@@ -375,8 +426,6 @@ class CompletionRequest(BaseModel):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -394,9 +443,20 @@ class CompletionRequest(BaseModel):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_prefill_dp_rank(cls, values):
+        return _migrate_deprecated_prefill_dp_rank(values)
+
     # For AttentionStore (AS) secondary cache
     kv_transfer_params: Optional[KVTransferParams] = None
     kv_cache_params: Optional[KVCacheParams] = None
+
+    # Deprecated: use routed_dp_rank instead
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
+    peer_data_parallel_rank: Optional[int] = None
 
 
     @field_validator("max_tokens")
@@ -455,6 +515,7 @@ class CompletionResponse(BaseModel):
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -467,6 +528,7 @@ class CompletionResponse(BaseModel):
 class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
+    tokens: int
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
@@ -494,6 +556,7 @@ class CompletionStreamResponse(BaseModel):
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -674,6 +737,9 @@ class ChatCompletionMessageGenericParam(BaseModel):
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
+    # Captured only so dynamic tools placed on a non-system message can be
+    # rejected during validation; user-role tools are never collected/rendered.
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
 
     @model_validator(mode="after")
     def validate_thinking_parts_role(self):
@@ -756,6 +822,7 @@ class ChatCompletionRequest(BaseModel):
         "including visible output tokens and reasoning tokens. Input tokens are not included. ",
     )
     n: int = 1
+    parallel_tool_calls: bool = True
     presence_penalty: float = 0.0
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     seed: Optional[int] = None
@@ -769,6 +836,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    # Server-derived (see set_tool_choice_default); not part of the API.
+    tool_choice_explicit: bool = Field(default=False, exclude=True)
     parallel_tool_calls: bool = True
     return_hidden_states: bool = False
     return_routed_experts: bool = False
@@ -812,6 +881,7 @@ class ChatCompletionRequest(BaseModel):
     no_stop_trim: bool = False
     ignore_eos: bool = False
     continue_final_message: bool = False
+    continuation_token_ids: Optional[List[int]] = None
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_id: Optional[str] = None
@@ -830,6 +900,10 @@ class ChatCompletionRequest(BaseModel):
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
+    # Thinking budget (only limits <think>...</think>)
+    thinking_budget: Optional[int] = None
+    # Must NOT include </think>; server will append end token when injecting.
+    thinking_prompt_token_ids: Optional[List[int]] = None
 
     # Pre-computed prompt token IDs: when provided, bypasses chat template
     # tokenization entirely.  Messages are still used to derive stop tokens
@@ -856,6 +930,8 @@ class ChatCompletionRequest(BaseModel):
     disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
+    # Deprecated: use disagg_prefill_dp_rank instead
+    peer_data_parallel_rank: Optional[int] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -874,6 +950,10 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
+        # Record whether the client sent tool_choice before the default is
+        # injected below; renderers (K3) must tell an explicit "none" apart
+        # from the injected one. Always overwritten, so clients can't spoof it.
+        values["tool_choice_explicit"] = values.get("tool_choice") is not None
         if values.get("tool_choice") is None:
             if values.get("tools") is None and not _has_message_level_tools(
                 values.get("messages")
@@ -932,8 +1012,41 @@ class ChatCompletionRequest(BaseModel):
             if enabled:
                 thinking = True
 
+        # Kimi K3 `thinking` dict: {type: "enabled"|"disabled", keep, effort}.
+        # `thinking.effort`, when explicitly present, takes priority over
+        # `reasoning_effort` (a `thinking.effort=low` + `reasoning_effort=max`
+        # request must behave like low). `effort` is ignored when disabled.
+        t = values.get("thinking")
+        thinking_type_set = False
+        if isinstance(t, dict):
+            ttype = t.get("type")
+            if ttype == "disabled":
+                thinking = False
+                thinking_type_set = True
+            elif ttype in ("enabled", None):
+                thinking = True
+                thinking_type_set = True
+            teffort = t.get("effort")
+            if teffort is not None and ttype != "disabled":
+                if isinstance(teffort, str) and teffort in {
+                    "none",
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                }:
+                    values["reasoning_effort"] = teffort
+                elif isinstance(teffort, (int, float)) and not isinstance(
+                    teffort, bool
+                ):
+                    values["reasoning_effort"] = float(teffort)
+                else:
+                    raise ValueError(f"invalid thinking effort: {teffort!r}")
+
         effort = values.get("reasoning_effort")
-        if effort is not None:
+        if effort is not None and not thinking_type_set:
             thinking = effort != "none"
 
         if thinking is not None:
@@ -945,6 +1058,15 @@ class ChatCompletionRequest(BaseModel):
             # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
             ctk.setdefault("thinking", thinking)
             ctk.setdefault("enable_thinking", thinking)
+            values["chat_template_kwargs"] = ctk
+
+        if AIAK_DISABLE_THINKING:
+            # Always force thinking to False regardless of user input
+            ctk = values.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            ctk["thinking"] = False
+            ctk["enable_thinking"] = False
             values["chat_template_kwargs"] = ctk
 
         return values
@@ -978,6 +1100,30 @@ class ChatCompletionRequest(BaseModel):
                 "strict": strict_,
             }
 
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_continuation_request(cls, values):
+        """Validate continuation is used only for resumable tool-call generation."""
+        cont_ids = values.get("continuation_token_ids")
+        if not cont_ids:
+            return values
+
+        if values.get("continue_final_message", False):
+            raise ValueError(
+                "continuation_token_ids and continue_final_message cannot be used together"
+            )
+
+        has_tools = bool(values.get("tools")) or _has_message_level_tools(
+            values.get("messages")
+        )
+        if not has_tools:
+            raise ValueError("continuation_token_ids requires tools")
+        if values.get("tool_choice") == "none":
+            raise ValueError(
+                "continuation_token_ids requires tool_choice other than 'none'"
+            )
         return values
 
     def to_sampling_params(
@@ -1030,6 +1176,12 @@ class ChatCompletionRequest(BaseModel):
             "sampling_seed": self.seed,
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }
+        if self.thinking_budget is not None:
+            sampling_params["thinking_budget"] = self.thinking_budget
+        if self.thinking_prompt_token_ids is not None:
+            sampling_params["thinking_prompt_token_ids"] = (
+                self.thinking_prompt_token_ids
+            )
 
         if self.response_format and self.response_format.type == "json_schema":
             if self.response_format.json_schema.strict is not False:
@@ -1090,6 +1242,8 @@ class ChatCompletionResponseChoice(BaseModel):
     prompt_token_ids: Optional[List[int]] = None
     token_ids: Optional[List[int]] = None
     meta_info: Optional[Dict[str, Any]] = None
+    # incremental; excludes continuation_token_ids prefix
+    output_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -1102,6 +1256,8 @@ class ChatCompletionResponseChoice(BaseModel):
             data.pop("token_ids", None)
         if self.meta_info is None:
             data.pop("meta_info", None)
+        if self.output_token_ids is None:
+            data.pop("output_token_ids", None)
         return data
 
 
@@ -1114,6 +1270,7 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -1129,12 +1286,24 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
+    tokens: Optional[int] = None
+    # Moonshot/Kimi streaming spec; only set when
+    # stream_options.include_internal_content is requested.
+    internal_content: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        # Drop some null fields
+        for key in ("role", "tool_calls", "tokens", "internal_content"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        # Make some null fields empty string
+        for key in ("content", "reasoning_content"):
+            if data.get(key) is None:
+                data[key] = ""
         return data
 
 
@@ -1148,6 +1317,15 @@ class ChatCompletionResponseStreamChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    # incremental; excludes continuation_token_ids prefix
+    output_token_ids: Optional[List[int]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.output_token_ids is None:
+            data.pop("output_token_ids", None)
+        return data
 
 
 class ChatCompletionStreamResponse(BaseModel):
@@ -1158,6 +1336,7 @@ class ChatCompletionStreamResponse(BaseModel):
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -1343,7 +1522,7 @@ class TokenizeRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str = DEFAULT_MODEL_NAME
-    prompt: Optional[Union[str, List[str]]] = None
+    prompt: Optional[Union[List[int], List[List[int]], str, List[str]]] = None
     messages: Optional[List[ChatCompletionMessageParam]] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
@@ -1354,7 +1533,10 @@ class TokenizeRequest(BaseModel):
     chat_template_kwargs: Optional[Dict] = None
     add_special_tokens: bool = Field(
         default=True,
-        description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
+        description=(
+            "Compatibility field; only true is supported. Special-token handling "
+            "is determined by the matching chat/completions preprocessing path."
+        ),
     )
 
     @model_validator(mode="after")
@@ -1366,6 +1548,7 @@ class TokenizeRequest(BaseModel):
     def to_chat_completion_request(self) -> ChatCompletionRequest:
         data = self.model_dump(
             exclude={"prompt", "add_special_tokens"},
+            exclude_unset=True,
             exclude_none=True,
         )
         extra = getattr(self, "__pydantic_extra__", None)

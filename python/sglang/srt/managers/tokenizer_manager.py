@@ -79,6 +79,7 @@ from sglang.srt.managers.io_struct import (
     ShutdownReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TokenizeReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     async_sock_recv,
@@ -447,6 +448,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.tokenize_req_futures: Dict[str, asyncio.Future] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -609,6 +611,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             [
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (TokenizeReqOutput, self._handle_tokenize_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
@@ -638,16 +641,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
 
-        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            dp_size = self.elastic_worker_count
-            if dp_size <= 1 and obj.routed_dp_rank == 0:
-                logger.debug(
-                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
-                )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
-                raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
-                )
+        logger.info(f"[trace] tokenizer received request rid={obj.rid}")
+
+        self._validate_routed_dp_rank(obj)
 
         self._init_req_state(obj, request)
         try:
@@ -685,6 +681,110 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # path are left untouched (pop is a no-op).
             self._discard_pending_req_states(obj)
             raise
+
+    def _validate_routed_dp_rank(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
+            dp_size = self.elastic_worker_count
+            if dp_size <= 1 and obj.routed_dp_rank == 0:
+                logger.debug(
+                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
+                )
+            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+                raise ValueError(
+                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
+                )
+
+    async def tokenize_request(
+        self,
+        obj: GenerateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Union[List[int], List[List[int]]]:
+        """Return the prompt IDs that the scheduler would use for generation."""
+        self.auto_create_handle_loop()
+
+        obj.normalize_batch_and_arguments()
+        self._set_default_priority(obj)
+        self._validate_routed_dp_rank(obj)
+
+        logger.info(f"[trace] tokenizer received tokenize-only request rid={obj.rid}")
+
+        self._init_req_state(obj, request)
+        lora_acquired = False
+        try:
+            if self.server_args.language_only:
+                self._handle_epd_disaggregation_encode_request(obj)
+
+            self.request_logger.log_received_request(obj, self.tokenizer, request)
+
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+            async with self.model_update_lock.reader_lock:
+                await self._validate_and_resolve_lora(obj)
+                lora_acquired = bool(obj.lora_path)
+
+                if obj.is_single:
+                    tokenized_obj = await self._tokenize_one_request(obj)
+                    return await self._send_tokenize_only_request(tokenized_obj)
+
+                batch_size = obj.batch_size
+                if getattr(obj, "parallel_sample_num", 1) == 1 and (
+                    self._should_use_batch_tokenization(batch_size, obj)
+                ):
+                    tokenized_objs = await self._batch_tokenize_and_process(
+                        batch_size, obj
+                    )
+                else:
+                    tokenized_objs = await asyncio.gather(
+                        *(self._tokenize_one_request(obj[i]) for i in range(batch_size))
+                    )
+
+                return await asyncio.gather(
+                    *(
+                        self._send_tokenize_only_request(tokenized_obj)
+                        for tokenized_obj in tokenized_objs
+                    )
+                )
+        finally:
+            try:
+                if lora_acquired:
+                    await self.lora_registry.release(obj.lora_id)
+            finally:
+                self._finish_tokenize_request_states(obj)
+
+    async def _send_tokenize_only_request(
+        self, tokenized_obj: TokenizedGenerateReqInput
+    ) -> List[int]:
+        rid = tokenized_obj.rid
+        if rid in self.tokenize_req_futures:
+            raise ValueError(f"Duplicate tokenize-only request ID: {rid}")
+
+        future = asyncio.get_running_loop().create_future()
+        self.tokenize_req_futures[rid] = future
+        tokenized_obj.tokenize_only = True
+
+        try:
+            self._send_one_request(tokenized_obj)
+            output: TokenizeReqOutput = await future
+        finally:
+            self.tokenize_req_futures.pop(rid, None)
+
+        if output.error_message is not None:
+            raise fastapi.HTTPException(
+                status_code=output.status_code,
+                detail=output.error_message,
+            )
+        return output.input_ids
+
+    def _finish_tokenize_request_states(self, obj: GenerateReqInput) -> None:
+        rids = [obj.rid] if obj.is_single else obj.rid
+        for rid in rids:
+            state = self.rid_to_state.get(rid)
+            if state is not None and not state.time_stats.finished_time:
+                state.time_stats.set_finished_time()
+        self._discard_pending_req_states(obj)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -871,6 +971,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 input_ids, token_type_ids = await self._tokenize_texts(
                     input_text, is_cross_encoder_request
                 )
+
+        # Append continuation_token_ids after input_ids is resolved (whether
+        # from obj.input_ids directly or from tokenization of text).  This
+        # handles the multimodal-model case where serving_chat sends text
+        # instead of pre-built input_ids.
+        if getattr(obj, "continuation_token_ids", None) and input_ids is not None:
+            orig_len = len(input_ids)
+            input_ids = input_ids + obj.continuation_token_ids
+            logger.info(
+                "FC continuation in tokenizer_manager (rid=%s): appended %d tokens "
+                "(input_ids %d -> %d)",
+                obj.rid,
+                len(obj.continuation_token_ids),
+                orig_len,
+                len(input_ids),
+            )
 
         contains_mm_input = obj.contains_mm_input()
         is_mossvl = (
@@ -1175,6 +1291,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
+        sampling_kwargs = dict(sampling_kwargs)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and sampling_kwargs.get("thinking_budget") is not None
+            and obj.custom_logit_processor
+            and isinstance(sampling_kwargs.get("custom_params"), dict)
+            and "thinking_budget" in sampling_kwargs["custom_params"]
+        ):
+            logger.warning(
+                "Detected both scheduler-level thinking_budget and custom_logit_processor with "
+                "custom_params['thinking_budget']; scheduler injection takes precedence and the "
+                "custom_params['thinking_budget'] will be ignored."
+            )
+            sampling_kwargs["custom_params"] = dict(sampling_kwargs["custom_params"])
+            sampling_kwargs["custom_params"].pop("thinking_budget", None)
+        if (
+            sampling_kwargs.get("thinking_budget") is not None
+            and sampling_kwargs.get("thinking_budget") >= 0
+            and sampling_kwargs.get("thinking_prompt_token_ids") is None
+        ):
+            sampling_kwargs["thinking_prompt_token_ids"] = self.tokenizer.encode(
+                "思考已达上限，请开始回答", add_special_tokens=False
+            )
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
@@ -2938,6 +3077,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not future.done():
             future.set_result(recv_obj.session_id if recv_obj.success else None)
+
+    def _handle_tokenize_req_output(self, recv_obj: TokenizeReqOutput) -> None:
+        future = self.tokenize_req_futures.get(recv_obj.rid)
+        if future is None:
+            logger.warning(
+                "Tokenize-only response arrived after waiter cleanup: %s",
+                recv_obj.rid,
+            )
+            return
+        if not future.done():
+            future.set_result(recv_obj)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.model_update_expected_workers == 1:

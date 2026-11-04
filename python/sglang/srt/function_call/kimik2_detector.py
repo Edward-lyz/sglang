@@ -9,6 +9,23 @@ from sglang.srt.function_call.base_format_detector import (
     StructuralTag,
     get_model_structural_tag,
 )
+from xgrammar.structural_tag import (
+    ConstStringFormat,
+    JSONSchemaFormat,
+    RegexFormat,
+    SequenceFormat,
+    StructuralTag,
+    TagFormat,
+    TagsWithSeparatorFormat,
+    TriggeredTagsFormat,
+)
+
+from sglang.srt.entrypoints.openai.protocol import (
+    Tool,
+    ToolCallConstraint,
+    ToolChoice,
+)
+from sglang.srt.environ import ToolStrictLevel
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -55,8 +72,13 @@ class KimiK2Detector(BaseFormatDetector):
     Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self,
+        tools: List[Tool],
+        tool_choice: Union[Literal["required", "auto", "none"], ToolChoice],
+        parallel_tool_calls: bool,
+    ):
+        super().__init__(tools, tool_choice, parallel_tool_calls)
 
         self.bot_token: str = "<|tool_calls_section_begin|>"
         self.eot_token: str = "<|tool_calls_section_end|>"
@@ -471,3 +493,79 @@ class KimiK2Detector(BaseFormatDetector):
 
     def get_structural_tag_name(self) -> str:
         return "kimi"
+
+    def get_structure_constraint(self) -> Optional[ToolCallConstraint]:
+        """Get structure constraint for guided generation."""
+
+        # Only parsing for requests with "tool_choice=auto"
+        if self.tool_choice != "auto":
+            return None
+
+        if self.tool_strict_level == ToolStrictLevel.OFF:
+            return None
+
+        return ("structural_tag", self._get_structural_tag())
+
+    def _get_structural_tag(self) -> StructuralTag:
+        return StructuralTag(
+            format=TriggeredTagsFormat(
+                triggers=[self.bot_token],
+                tags=[
+                    TagFormat(
+                        begin=self.bot_token,
+                        end=self.eot_token,
+                        content=TagsWithSeparatorFormat(
+                            tags=[
+                                TagFormat(
+                                    begin=self.tool_call_start_token,
+                                    end=self.tool_call_end_token,
+                                    content=SequenceFormat(
+                                        elements=[
+                                            ConstStringFormat(
+                                                value=f"functions.{tool.function.name}:",
+                                            ),
+                                            RegexFormat(
+                                                pattern=r"^(0|[1-9]\d*)$",
+                                            ),
+                                            ConstStringFormat(
+                                                value="<|tool_call_argument_begin|>",
+                                            ),
+                                            JSONSchemaFormat(
+                                                json_schema=(
+                                                    tool.function.parameters
+                                                    if self.tool_strict_level
+                                                    == ToolStrictLevel.PARAMETER
+                                                    and tool.function.parameters
+                                                    is not None
+                                                    and tool.function.strict
+                                                    else {
+                                                        "type": "object",
+                                                        "properties": {},
+                                                        "additionalProperties": True,
+                                                    }
+                                                ),
+                                            ),
+                                        ],
+                                    ),
+                                )
+                                for tool in self.tools
+                            ],
+                            separator="",
+                            at_least_one=True,
+                            stop_after_first=(not self.parallel_tool_calls),
+                        ),
+                    ),
+                ],
+                at_least_one=False,
+                stop_after_first=True,
+            ),
+        )
+    # Kimi stays on the SGLang legacy structural tag path. xgrammar 0.2.0's
+    # get_kimi_structural_tag(tool_choice="auto") emits a bare
+    # <|tool_call_begin|>...<|tool_call_end|> grammar without the
+    # <|tool_calls_section_begin|>/<|tool_calls_section_end|> wrapper Kimi's
+    # chat template uses, and KimiK2Detector.has_tool_call() keys off the
+    # section marker — bare tool calls would be silently dropped. Inheriting
+    # the base get_structural_tag_name (returns None) keeps FunctionCallParser
+    # on the legacy path, whose structure_info bakes the section markers in.
+    # TODO: re-enable the builtin once https://github.com/mlc-ai/xgrammar/issues/622 is fixed.

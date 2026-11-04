@@ -57,8 +57,13 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
     Reference: DeepSeek V4 format specification
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self,
+        tools=None,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    ):
+        super().__init__(tools, tool_choice, parallel_tool_calls)
         self.bot_token = "<｜DSML｜tool_calls>"
         self.eot_token = "</｜DSML｜tool_calls>"
         self.function_calls_regex = r"<｜DSML｜tool_calls>(.*?)</｜DSML｜tool_calls>"

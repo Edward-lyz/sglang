@@ -29,6 +29,8 @@ from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
+from sglang.srt.function_call.kimik3_detector import KimiK3Detector
+from sglang.srt.function_call.kimik3_structural_tag import promote_tools_to_strict
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
@@ -43,7 +45,9 @@ from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.srt.function_call.utils import (
+    StreamingInputBuffer,
     _get_tool_schema_defs,
+    collect_streaming_markers,
     get_json_schema_constraint,
 )
 
@@ -71,6 +75,7 @@ class FunctionCallParser:
         "glm47": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
         "kimi_k2": KimiK2Detector,
+        "kimi_k3": KimiK3Detector,
         "lfm2": Lfm2Detector,
         "llama3": Llama32Detector,
         "mimo": MiMoDetector,
@@ -94,21 +99,53 @@ class FunctionCallParser:
         "inkling": InklingDetector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
+    def __init__(
+        self,
+        tool_call_parser: str,
+        tools: List[Tool],
+        tool_choice: Union[Literal["required", "auto", "none"], ToolChoice] = "auto",
+        parallel_tool_calls: bool = True,
+        thinking_mode: bool = False,
+        tokenizer=None,
+        canonical_streaming: bool = False,
+    ):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
-            kwargs = {}
+            signature = inspect.signature(detector_class)
+            accepts_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+            kwargs = {
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "parallel_tool_calls": parallel_tool_calls,
+            }
             if tokenizer is not None:
-                sig = inspect.signature(detector_class)
-                if "tokenizer" in sig.parameters:
-                    kwargs["tokenizer"] = tokenizer
+                kwargs["tokenizer"] = tokenizer
+            if not accepts_kwargs:
+                # Older detectors receive request options through their parse
+                # methods and still expose a parameterless constructor.
+                kwargs = {
+                    name: value
+                    for name, value in kwargs.items()
+                    if name in signature.parameters
+                }
             detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 
         self.detector = detector
         self.tools = tools
+        self.tool_choice = tool_choice
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+        self.parallel_tool_calls = parallel_tool_calls
+        self.thinking_mode = thinking_mode
+        self._stream_input = (
+            StreamingInputBuffer(collect_streaming_markers(detector, tokenizer))
+            if canonical_streaming
+            else None
+        )
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -147,7 +184,9 @@ class FunctionCallParser:
         else:
             return full_text, []
 
-    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def parse_stream_chunk(
+        self, chunk_text: str, *, final: bool = False
+    ) -> Tuple[str, list[ToolCallItem]]:
         """
         Streaming incremental parsing of chunks of text as they arrive.
 
@@ -161,17 +200,57 @@ class FunctionCallParser:
         """
         if not self.tools:
             return chunk_text, []
-        final_normal_text = ""
+        final_normal_text = []
         final_calls = []
 
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
-        if sp_result.normal_text:
-            final_normal_text = sp_result.normal_text
-        if sp_result.calls:
-            final_calls.extend(sp_result.calls)
-            final_normal_text = sp_result.normal_text
+        if self._stream_input is None:
+            parts = [chunk_text]
+        else:
+            parts = self._stream_input.feed(chunk_text)
+            if final:
+                parts.extend(self._stream_input.finish())
 
-        return final_normal_text, final_calls
+        for part in parts:
+            result = self.detector.parse_streaming_increment(part, self.tools)
+            final_normal_text.append(result.normal_text)
+            final_calls.extend(result.calls)
+
+        if final and self._stream_input is not None:
+            # Some detectors emit a name, arguments and subsequent calls on
+            # separate invocations. Drain only at a real stop, never at a
+            # request's length boundary or the end of a replayed prefix.
+            while True:
+                result = self.detector.parse_streaming_increment("", self.tools)
+                final_normal_text.append(result.normal_text)
+                final_calls.extend(result.calls)
+                if not result.normal_text and not result.calls:
+                    break
+
+        return "".join(final_normal_text), final_calls
+
+    def replay_continuation(self, continuation_text: str) -> bool:
+        """Replay parser state and report whether it emitted tool calls."""
+        if not self.tools:
+            return False
+        _, calls = self.parse_stream_chunk(continuation_text)
+        saw_tool_calls = bool(calls)
+        if self._stream_input is not None:
+            # Live input and replay retain exactly the same unfinished block
+            # and detector state. Empty-input draining would change that state.
+            return saw_tool_calls
+        max_iters = 100
+        for _ in range(max_iters):
+            normal_text, calls = self.parse_stream_chunk("")
+            saw_tool_calls = saw_tool_calls or bool(calls)
+            if not calls and not normal_text:
+                break
+        else:
+            logger.warning(
+                "replay_continuation: hit max_iters=%d; "
+                "parser state may be incomplete",
+                max_iters,
+            )
+        return saw_tool_calls
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
@@ -225,12 +304,46 @@ class FunctionCallParser:
             at_least_one=at_least_one,
         )
 
-    def get_structure_constraint(
-        self,
-        tool_choice: Union[ToolChoice, Literal["auto", "required"]],
-        parallel_tool_calls: bool = True,
-        thinking_mode: bool = False,
-    ) -> Optional[ToolCallConstraint]:
+    def _get_kimik3_structure_constraint(self) -> Optional[ToolCallConstraint]:
+        """Route Kimi K3 to its model-native structural tag.
+
+        ``auto`` with no strictness requested still gets the auto hook, which
+        constrains a call once the model opens the tools channel without forcing
+        one. Requesting strictness -- per-tool ``strict`` or
+        ``SGLANG_TOOL_STRICT_LEVEL`` -- switches to the full tag, and PARAMETER
+        level promotes every tool to strict.
+        """
+        wants_call = self.tool_choice == "required" or isinstance(
+            self.tool_choice, ToolChoice
+        )
+        wants_strict = self.tool_strict_level >= ToolStrictLevel.FUNCTION or any(
+            tool.function.strict for tool in self.tools
+        )
+
+        if not wants_call and not wants_strict:
+            structural_tag = self.detector.get_auto_tool_call_structural_tag(
+                tools=self.tools,
+                thinking_mode=self.thinking_mode,
+                parallel_tool_calls=self.parallel_tool_calls,
+            )
+            if structural_tag is None:
+                return None
+            return ("structural_tag", structural_tag)
+
+        tools = self.tools
+        if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
+            tools = promote_tools_to_strict(tools)
+        return (
+            "structural_tag",
+            self.detector.get_structural_tag(
+                tools=tools,
+                tool_choice=self.tool_choice,
+                thinking_mode=self.thinking_mode,
+                parallel_tool_calls=self.parallel_tool_calls,
+            ),
+        )
+
+    def get_structure_constraint(self) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
         The constraint is used to guide the model's output format.
@@ -242,44 +355,27 @@ class FunctionCallParser:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
             or None if no constraint applies.
         """
-        is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
-        should_constrain_auto = tool_choice == "auto" and (
-            any(tool.function.strict for tool in self.tools)
-            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
-        )
+        # TODO(liyaolang): Should move to the newest community implementation later.
+        if isinstance(self.detector, KimiK3Detector):
+            return self._get_kimik3_structure_constraint()
 
-        # Highest priority: model-native structural_tag when available.
-        try:
-            if tool_choice == "auto" and not should_constrain_auto:
-                structural_tag = self.detector.get_auto_tool_call_structural_tag(
-                    tools=self.tools
-                )
-                if structural_tag is not None:
-                    return ("structural_tag", structural_tag)
-
-            if is_required or should_constrain_auto:
-                structural_tag = self.detector.get_structural_tag(
-                    tools=self.tools,
-                    thinking_mode=thinking_mode,
-                    tool_choice=tool_choice,
-                )
-                if structural_tag is not None:
-                    return ("structural_tag", structural_tag)
-
-                # Fallback to legacy structural tag if model-native tag is not supported.
-                if self.detector.supports_structural_tag():
-                    # For "required"/named: always use structural_tag to preserve the
-                    # model's native tool call format. Schema is only included when
-                    # strict=True, per OpenAI protocol semantics.
-                    # For "auto": only constrain when strict is enabled.
-                    tag = self.get_legacy_structural_tag(at_least_one=is_required)
-                    return ("structural_tag", tag)
-
-            if tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-                json_schema = get_json_schema_constraint(
-                    self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
-                )
-                return ("json_schema", json_schema)
-        except Exception as e:
-            logger.error(f"Error getting structure constraint: {e}")
-            return None
+        # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
+        # It cannot parse or validate function call Pythonic or XML-ish syntax.
+        if (
+            self.detector.supports_structural_tag()
+            and self.tool_choice == "auto"
+            and self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        ):
+            # Use new structural tag to support parallel tool callings
+            # TODO(liyaolang): Other models should also support in the future
+            if isinstance(self.detector, KimiK2Detector):
+                return self.detector.get_structure_constraint()
+            tag = self._get_legacy_structural_tag()
+            return ("structural_tag", tag)
+        elif self.tool_choice == "required" or isinstance(self.tool_choice, ToolChoice):
+            json_schema = get_json_schema_constraint(
+                self.tools,
+                self.tool_choice,
+                parallel_tool_calls=self.parallel_tool_calls,
+            )
+            return ("json_schema", json_schema)

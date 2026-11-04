@@ -69,6 +69,7 @@ class SchedulerRequestReceiver:
     model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
+    send_tokenize_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
 
@@ -240,8 +241,11 @@ class SchedulerRequestReceiver:
                     status_code = error_code
                 else:
                     status_code = HTTPStatus(int(error_code))
-                prepare_abort(req, error_msg, status_code=status_code)
-                self.stream_output([req], req.return_logprob)
+                if getattr(req, "tokenize_only", False):
+                    self.send_tokenize_output(req, error_msg, status_code)
+                else:
+                    prepare_abort(req, error_msg, status_code=status_code)
+                    self.stream_output([req], req.return_logprob)
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:

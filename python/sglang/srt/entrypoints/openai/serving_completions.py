@@ -135,6 +135,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
             images_config=getattr(request, "images_config", None),
         )
 
+        # Convert kv_cache_params and kv_transfer_params to as_* flat fields
+        if request.kv_transfer_params is not None:
+            kv_cache_dict = request.kv_cache_params.dict() if request.kv_cache_params else {}
+            adapted_request.as_kv_cache_params = {
+                key: str(value) if value is not None else ""
+                for key, value in kv_cache_dict.items()
+            }
+            adapted_request.as_max_hit_host_ip = request.kv_transfer_params.max_hit_host_ip
+            adapted_request.as_max_hit_token_len = request.kv_transfer_params.max_hit_token_len
+
         return adapted_request, request
 
     def _build_sampling_params(self, request: CompletionRequest) -> Dict[str, Any]:
@@ -163,6 +173,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
             "sampling_seed": request.seed,
+            "thinking_budget": request.thinking_budget,
+            "thinking_prompt_token_ids": request.thinking_prompt_token_ids,
         }
 
         # Handle response_format constraints
@@ -218,6 +230,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming completion response"""
         created = int(time.time())
@@ -244,7 +257,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             )
 
             async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
+                adapted_request, raw_request, tokenizer_rev_request_time
             ):
                 index = content.get("index", 0)
 
@@ -340,7 +353,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Abort with an explicit error status_code is a system error
-                # (timeout, OOM, validation): emit a streaming error chunk.
+                # (timeout, OOM, validation). If no chunk has been sent yet the
+                # HTTP status is still ours to choose, so raise and let the
+                # kick-start in _handle_streaming_request turn it into a real
+                # error response; otherwise HTTP 200 is already committed and the
+                # only option is an in-band error chunk.
                 # A graceful abort (no status_code, e.g. user-initiated via
                 # /abort_request or session lifecycle cleanup) falls through
                 # to the normal chunk path, matching the non-stream behavior
@@ -348,6 +365,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 if finish_reason_type == "abort" and isinstance(
                     finish_reason.get("status_code"), HTTPStatus
                 ):
+                    if not stream_started:
+                        self.raise_abort_before_stream(finish_reason)
                     code = finish_reason["status_code"]
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
@@ -360,6 +379,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
                     text=delta,
+                    tokens=content.get("generated_token_num", 1),
                     logprobs=logprobs,
                     finish_reason=finish_reason_type,
                     matched_stop=(
@@ -386,8 +406,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                     )
 
-                yield f"data: {chunk.model_dump_json()}\n\n"
+                # Set before the yield: once the chunk leaves this generator
+                # HTTP 200 is committed, and the flag is what guards against
+                # raising after that point.
                 stream_started = True
+                yield f"data: {chunk.model_dump_json()}\n\n"
 
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
@@ -457,6 +480,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     choices=[],
                     model=request.model,
                     usage=usage,
+                    trace_info=self._build_trace_info(request, content["meta_info"]),
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
@@ -474,11 +498,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming completion request"""
         try:
             generator = self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
+                adapted_request, raw_request, tokenizer_rev_request_time
             )
             ret = await generator.__anext__()
         except ValueError as e:
@@ -594,6 +619,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
             sglext=response_sglext,
+            trace_info=self._build_trace_info(request, ret[0]["meta_info"]),
         )
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:

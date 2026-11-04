@@ -827,6 +827,11 @@ class Req(ReqDllmMixin):
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        # The thinking-related fields are mutated in the scheduler event loop.
+        # They are not designed for concurrent multi-thread mutation.
+        self.thinking_budget: Optional[int] = None
+        self.thinking_inject_index: int = 0
+        self.thinking_prompt_token_ids: Optional[List[int]] = None
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -1020,6 +1025,7 @@ class Req(ReqDllmMixin):
             None
         )
         self.grammar_wait_ct = 0
+        self.continuation_token_ids: Optional[List[int]] = None
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
@@ -1532,6 +1538,113 @@ class Req(ReqDllmMixin):
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
+    def init_thinking_budget(self):
+        """Initialize per-request thinking budget state.
+
+        This reads `thinking_budget` and `thinking_prompt_token_ids` from
+        `self.sampling_params` and prepares request-local mutable fields for decode.
+
+        Notes:
+        - `thinking_budget` is an int state machine: `>0` counts down, `==0` starts
+          injection, `-1` means thinking is finished/disabled.
+        - `thinking_prompt_token_ids` passed from the request must NOT include the
+          `</think>` token; the server appends `think_end_id` here to ensure the
+          injected sequence always terminates the thinking segment.
+        """
+        thinking_budget = getattr(self.sampling_params, "thinking_budget", None)
+        if thinking_budget is None:
+            return
+        if self.tokenizer is None:
+            return
+
+        self.thinking_budget = int(thinking_budget)
+        self.thinking_inject_index = 0
+
+        prompt_token_ids = getattr(
+            self.sampling_params, "thinking_prompt_token_ids", None
+        )
+        self.thinking_prompt_token_ids = list(prompt_token_ids or [])
+
+        think_end_id = getattr(self.tokenizer, "think_end_id", None)
+        if think_end_id is None:
+            # Fallback for when the server is launched without --reasoning-parser:
+            # infer think_end_id from tokenizer vocab and cache it on the tokenizer.
+            # Only accept single-token encodings to match the current state machine.
+            ids = self.tokenizer.encode("</think>", add_special_tokens=False)
+            if len(ids) == 1:
+                think_end_id = int(ids[0])
+                self.tokenizer.think_end_id = think_end_id
+        if think_end_id is not None:
+            self.thinking_prompt_token_ids.append(int(think_end_id))
+
+    def inject_thinking_prompt_tokens(
+        self,
+        draft_tokens: torch.Tensor,
+        start_idx: int,
+        max_count: int,
+        advance: bool = True,
+    ) -> int:
+        """Inject thinking prompt token ids into a token tensor.
+
+        This is used to truncate the `<think>...</think>` segment by injecting a
+        predefined token sequence (e.g. "思考已达上限，请开始回答" + `</think>`).
+
+        Semantics:
+        - Only active when `self.thinking_budget == 0` (budget reached, start injecting).
+        - `advance=False` is for speculative draft stage (write tokens without consuming
+          the inject sequence).
+        - `advance=True` is for verify/sample stage (commit the injection and advance
+          `thinking_inject_index`; when finished, set `thinking_budget = -1`).
+
+        Args:
+            draft_tokens: The target tensor to be overwritten in-place.
+            start_idx: Start offset in `draft_tokens` to write.
+            max_count: Maximum number of tokens to inject.
+            advance: Whether to advance the injection cursor and update state.
+
+        Returns:
+            The number of injected tokens.
+        """
+        if self.thinking_budget != 0 or not self.thinking_prompt_token_ids:
+            return 0
+        inject_index = self.thinking_inject_index
+        remains = len(self.thinking_prompt_token_ids) - inject_index
+        if remains <= 0:
+            return 0
+        count = min(max_count, remains)
+        inject_ids = self.thinking_prompt_token_ids[inject_index : inject_index + count]
+        draft_tokens[start_idx : start_idx + count] = torch.tensor(
+            inject_ids, dtype=draft_tokens.dtype, device=draft_tokens.device
+        )
+        if advance:
+            self.thinking_inject_index += count
+            if self.thinking_inject_index >= len(self.thinking_prompt_token_ids):
+                self.thinking_budget = -1  # -1 means thinking is finished/disabled
+        return count
+
+    def update_thinking_state(self, new_token_ids: List[int]) -> None:
+        """Update thinking budget state given newly accepted token ids.
+
+        Behavior:
+        - If `think_end_id` is observed, set `thinking_budget = -1` to stop all future
+          thinking budget accounting/injection for this request.
+        - Otherwise, if `thinking_budget > 0`, decrement by 1 per token.
+
+        This function does not perform injection; it only maintains the state machine.
+        """
+        if self.thinking_budget is None or self.thinking_budget < 0:
+            return
+        if self.tokenizer is None:
+            return
+
+        think_end_id = getattr(self.tokenizer, "think_end_id", None)
+        for token_id in new_token_ids:
+            if think_end_id is not None and token_id == think_end_id:
+                self.thinking_budget = -1  # -1 means thinking is finished/disabled
+                continue
+            if self.thinking_budget > 0:
+                self.thinking_budget -= 1
+
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
@@ -1685,19 +1798,50 @@ class Req(ReqDllmMixin):
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
 
-    def update_reasoning_tokens(self, token_id, think_end_id):
+    def init_continuation_reasoning_state(self, think_end_ids) -> None:
+        """Restore reasoning state from continuation tokens.
+
+        They bypass ``update_reasoning_tokens``, so replay the think-end matcher,
+        including a marker split across requests.
+        """
+        if (
+            not self.require_reasoning
+            or not think_end_ids
+            or not self.continuation_token_ids
+        ):
+            return
+
+        matcher = TokenSequenceMatcher(think_end_ids)
+        match = 0
+        for token_id in self.continuation_token_ids:
+            match = matcher.advance(match, token_id)
+            if match == len(matcher):
+                self._is_reasoning_over = True
+                self._think_end_match_len = 0
+                return
+
+        self._think_end_match_len = match
+
+    def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:
             return
 
         if not isinstance(token_id, list):
             token_id = [token_id]
 
-        try:
-            end_pos = token_id.index(think_end_id)
-            self.reasoning_tokens += end_pos + 1
-            self._is_reasoning_over = True
-        except ValueError:
-            self.reasoning_tokens += len(token_id)
+        # The marker may span both several tokens and several decode steps, so
+        # the partial match carries over between calls.
+        matcher = TokenSequenceMatcher(think_end_ids)
+        match = self._think_end_match_len
+        for pos, token in enumerate(token_id):
+            match = matcher.advance(match, token)
+            if match == len(matcher):
+                self.reasoning_tokens += pos + 1
+                self._is_reasoning_over = True
+                return
+
+        self._think_end_match_len = match
+        self.reasoning_tokens += len(token_id)
 
     def __repr__(self):
         return (
@@ -1998,6 +2142,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For processing logprobs
     return_logprob: bool = False
+
+    # For logits and logprob post processing
+    temp_scaled_logprobs: bool = False
+    top_p_normalized_logprobs: bool = False
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
