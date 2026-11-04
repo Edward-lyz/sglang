@@ -1476,6 +1476,32 @@ class MQALayer(MqaAttentionBase):
             positions=positions,
         )
 
+    def _cp_kv_store_local_first_ok(self, attn_backend) -> bool:
+        """[fusion-opt] Gate of SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST: full-row prefill-CP
+        extend into the paged V4 / V4.1 fp8 SWA cache (no tail layout / request window)."""
+        if not envs.SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST.get():
+            return False
+        if attn_backend.forward_metadata.late_layer_tail is not None:
+            return False
+        pool = get_token_to_kv_pool()
+        ok = (
+            getattr(pool, "request_window", None) is None
+            and not getattr(pool, "uniform_fp8", False)
+            and getattr(getattr(pool, "kv_layout", None), "value", None) in ("v4", "v41")
+        )
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "fusion-opt cp_kv_store_local_first",
+            "CP KV store local-first: %s (pool=%s layout=%s req_window=%s uniform_fp8=%s)",
+            "ON" if ok else "OFF",
+            type(pool).__name__,
+            getattr(pool, "kv_layout", None),
+            getattr(pool, "request_window", None) is not None,
+            getattr(pool, "uniform_fp8", None),
+        )
+        return ok
+
     def _compute_kv_bf16(
         self,
         x: torch.Tensor,
@@ -2026,6 +2052,12 @@ class MQALayer(MqaAttentionBase):
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
             elif kv_written:
+                kv = None
+            elif use_cp and self._cp_kv_store_local_first_ok(attn_backend):
+                # [fusion-opt] SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST: norm+RoPE+fp8 the
+                # local rows into cache-format staging pages, all-gather those (584 B V4 /
+                # 528 B V4.1 vs 1024 B per row) and copy rows into the SWA cache; bitwise the
+                # same cache bytes as the stock path below.
                 kv = None
             elif use_cp:
                 # every rank writes the whole chunk's window KV with the fused fp32 store
