@@ -263,17 +263,19 @@ class DeepseekV2MLP(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ):
-        if (self.tp_size == 1) and x.shape[0] == 0:
-            return x
+        x_shape = x[0].shape if isinstance(x, tuple) else x.shape
+        if (self.tp_size == 1) and x_shape[0] == 0:
+            return x[0] if isinstance(x, tuple) else x
 
         if (
-            gemm_output_zero_allocator is not None
-            and x.shape[0] <= 256
+            not isinstance(x, tuple)
+            and gemm_output_zero_allocator is not None
+            and x_shape[0] <= 256
             and self.gate_up_proj.weight.dtype == torch.uint8
         ):
             y = gemm_output_zero_allocator.allocate(
-                x.shape[0] * self.gate_up_proj.output_size_per_partition
-            ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
+                x_shape[0] * self.gate_up_proj.output_size_per_partition
+            ).view(x_shape[0], self.gate_up_proj.output_size_per_partition)
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
@@ -977,11 +979,20 @@ class DeepseekV2MoE(nn.Module):
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            quant_input = getattr(hidden_states, "_sglang_shared_expert_quant_input", None)
+            if quant_input is not None and self._can_use_shared_expert_quant_input():
+                hidden_states = quant_input
             return self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
         else:
             return None
+
+    def _can_use_shared_expert_quant_input(self) -> bool:
+        if not hasattr(self, "shared_experts"):
+            return False
+        quant_method = getattr(self.shared_experts.gate_up_proj, "quant_method", None)
+        return self.shared_experts_is_fp8 and getattr(quant_method, "block_quant", False)
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
@@ -997,7 +1008,7 @@ class DeepseekV2MoE(nn.Module):
         if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, hidden_states_mlp_input
         ):
-            state.shared_output = self.shared_experts(hidden_states_mlp_input)
+            state.shared_output = self._forward_shared_experts(hidden_states_mlp_input)
         else:
             state.shared_output = None
 
@@ -2476,7 +2487,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices = None
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            enable_shared_expert_rmsnorm_quant=(
+                isinstance(self.mlp, DeepseekV2MoE)
+                and self.mlp._can_use_shared_expert_quant_input()
+            ),
         )
 
         should_allreduce_fusion = (
@@ -2539,6 +2556,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                 state.pop("hidden_states_after_attn"),
                 state.pop("residual_after_input_ln"),
                 state.forward_batch,
+                enable_shared_expert_rmsnorm_quant=(
+                    isinstance(self.mlp, DeepseekV2MoE)
+                    and self.mlp._can_use_shared_expert_quant_input()
+                ),
             )
         )
 

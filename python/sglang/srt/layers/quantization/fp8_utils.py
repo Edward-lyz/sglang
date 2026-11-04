@@ -448,7 +448,12 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 ) -> torch.Tensor:
     assert input_scale is None
 
-    output_dtype = input.dtype
+    if input_scale is not None:
+        assert shape_supported, (
+            "pre-quantized block fp8 input requires a DeepGEMM-supported shape, "
+            f"got weight.shape={weight.shape}"
+        )
+    output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
     dtype_supported = output_dtype == torch.bfloat16
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737

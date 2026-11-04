@@ -129,8 +129,9 @@ class Glm4MoeLiteMLP(nn.Module):
     ):
         # Keep parity with DeepseekV2MLP.forward signature since DeepseekV2DecoderLayer
         # invokes MLP modules with these extra arguments.
-        if (self.tp_size == 1) and x.shape[0] == 0:
-            return x
+        x_shape = x[0].shape if isinstance(x, tuple) else x.shape
+        if (self.tp_size == 1) and x_shape[0] == 0:
+            return x[0] if isinstance(x, tuple) else x
 
         # Some quantization wrappers store the underlying parameter as `weight_packed`.
         if not hasattr(self.gate_up_proj, "weight"):
@@ -139,13 +140,14 @@ class Glm4MoeLiteMLP(nn.Module):
             self.down_proj.weight = getattr(self.down_proj, "weight_packed")
 
         if (
-            gemm_output_zero_allocator is not None
-            and x.shape[0] <= 256
+            not isinstance(x, tuple)
+            and gemm_output_zero_allocator is not None
+            and x_shape[0] <= 256
             and self.gate_up_proj.weight.dtype == torch.uint8
         ):
             y = gemm_output_zero_allocator.allocate(
-                x.shape[0] * self.gate_up_proj.output_size_per_partition
-            ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
+                x_shape[0] * self.gate_up_proj.output_size_per_partition
+            ).view(x_shape[0], self.gate_up_proj.output_size_per_partition)
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
