@@ -126,6 +126,7 @@ from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    decode_scheduler_input,
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
@@ -281,6 +282,9 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 )
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
+)
+from sglang.srt.managers.scheduler_components.request_ring import (
+    maybe_create_request_ring,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
@@ -2727,7 +2731,17 @@ class Scheduler(
         return get_serving().tokenizer_path
 
     def init_request_receiver(self) -> None:
+        """Build the request receiver (and the shared-memory request ring if enabled)."""
+        request_ring = maybe_create_request_ring(
+            ps=self.ps,
+            tp_group=self.tp_group,
+            tp_cpu_group=self.tp_cpu_group,
+            recv_from_tokenizer=self.recv_from_tokenizer,
+            scheduler_input_endpoint=self.scheduler_input_ipc_name,
+            decode=decode_scheduler_input,
+        )
         self.request_receiver = SchedulerRequestReceiver(
+            request_ring=request_ring,
             recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
