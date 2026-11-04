@@ -53,25 +53,36 @@ class TestCaV2MultinodeAuto(CustomTestCase):
             self.assertTrue(envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get())
             self.assertTrue(envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get())
 
-    def test_non_fabric_multinode_still_disables_v2(self):
-        """Non-fabric multi-node keeps the legacy force-disable (the predicate
-        must not degrade to always-true)."""
+    def test_non_fabric_multinode_keeps_v2_per_group(self):
+        """Non-fabric multi-node: no multinode opt-in (the predicate must not
+        degrade to always-true), but v2 itself stays on so node-local groups
+        (attn_tp under DP attention) still get it; node-spanning groups are
+        rejected per group by can_use_custom_all_reduce_v2."""
         with _cleared(
             envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE,
             envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2,
         ), patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=False):
-            _HANDLE(SimpleNamespace(nnodes=2, tp_size=8))
+            _HANDLE(SimpleNamespace(nnodes=2, tp_size=16))
             self.assertFalse(envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get())
-            self.assertFalse(envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get())
+            self.assertTrue(envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get())
 
     def test_explicit_off_wins_over_fabric(self):
         """SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE=0 on a fabric device
-        must still force-disable v2 (explicit off beats auto-detection)."""
+        keeps the multinode mode off (explicit off beats auto-detection);
+        v2 is then limited to node-local groups like any other multi-node run."""
         with _cleared(envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2), patch(
             "sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True
         ), envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.override("0"):
             _HANDLE(SimpleNamespace(nnodes=2, tp_size=8))
             self.assertFalse(envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get())
+            self.assertTrue(envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get())
+
+    def test_explicit_v2_off_respected_on_multinode(self):
+        """SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 stays off on multi-node."""
+        with _cleared(envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE), patch(
+            "sglang.srt.server_args.is_mnnvl_fabric_device", return_value=False
+        ), envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.override("0"):
+            _HANDLE(SimpleNamespace(nnodes=2, tp_size=16))
             self.assertFalse(envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get())
 
     def test_tp16_not_auto_opted_in(self):

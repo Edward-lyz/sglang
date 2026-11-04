@@ -3,7 +3,7 @@
 The reduce-scatter folds the pending attention residual into its reduction
 epilogue.  The matching all-gather reassembles the token shards after MoE.
 Both reuse CustomAllReduceV2's push workspace and fall back as a pair outside
-the checked-in GB300 tuning envelope.
+the checked-in per-device tuning envelope.
 """
 
 from __future__ import annotations
@@ -26,7 +26,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _HIDDEN_SIZE = 7168
-_SUPPORTED_WORLD_SIZES = (4, 8)
+_SUPPORTED_WORLD_SIZES = (4, 8, 16)
+# The kernels only use multimem.* instructions, which every SM90+ part has.
+# The real gate is the checked-in tuning table, so this list only needs to name
+# the architectures a table has been measured on.
+_SUPPORTED_SMS = (100, 103)
 
 
 class _State:
@@ -66,7 +70,7 @@ def _init_state() -> Optional[_State]:
     group = get_parallel().attn_tp_group
     comm = group.ca_comm
     if (
-        get_device_sm() != 103
+        get_device_sm() not in _SUPPORTED_SMS
         or group.world_size not in _SUPPORTED_WORLD_SIZES
         or a2a not in ("megamoe", "deepep")
         or not isinstance(comm, CustomAllReduceV2)
@@ -74,7 +78,7 @@ def _init_state() -> Optional[_State]:
         or comm.mc_base_ptr == 0
     ):
         message = (
-            "K3 SP collective requires SM103, TP4/TP8, MegaMoE/DeepEP, and "
+            "K3 SP collective requires SM100/SM103, TP4/TP8, MegaMoE/DeepEP, and "
             "CustomAllReduceV2 with multicast; using NCCL."
         )
         (logger.warning if explicit else logger.info)(message)
