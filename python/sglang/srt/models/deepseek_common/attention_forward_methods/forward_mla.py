@@ -92,6 +92,103 @@ class MlaBmmFusionPlan:
     attn_output_buf: torch.Tensor
 
 
+def _select_local_dcp_heads_for_autotune(
+    attn_output: torch.Tensor, num_local_heads: int
+) -> torch.Tensor:
+    """Select this rank's head shard without communicating dummy outputs."""
+    rank = get_parallel().attn_dcp_rank
+    return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
+
+
+def _project_q_replicated(
+    self: DeepseekV2AttentionMLA, x: torch.Tensor
+) -> torch.Tensor:
+    """Project full-head Q from the pre-gathered weight (skips the Q all-gather).
+
+    ``q_b_proj_qrep_scale`` is set only when the gathered weight stayed
+    block-FP8; then the projection reuses the q-proj's own block-FP8 runner so
+    the quantization semantics match the non-replicated path, instead of a
+    plain 16-bit ``F.linear``.
+    """
+    if self.q_b_proj_qrep_scale is None:
+        out = torch.nn.functional.linear(x, self.q_b_proj_qrep_weight)
+    else:
+        qp = self.q_b_proj if self.has_q_b_proj else self.q_proj
+        out = qp.quant_method.w8a8_block_fp8_linear(
+            input=x,
+            weight=self.q_b_proj_qrep_weight,
+            block_size=[128, 128],
+            weight_scale=self.q_b_proj_qrep_scale,
+            input_scale=None,
+            bias=None,
+        )
+    return out.view(
+        -1,
+        self.num_local_heads * get_parallel().attn_dcp_size,
+        self.qk_head_dim,
+    )
+
+
+def _use_dcp_vc_before_a2a(self: DeepseekV2AttentionMLA) -> bool:
+    """SGLANG_OPT_DCP_VC_BEFORE_A2A applies to this layer (full-head w_vc gathered,
+    plain 16-bit w_vc bmm, no LoRA correction on the latent output)."""
+    return (
+        self.w_vc_qrep is not None
+        and not self.use_deep_gemm_bmm
+        and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+        and not is_kv_b_lora_active(self)
+        and not is_in_tc_piecewise_cuda_graph()
+    )
+
+
+def _dcp_vc_then_a2a_lse_reduce(
+    self: DeepseekV2AttentionMLA,
+    attn_output: torch.Tensor,
+    lse: torch.Tensor,
+    comm_backend: str,
+) -> torch.Tensor:
+    """w_vc on every DCP-group head first, then the a2a exchange + LSE combine.
+
+    The LSE combine is a per-(token, head) scalar weighting of the rank
+    partials, so it commutes with the per-head w_vc; projecting first shrinks
+    the exchanged partials from kv_lora_rank to v_head_dim.
+    attn_output [B, H_dcp, kv_lora_rank] -> [B, H_local * v_head_dim].
+    """
+    out_v = attn_output.new_empty(
+        (attn_output.shape[0], attn_output.shape[1], self.v_head_dim)
+    )
+    torch.bmm(
+        attn_output.transpose(0, 1), self.w_vc_qrep, out=out_v.transpose(0, 1)
+    )
+    out_v = dcp_a2a_lse_reduce(
+        out_v,
+        lse.contiguous(),
+        get_parallel().dcp_group,
+        is_lse_base_on_e=False,
+        comm_backend=comm_backend,
+    )
+    return out_v.flatten(1, 2)
+
+
+def _is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
+    if not get_parallel().dcp_enabled:
+        return False
+    if forward_batch.forward_mode.is_decode():
+        return True
+    if not forward_batch.forward_mode.is_target_verify() or not _is_cuda:
+        return False
+
+    server_args = get_server_args()
+    decode_backend = (
+        server_args.decode_attention_backend or server_args.attention_backend
+    )
+    return (
+        server_args.speculative_algorithm == "DSPARK"
+        and server_args.speculative_attention_mode == "decode"
+        and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
+    )
+
+
 if _is_cuda:
     from sglang.kernels.ops.gemm import bmm_fp8
 
@@ -258,8 +355,7 @@ class DeepseekMLAForwardMixin:
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
             get_server_args().dcp_replicate_q_proj
-            and get_parallel().dcp_enabled
-            and forward_batch.forward_mode.is_decode()
+            and _is_dcp_mla_decode_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
@@ -599,12 +695,12 @@ class DeepseekMLAForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
-            if forward_batch.forward_mode.is_decode() and not q_replicate_active:
-                # if forward_batch.forward_mode is decode, gather q
-                q_nope_out, q_pe = all_gather_q_for_mla_decode(
-                    q_nope_out=q_nope_out,
-                    q_pe=q_pe,
-                )
+            if _is_dcp_mla_decode_phase(forward_batch):
+                if not q_replicate_active:
+                    q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                        q_nope_out=q_nope_out,
+                        q_pe=q_pe,
+                    )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
                 all_gather_kv_cache_for_mla_extend(
@@ -752,10 +848,7 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif (
-                    forward_batch.forward_mode.is_decode()
-                    and get_parallel().dcp_enabled
-                ):
+                elif _is_dcp_mla_decode_phase(forward_batch):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -829,28 +922,51 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled:
+        if _is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank,
             )
-            dcp_comm_backend = get_server_args().dcp_comm_backend
-            if dcp_comm_backend in ("a2a", "fi_a2a"):
-                # A2A exchange of head partials + LSE, then local Triton combine.
-                # MLA decode LSE is base-2 (FlashInfer-MLA/FlashMLA) -> base_on_e=False.
-                attn_output = dcp_a2a_lse_reduce(
-                    attn_output.contiguous(),
-                    lse.contiguous(),
-                    get_parallel().dcp_group,
-                    is_lse_base_on_e=False,
-                    comm_backend=dcp_comm_backend,
+            if get_in_autotune_dummy_run():
+                # The synthetic FlashInfer MoE autotune pass discards model
+                # outputs. Avoid an unnecessary cross-node MNNVL exchange of
+                # zero attention partials.
+                attn_output = _select_local_dcp_heads_for_autotune(
+                    attn_output, self.num_local_heads
                 )
             else:
-                attn_output = cp_lse_ag_out_rs_mla(
-                    attn_output, lse, get_parallel().dcp_group
-                )
-                attn_output = attn_output.transpose(0, 1)
+                dcp_comm_backend = get_server_args().dcp_comm_backend
+                if dcp_comm_backend in ("a2a", "fi_a2a") and _use_dcp_vc_before_a2a(
+                    self
+                ):
+                    # w_vc is applied per head before the exchange, so the
+                    # reduced output is already [B, H_local * v_head_dim].
+                    output, _ = self.o_proj(
+                        _dcp_vc_then_a2a_lse_reduce(
+                            self, attn_output, lse, dcp_comm_backend
+                        )
+                    )
+                    if self.next_skip_topk is None:
+                        return output
+                    if not self.next_skip_topk:
+                        return output, None
+                    return output, topk_indices
+                if dcp_comm_backend in ("a2a", "fi_a2a"):
+                    # A2A exchange of head partials + LSE, then local Triton combine.
+                    # MLA decode LSE is base-2 (FlashInfer-MLA/FlashMLA) -> base_on_e=False.
+                    attn_output = dcp_a2a_lse_reduce(
+                        attn_output.contiguous(),
+                        lse.contiguous(),
+                        get_parallel().dcp_group,
+                        is_lse_base_on_e=False,
+                        comm_backend=dcp_comm_backend,
+                    )
+                else:
+                    attn_output = cp_lse_ag_out_rs_mla(
+                        attn_output, lse, get_parallel().dcp_group
+                    )
+                    attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None

@@ -1777,6 +1777,10 @@ class DeepseekV2AttentionMLA(
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
+        self.q_b_proj_qrep_scale = None
+        # Full-head w_vc for SGLANG_OPT_DCP_VC_BEFORE_A2A, gathered in the same
+        # pass; None unless that flag is on.
+        self.w_vc_qrep = None
 
         self.w_scale_k = None
         self.w_scale_v = None
