@@ -363,6 +363,7 @@ class Envs:
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_NSA_FORCE_MLA = EnvBool(False)
+    SGLANG_NSA_TOPK_IMPL = EnvStr("cuda")
     SGLANG_NSA_PAGED_MQA_LOGITS_MAX_CHUNK_MB = EnvInt(128)
 
     # sgl-kernel

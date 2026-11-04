@@ -26,6 +26,11 @@ from sglang.srt.layers.attention.nsa.page_table import (
     gather_page_table_into,
 )
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
+from sglang.srt.layers.attention.nsa.topk_stable import (
+    TOPK_STABLE_MAX_SEQ_LEN,
+    get_nsa_topk_impl,
+    transform_index_ragged_stable,
+)
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode_fast,
     transform_index_page_table_prefill,
@@ -180,7 +185,8 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
     attn_metadata: NSAMetadata
     topk_transform_method: TopkTransformMethod
-    paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    layer_id: int
+    paged_mqa_schedule_metadata: Optional[PagedMQASchedule] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
@@ -262,7 +268,40 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             if batch_idx_list is not None:
                 page_table = page_table[batch_idx_list]
         else:
-            page_table_size_1 = self.attn_metadata.page_table_1
+            page_table = self.attn_metadata.real_page_table
+            page_size = self.attn_metadata.page_size
+            if batch_idx_list is not None:
+                page_table = page_table[batch_idx_list]
+
+        topk_impl = get_nsa_topk_impl()
+        if topk_impl == "cuda_stable" and logits.size(1) <= TOPK_STABLE_MAX_SEQ_LEN:
+            from sglang.jit_kernel.topk_stable import fast_topk_stable
+
+            topk_indices = fast_topk_stable(logits, seq_lens_topk, topk, row_starts=ks)
+            if not envs.SGLANG_NSA_FUSE_TOPK.get():
+                return topk_indices
+            elif self.topk_transform_method == TopkTransformMethod.PAGED:
+                if page_size > 1:
+                    return transform_index_page_table_decode_fast(
+                        page_table,
+                        topk_indices,
+                        page_size=page_size,
+                    )
+                return fast_topk_transform_fused(
+                    score=logits,
+                    lengths=seq_lens_topk,
+                    page_table_size_1=page_table,
+                    cu_seqlens_q=cu_seqlens_q_topk,
+                    topk=topk,
+                    row_starts=ks,
+                )
+            elif self.topk_transform_method == TopkTransformMethod.RAGGED:
+                return transform_index_ragged_stable(
+                    topk_indices=topk_indices,
+                    topk_indices_offset=cu_topk_indices_offset,
+                )
+            else:
+                assert False, f"Unsupported {self.topk_transform_method = }"
 
         if not envs.SGLANG_NSA_FUSE_TOPK.get():
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
@@ -2055,6 +2094,7 @@ class NativeSparseAttnBackend(
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(),
+            layer_id=layer_id,
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
         )
 
