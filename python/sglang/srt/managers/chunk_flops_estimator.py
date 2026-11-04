@@ -22,7 +22,7 @@ per-dtype rates, not a hardware name table, so it is deliberately not modeled.
 """
 
 import logging
-from typing import Dict, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -60,6 +60,33 @@ def resolve_llm_config(hf_config):
     return getattr(hf_config, "text_config", None) or hf_config
 
 
+def _logical_elems_per_stored_elem(name: str, param) -> float:
+    """How many logical weight values one stored element holds.
+
+    A byte-typed tensor is ambiguous on its own: `uint8` carries two 4-bit
+    values under mxfp4/int4, but exactly one under an 8-bit scheme that stores
+    its bytes untyped. Guessing from the dtype alone silently doubles that
+    stage's FLOPs, and because stages can carry different quantization the
+    error does not cancel in the max-over-stages normalization.
+
+    So the packing factor is taken from the parameter when it declares one, and
+    only falls back to the 4-bit assumption for `uint8` -- which is announced by
+    the caller, never silent.
+    """
+    packed_factor = getattr(param, "packed_factor", None)
+    if packed_factor is not None:
+        try:
+            factor = float(packed_factor)
+        except (TypeError, ValueError):
+            factor = 0.0
+        if factor >= 1.0:
+            return factor
+    if param.dtype == torch.uint8:
+        return 2.0
+    # int8 / float8 / bf16 / fp16 / fp32 all store one value per element.
+    return 1.0
+
+
 def estimate_stage_flops_per_token(model, hf_config) -> Dict[str, float]:
     """Per-new-token weight-GEMM FLOPs of this rank's loaded stage, plus the
     stage's full-attention (MLA) layer count."""
@@ -73,6 +100,7 @@ def estimate_stage_flops_per_token(model, hf_config) -> Dict[str, float]:
     # pp_size" cannot give this, and the count has to come from the same stage
     # as the FLOPs it scales.
     mla_layer_prefixes = set()
+    assumed_4bit: List[str] = []
     for name, param in model.named_parameters():
         if "kv_b_proj" in name:
             mla_layer_prefixes.add(name.split("kv_b_proj")[0])
@@ -82,9 +110,11 @@ def estimate_stage_flops_per_token(model, hf_config) -> Dict[str, float]:
         if any(part in lname for part in _SKIP_NAME_PARTS):
             continue
         elems = float(param.numel())
-        if param.dtype == torch.uint8:
-            # mxfp4 / int4 weights are stored two elements per byte.
-            elems *= 2.0
+        factor = _logical_elems_per_stored_elem(name, param)
+        if factor != 1.0:
+            elems *= factor
+            if getattr(param, "packed_factor", None) is None:
+                assumed_4bit.append(name)
         if param.dim() == 3 and "expert" in lname and num_experts > 0 and topk > 0:
             # Stacked routed-expert weights [E_local, n, k]: a token activates
             # topk of the global experts, and with EP each rank executes its
@@ -93,6 +123,16 @@ def estimate_stage_flops_per_token(model, hf_config) -> Dict[str, float]:
             elems *= topk / float(num_experts)
         buckets["flops"] += 2.0 * elems
     buckets["mla_layers"] = float(len(mla_layer_prefixes))
+    if assumed_4bit:
+        # Printed so a checkpoint that stores 8-bit weights in uint8 shows up as
+        # a doubled count here instead of quietly shrinking every chunk.
+        logger.info(
+            "[ChunkFlopsEstimator] Assumed 4-bit packing (2 values/byte) for %d "
+            "uint8 tensors with no declared packed_factor, e.g. %s. If this "
+            "checkpoint is 8-bit, its FLOPs are counted 2x.",
+            len(assumed_4bit),
+            assumed_4bit[0],
+        )
     logger.info(
         "[ChunkFlopsEstimator] Stage per-token GEMM FLOPs from loaded weights: "
         "%.3e, mla_layers=%d (topk=%d, num_experts=%d)",
