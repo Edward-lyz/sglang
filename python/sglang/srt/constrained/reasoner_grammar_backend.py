@@ -261,6 +261,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
 
 class ReasonerGrammarBackend(BaseGrammarBackend):
+    """Wraps a grammar backend so constraints apply only after the reasoning section ends."""
+
     def __init__(
         self,
         grammar_backend: BaseGrammarBackend,
@@ -268,8 +270,10 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
         enable_strict_thinking: bool = False,
     ):
+        """Wrap ``grammar_backend``; ``reasoning_parser`` gives the think-end token ids."""
         super().__init__()
         self.grammar_backend = grammar_backend
+        self._cache_compiled_grammars = grammar_backend._cache_compiled_grammars
         think_end_ids = tokenizer.encode(
             reasoning_parser.detector.think_end_token, add_special_tokens=False
         )
@@ -353,3 +357,8 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
         return self._make_grammar_object(ret, reasoning)
+
+    def reset(self):
+        """Reset the grammar backend."""
+        super().reset()
+        self.grammar_backend.reset()

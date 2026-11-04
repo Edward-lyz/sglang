@@ -1317,12 +1317,23 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
+    # Completion-token increment carried by this chunk. The internal gateway
+    # bills streaming traffic per chunk instead of waiting for the usage chunk.
+    tokens: Optional[int] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        # Drop some null fields
+        for key in ("role", "tool_calls", "tokens"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        # Make some null fields empty string
+        for key in ("content", "reasoning_content"):
+            if data.get(key) is None:
+                data[key] = ""
         return data
 
 

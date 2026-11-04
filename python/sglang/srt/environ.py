@@ -1,3 +1,5 @@
+"""Typed registry of the SGLANG_* environment variables (``envs``)."""
+
 import base64
 import functools
 import json
@@ -344,6 +346,10 @@ class Envs:
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    # Streaming tool-call keepalive interval, in seconds. When the tool-call
+    # parser holds back every delta for longer than this, serving_chat emits an
+    # empty chunk so gateways do not close the connection on their TPOT timeout.
+    SGLANG_TOOL_CALL_EMPTY_RETURN_INTERVAL = EnvFloat(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
@@ -415,6 +421,10 @@ class Envs:
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
+    # LRU cap on xgrammar's GrammarCompiler cache, in GB of xgrammar's own
+    # accounting (CompiledGrammar.memory_size_bytes, which overestimates real
+    # RSS by ~15x on DSV4.1). Negative = unbounded.
+    SGLANG_XGRAMMAR_CACHE_LIMIT_GB = EnvFloat(200.0)
 
     # ===================================================================
     # Fault injection and regression tests
@@ -762,6 +772,16 @@ class Envs:
     # Tool calling and native web search
     # ===================================================================
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    # Inline local $ref pointers against the $defs/definitions of each tool's
+    # `parameters` schema at request time, so downstream prompt rendering and
+    # constrained decoding get a self-contained tree. Off by default; opt in
+    # per deployment.
+    SGLANG_ENABLE_TOOL_SCHEMA_REF_EXPANSION = EnvBool(False)
+    # Move the fragment out of every `$id` in a tool's `parameters` schema, so
+    # draft-07 identifiers such as `{"$id": "#user"}` stay admissible instead of
+    # being rejected outright by the 2020-12 metaschema. Set False to restore the
+    # legacy behavior, which answers such a request with HTTP 400.
+    SGLANG_ENABLE_TOOL_SCHEMA_ID_NORMALIZATION = EnvBool(True)
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
     # request defaults for the built-in GPT-OSS web_search tool.

@@ -34,9 +34,13 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
     ) -> Optional[StructuralTag]:
         """The builtin "deepseek_v4" shape with the spaced tag names.
 
-        Bodies are JSON: xgrammar's "deepseek_xml" body style also hardcodes
-        the unspaced " parameter" name, and the V3.2-lineage parser accepts a
-        JSON body inside an invoke.
+        Non-strict invokes constrain only the function name and leave the body
+        as free text, so the model keeps writing its native DSML parameters.
+        A schema-free JSON body there pushes the model off that format and it
+        mostly closes the object empty. Strict invokes take a schema-checked
+        JSON body instead: xgrammar's "deepseek_xml" body style hardcodes the
+        unspaced " parameter" name, and the V3.2-lineage parser accepts a JSON
+        body inside an invoke.
         """
         try:
             from xgrammar.structural_tag import (
@@ -65,12 +69,14 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
 
         def invoke_tag(tool: Tool) -> TagFormat:
             function = tool.function
-            schema = function.parameters if function.strict else True
-            if schema is None:
-                schema = True
+            if function.strict:
+                schema = True if function.parameters is None else function.parameters
+                content = JSONSchemaFormat(json_schema=schema)
+            else:
+                content = AnyTextFormat()
             return TagFormat(
                 begin=f'{self.invoke_start_token} name="{function.name}">',
-                content=JSONSchemaFormat(json_schema=schema),
+                content=content,
                 end=f"{self.invoke_end_token}\n",
             )
 

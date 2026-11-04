@@ -1,3 +1,5 @@
+"""DeepSeek-V4 / V4.1 model: attention, mHC, MoE decoder layers and the causal LM wrapper."""
+
 from __future__ import annotations
 
 import concurrent.futures

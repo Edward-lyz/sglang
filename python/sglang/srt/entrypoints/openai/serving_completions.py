@@ -347,7 +347,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Abort with an explicit error status_code is a system error
-                # (timeout, OOM, validation): emit a streaming error chunk.
+                # (timeout, OOM, validation). If no chunk has been sent yet the
+                # HTTP status is still ours to choose, so raise and let the
+                # kick-start in _handle_streaming_request turn it into a real
+                # error response; otherwise HTTP 200 is already committed and the
+                # only option is an in-band error chunk.
                 # A graceful abort (no status_code, e.g. user-initiated via
                 # /abort_request or session lifecycle cleanup) falls through
                 # to the normal chunk path, matching the non-stream behavior
@@ -355,6 +359,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 if finish_reason_type == "abort" and isinstance(
                     finish_reason.get("status_code"), HTTPStatus
                 ):
+                    if not stream_started:
+                        self.raise_abort_before_stream(finish_reason)
                     code = finish_reason["status_code"]
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
@@ -393,6 +399,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                     )
 
+                # Set before the yield: once the chunk leaves this generator
+                # HTTP 200 is committed, and the flag is what guards against
+                # raising after that point.
                 yield f"data: {chunk.model_dump_json()}\n\n"
                 stream_started = True
 

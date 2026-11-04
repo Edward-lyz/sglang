@@ -1,3 +1,5 @@
+"""Forward metadata dataclasses of the DeepSeek-V4 attention backend (core attention, indexer, compressor)."""
+
 from __future__ import annotations
 
 import warnings
@@ -8,6 +10,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
+
 
 _IS_SM120 = is_sm120_supported()
 
@@ -49,6 +52,8 @@ Some other notes:
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
 _SM120_INDEXER_M_CHUNK = 4096
+
+
 
 
 def copy_metadata(
@@ -193,6 +198,7 @@ class PagedIndexerMetadata:
         assert self.page_size % self.compress_ratio == 0, (
             f"{self.page_size = } must divide {self.compress_ratio = }"
         )
+
 
     @property
     def max_seq_len(self) -> int:

@@ -199,9 +199,16 @@ class InvalidGrammarObject(BaseGrammarObject):
 
 
 class BaseGrammarBackend:
+    """Base grammar backend: compiles on an executor, caches compiled grammars."""
+
     _enable_strict_thinking: bool = False
+    # Backends with their own bounded compile cache (xgrammar) turn this off:
+    # successful grammars are then recompiled through that cache instead of
+    # pinned here forever. Failures are always cached (see set_cache).
+    _cache_compiled_grammars: bool = True
 
     def __init__(self):
+        """Create the compile executor and the (key -> grammar) cache."""
         self.executor = ThreadPoolExecutor()
         self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
 
@@ -292,7 +299,11 @@ class BaseGrammarBackend:
         return value, False
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
-        self.cache[key] = value
+        """Cache a failure, or a compiled grammar unless the backend has its own cache."""
+        # Invalid / timed-out keys stay cached so a resent bad schema fails fast
+        # instead of re-occupying an executor worker until the poll timeout.
+        if self._cache_compiled_grammars or isinstance(value, InvalidGrammarObject):
+            self.cache[key] = value
 
     def reset(self):
         self.cache.clear()

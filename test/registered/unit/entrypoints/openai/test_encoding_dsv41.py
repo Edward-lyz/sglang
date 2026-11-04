@@ -66,6 +66,48 @@ class TestDsmlTags(CustomTestCase):
         )
         self.assertEqual(prompt[prompt.index("<｜User｜>") :], expected)
 
+    def test_malformed_history_arguments_render_verbatim(self):
+        """A history call whose arguments are malformed JSON must encode, not 400."""
+        malformed = '{"edits": [{{\\"old\\": 1}]}'
+        messages = [
+            {"role": "system", "content": "", "tools": [_tool()]},
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "a",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": malformed},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "invalid arguments"},
+        ]
+        prompt = encode_messages(messages, thinking_mode="chat")
+        self.assertIn(
+            f'<｜DSML｜ invoke name="lookup">\n{malformed}\n</｜DSML｜ invoke>', prompt
+        )
+
+    def test_non_object_history_arguments_still_rejected(self):
+        messages = [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "a",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '"Beijing"'},
+                    }
+                ],
+            },
+        ]
+        with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+            encode_messages(messages, thinking_mode="chat")
+
 
 if __name__ == "__main__":
     unittest.main()

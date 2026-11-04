@@ -2,6 +2,9 @@
 
 import json
 
+import xgrammar as xgr
+from xgrammar.testing import _is_grammar_accept_string
+
 from sglang.srt.entrypoints.openai import encoding_dsv41
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
@@ -9,6 +12,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -205,6 +209,77 @@ class TestDeepSeekV41ConstrainedDecoding(CustomTestCase):
         kind, tag = parser.get_structure_constraint("required")
         self.assertEqual(kind, "structural_tag")
         self.assertEqual(tag.format.elements[0].value, f"\n\n<{DSML} calls>\n")
+
+
+def _native_content(name, arguments):
+    """Encoder-rendered assistant turn after the reasoning span, without EOS."""
+    completion = "<think>" + encoding_dsv41.render_message(
+        1,
+        [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "reasoning_content": "reason",
+                "content": "summary",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(arguments)},
+                    }
+                ],
+            },
+        ],
+        thinking_mode="thinking",
+    )
+    _, content = ReasoningParser("deepseek-v41").parse_non_stream(completion)
+    return content.removesuffix(encoding_dsv41.eos_token)
+
+
+class TestDeepSeekV41FunctionLevelBody(CustomTestCase):
+    """SGLANG_TOOL_STRICT_LEVEL=1 constrains tool names only. A schema-free JSON
+    invoke body pushed the model off its DSML parameters and it mostly closed
+    the object empty, so non-strict invokes keep a free-text native body."""
+
+    def setUp(self):
+        self.tools = _tools()
+        self.detector = DeepSeekV41Detector()
+
+    def test_non_strict_invoke_body_is_free_text(self):
+        tag = self.detector.get_structural_tag(tools=self.tools, tool_choice="auto")
+        invokes = tag.format.tags[0].content.tags
+        self.assertEqual([t.content.type for t in invokes], ["any_text", "any_text"])
+
+    def test_strict_invoke_body_is_the_schema(self):
+        strict = [
+            t.model_copy(
+                update={"function": t.function.model_copy(update={"strict": True})}
+            )
+            for t in self.tools
+        ]
+        tag = self.detector.get_structural_tag(tools=strict, tool_choice="auto")
+        invokes = tag.format.tags[0].content.tags
+        self.assertEqual(
+            [t.content.json_schema for t in invokes],
+            [t.function.parameters for t in self.tools],
+        )
+
+    def test_function_level_grammar_accepts_native_calls_only_for_declared_tools(self):
+        with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.FUNCTION.value):
+            parser = FunctionCallParser(self.tools, "deepseekv41")
+            kind, tag = parser.get_structure_constraint("auto")
+        self.assertEqual(kind, "structural_tag")
+        grammar = xgr.Grammar.from_structural_tag(tag)
+        arguments = {"query": "x", "limit": 2, "flags": [1, True]}
+        native = _native_content("lookup", arguments)
+        self.assertIn(f'<{DSML} parameter name="limit" string="false">2', native)
+        self.assertTrue(_is_grammar_accept_string(grammar, native))
+        self.assertFalse(
+            _is_grammar_accept_string(grammar, _native_content("img_gen", arguments))
+        )
+        _, calls = parser.parse_non_stream(native)
+        self.assertEqual(
+            [(c.name, json.loads(c.parameters)) for c in calls], [("lookup", arguments)]
+        )
 
 
 if __name__ == "__main__":

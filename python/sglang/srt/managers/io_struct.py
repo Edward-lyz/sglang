@@ -1095,6 +1095,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
     # Append defaulted fields to preserve the positional IPC schema.
     # Internal warmup/health requests opt out; fake-prefill user requests cache.
     skip_radix_cache_insert: bool = False
@@ -2093,6 +2094,9 @@ class EncoderDispatchErrorReq(BaseReq, kw_only=True):
 
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
+
+
+
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):

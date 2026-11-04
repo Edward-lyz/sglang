@@ -4,7 +4,9 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, Tuple, Union
 
 import orjson
 from fastapi import HTTPException, Request
@@ -225,6 +227,25 @@ class OpenAIServingBase(ABC):
             code=status_code,
         )
         return json.dumps({"error": error.model_dump()})
+
+    @staticmethod
+    def raise_abort_before_stream(finish_reason: dict) -> NoReturn:
+        """Re-raise a scheduler abort that arrived before any SSE chunk was sent.
+
+        A StreamingResponse commits HTTP 200 the moment it is returned, so an
+        abort can only be reported in-band once streaming has started. Before
+        that -- while the caller is still inside the kick-start ``__anext__()``
+        of ``_handle_streaming_request`` -- raising instead lets
+        ``handle_request`` emit the real HTTP status code, matching the
+        non-streaming path. The exception mapping mirrors
+        ``TokenizerManager._handle_abort_finish_reason`` so both modes produce
+        identical response bodies.
+        """
+        message = finish_reason.get("message", "Generation aborted.")
+        code = finish_reason["status_code"]
+        if code == HTTPStatus.BAD_REQUEST:
+            raise ValueError(message)
+        raise HTTPException(status_code=int(code), detail=message)
 
     def extract_custom_labels(self, raw_request):
         if (

@@ -92,7 +92,9 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
+    expand_json_schema_refs,
     get_json_schema_constraint,
+    normalize_json_schema_ids,
     normalize_json_schema_types,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -206,6 +208,8 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_max_dynamic_patch = min(img_vals) if img_vals else None
     vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
     return img_max_dynamic_patch, vid_max_dynamic_patch
+
+
 def _media_part_url(part) -> Optional[str]:
     """Extract the media URL from an image_url/video_url content part.
 
@@ -542,6 +546,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Per-request response parser for custom decoding (set by _encode_messages)
         self._response_parser: Optional[ResponseParserProtocol] = None
+
+        # Streaming tool-call keepalive interval; see the emit site in
+        # _process_tool_call_stream.
+        self.tool_call_empty_return_interval: float = (
+            envs.SGLANG_TOOL_CALL_EMPTY_RETURN_INTERVAL.get()
+        )
 
         # Probe whether ``encode("")`` returns specials. If it does, we must
         # keep ``add_special_tokens=False`` at the chat-template encode site
@@ -1043,6 +1053,24 @@ class OpenAIServingChat(OpenAIServingBase):
             canonical.extend(cls._sort_tool_message_run(run, tool_calls))
         return canonical
 
+    def _consume_stream_token_delta(
+        self,
+        index: int,
+        total_completion_tokens: int,
+        last_return_tokens: Optional[Dict[int, int]],
+    ) -> Optional[int]:
+        """Completion tokens generated since this index's previous SSE chunk.
+
+        The internal gateway bills streaming traffic on the per-chunk increment,
+        so every content-bearing chunk reports its own delta exactly once. Pass
+        last_return_tokens=None to keep the field out of the payload.
+        """
+        if last_return_tokens is None:
+            return None
+        delta = total_completion_tokens - last_return_tokens.get(index, 0)
+        last_return_tokens[index] = total_completion_tokens
+        return delta
+
     async def _generate_stream_content(
         self,
         content: Dict[str, Any],
@@ -1058,6 +1086,8 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens: Dict[int, int],
         reasoning_tokens: Dict[int, int],
         completion_tokens: Dict[int, int],
+        last_return_tokens: Optional[Dict[int, int]] = None,
+        tool_call_last_return_time: Optional[Dict[int, float]] = None,
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
         offset = stream_offsets.get(index, 0)
@@ -1066,6 +1096,7 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             delta = content["text"][offset:]
             stream_offsets[index] = len(content["text"])
+
 
         # Attach logprobs to the first chunk emitted this step (reasoning,
         # tool-call, or content) so they aren't dropped when a parser is active
@@ -1100,6 +1131,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_content=reasoning_text,
                     logprobs=remaining_logprobs,
                     usage=usage,
+                    tokens=self._consume_stream_token_delta(
+                        index, completion_tokens.get(index, 0), last_return_tokens
+                    ),
                 )
                 remaining_logprobs = None
 
@@ -1114,6 +1148,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 has_tool_calls,
                 continuous_usage_stats,
                 flush=finish_reason_type is not None and finish_reason_type != "abort",
+                last_return_tokens=last_return_tokens,
+                tool_call_last_return_time=tool_call_last_return_time,
             ):
                 if chunk:
                     yield chunk
@@ -1147,6 +1183,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     content=delta,
                     logprobs=remaining_logprobs,
                     usage=usage,
+                    tokens=self._consume_stream_token_delta(
+                        index, completion_tokens.get(index, 0), last_return_tokens
+                    ),
                 )
                 remaining_logprobs = None
 
@@ -1234,11 +1273,23 @@ class OpenAIServingChat(OpenAIServingBase):
             if tool.function.parameters is None:
                 continue
             try:
+                # Optionally inline local $ref pointers against the schema's
+                # $defs/definitions so downstream prompt rendering and
+                # constrained decoding get a self-contained tree.
+                if envs.SGLANG_ENABLE_TOOL_SCHEMA_REF_EXPANSION.get():
+                    tool.function.parameters = expand_json_schema_refs(
+                        tool.function.parameters
+                    )
                 # Rewrite DB/ORM-style aliases (e.g. "varchar", "enum", "int")
                 # to standard JSON Schema types before validation. RecursionError
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
+                # Draft-07 `$id` fragments ("#user", "...#/definitions/name") are
+                # a schema error under 2020-12, which would reject the whole
+                # request before it ever reaches grammar compilation.
+                if envs.SGLANG_ENABLE_TOOL_SCHEMA_ID_NORMALIZATION.get():
+                    normalize_json_schema_ids(tool.function.parameters)
                 Draft202012Validator.check_schema(tool.function.parameters)
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
@@ -1619,7 +1670,7 @@ class OpenAIServingChat(OpenAIServingBase):
         messages = [msg.model_dump() for msg in request.messages]
         for message in messages:
             normalize_assistant_tool_call_arguments(
-                message, strict=self.chat_encoding_spec != "kimi_k3"
+                message, strict=self.chat_encoding_spec not in ("kimi_k3", "dsv41")
             )
 
         prompt_ids = self._encode_messages(
@@ -2062,11 +2113,15 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
+        # Last time a tool-call chunk reached the client, per choice index.
+        tool_call_last_return_time = {}
 
         # Usage tracking
         prompt_tokens = {}
         reasoning_tokens = {}
         completion_tokens = {}
+        # Completion tokens already billed to the client, per choice index.
+        last_return_tokens = {}
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
@@ -2164,7 +2219,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 # Track finish_reason for each index
                 if finish_reason_type:
                     # Abort with an explicit error status_code is a system error
-                    # (timeout, OOM, validation): emit a streaming error chunk.
+                    # (timeout, OOM, validation). If no chunk has been sent yet
+                    # the HTTP status is still ours to choose, so raise and let
+                    # the kick-start in _handle_streaming_request turn it into a
+                    # real error response; otherwise HTTP 200 is already
+                    # committed and the only option is an in-band error chunk.
                     # A graceful abort (no status_code, e.g. user-initiated via
                     # /abort_request or session lifecycle cleanup) falls through
                     # to the normal chunk path, matching the non-stream behavior
@@ -2172,6 +2231,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     if finish_reason_type == "abort" and isinstance(
                         finish_reason.get("status_code"), HTTPStatus
                     ):
+                        if not stream_started:
+                            self.raise_abort_before_stream(finish_reason)
                         code = finish_reason["status_code"]
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
@@ -2186,6 +2247,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
+                    # Set before the yield: once the chunk leaves this generator
+                    # HTTP 200 is committed, and the flag is what guards against
+                    # raising after that point.
+                    stream_started = True
                     yield build_sse_content(
                         chunk_id=content["meta_info"]["id"],
                         created=int(time.time()),
@@ -2194,7 +2259,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         role="assistant",
                         content="",
                     )
-                    stream_started = True
 
                 # Generate streaming content (override in subclass for custom behavior)
                 async for chunk in self._generate_stream_content(
@@ -2211,6 +2275,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
+                    last_return_tokens=last_return_tokens,
+                    tool_call_last_return_time=tool_call_last_return_time,
                 ):
                     yield chunk
 
@@ -2231,6 +2297,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     index=idx,
                     finish_reason=final_finish_reason,
                     matched_stop=matched_stop,
+                    tokens=self._consume_stream_token_delta(
+                        idx, completion_tokens.get(idx, 0), last_return_tokens
+                    ),
                 )
 
             # Send hidden states if requested
@@ -3109,6 +3178,8 @@ class OpenAIServingChat(OpenAIServingBase):
         has_tool_calls: Dict[int, bool],
         continuous_usage_stats: bool = False,
         flush: bool = False,
+        last_return_tokens: Optional[Dict[int, int]] = None,
+        tool_call_last_return_time: Optional[Dict[int, float]] = None,
     ):
         """Process tool calls in streaming response.
 
@@ -3161,11 +3232,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 normal_text = (normal_text or "") + end_text
                 calls = list(calls) + end_calls
 
+        if tool_call_last_return_time is None:
+            # Direct callers keep per-call state, so no keepalive chunk fires.
+            tool_call_last_return_time = {}
+        last_client_return = tool_call_last_return_time.setdefault(index, time.time())
+        has_yielded = False
+
         # Yield normal text
         if normal_text:
+            has_yielded = True
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
-                delta=DeltaMessage(content=normal_text),
+                delta=DeltaMessage(
+                    content=normal_text,
+                    tokens=self._consume_stream_token_delta(
+                        index,
+                        content["meta_info"].get("completion_tokens", 0),
+                        last_return_tokens,
+                    ),
+                ),
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
@@ -3188,10 +3273,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
+            tool_call_last_return_time[index] = time.time()
 
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
         for call_item in calls:
+            has_yielded = True
             # Mark that this choice has tool calls
             has_tool_calls[index] = True
 
@@ -3218,7 +3305,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
-                delta=DeltaMessage(tool_calls=[tool_call]),
+                delta=DeltaMessage(
+                    tool_calls=[tool_call],
+                    tokens=self._consume_stream_token_delta(
+                        index,
+                        content["meta_info"].get("completion_tokens", 0),
+                        last_return_tokens,
+                    ),
+                ),
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
@@ -3241,6 +3335,41 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
+            tool_call_last_return_time[index] = time.time()
+
+        # The parser can swallow a whole delta while it waits for a tool-call
+        # marker, which looks like a stalled stream to the gateway. Emit an empty
+        # chunk once the client has been waiting longer than the keepalive
+        # interval so the connection survives its TPOT timeout.
+        if (
+            not has_yielded
+            and delta
+            and time.time() - last_client_return >= self.tool_call_empty_return_interval
+        ):
+            logger.info(
+                "Tool call stream keepalive: rid=%s, index=%s", request.rid, index
+            )
+            choice_data = ChatCompletionResponseStreamChoice(
+                index=index,
+                delta=DeltaMessage(content="", tool_calls=[]),
+                finish_reason=None,
+            )
+            chunk = ChatCompletionStreamResponse(
+                id=content["meta_info"]["id"],
+                created=int(time.time()),
+                choices=[choice_data],
+                model=request.model,
+            )
+            if continuous_usage_stats:
+                chunk.usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=self._reported_prompt_tokens(content["meta_info"]),
+                    completion_tokens=content["meta_info"].get("completion_tokens", 0),
+                    reasoning_tokens=content["meta_info"].get("reasoning_tokens", 0),
+                    cached_tokens=self._continuous_usage_cached_details(content),
+                )
+
+            yield f"data: {chunk.model_dump_json()}\n\n"
+            tool_call_last_return_time[index] = time.time()
 
     def _check_for_unstreamed_tool_args(
         self,

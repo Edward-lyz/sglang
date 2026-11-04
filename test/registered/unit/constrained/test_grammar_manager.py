@@ -471,6 +471,8 @@ class TestAbortRequests(unittest.TestCase):
 
 
 class TestGetReadyGrammarRequests(unittest.TestCase):
+    """GrammarManager.get_ready_grammar_requests: ready, failed and timed-out grammars."""
+
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
@@ -543,6 +545,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertEqual(len(mgr.grammar_queue), 0)
 
     def test_timeout_aborts_req(self):
+        """A grammar that never becomes ready aborts its request and is cached as invalid."""
         mgr = self._make_mgr()
         mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 1
 

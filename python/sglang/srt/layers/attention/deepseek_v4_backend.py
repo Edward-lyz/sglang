@@ -1,3 +1,5 @@
+"""DeepSeek-V4 attention backend: forward metadata, SWA / compressed KV stores, indexer and attention dispatch."""
+
 from __future__ import annotations
 
 import enum
