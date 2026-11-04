@@ -1768,6 +1768,24 @@ class Envs:
     # ties. OFF by default (must pass the live decode boot gate).
     # (see record_kernel_opt/deepseekv4.1_flash_decode_kernel_candsrc_0923).
     SGLANG_FUSE_CANDIDATE_SOURCE_OPT = EnvBool(False)
+    # [fusion-opt] DSPARK prefill commit under decoder SWA bounded replay: commit only
+    # the late-layer tail rows (the only rows whose aux hidden was computed) instead of
+    # every row of the chunk.
+    SGLANG_FUSE_DSPARK_COMMIT_TAIL_ONLY = EnvBool(False)
+    # [fusion-opt] Stronger form of the above: do not scatter the tail aux back to the
+    # full layout at all; CP-gather only the tail rows (+ their global token index) and
+    # hand them to the commit rank-major. Removes the full-size aux pack + all-gather.
+    SGLANG_FUSE_DSPARK_AUX_TAIL_GATHER = EnvBool(False)
+    # [fusion-opt] Candidate-source publish on the dense (CP) prefill indexer: one
+    # Triton kernel does the length mask + block-amax + newest-block keep instead of
+    # the torch masked_fill / pad / amax / masked_fill chain.
+    SGLANG_FUSE_CANDIDATE_BLOCK_SCORE = EnvBool(False)
+    # [fusion-opt] Prefill-CP compressor: project kv/score on the local rows, then
+    # gather the projected [T, *] instead of gathering the raw [T, hidden] x.
+    SGLANG_FUSE_CP_COMPRESS_PROJ_FIRST = EnvBool(False)
+    # [fusion-opt] shared expert: silu*up + clamp + per-32 ue8m0 quant in one kernel
+    # feeding the DeepGEMM MXFP8 down_proj (block-fp8 [32,32] checkpoints).
+    SGLANG_FUSE_SHARED_SILU_QUANT_DEEPGEMM = EnvBool(False)
     # DeepGEMM mega mHC: one `deep_gemm.mega_mhc` launch replaces the whole
     # attn->FFN mHC boundary of the DeepSeek-V4.1 predecessor-pre scheme
     # (hc_post + hc_combine + the sublayer input RMSNorm + the next pre-norm

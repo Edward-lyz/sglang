@@ -4786,6 +4786,67 @@ class DeepseekV4Model(nn.Module):
             pre_hc_head = _scatter_tail_rows(
                 tail=tail, rows=pre_hc_head, num_tokens=num_tokens
             )
+            if capture_dspark:
+                # DSpark aux is captured at the late layers, so it only holds the
+                # tail-window rows. Scatter it back to the full layout too, so the
+                # post-forward CP gather (which gathers the aux the same way as the
+                # hidden states) sees each rank's full local shard instead of the
+                # 16-row tail (the last prompt token, which the draft needs, is in
+                # the tail and is preserved).
+                cp_meta = getattr(forward_batch, "attn_cp_metadata", None)
+                if (
+                    envs.SGLANG_FUSE_DSPARK_AUX_TAIL_GATHER.get()
+                    and dsa_use_prefill_cp(forward_batch)
+                    and dspark_aux_hidden_states
+                    and cp_meta is not None
+                    and getattr(cp_meta, "gather_index", None) is None
+                ):
+                    # [fusion-opt] Keep the aux tail-only. Interleave CP puts global
+                    # token j * cp_size + cp_rank on local row j; pad rows get
+                    # total_tokens (= "do not commit" for the rank-major consumer).
+                    local_idx = (
+                        torch.arange(
+                            tail.contiguous_start, num_tokens, device=input_ids.device
+                        )
+                        if tail.contiguous_start is not None
+                        else tail.token_indices
+                    ).to(torch.int32)
+                    rows = dspark_aux_hidden_states[0].shape[0]
+                    total_tokens = int(cp_meta.total_seq_lens)
+                    global_idx = torch.full(
+                        (rows,), total_tokens, dtype=torch.int32, device=input_ids.device
+                    )
+                    parallel = get_parallel()
+                    global_idx[: local_idx.shape[0]] = (
+                        local_idx * parallel.attn_cp_size + parallel.attn_cp_rank
+                    )
+                    forward_batch.dspark_aux_tail_global_idx = global_idx
+                else:
+                    dspark_aux_hidden_states = [
+                        _scatter_tail_rows(tail=tail, rows=a, num_tokens=num_tokens)
+                        for a in dspark_aux_hidden_states
+                    ]
+                if (
+                    getattr(forward_batch, "dspark_aux_tail_global_idx", None) is None
+                    and envs.SGLANG_FUSE_DSPARK_COMMIT_TAIL_ONLY.get()
+                    and dsa_use_prefill_cp(forward_batch)
+                    and dspark_aux_hidden_states
+                ):
+                    # [fusion-opt] Only the tail rows carry a computed aux; mark them
+                    # with one extra column that rides the CP gather with the aux
+                    # (eager_runner strips it) so the DSpark commit can skip the rest.
+                    ref = dspark_aux_hidden_states[0]
+                    commit_mask = ref.new_zeros((num_tokens, 1))
+                    if tail.contiguous_start is not None:
+                        commit_mask[tail.contiguous_start :] = 1
+                    else:
+                        commit_mask[tail.token_indices] = 1
+                    dspark_aux_hidden_states.append(commit_mask)
+                    forward_batch.dspark_commit_mask_appended = True
+                    # every CP rank's tail is padded to the same share
+                    forward_batch.dspark_commit_rows_ub = (
+                        tail.token_indices.shape[0] + tail.pad_rows
+                    ) * get_parallel().attn_cp_size
 
         if capture_dspark:
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states

@@ -3003,6 +3003,37 @@ class DeepseekV4AttnBackend(
             pos_global = forward_batch.positions[:total].to(torch.int64)
         num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
+            fused_extend = (
+                layer.compressor.use_fused_compress
+                and tail is None
+                and envs.SGLANG_OPT_DSV41_FUSED_EXTEND_COMPRESS.get()
+            )
+            if fused_extend and envs.SGLANG_FUSE_CP_COMPRESS_PROJ_FIRST.get():
+                # [fusion-opt] The compressor projection is row-wise: run it on this
+                # rank's rows and CP-gather the projected [T, D|2D] instead of the raw
+                # [T, hidden] x (2.5x / 10x fewer bytes, 1/cp of the GEMM rows).
+                compressor = layer.compressor
+                proj_local = (
+                    compressor.wkv(x)
+                    if layer.compress_ratio == 1
+                    else compressor.project_fused(x)
+                )
+                proj_global = cp_materialize_global_token_order(
+                    proj_local.contiguous(), forward_batch, torch.cuda.current_stream()
+                )[:total]
+                del proj_local
+                lens = forward_batch.extend_seq_lens.to(torch.int32)
+                self._low_ratio_compress_fused(
+                    layer,
+                    None,
+                    req_global,
+                    pos_global,
+                    extend_offsets=(torch.cumsum(lens, 0, dtype=torch.int32) - lens, lens),
+                    projected=proj_global,
+                )
+                del proj_global
+                run_compressor = False
+        if run_compressor and layer.compressor is not None:
             x_global = cp_materialize_global_token_order(
                 x.contiguous(), forward_batch, torch.cuda.current_stream()
             )[:total]
