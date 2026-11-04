@@ -593,6 +593,8 @@ class GrammarTree:
     def __init__(self, host: Tuple[torch.Tensor, ...], done_event):
         self._host = host
         self._done = done_event
+        # Set by from_linear_chain: lets the bitmask take the batched chain path.
+        self.is_linear_chain = False
 
     @classmethod
     def from_device(
@@ -633,7 +635,9 @@ class GrammarTree:
         next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
         next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
         next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
-        return cls.from_device(next_token, next_sibling, verify_ids_2d)
+        tree = cls.from_device(next_token, next_sibling, verify_ids_2d)
+        tree.is_linear_chain = True
+        return tree
 
     def resolve(self) -> Tuple[torch.Tensor, ...]:
         if self._done is not None:
@@ -657,6 +661,10 @@ def build_grammar_vocab_mask(
     """
     if barrier is not None:
         barrier()
+    if tree.is_linear_chain and envs.SGLANG_SPEC_GRAMMAR_CHAIN_FAST_PATH.get():
+        return _build_chain_grammar_vocab_mask(
+            reqs=reqs, tree=tree, sampling_info=sampling_info, device=device
+        )
     vocab_mask, grammar = generate_token_bitmask(
         reqs,
         *tree.resolve(),
@@ -671,6 +679,42 @@ def build_grammar_vocab_mask(
     # Otherwise the extend stage's leftover mask is applied instead.
     sampling_info.grammar_mask = None
     return GrammarMask(grammar, vocab_mask)
+
+
+def _build_chain_grammar_vocab_mask(
+    *,
+    reqs: List[Req],
+    tree: GrammarTree,
+    sampling_info: SamplingBatchInfo,
+    device,
+) -> Optional[GrammarMask]:
+    from sglang.srt.speculative.grammar_chain_mask import (
+        generate_chain_token_bitmask,
+    )
+
+    _, _, draft_tokens = tree.resolve()
+    vocab_size = sampling_info.vocab_size
+    chain = draft_tokens.shape[-1]
+    next_token = list(range(1, chain)) + [-1]
+    next_sibling = [-1] * chain
+
+    def fallback(row_tokens, grammar, rows):
+        traverse_tree(
+            next_token, next_sibling, row_tokens, grammar, rows, vocab_size=vocab_size
+        )
+
+    chain_mask, grammar = generate_chain_token_bitmask(
+        reqs, draft_tokens, vocab_size, fallback
+    )
+    if chain_mask is None:
+        return None
+    # Otherwise the extend stage's leftover mask is applied instead.
+    sampling_info.grammar_mask = None
+    if chain_mask.num_constrained == 0:
+        # Every row would be all-ones: applying it is a no-op, so skip the copy
+        # and the kernel (e.g. the whole batch is still reasoning).
+        return None
+    return GrammarMask(grammar, chain_mask.to_device(device))
 
 
 def load_token_map(token_map_path: str) -> List[int]:
