@@ -197,9 +197,14 @@ def _update_gather_batch(
     skip_all_gather=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
-    if not require_mlp_tp_gather:
+    # A DP-wide list exists either because the all-gather produced it or because
+    # the static synthesis did (see _fill_static_sync_values); both describe the
+    # same layout, so both take the gathered branch. Its absence is what marks
+    # "this rank only" -- that is the SKIP_ALL_GATHER case without a static bound.
+    if mlp_sync_info.global_num_tokens is None or not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
+        batch.dp_global_num_tokens_for_metric = [mlp_sync_info.num_tokens]
     else:
         batch.global_num_tokens = mlp_sync_info.global_num_tokens
         batch.global_num_tokens_for_logprob = (
@@ -213,6 +218,40 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
     batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_breakable_cuda_graph
+
+
+def _fill_static_sync_values(
+    mlp_sync_info: MLPSyncBatchInfo, dp_size: int, bound: int
+) -> None:
+    """Stand in for the all-gather by padding every rank to the same constant.
+
+    ``bound`` must be identical on every rank and independent of the local batch:
+    that is what makes the resulting layout derivable without talking to anyone.
+    Because the list is uniform, ``compute_dp_attention_metadata`` picks MAX_LEN
+    and every offset becomes ``rank * bound`` -- a cumsum over a constant --
+    which is exactly what the all-gathered path would have produced for an
+    evenly loaded step. Every consumer of ``global_num_tokens`` is therefore
+    fixed at once: the LayerCommunicator's DP gather, the dense MLP, the
+    vocab-sharded embed / lm_head, and DSpark's row capacity.
+
+    What this does NOT recover is the rest of the all-gathered payload:
+    ``global_forward_mode``, ``tbo_split_seq_index`` and the min-reduced
+    ``can_cuda_graph`` stay local (see the ``not skip_all_gather`` guard in
+    ``_update_gather_batch``). So this is sound only while every DP rank runs the
+    same forward mode on every step -- ranks in different modes scale this bound
+    by different ``spec_info.num_tokens_per_req`` factors and end up with
+    different buffers.
+    """
+    local = max(mlp_sync_info.num_tokens, mlp_sync_info.num_tokens_for_logprob)
+    if local > bound:
+        raise RuntimeError(
+            f"Local MLP sync value {local} exceeds SGLANG_DP_STATIC_SYNC_BOUND "
+            f"({bound}): the padded layout would drop rows. Raise the bound "
+            f"above the per-rank maximum (request counts on decode-family "
+            f"rounds, tokens on extend rounds)."
+        )
+    mlp_sync_info.global_num_tokens = [bound] * dp_size
+    mlp_sync_info.global_num_tokens_for_logprob = [bound] * dp_size
 
 
 def prepare_mlp_sync_batch_raw(
@@ -255,6 +294,7 @@ def prepare_mlp_sync_batch_raw(
         )
 
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    static_sync_bound = envs.SGLANG_DP_STATIC_SYNC_BOUND.get()
     can_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
@@ -325,6 +365,11 @@ def prepare_mlp_sync_batch_raw(
                 mlp_sync_info.tp0_info[:, 4:6],
             )
         )
+    elif require_mlp_tp_gather and static_sync_bound > 0:
+        # Opt-in only: a bound of 0 keeps today's behaviour (a this-rank-only
+        # list), which is what DWDP -- the other SKIP_ALL_GATHER user -- relies on
+        # to let its ranks run fully independently.
+        _fill_static_sync_values(mlp_sync_info, dp_size, static_sync_bound)
 
     # Decide whether to emit idle batch
     if skip_all_gather:

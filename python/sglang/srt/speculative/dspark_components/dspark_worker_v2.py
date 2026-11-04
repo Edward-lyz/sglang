@@ -163,6 +163,32 @@ class DSparkWorkerV2(BaseSpecWorker):
             embed_tokens=self._resolve_target_embed_tokens(target_model),
             lm_head=lm_head,
         )
+        # Set by attach_shared_modules: a shared target embed / lm_head that
+        # shards its vocab over the global TP group (dp attention without
+        # --enable-dp-lm-head, or SGLANG_ENABLE_EMBED_DP_SHARD) makes the draft
+        # gather rows across attention-DP ranks, so every rank must join.
+        self._dp_vocab_sync = bool(
+            getattr(self.draft_model, "lm_head_dp_gather", False)
+            or getattr(self.draft_model, "embed_dp_gather", False)
+        )
+        # Largest captured draft row count: the capacity every DP-gathered vocab
+        # collective pads to when the batch fits, so graph replays (which bake
+        # it) and eager / idle joins always agree on the shape.
+        # A static capacity (SGLANG_VOCAB_DP_STATIC_ROWS) wins: it is the one
+        # value that also holds when the per-rank counts are no longer DP-synced,
+        # and captures must bake the same number the eager path will use.
+        static_vocab_rows = vocab_dp_static_rows()
+        if not self._dp_vocab_sync:
+            self._dp_graph_rows = None
+        elif static_vocab_rows:
+            self._dp_graph_rows = static_vocab_rows
+        elif self._decode_graph_allowed:
+            self._dp_graph_rows = max(server_args.cuda_graph_config.decode.bs) * int(
+                self.gamma
+            )
+        else:
+            self._dp_graph_rows = None
+        self.draft_model.dp_embed_rows_capacity = self._dp_graph_rows
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,

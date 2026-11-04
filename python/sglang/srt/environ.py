@@ -515,6 +515,23 @@ class Envs:
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
+    # Per-rank constant that stands in for the all-gathered sync value when
+    # SGLANG_SCHEDULER_SKIP_ALL_GATHER is on but the MLP path still needs a
+    # DP-uniform row layout (require_mlp_tp_gather -- i.e. anything under
+    # --enable-dp-attention that gathers rows across DP ranks: the
+    # LayerCommunicator, the dense MLP, a TP-sharded embedding / lm_head).
+    # Every rank reports the SAME constant, so the layout becomes MAX_LEN with
+    # offsets rank * bound and no collective is needed to learn it.
+    # Units match the gathered value: request counts on decode-family rounds
+    # (spec_scale_global_num_tokens turns them into tokens later), tokens on
+    # extend rounds -- so the bound must cover the largest of the two across
+    # every mode the ranks can be in. Start from max_running_requests // dp_size;
+    # if it is too small the scheduler raises and names the value it saw.
+    # 0 = off, keeping today's behaviour (a this-rank-only list), which is what
+    # DWDP relies on. Must be set identically on every rank, and every rank must
+    # be in the same forward mode on every step: the skipped all-gather no longer
+    # reconciles global_forward_mode / can_run_dp_cuda_graph.
+    SGLANG_DP_STATIC_SYNC_BOUND = EnvInt(0)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
