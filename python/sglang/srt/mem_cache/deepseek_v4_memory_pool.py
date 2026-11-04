@@ -653,6 +653,19 @@ class DeepSeekV4IndexerPool(KVCache):
         [page_size * 64 payload | page_size * 4 scale bytes]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if buf.is_cuda:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                gather_fp4_index_k,
+            )
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "#41658 gather_fp4_index_k",
+                "Triton index-K fp4 gather enabled (rows=%d, page_size=%d)",
+                slots.numel(),
+                self.page_size,
+            )
+            return gather_fp4_index_k(buf, slots, page_size=self.page_size)
         slots = slots.to(torch.int64)
         p = self.page_size
         page, off = (slots // p).unsqueeze(-1), slots % p
@@ -1040,6 +1053,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self._init_compressed_layer_mapping()
 
         self._init_paged_compress_states(enable_memory_saver)
+
         self.max_context_length = max_context_length
         self.is_draft_worker = is_draft_worker
         self.init_as_swa_pool()
@@ -1228,6 +1242,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     buf.nbytes,
                     buf[0].nbytes * index_pages_per_full_page,
                 )
+
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """Return per-buffer ``(data_ptrs, data_lens, item_lens)`` for page transfer."""
         data_ptrs: List[int] = []
@@ -1244,6 +1259,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             data_lens.append(transfer_bytes)
             item_lens.append(item_bytes)
         return data_ptrs, data_lens, item_lens
+
     def get_contiguous_buf_tensor_infos(self):
         """Tensor-level view of the page transfer for the AS content digest.
 

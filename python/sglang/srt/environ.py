@@ -1663,6 +1663,24 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    # Tuned launch for the candidate-block visibility mask (_candidate_mask_kernel),
+    # bit-exact, ~1.1x at bs256. OFF by default (must pass the live decode boot gate).
+    SGLANG_FUSE_CANDIDATE_MASK_OPT = EnvBool(False)
+    # Row-loop candidate-block visibility mask: grid=(rows,), each row loops only its
+    # live [0:seq_len] tiles and skips writing the dead page-capacity tail (the vendor
+    # paged top-k reads only [0:seq_len]). Bit-exact final top-k selection (as a set),
+    # ~6.3x on the mask / ~3.4x on the select_decode group at bs256. OFF by default
+    # (must pass the live decode CUDA-graph boot gate).
+    # (see record_kernel_opt/deepseekv4.1_flash_decode_kernel_topk_0923).
+    SGLANG_FUSE_CANDIDATE_MASK_ROWLOOP = EnvBool(False)
+    # Candidate-SOURCE (publish_decode / layer 20) optimization: row-loop block scoring
+    # (skips the dead page-capacity tail) + replaces the slow torch.topk (at::native::
+    # mbtopk) block selection with the vendor topk_transform_paged_v2 + a membership
+    # publish. ~4x on the candidate-source path. keep-mask bit-exact when live blocks
+    # <= topk_blocks (traced regime); extreme-context differences are top-k boundary
+    # ties. OFF by default (must pass the live decode boot gate).
+    # (see record_kernel_opt/deepseekv4.1_flash_decode_kernel_candsrc_0923).
+    SGLANG_FUSE_CANDIDATE_SOURCE_OPT = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
@@ -1685,6 +1703,7 @@ class Envs:
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER = EnvBool(False)
     # use multistream to overlap the publish-side with other computation
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP = EnvBool(True)
+    SGLANG_OPT_DSV41_INDEXER_REQUEST_GROUPED_ROWS = EnvBool(True)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)

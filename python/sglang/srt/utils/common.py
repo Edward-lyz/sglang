@@ -558,6 +558,11 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
+def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """A host list on ``device``; staged in pinned memory so the copy is enqueued
+    on the current stream instead of synchronizing like a pageable copy."""
+    pin = is_pin_memory_available(device)
+    return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
 
 
 def get_dispatch_device_backend():

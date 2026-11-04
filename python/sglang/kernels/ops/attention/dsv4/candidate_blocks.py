@@ -65,6 +65,56 @@ def _candidate_mask_kernel(
 
 
 @triton.jit
+def _candidate_mask_live_prefix_kernel(
+    X,
+    LENS,
+    KEEP,
+    OUT,
+    WIDTH: tl.constexpr,
+    STRIDE: tl.constexpr,
+    KEEP_STRIDE: tl.constexpr,
+    KEEP_COL_STRIDE: tl.constexpr,
+    TILE: tl.constexpr,
+    TILES_PER_ROW: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    length = tl.load(LENS + row).to(tl.int64)
+    # Paged top-k ignores its final vector's padding lanes. Initialize them
+    # anyway, including index 0 for empty rows, without touching capacity tails.
+    write_end = tl.minimum(WIDTH, ((tl.maximum(length, 1) + 3) // 4) * 4)
+    start = tl.program_id(1) * TILE
+    while start < write_end:
+        cols = start + tl.arange(0, TILE)
+        visible = (cols < WIDTH) & (cols < length)
+        keep = tl.load(
+            KEEP + row * KEEP_STRIDE + cols * KEEP_COL_STRIDE, visible, other=0
+        )
+        values = tl.load(
+            X + row * STRIDE + cols, visible & keep, other=-float("inf")
+        ).to(tl.float32)
+        tl.store(OUT + row * WIDTH + cols, values, cols < write_end)
+        start += TILES_PER_ROW * TILE
+
+
+def _mask_candidate_live_prefix(logits, seq_lens, published, output):
+    rows, width = logits.shape
+    tile = 1024
+    tiles_per_row = min(8, triton.cdiv(width, tile))
+    _candidate_mask_live_prefix_kernel[(rows, tiles_per_row)](
+        logits,
+        seq_lens,
+        published,
+        output,
+        width,
+        logits.stride(0),
+        published.stride(0),
+        published.stride(1),
+        tile,
+        tiles_per_row,
+    )
+
+
+@triton.jit
 def _publish_candidate_mask_kernel(
     INDICES,
     VALUES,
@@ -94,28 +144,84 @@ def candidate_block_logits(
     topk_blocks: int,
     block_size: int,
     published: torch.Tensor | None,
+    _consumer_live_prefix: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Keep torch.topk's block selection, including its tie behavior.
 
     A source masks the unread tail while reducing each block. A consumer masks
     visibility and the published candidates in one pass, without copying the
     capacity-sized logits before each masked_fill.
+
+    The private consumer opt-in initializes only [0, S), where
+    S = min(width, round_up(max(seq_len, 1), 4)). Its caller must pass the same
+    lengths to paged top-k and must not otherwise read the untouched tail.
     """
     rows, width = logits.shape
     output = torch.empty((rows, width), dtype=torch.float32, device=logits.device)
     if published is not None:
-        _candidate_mask_kernel[(rows, triton.cdiv(width, 4096))](
-            logits,
-            seq_lens,
-            published,
-            output,
-            width,
-            logits.stride(0),
-            published.stride(0),
-            published.stride(1),
-            4096,
-        )
+        from sglang.srt.environ import envs
+
+        # Only the paged-top-k consumer may leave scores beyond its device
+        # lengths undefined, so the live-prefix kernel needs both the caller's
+        # opt-in and the switch. Restrict the bounded grid to larger batches;
+        # small near-capacity batches retain the original launch policy.
+        if (
+            envs.SGLANG_FUSE_CANDIDATE_MASK_LIVE_PREFIX.get()
+            and _consumer_live_prefix
+            and rows >= 128
+            and width > 0
+            and width % 4 == 0
+        ):
+            _mask_candidate_live_prefix(logits, seq_lens, published, output)
+        elif envs.SGLANG_FUSE_CANDIDATE_MASK_ROWLOOP.get():
+            # Row-loop mask: one program per row, writes ONLY the live [0:seq_len] tiles
+            # and skips the dead page-capacity tail (the vendor paged top-k reads only
+            # [0:seq_len], so the tail is never read). Bit-exact final selection (set).
+            # ~6.3x on the mask at bs256. Default OFF (needs the live decode boot gate).
+            from sglang.kernels.ops.attention.dsv4.candidate_mask_rowloop import (
+                candidate_mask_rowloop,
+            )
+
+            candidate_mask_rowloop(
+                logits, seq_lens, published, out=output, TILE=1024, num_warps=4
+            )
+        elif envs.SGLANG_FUSE_CANDIDATE_MASK_OPT.get():
+            # Tuned launch (TILE/num_warps + contiguous-keep specialization),
+            # bit-exact with _candidate_mask_kernel; ~1.1x at bs256. Default OFF.
+            from sglang.kernels.ops.attention.dsv4.candidate_mask_opt import (
+                candidate_mask_opt,
+            )
+
+            candidate_mask_opt(
+                logits, seq_lens, published, out=output, TILE=2048, num_warps=8
+            )
+        else:
+            _candidate_mask_kernel[(rows, triton.cdiv(width, 4096))](
+                logits,
+                seq_lens,
+                published,
+                output,
+                width,
+                logits.stride(0),
+                published.stride(0),
+                published.stride(1),
+                4096,
+            )
         return output, None
+
+    from sglang.srt.environ import envs as _envs
+
+    if _envs.SGLANG_FUSE_CANDIDATE_SOURCE_OPT.get():
+        # Candidate-source opt: row-loop block scoring (skips dead tail) + vendor
+        # block top-k (replaces slow torch.topk) + membership publish. ~4x on the
+        # source path; keep-mask bit-exact when live blocks <= topk_blocks. Default OFF.
+        from sglang.kernels.ops.attention.dsv4.candidate_source_opt import (
+            candidate_source_scores_and_keep,
+        )
+
+        return candidate_source_scores_and_keep(
+            logits, seq_lens, topk_blocks, block_size, out=output
+        )
 
     blocks = triton.cdiv(width, block_size)
     scores = torch.empty((rows, blocks), dtype=torch.float32, device=logits.device)

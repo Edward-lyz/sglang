@@ -59,6 +59,13 @@ def _jit_main_k_norm_rope_flashmla_module(
     layout: KVLayout,
 ):
     """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "#38409 k_norm_rope_pdl_wait",
+        "main K norm+rope store reads out_loc after the PDL wait (layout=%s)",
+        layout.cpp_name,
+    )
     args = make_cpp_args(
         dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
     )

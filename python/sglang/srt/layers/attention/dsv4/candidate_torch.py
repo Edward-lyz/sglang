@@ -6,10 +6,13 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
     IndexerInputs,
+    PrefillIndexerInputs,
+    mask_topk_scores,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     fp4_paged_mqa_logits,
@@ -22,6 +25,73 @@ from sglang.srt.layers.attention.dsv4.indexer import (
 class CandidateMasks(CandidateMetadata):
     mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
     request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
+
+
+@dataclass
+class PrefillCandidateBlocks(CandidateMetadata):
+    """Prefill level-one candidates as int32 block ids ``[rows_b, <= topk_blocks]``
+    per request (-1 = none), instead of bool ``[rows_b, lc_b]`` position masks:
+    the published size no longer grows with the prompt length."""
+
+    request_blocks: List[torch.Tensor]
+
+    def tail(self, lengths: List[int]) -> "PrefillCandidateBlocks":
+        """Like ``tail`` for requests, but returning blocks instead of masks."""
+        return PrefillCandidateBlocks(
+            request_blocks=[
+                blocks[blocks.shape[0] - length :]
+                for blocks, length in zip(self.request_blocks, lengths)
+            ]
+        )
+
+
+def published_prefill_blocks(candidate) -> PrefillCandidateBlocks:
+    """The forward's ``candidate_metadata`` as the block ids the source published."""
+    assert isinstance(candidate, PrefillCandidateBlocks), "candidate blocks missing"
+    return candidate
+
+
+def _candidate_block_topk(
+    logits: torch.Tensor,
+    compress_lens,
+    topk_blocks: int,
+    block_size: int,
+):
+    width = logits.size(-1)
+    padding = -width % block_size
+    scores = F.pad(logits, (0, padding), value=-torch.inf) if padding else logits
+    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    num_blocks = scores.size(-1)
+    # The block holding the query's newest position is always kept.
+    last = (compress_lens - 1) // block_size
+    scores = scores.masked_fill(
+        torch.arange(num_blocks, device=logits.device) == last, torch.inf
+    )
+    return scores.topk(min(topk_blocks, num_blocks), dim=-1)
+
+
+def select_candidate_block_ids(
+    logits: torch.Tensor,
+    compress_lens,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """``select_candidate_blocks`` as block ids: the same kept blocks, -1 where the
+    mask would keep nothing (all -inf block)."""
+    top = _candidate_block_topk(logits, compress_lens, topk_blocks, block_size)
+    return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
+
+
+def candidate_block_mask(
+    blocks: torch.Tensor, width: int, block_size: int
+) -> torch.Tensor:
+    """Expand block ids back to the bool position mask over ``width`` columns."""
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (*blocks.shape[:-1], num_blocks + 1), dtype=torch.bool, device=blocks.device
+    )
+    keep.scatter_(-1, blocks.to(torch.int64).masked_fill(blocks < 0, num_blocks), True)
+    return keep[..., :num_blocks].repeat_interleave(block_size, dim=-1)[..., :width]
 
 
 def published_masks(candidate) -> CandidateMasks:
@@ -39,13 +109,15 @@ def two_level_decode_logits(
     topk_blocks: int,
     block_size: int,
     published: Optional[torch.Tensor],
+    _consumer_live_prefix: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Apply candidate-block filtering and return logits plus an optional published mask.
 
     Mask columns past each sequence length to -inf before selection: the paged
     logits kernel leaves that tail uninitialized, and an all -inf block means
     unreachable. This path is graph-captured and must not synchronize with the host.
-    Work scales with allocated page-table capacity, not live sequence length.
+    Work normally scales with allocated page-table capacity. The private decode
+    consumer opt-in writes only its live prefix and vector padding on CUDA.
     """
     if not (is_candidate_source or uses_candidates):
         return logits, None
@@ -78,6 +150,7 @@ def two_level_decode_logits(
             topk_blocks=topk_blocks,
             block_size=block_size,
             published=None if is_candidate_source else published,
+            _consumer_live_prefix=_consumer_live_prefix and not is_candidate_source,
         )
 
     lens_col = seq_lens if seq_lens.dim() > 1 else seq_lens.unsqueeze(-1)
@@ -97,26 +170,43 @@ def two_level_decode_logits(
     return logits.masked_fill(~published[:, : logits.shape[-1]], -torch.inf), None
 
 
-def mask_topk_scores(
-    scores: torch.Tensor,
-    indices: torch.Tensor,
-    offsets: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Keep masked indexer scores out of attention even when top-k underfills."""
-    columns = indices.to(torch.int64)
-    if offsets is not None:
-        columns = columns - offsets[:, None]
-    selected_scores = scores.gather(1, columns.clamp(0, scores.shape[1] - 1))
-    valid = (
-        (columns >= 0) & (columns < scores.shape[1]) & (selected_scores > -torch.inf)
+def cut_request_masks(masks: CandidateMasks, tail_lens: List[int]) -> CandidateMasks:
+    """The last ``tail_lens[b]`` rows of each request's mask."""
+    assert masks.request_masks is not None, "prefill masks missing"
+    return CandidateMasks(
+        request_masks=[
+            mask[mask.shape[0] - t :] for mask, t in zip(masks.request_masks, tail_lens)
+        ]
     )
-    return indices.masked_fill(~valid, -1)
 
 
 class TorchCandidateIndexer:
-    def __init__(self, topk_blocks: int, block_size: int):
+    def __init__(self, topk_blocks: int, block_size: int, prefill_dense=None):
         self.topk_blocks = topk_blocks
         self.block_size = block_size
+        # the dense-score prefill implementation (DenseCandidateIndexer)
+        self._prefill_dense = prefill_dense
+
+    def publish_prefill(
+        self, inputs: PrefillIndexerInputs, out_positions: torch.Tensor
+    ) -> CandidateMetadata:
+        """Publish the chunk's candidates through the dense prefill indexer."""
+        return self._prefill_dense.publish_prefill(inputs, out_positions)
+
+    def select_prefill(
+        self,
+        published: CandidateMetadata,
+        inputs: PrefillIndexerInputs,
+        out_positions: torch.Tensor,
+    ) -> None:
+        """A consumer layer's top-k through the dense prefill indexer."""
+        self._prefill_dense.select_prefill(published, inputs, out_positions)
+
+    def prefill_tail(
+        self, published: CandidateMetadata, tail_lens: List[int]
+    ) -> CandidateMetadata:
+        """The published candidates of the late-layer tail rows."""
+        return self._prefill_dense.prefill_tail(published, tail_lens)
 
     def publish_decode(
         self,
@@ -136,6 +226,7 @@ class TorchCandidateIndexer:
             metadata.page_table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            request_ids=metadata.request_ids,
         )
         logits, mask = two_level_decode_logits(
             logits,
@@ -170,6 +261,7 @@ class TorchCandidateIndexer:
             metadata.page_table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            request_ids=metadata.request_ids,
         )
         logits, _ = two_level_decode_logits(
             logits,
@@ -179,6 +271,7 @@ class TorchCandidateIndexer:
             topk_blocks=self.topk_blocks,
             block_size=self.block_size,
             published=candidate_metadata.mask,
+            _consumer_live_prefix=metadata.use_topk_v2,
         )
         # raw positions into `selected`; `page_indices` gets the unfiltered slots
         # here and is rewritten with the masked selection just below
