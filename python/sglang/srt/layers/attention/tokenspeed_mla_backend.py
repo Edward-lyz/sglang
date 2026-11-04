@@ -807,7 +807,26 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         o_sf_scale: float = 1.0,
     ):  # Q/K/V arrive already in FP8 via the model-side fused path
         # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
-        return tokenspeed_mla.tokenspeed_mla_prefill(
+        # Hybrid MLA models resolve the model-side hook through the outer
+        # HybridLinearAttnBackend, so their fallback MHA path can pass V as a
+        # last-dimension slice of kv_b_proj (stride(-2) > size(-1)). The
+        # TokenSpeed prefill kernel requires dense Q/K/V layouts even though
+        # the public wrapper accepts arbitrary torch tensors.
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        valid_q_tokens = int(cum_seq_lens_q[-1].detach().item())
+        has_tail_padding = valid_q_tokens < q.shape[0]
+
+        if has_tail_padding:
+            # SGLang may pass padded Q/O buffers while cum_seq_lens_q describes
+            # the real ragged token count. TokenSpeed only writes real rows, so
+            # keep padded rows deterministic instead of returning uninitialized
+            # torch.empty() contents into the residual stream.
+            out_buffer.zero_()
+
+        result = tokenspeed_mla.tokenspeed_mla_prefill(
             query=q,
             key=k,
             value=v,
@@ -822,6 +841,16 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             max_seq_len_q=int(max_q_len),
             enable_pdl=is_arch_support_pdl(),
         )
+        if has_tail_padding:
+            if isinstance(result, tuple):
+                out, lse = result
+                if out.shape[0] > valid_q_tokens:
+                    out[valid_q_tokens:].zero_()
+                if lse is not None and lse.shape[0] > valid_q_tokens:
+                    lse[valid_q_tokens:].fill_(float("-inf"))
+            elif result.shape[0] > valid_q_tokens:
+                result[valid_q_tokens:].zero_()
+        return result
 
 
 class TokenspeedMLAMultiStepDraftBackend(TRTLLMMLAMultiStepDraftBackend):
