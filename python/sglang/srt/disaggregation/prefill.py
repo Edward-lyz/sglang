@@ -23,6 +23,7 @@ import hashlib
 import logging
 from array import array
 from collections import deque
+from contextlib import contextmanager
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
@@ -136,6 +137,28 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+@contextmanager
+def _batched_kv_release(allocator):
+    """Defer the KV frees of one inflight-queue pass into a single free group (and one
+    SWA segment batch), so releasing N finished requests costs a few kernels instead of
+    a few per request on the scheduler thread. Gated by
+    SGLANG_OPT_DISAGG_PREFILL_RELEASE_BATCH; a no-op inside an already open group."""
+    if (
+        not envs.SGLANG_OPT_DISAGG_PREFILL_RELEASE_BATCH.get()
+        or getattr(allocator, "free_group", True) is not None
+    ):
+        yield
+        return
+    batch_swa = hasattr(allocator, "begin_swa_segment_batch")
+    allocator.free_group_begin()
+    if batch_swa:
+        allocator.begin_swa_segment_batch()
+    try:
+        yield
+    finally:
+        if batch_swa:
+            allocator.end_swa_segment_batch()
+        allocator.free_group_end()
 
 
 class PrefillBootstrapQueue:
@@ -617,6 +640,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            self.process_disagg_prefill_inflight_queue(
+                prepolled=self._fused_inflight_polls
+            )
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -638,7 +664,6 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 self.on_idle()
 
-            self.process_disagg_prefill_inflight_queue()
 
             # Update last_batch
             self.last_batch = batch
@@ -656,6 +681,9 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            )
+            self.process_disagg_prefill_inflight_queue(
+                prepolled=self._fused_inflight_polls
             )
 
             # Get the next batch to run
@@ -687,7 +715,6 @@ class SchedulerDisaggregationPrefillMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
-            self.process_disagg_prefill_inflight_queue()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -768,6 +795,13 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
+        # Rescue every finished req's tail SWA window in ONE batched staging
+        # pass, before the per-req loop below submits any AttentionStore write
+        # (the write consumes the staged slots). The window is only HBM-resident
+        # this forward, so this must run before any early-continue below.
+        self.detect_and_may_copy_as_swa_batch(
+            [req for req in batch.reqs if req.inflight_middle_chunks <= 0]
+        )
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -861,7 +895,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
-                if not req.pending_bootstrap:
+                if not req.pending_bootstrap and not self._prefill_fake_free_kv(req):
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
@@ -939,75 +973,109 @@ class SchedulerDisaggregationPrefillMixin:
         )
         self.maybe_send_health_check_signal()
 
+    def _prefill_fake_free_kv(self: Scheduler, req) -> bool:
+        """Benchmark single-press: free a fake-bootstrap request's KV right after
+        prefill. aiakperf --fake-bootstrap sets req.bootstrap_host=FAKE_BOOTSTRAP_HOST
+        and no decode peer ever pulls the KV, so it would otherwise leak until an
+        impossible transfer concludes (oversubscribes SWA -> stall). Gated by env
+        SGLANG_PREFILL_FAKE_FREE_KV=1; never affects real PD (real bootstrap_host).
+        """
+        return (
+            self._fake_transfer_bypass
+            and req.bootstrap_host == FAKE_BOOTSTRAP_HOST
+        )
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
-        self: Scheduler, rids_to_check: Optional[List[str]] = None
+        self: Scheduler,
+        rids_to_check: Optional[List[str]] = None,
+        prepolled: Optional[List[int]] = None,
     ) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
+        prepolled: poll states already MIN all-reduced together with the bootstrap
+            and waiting queues by fuse_bootstrap_polls (one all_reduce instead of
+            three). Positionally aligned with disagg_prefill_inflight_queue.
         """
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
         done_reqs = []
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+        polls = (
+            prepolled
+            if prepolled is not None
+            and len(prepolled) == len(self.disagg_prefill_inflight_queue)
+            else poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
         )
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if rids_to_check is not None:
-                if req.rid not in rids_to_check:
-                    undone_reqs.append(req)
+        with _batched_kv_release(self.token_to_kv_pool_allocator):
+            for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+                if self._prefill_fake_free_kv(req):
+                    # Synthetic single-press: no decode peer pulls this KV; free it now.
+                    if not isinstance(req.finished_reason, FINISH_ABORT):
+                        req.finished_reason = FINISH_LENGTH(length=0)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    try:
+                        req.disagg_kv_sender.clear()
+                    except Exception:
+                        pass
+                    done_reqs.append(req)
+                    continue
+                if rids_to_check is not None:
+                    if req.rid not in rids_to_check:
+                        undone_reqs.append(req)
+                        continue
+
+                    # In PP mode, the previous rank may have reached a terminal
+                    # state (Success/Failed) while this rank's local poll is still
+                    # in a transient state due to clock skew or propagation delay.
+                    # Treat non-terminal states as undone instead of crashing.
+                    if poll not in (
+                        KVPoll.Success,
+                        KVPoll.Failed,
+                    ):
+                        logger.warning_once(
+                            f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
+                            f"from consensus; treating as undone",
+                        )
+                        undone_reqs.append(req)
+                        continue
+
+                if req.pending_bootstrap:
+                    # Parked: prefill finished before bootstrap completed.
+                    if self.handle_pending_bootstrap(req, poll):
+                        self.send_kv_chunk(req, last_chunk=True)
+                        undone_reqs.append(req)
+                    elif poll != KVPoll.Failed:
+                        undone_reqs.append(req)
                     continue
 
-                # In PP mode, the previous rank may have reached a terminal
-                # state (Success/Failed) while this rank's local poll is still
-                # in a transient state due to clock skew or propagation delay.
-                # Treat non-terminal states as undone instead of crashing.
-                if poll not in (
-                    KVPoll.Success,
-                    KVPoll.Failed,
-                ):
-                    logger.warning_once(
-                        f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone",
+                if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
+                    # todo: set Transferring correctly in backend
+                    undone_reqs.append(req)
+                elif poll == KVPoll.Success:  # transfer done
+                    if not isinstance(req.finished_reason, FINISH_ABORT):
+                        req.finished_reason = FINISH_LENGTH(length=0)
+                    release_kv_cache(req, self.tree_cache)  # unlock the tree
+                    # FIXME: clean up req's data in transfer engine
+                    req.disagg_kv_sender.clear()
+                    done_reqs.append(req)
+                    req.time_stats.set_prefill_kv_transfer_finish_time()
+                elif poll == KVPoll.Failed:
+                    self.handle_inflight_transfer_failure(req)
+                    done_reqs.append(req)
+                else:
+                    raise RuntimeError(
+                        f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
                     )
-                    undone_reqs.append(req)
-                    continue
-
-            if req.pending_bootstrap:
-                # Parked: prefill finished before bootstrap completed.
-                if self.handle_pending_bootstrap(req, poll):
-                    self.send_kv_chunk(req, last_chunk=True)
-                    undone_reqs.append(req)
-                elif poll != KVPoll.Failed:
-                    undone_reqs.append(req)
-                continue
-
-            if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
-                # todo: set Transferring correctly in backend
-                undone_reqs.append(req)
-            elif poll == KVPoll.Success:  # transfer done
-                if not isinstance(req.finished_reason, FINISH_ABORT):
-                    req.finished_reason = FINISH_LENGTH(length=0)
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
-                # FIXME: clean up req's data in transfer engine
-                req.disagg_kv_sender.clear()
-                done_reqs.append(req)
-                req.time_stats.set_prefill_kv_transfer_finish_time()
-            elif poll == KVPoll.Failed:
-                self.handle_inflight_transfer_failure(req)
-                done_reqs.append(req)
-            else:
-                raise RuntimeError(
-                    f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
-                )
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
@@ -1318,6 +1386,8 @@ class SchedulerDisaggregationPrefillMixin:
                 start_idx,
                 end_idx,
             )
+            return
+
         if self._sendkv_fake_transfer(req):
             # FakeKVSender.send only counts pages; drive the same accounting
             # from token math instead of gathering req_to_token rows to host.

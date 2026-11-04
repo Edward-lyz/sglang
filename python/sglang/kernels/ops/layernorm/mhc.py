@@ -2171,6 +2171,8 @@ def _num_slices_for(k: int) -> int:
     return 1
 
 
+_MHC_USE_DEEPGEMM = envs.SGLANG_MHC_USE_DEEPGEMM.get()
+_MHC_DEEPGEMM_SPLITS = envs.SGLANG_MHC_DEEPGEMM_SPLITS.get()
 def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch.Tensor:
     """Batch-invariant F.linear(x_flat.float(), hc_fn) * rsqrt(mean(x_flat^2) + eps).
 

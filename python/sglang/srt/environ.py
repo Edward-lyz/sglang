@@ -1247,6 +1247,19 @@ class Envs:
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+    # ===================================================================
+    # MHC (mixed hidden-state compute) layernorm kernel
+    # ===================================================================
+    # SGLANG_MHC_USE_DEEPGEMM=0 forces the Triton split-K producer.
+    SGLANG_MHC_USE_DEEPGEMM = EnvBool(True)
+    SGLANG_MHC_DEEPGEMM_SPLITS = EnvInt(16)
+
+    # ===================================================================
+    # DeepSeek-V4 SWA pool sizing
+    # ===================================================================
+    # Multiplier on the computed SWA KV-cache cap; >1 spends free GPU memory on a
+    # larger SWA pool to avoid chunk fragmentation under DP fan-out (default 1.0).
+    SGLANG_SWA_CAP_MULT = EnvFloat(1.0)
 
     # ===================================================================
     # Top-k kernels

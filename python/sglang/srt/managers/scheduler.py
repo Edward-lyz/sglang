@@ -2130,10 +2130,7 @@ class Scheduler(
                 "AS draft SWA fan-out requires the paged SWA pool: the unified-KV "
                 "ring has no page halves to stage a window from"
             )
-        if (
-            target.full_to_swa_index_mapping
-            is not draft_pool.full_to_swa_index_mapping
-        ):
+        if target.full_to_swa_index_mapping is not draft_pool.full_to_swa_index_mapping:
             raise RuntimeError(
                 "AS draft SWA fan-out requires the target and draft pools to "
                 "share one full->swa index mapping object"
@@ -3176,6 +3173,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                skip_radix_cache_insert=recv_req.skip_radix_cache_insert,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,

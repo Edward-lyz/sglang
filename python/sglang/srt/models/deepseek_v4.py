@@ -4010,8 +4010,15 @@ class DeepseekV4Model(nn.Module):
             )
         hidden_states = self.norm(hidden_states)
 
-        if tail is not None and not capture_dspark:
-            # The logits processor indexes rows by the full extend layout.
+        if tail is not None:
+            # The logits processor indexes rows by the full extend layout; and under
+            # prefill-CP the post-forward CP gather (cp_gather_after_forward) needs
+            # each rank's full local shard, not the late-layer tail slice. Always
+            # scatter the tail rows back to the full layout -- including when
+            # capturing DSpark aux -- so swa-bounded-replay coexists with DSpark
+            # (the DSpark aux is captured separately in the layer loop and is
+            # unaffected; the head/draft only needs the last token, which is in the
+            # tail and preserved by the scatter).
             num_tokens = input_ids.shape[0]
             hidden_states = _scatter_tail_rows(
                 tail=tail, rows=hidden_states, num_tokens=num_tokens
