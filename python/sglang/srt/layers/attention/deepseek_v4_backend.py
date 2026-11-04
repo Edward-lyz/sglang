@@ -4646,10 +4646,17 @@ class DeepseekV4AttnBackend(
 
         The fused decode op reads the pool's records in place: V4 (584 B) and V4.1 (528 B / 288 B fp4 extra)
         records are read by the FlashMLA build at 07a1089 (the first V4.1 release); later FlashMLA builds read
-        per-token V4.1 records only, which is not the layout this pool writes."""
+        per-token V4.1 records only, which is not the layout this pool writes.
+
+        Also serves DSPARK target-verify. That batch is request-major query rows over the same paged
+        caches; the fused decode op's s_q is a free per-row dimension (each row attends only to its own
+        indices[row, :topk_length[row]] -- the op's documented way to express causal attention), so the
+        draft tokens are attended exactly like decode rows. The DSPARK *draft* worker's own block
+        attention takes a different metadata/kernel path and stays off (is_dspark_draft)."""
         pool = self.token_to_kv_pool
         if not isinstance(pool, DeepSeekV4TokenToKVPool):
             return False
+        mode = forward_batch.forward_mode
         return (
             forward_batch.forward_mode.is_decode()
             and isinstance(
