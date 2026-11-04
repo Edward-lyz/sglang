@@ -58,7 +58,7 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
     backend = get_attn_backend()
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
-    return backend
+    return getattr(backend, "full_attn_backend", backend)
 
 
 def _forward_dsa_indexer_for_mha(
@@ -469,10 +469,15 @@ class DeepseekMHAForwardMixin:
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
+        # kv_b_proj consumes BF16 latent KV. TokenSpeed repacks the resulting
+        # dense K/V to FP8; other backends keep BF16 compute inputs.
         backend = _resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
-        kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
+        use_bf16_kv = (
+            pack_fn is not None
+            or getattr(backend, "enable_kimi_k3_prefill_fp8_cache", False)
+        )
+        kv_a_dtype = torch.bfloat16 if use_bf16_kv else q.dtype
 
         assert forward_batch.num_prefix_chunks is not None
         for i in range(forward_batch.num_prefix_chunks):
@@ -483,6 +488,8 @@ class DeepseekMHAForwardMixin:
             kv_a_normed, k_pe = self._get_mla_kv_buffer(
                 kv_indices, kv_a_dtype, forward_batch
             )
+            assert kv_a_normed.dtype == kv_a_dtype
+            assert k_pe.dtype == kv_a_dtype
             kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
                 kv_a_normed,
                 k_pe,
@@ -538,6 +545,11 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
+            backend = _resolve_attn_backend(forward_batch)
+            quantize = getattr(backend, "quantize_prefill_mla_kv_cache", None)
+            if quantize is not None:
+                kv_a, k_pe = quantize(kv_a, k_pe)
+
             # Save latent cache
             get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
