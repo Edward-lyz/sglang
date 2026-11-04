@@ -319,6 +319,9 @@ class GenerateReqInput:
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
+    # Content-detection / trace settings resolved by the OpenAI entrypoint.
+    trace_config: Optional[Dict[str, Any]] = None
+
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
     # Whether to return entropy

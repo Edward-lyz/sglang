@@ -405,6 +405,10 @@ class CompletionRequest(BaseModel):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
+    # Per-request content-detection / trace settings, merged over the
+    # CD_* environment defaults in OpenAIServingBase.
+    trace_config: Optional[Dict[str, Any]] = None
+
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
@@ -499,12 +503,16 @@ class CompletionResponse(BaseModel):
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
     sglext: Optional[SglExt] = None
+    # Content-detection / trace payload, present only for traced requests.
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.sglext is None:
             data.pop("sglext", None)
+        if self.trace_info is None:
+            data.pop("trace_info", None)
         return data
 
 
@@ -538,12 +546,16 @@ class CompletionStreamResponse(BaseModel):
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
+    # Content-detection / trace payload, present only for traced requests.
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.sglext is None:
             data.pop("sglext", None)
+        if self.trace_info is None:
+            data.pop("trace_info", None)
         return data
 
 
@@ -963,6 +975,10 @@ class ChatCompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
+    # Per-request content-detection / trace settings, merged over the
+    # CD_* environment defaults in OpenAIServingBase.
+    trace_config: Optional[Dict[str, Any]] = None
+
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
@@ -1302,12 +1318,16 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
     sglext: Optional[SglExt] = None
+    # Content-detection / trace payload, present only for traced requests.
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.sglext is None:
             data.pop("sglext", None)
+        if self.trace_info is None:
+            data.pop("trace_info", None)
         return data
 
 
@@ -1357,12 +1377,16 @@ class ChatCompletionStreamResponse(BaseModel):
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
+    # Content-detection / trace payload, present only for traced requests.
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.sglext is None:
             data.pop("sglext", None)
+        if self.trace_info is None:
+            data.pop("trace_info", None)
         return data
 
 

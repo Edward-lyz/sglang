@@ -14,6 +14,7 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.content_detection.config import DETECTION_CONFIG
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.environ import envs
@@ -117,6 +118,7 @@ class OpenAIServingBase(ABC):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
 
+            self._process_trace_config(request, adapted_request)
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
@@ -343,3 +345,68 @@ class OpenAIServingBase(ABC):
                 )
 
         return body_routed_dp_rank
+
+    @staticmethod
+    def _serialize_trace_value(value: Any) -> Any:
+        """JSON-ready copy of a request field for the trace payload."""
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json")
+        if isinstance(value, list):
+            return [OpenAIServingBase._serialize_trace_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: OpenAIServingBase._serialize_trace_value(item)
+                for key, item in value.items()
+            }
+        return value
+
+    def _build_trace_info(
+        self,
+        request: OpenAIServingRequest,
+        meta_info: Optional[Dict[str, Any]] = None,
+    ) -> Optional[dict]:
+        """Trace payload the scheduler attached to this request, if any.
+
+        The scheduler-side dump tool that fills meta_info["trace_info"] is not
+        part of this delivery, so this returns None until it lands; the response
+        field exists so the gateway contract does not change when it does.
+        """
+        if not DETECTION_CONFIG.enable_trace or not request.trace_config:
+            return None
+        if not meta_info or "trace_info" not in meta_info:
+            return None
+        return dict(meta_info["trace_info"])
+
+    def _process_trace_config(self, request, adapted_request) -> None:
+        """Resolve trace settings onto the internal request.
+
+        A trace_config only survives when tracing is enabled, and asking for a
+        logprobs trace has to turn logprobs on, otherwise the trace would be
+        assembled from data the scheduler was never told to produce.
+        """
+        trace_config = getattr(request, "trace_config", None)
+        if not trace_config:
+            return
+        if not DETECTION_CONFIG.enable_trace:
+            logger.info(
+                "CD_ENABLE_TRACE is not set, so the trace config of req %s is ignored",
+                getattr(request, "rid", None),
+            )
+            trace_config["enable_trace"] = False
+
+        trace_type = trace_config.get("trace_type")
+        if trace_type in ("prompt", "all"):
+            if hasattr(request, "messages"):
+                trace_config["payload"] = {
+                    "messages": self._serialize_trace_value(request.messages)
+                }
+            elif hasattr(request, "prompt"):
+                trace_config["payload"] = {
+                    "prompt": self._serialize_trace_value(request.prompt)
+                }
+        if trace_type in ("logprobs", "all"):
+            adapted_request.return_logprob = True
+            if "top_logprobs" in trace_config:
+                adapted_request.top_logprobs_num = trace_config.get("top_logprobs")
+
+        adapted_request.trace_config = trace_config

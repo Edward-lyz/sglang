@@ -88,9 +88,7 @@ class TestExpandJsonSchemaRefs(CustomTestCase):
         """A keyword beside $ref (2020-12) overrides the referenced value."""
         schema = {
             "$defs": {"Base": {"type": "string", "description": "base"}},
-            "properties": {
-                "x": {"$ref": "#/$defs/Base", "description": "overridden"}
-            },
+            "properties": {"x": {"$ref": "#/$defs/Base", "description": "overridden"}},
         }
         result = expand_json_schema_refs(schema)
         self.assertEqual(
@@ -126,9 +124,7 @@ class TestExpandJsonSchemaRefs(CustomTestCase):
         """A non-local $ref (URI) is not something we can inline; leave it."""
         schema = {
             "type": "object",
-            "properties": {
-                "loc": {"$ref": "https://example.com/geo.schema.json"}
-            },
+            "properties": {"loc": {"$ref": "https://example.com/geo.schema.json"}},
         }
         result = expand_json_schema_refs(schema)
         self.assertEqual(

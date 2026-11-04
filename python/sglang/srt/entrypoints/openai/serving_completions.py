@@ -402,6 +402,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # Set before the yield: once the chunk leaves this generator
                 # HTTP 200 is committed, and the flag is what guards against
                 # raising after that point.
+                stream_started = True
                 yield f"data: {chunk.model_dump_json()}\n\n"
                 stream_started = True
 
@@ -493,6 +494,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     choices=[],
                     model=request.model,
                     usage=usage,
+                    trace_info=self._build_trace_info(request, content["meta_info"]),
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
@@ -643,6 +645,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             usage=usage,
             metadata=build_endpoint_weight_version_metadata(ret[0]["meta_info"]),
             sglext=response_sglext,
+            trace_info=self._build_trace_info(request, ret[0]["meta_info"]),
         )
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:

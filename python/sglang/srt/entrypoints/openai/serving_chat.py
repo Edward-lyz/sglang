@@ -39,6 +39,9 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
+from sglang.srt.content_detection.config import DETECTION_CONFIG
+from sglang.srt.content_detection.pipeline import build_detection_pipeline
+from sglang.srt.content_detection.recorder import ChunkInfo, RequestContext
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
     encoding_dsv4,
@@ -551,6 +554,14 @@ class OpenAIServingChat(OpenAIServingBase):
         # _process_tool_call_stream.
         self.tool_call_empty_return_interval: float = (
             envs.SGLANG_TOOL_CALL_EMPTY_RETURN_INTERVAL.get()
+        )
+
+        # Content detection over streamed output; stays None (and costs nothing)
+        # unless CD_ENABLE_DETECTION is set.
+        self.detection_pipeline = (
+            build_detection_pipeline(self.tokenizer_manager.server_args)
+            if DETECTION_CONFIG.enable_detection
+            else None
         )
 
         # Probe whether ``encode("")`` returns specials. If it does, we must
@@ -1071,6 +1082,30 @@ class OpenAIServingChat(OpenAIServingBase):
         last_return_tokens[index] = total_completion_tokens
         return delta
 
+    def _build_detection_context(
+        self, request: ChatCompletionRequest
+    ) -> Optional[RequestContext]:
+        """Per-request content-detection state, or None when detection is off.
+
+        The per-request trace_config wins over the CD_* environment defaults, so
+        a caller can narrow the detector set or ask for a stricter action.
+        """
+        if self.detection_pipeline is None:
+            return None
+        custom_params = request.custom_params or {}
+        request_trace_config = (
+            getattr(request, "trace_config", None)
+            or custom_params.get("trace_config")
+            or {}
+        )
+        trace_config = DETECTION_CONFIG.build_trace_config()
+        trace_config.update(request_trace_config)
+        return RequestContext(
+            rid=request.rid,
+            tokenizer_manager=self.tokenizer_manager,
+            trace_config=trace_config,
+        )
+
     async def _generate_stream_content(
         self,
         content: Dict[str, Any],
@@ -1088,6 +1123,7 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens: Dict[int, int],
         last_return_tokens: Optional[Dict[int, int]] = None,
         tool_call_last_return_time: Optional[Dict[int, float]] = None,
+        detection_ctx: Optional[RequestContext] = None,
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
         offset = stream_offsets.get(index, 0)
@@ -1097,6 +1133,9 @@ class OpenAIServingChat(OpenAIServingBase):
             delta = content["text"][offset:]
             stream_offsets[index] = len(content["text"])
 
+        if detection_ctx is not None:
+            # The detectors only read text, so the increment is all they need.
+            await self.detection_pipeline.process(detection_ctx, ChunkInfo(text=delta))
 
         # Attach logprobs to the first chunk emitted this step (reasoning,
         # tool-call, or content) so they aren't dropped when a parser is active
@@ -2115,6 +2154,7 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reasons = {}
         # Last time a tool-call chunk reached the client, per choice index.
         tool_call_last_return_time = {}
+        detection_ctx = self._build_detection_context(request)
 
         # Usage tracking
         prompt_tokens = {}
@@ -2277,6 +2317,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens=completion_tokens,
                     last_return_tokens=last_return_tokens,
                     tool_call_last_return_time=tool_call_last_return_time,
+                    detection_ctx=detection_ctx,
                 ):
                     yield chunk
 
@@ -2434,6 +2475,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
                     usage=usage,
+                    trace_info=self._build_trace_info(request, content["meta_info"]),
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
@@ -2661,6 +2703,7 @@ class OpenAIServingChat(OpenAIServingBase):
             usage=usage,
             metadata=build_endpoint_weight_version_metadata(ret[0]["meta_info"]),
             sglext=response_sglext,
+            trace_info=self._build_trace_info(request, ret[0]["meta_info"]),
         )
 
     def _process_logprobs_tokens(
