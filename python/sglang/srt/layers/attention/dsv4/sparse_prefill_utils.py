@@ -34,13 +34,16 @@ compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import triton
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
+from sglang.srt.environ import envs
 from sglang.srt.utils import ceil_align
+from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.community_opt import log_community_opt_once
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
 # for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
@@ -55,6 +58,10 @@ from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
     _build_swa_token_ids_kernel,
     _combine_topk_swa_indices_kernel,
 )
+
+# Binary-search depth floor for the combine kernel: covers up to 127 requests per
+# chunk with one compiled variant per (ratio, block) instead of one per bit length.
+_COMBINE_MIN_SEARCH_STEPS = 7
 
 
 def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
@@ -87,6 +94,9 @@ class SparsePrefillWorkspace:
     def __init__(self, device: torch.device):
         self.device = device
         self._buffer: Optional[torch.Tensor] = None
+        # Bumped on every reallocation, so contents tracked across layers (the
+        # chunk cache's ``resident`` compressed gather) are known to be gone.
+        self.generation = 0
 
     def get(
         self,
@@ -102,6 +112,7 @@ class SparsePrefillWorkspace:
                 dtype=dtype,
                 device=self.device,
             )
+            self.generation += 1
         return self._buffer[:num_tokens]
 
 
@@ -157,7 +168,6 @@ def combine_topk_swa_indices(
         # The kernel writes whole -1 padded rows.
         combined_indices = torch.empty(
             (num_tokens, combined_topk),
-            -1,
             dtype=torch.int32,
             device=topk_indices.device,
         )
@@ -174,8 +184,18 @@ def combine_topk_swa_indices(
         assert out_lens.dtype == torch.int32
         combined_lens = out_lens
 
-    NUM_WORKERS = 128
-    _combine_topk_swa_indices_kernel[(num_reqs, NUM_WORKERS)](
+    if num_tokens == 0:
+        return combined_indices, combined_lens
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "#41658 combine_topk_swa_indices",
+        "token-parallel combine kernel enabled (tokens=%d, reqs=%d)",
+        num_tokens,
+        num_reqs,
+    )
+    block_t = 2  # Measured on B200 with num_warps=2, 16384 tokens, bs 1 to 64.
+    _combine_topk_swa_indices_kernel[(triton.cdiv(num_tokens, block_t),)](
         combined_indices,
         combined_indices.stride(0),
         combined_lens,
@@ -187,10 +207,18 @@ def combine_topk_swa_indices(
         gather_lens,
         compressed_base,
         swa_base,
+        num_tokens,
+        num_reqs,
         top_k=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
-        PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+        WIDTH=combined_topk,
+        PADDED_WIDTH=triton.next_power_of_2(combined_topk),
+        BLOCK_T=block_t,
+        # Bucketed so a new request count does not compile a new variant at serve
+        # time; the extra steps are masked out once lo == hi.
+        SEARCH_STEPS=max(max(num_reqs, 1).bit_length(), _COMBINE_MIN_SEARCH_STEPS),
+        num_warps=2,
     )
     return combined_indices, combined_lens
 
@@ -269,14 +297,16 @@ def build_swa_token_ids(
 class CompressedGather:
     """Positional layout of one top-k compressed cache inside the workspace."""
 
-    flat_token_ids: torch.Tensor  # (num_reqs * c_max,) int32
+    # (num_reqs * c_max,) int32, or (sum of per-request rows,) in the compact layout
+    flat_token_ids: torch.Tensor
     page_size: int
     compressed_base: torch.Tensor  # (num_reqs,) int32
     swa_base: torch.Tensor  # (num_reqs,) int32
-    # Tail stays at the -1 sentinel because the valid prefix length is
-    # chunk-invariant per request; subsequent layers only overwrite that prefix.
+    # Output buffers of the last combine; the kernel rewrites whole rows.
     combined_indices: Optional[torch.Tensor] = None
     combined_lens: Optional[torch.Tensor] = None
+    # (top-k version, raw_indices data_ptr) the buffers above were combined from.
+    combined_key: Optional[tuple] = None
 
 
 @dataclass
@@ -323,6 +353,15 @@ class SparsePrefillChunkCache:
     # Top-k compressed caches (c1 / c2 / c4), keyed by compress ratio.
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
 
+    # Host lengths for the compact compressed layout (vllm#59131); None keeps
+    # the num_reqs * c_max padded layout.
+    seq_lens_cpu: Optional[List[int]] = None
+    query_lens_cpu: Optional[List[int]] = None
+    # The compressed gather the workspace head currently holds, as
+    # (ratio, source layer, rows, workspace generation, data_ptr, dtype); None
+    # once anything else was written there. Lives on the per-forward chunk cache.
+    resident: Optional[tuple] = None
+
     @classmethod
     def build(
         cls,
@@ -338,9 +377,13 @@ class SparsePrefillChunkCache:
         num_qo_tokens: int,
         max_seq_len: int,
         total_swa: int,
+        seq_lens_cpu: Optional[List[int]] = None,
+        query_lens_cpu: Optional[List[int]] = None,
     ) -> "SparsePrefillChunkCache":
         """``query_lens`` / ``query_pos``: the rows this forward runs (the extend, or
-        a CP rank's interleaved share of it); the SWA gather spans the whole extend."""
+        a CP rank's interleaved share of it); the SWA gather spans the whole extend.
+        ``seq_lens_cpu`` / ``query_lens_cpu`` mirror ``seq_lens`` / ``query_lens``
+        on the host and enable the compact compressed layout."""
         device = seq_lens.device
         num_reqs = seq_lens.shape[0]
 
@@ -372,6 +415,8 @@ class SparsePrefillChunkCache:
             swa_first_pos=swa_first_pos,
             swa_gather_lens=swa_gather_lens,
             swa_offsets=swa_offsets,
+            seq_lens_cpu=seq_lens_cpu,
+            query_lens_cpu=query_lens_cpu,
         )
 
         # Pre-compute the c0 combine output: TOPK=0, compressed_base=0,
@@ -466,6 +511,16 @@ class SparsePrefillChunkCache:
         gather = self.compressed.get(compress_ratio)
         if gather is not None:
             return gather
+        if (
+            self.seq_lens_cpu is not None
+            and self.query_lens_cpu is not None
+            and envs.SGLANG_OPT_DSV4_COMPACT_COMPRESSED_GATHER.get()
+        ):
+            gather = self._compact_compressed_gather(
+                compress_ratio, page_table, c_page_size
+            )
+            self.compressed[compress_ratio] = gather
+            return gather
         device = self.seq_lens.device
         c_max = max(self.max_seq_len // compress_ratio, 1)
         c_capacity = page_table.shape[-1] * c_page_size
@@ -503,28 +558,98 @@ class SparsePrefillChunkCache:
         self.compressed[compress_ratio] = gather
         return gather
 
+    def _compact_compressed_gather(
+        self,
+        compress_ratio: int,
+        page_table: torch.Tensor,
+        c_page_size: int,
+    ) -> CompressedGather:
+        """vllm#59131 layout: request r owns ``seq_len[r] // ratio`` rows (0 when it
+        has no query rows here, e.g. under CP), packed back to back. The combine
+        kernel only emits top-k values below ``(pos + 1) // ratio <= seq_len //
+        ratio``, so every referenced row is the same KV row the padded layout
+        holds, at a different offset."""
+        device = self.seq_lens.device
+        c_lens = [
+            s // compress_ratio if q > 0 else 0
+            for s, q in zip(self.seq_lens_cpu, self.query_lens_cpu, strict=True)
+        ]
+        bases = [0] * self.num_reqs
+        for r in range(1, self.num_reqs):
+            bases[r] = bases[r - 1] + c_lens[r - 1]
+        total = bases[-1] + c_lens[-1]
+        c_live = max(c_lens)
+        c_capacity = page_table.shape[-1] * c_page_size
+        assert c_live <= c_capacity, (
+            f"live c{compress_ratio} extent {c_live} exceeds metadata capacity {c_capacity}"
+        )
+        lens_bases = async_h2d([c_lens, bases], dtype=torch.int32, device=device)
+        c_lens_dev, compressed_base = lens_bases[0], lens_bases[1]
+        first_q_per_req = (
+            self.query_start_loc[:-1].clamp_max(self.num_qo_tokens - 1).long()
+        )
+        num_blocks = (c_live + c_page_size - 1) // c_page_size
+        per_req_page_table = page_table.narrow(1, 0, num_blocks).index_select(
+            0, first_q_per_req
+        )
+        req = torch.repeat_interleave(
+            torch.arange(self.num_reqs, device=device), c_lens_dev, output_size=total
+        )
+        p = torch.arange(total, dtype=torch.int32, device=device) - compressed_base[req]
+        block = per_req_page_table.reshape(-1)[req * num_blocks + (p // c_page_size)]
+        flat_ids = (block * c_page_size + p % c_page_size).to(torch.int32).clamp_min(0)
+        swa_base = (total + self.swa_offsets[:-1]).to(torch.int32)
+        padded = self.num_reqs * max(self.max_seq_len // compress_ratio, 1)
+        log_community_opt_once(
+            "vllm#59131 compact_compressed_gather",
+            "c%d gathers %d compressed rows instead of %d (reqs=%d)",
+            compress_ratio,
+            total,
+            padded,
+            self.num_reqs,
+        )
+        return CompressedGather(
+            flat_token_ids=flat_ids,
+            page_size=c_page_size,
+            compressed_base=compressed_base,
+            swa_base=swa_base,
+        )
+
     def combine_compressed(
         self,
         compress_ratio: int,
         sparse_raw_indices: torch.Tensor,
+        topk_version: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``sparse_raw_indices`` is the top-k as request-local compressed
         positions, already the workspace coordinate ``combine_topk_swa_indices``
         expects, so no remap is needed.
+
+        ``topk_version`` identifies the top-k the index_source layer last wrote;
+        while it and the buffer are unchanged, the previous combine is returned
+        (vllm#59131). None always recombines.
         """
         gather = self.compressed[compress_ratio]
         topk = sparse_raw_indices.shape[-1]
+        key = (
+            None
+            if topk_version is None
+            else (topk_version, sparse_raw_indices.data_ptr(), topk)
+        )
+        if key is not None and gather.combined_key == key:
+            return gather.combined_indices, gather.combined_lens
         if gather.combined_indices is None:
+            # The kernel writes whole -1 padded rows and every length.
             device = self.seq_lens.device
-            gather.combined_indices = torch.full(
+            gather.combined_indices = torch.empty(
                 (self.num_qo_tokens, combined_topk_width(topk, self.swa_window_size)),
-                -1,
                 dtype=torch.int32,
                 device=device,
             )
-            gather.combined_lens = torch.zeros(
+            gather.combined_lens = torch.empty(
                 self.num_qo_tokens, dtype=torch.int32, device=device
             )
+        gather.combined_key = key
         return combine_topk_swa_indices(
             topk_indices=sparse_raw_indices,
             query_start_loc=self.query_start_loc,

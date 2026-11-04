@@ -110,6 +110,7 @@ from sglang.srt.layers.engram import (
     Engram,
     EngramHasher,
     EngramLayout,
+    EngramPackedExchange,
     build_engram_layout,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -465,7 +466,8 @@ def _apply_wo_a_bf16_matmul(
     Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
     verify batches up to 384 rows write token-major output directly to avoid
     the layout copy before wo_b. ROCm decode can use aiter batched GEMM;
-    other cases use torch.einsum.
+    other CUDA cases run the einsum's bmm into a token-major output
+    (SGLANG_OPT_DSV41_WO_A_TOKEN_MAJOR), else torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     if (
@@ -526,6 +528,28 @@ def _apply_wo_a_bf16_matmul(
                 "falling back to einsum for the rest of this process: %s",
                 err,
             )
+    if _is_cuda and envs.SGLANG_OPT_DSV41_WO_A_TOKEN_MAJOR.get():
+        # vLLM bf16 baseline: the same per-group cuBLAS bmm as the einsum, but
+        # writing token-major [T, G, R] so wo_b's o.flatten(1) is a view instead
+        # of a strided copy. Bit-identical to the einsum.
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "vllm#60118 wo_a_token_major",
+            "wo_a bmm writes token-major output (T=%d, G=%d, R=%d)",
+            o.shape[0],
+            wo_a.shape[0],
+            wo_a.shape[1],
+        )
+        result = torch.empty(
+            (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
+        )
+        # Draft warmup/capture can enter with grad tracking enabled.
+        with torch.no_grad():
+            torch.bmm(
+                o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1)
+            )
+        return result
     return torch.einsum("tgd,grd->tgr", o, wo_a)
 
 
@@ -1725,6 +1749,12 @@ class MQALayer(MqaAttentionBase):
 
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
+        # vLLM #59894: the trimmed cut layer wrote this forward's KV for every row
+        # (forward_kv); on the late-layer tail it only reads it.
+        kv_written = (
+            getattr(attn_backend.forward_metadata, "cut_kv_written_layer_id", None)
+            == self.layer_id
+        )
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1873,6 +1903,8 @@ class MQALayer(MqaAttentionBase):
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+            elif kv_written:
+                kv = None
             elif use_cp:
                 # every rank writes the whole chunk's window KV with the fused fp32 store
                 if qkv_a is not None:
@@ -1924,6 +1956,7 @@ class MQALayer(MqaAttentionBase):
                     q_lora=q_lora,
                     positions=positions,
                     forward_batch=forward_batch,
+                    run_compressor=not kv_written,
                 )
         else:
             if self.indexer is not None:
@@ -1942,6 +1975,55 @@ class MQALayer(MqaAttentionBase):
                 )
 
         return q, kv
+    def forward_kv(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """vLLM #59894: write only the KV ``forward`` writes for these rows -- the
+        SWA window KV, then the compressed KV and index K -- skipping wq_b, the
+        indexer's scoring and attention. Mirrors the eager CUDA extend branches
+        of ``_forward_prepare`` (same GEMMs, same stores), so it is bitwise the
+        same KV."""
+        if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+            return
+        assert forward_batch.forward_mode.is_extend() and not is_in_breakable_cuda_graph()
+        attn_backend = get_attn_backend()
+        # The fused projection's kv columns are what forward stores; keep it.
+        qkv_a = self.wqkv_a(x)[0] if self.fuse_wqa_wkv else None
+        if self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch):
+            # Prefill CP: every rank writes the whole chunk's window KV, in global
+            # token order and at the global positions (as _forward_prepare).
+            kv = qkv_a[..., self.q_lora_rank :] if qkv_a is not None else self.wkv(x)[0]
+            kv = cp_materialize_global_token_order(
+                kv.contiguous(), forward_batch, torch.cuda.current_stream()
+            )
+            get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
+                layer_id=self.layer_id,
+                swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+                kv=kv,
+                kv_weight=self.kv_norm.weight.data,
+                eps=self.eps,
+                freqs_cis=self.freqs_cis,
+                positions=forward_batch.positions[: kv.shape[0]],
+            )
+            del kv
+        else:
+            self._compute_kv_to_cache(
+                x, positions, forward_batch, attn_backend, qkv_a=qkv_a
+            )
+        del qkv_a
+        if self.compress_ratio in (1, 2) and self.compressor is not None:
+            # The compressor writes both the compressed KV and the index K.
+            attn_backend.forward_low_ratio_sources(
+                layer=self,
+                x=x,
+                q_lora=None,
+                positions=positions,
+                forward_batch=forward_batch,
+                run_indexer=False,
+            )
 
     def forward(
         self,
@@ -3158,6 +3240,36 @@ class DeepseekV4DecoderLayer(nn.Module):
             fp8_out=fp8_out,
         )
 
+    def write_kv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        prev_pre: Optional[torch.Tensor],
+        deferred: Optional[Tuple[torch.Tensor, ...]],
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """vLLM #59894: write the KV this layer's forward would (SWA, compressed,
+        index K) for every row and nothing else; the layer then reruns on the
+        late-layer tail rows. The attention input is built exactly as
+        forward_hc_pre_from_prev builds it -- through the fused FFN->attn
+        boundary when one is deferred and it fuses -- so the KV is bitwise the
+        same. Returns the closed (hidden_states, prev_pre) for the tail."""
+        assert self.engram is None, "write_kv skips the Engram residual update"
+        opened = (
+            self._mega_mhc_ffn_boundary(*deferred) if deferred is not None else None
+        )
+        if opened is not None:
+            hidden_states, x = opened[0], opened[1]
+            prev_pre = deferred[2]
+        else:
+            if deferred is not None:
+                moe_out, prev_residual, d_pre, d_post, d_comb = deferred
+                hidden_states = self.hc_post(moe_out, prev_residual, d_post, d_comb)
+                prev_pre = d_pre
+            x = self._hc_combine(hidden_states, prev_pre, self.input_layernorm)
+        self.self_attn.forward_kv(x, positions, forward_batch)
+        return hidden_states, prev_pre
+
     def forward_hc_pre_from_prev(
         self,
         positions: torch.Tensor,
@@ -3818,6 +3930,11 @@ class DeepseekV4Model(nn.Module):
         self.engram_hasher = None
         if self.engram_layout is not None:
             self.engram_hasher = EngramHasher.from_config(config, self.engram_layout)
+        self.engram_exchange = None
+        if self.engram_layout is not None and self.pp_group.world_size == 1:
+            self.engram_exchange = EngramPackedExchange.create(
+                [layer.engram for layer in self.layers if layer.engram is not None]
+            )
 
         self.engram_prefetch_stream = None
         if (
@@ -3848,7 +3965,14 @@ class DeepseekV4Model(nn.Module):
         # Decoder SWA bounded replay: layers past the last kv_source layer run over
         # each request's last SWA_WINDOW extend tokens only.
         self.late_layer_start: Optional[int] = None
+        # vLLM #59894: with the cut (last kv_source) layer trimmed, it writes its
+        # KV for every row and then runs on the tail as its first layer.
+        self.decoder_replay_trim_cut: Optional[int] = None
         if get_exec().features.enable_decoder_swa_bounded_replay:
+            from sglang.srt.layers.attention.deepseek_v4_backend import (
+                decoder_replay_trim_cut_layer,
+            )
+
             assert config.kv_source_layer_ids, (
                 "decoder SWA bounded replay needs kv_source_layer_ids"
             )
@@ -3859,6 +3983,10 @@ class DeepseekV4Model(nn.Module):
             assert late_ratios <= {0, 1}, (
                 f"late layers must not compress on their own, got ratios {late_ratios}"
             )
+            self.decoder_replay_trim_cut = decoder_replay_trim_cut_layer(config)
+            if self.decoder_replay_trim_cut is not None:
+                assert self.start_layer <= self.decoder_replay_trim_cut < self.end_layer
+                self.late_layer_start = self.decoder_replay_trim_cut
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens

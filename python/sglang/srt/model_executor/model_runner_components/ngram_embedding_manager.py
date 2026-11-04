@@ -197,7 +197,16 @@ class NgramEmbeddingManager:
             lo = max(0, start - n1)
             ids = req.full_untruncated_fill_ids[lo:start]
             rows.append([0] * (n1 - len(ids)) + list(ids))
-        batch.ne_history = torch.tensor(
+        from sglang.srt.utils.common import async_h2d
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "#41659 engram_history_async_h2d",
+            "pinned non-blocking engram history upload enabled (rows=%d)",
+            len(rows),
+        )
+        # The forward stream waits on the schedule stream, which orders this copy.
+        batch.ne_history = async_h2d(
             rows, dtype=torch.int32, device=self.engram_hasher.history.device
         ).view(len(rows), n1)
 

@@ -132,6 +132,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.community_opt import log_community_opt_once
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -488,6 +489,10 @@ class DSV4AttnMetadata:
     # once per iteration in make_core_attn_metadata and read by the store path.
     request_window_layout: Optional[object] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # vLLM #59894, late-layer tail metadata only: the trimmed cut layer's window,
+    # not floored at the tail start, since that layer wrote every row's window KV.
+    cut_swa_page_indices: Optional[torch.Tensor] = None
+    cut_swa_topk_lengths: Optional[torch.Tensor] = None
     # Sorted compress ratios present in this stage; absent ratios keep no buffers
     # or schedules. The default (4, 128) supports V4 metadata constructed by hand.
     present_ratios: Tuple[int, ...] = (4, 128)
@@ -538,6 +543,11 @@ class DSV4AttnMetadata:
     )
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c128_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
+    # The cut layer's own schedule: FlashMLA plans one on first use from that
+    # call's lengths, and the later tail layers pass the floored ones.
+    cut_flashmla_metadata: Optional[FlashMLASchedMeta] = field(
+        init=False, default=None, repr=False
+    )
 
     @property
     def positions(self) -> torch.Tensor:
@@ -672,6 +682,8 @@ class DSV4AttnMetadata:
                 "c2_sparse_page_indices",
                 "c2_sparse_raw_indices",
                 "request_window_layout",
+                "cut_swa_page_indices",
+                "cut_swa_topk_lengths",
                 "trtllm_swa_lens",
                 "trtllm_c4_indices",
                 "trtllm_c4_lens",
@@ -687,6 +699,7 @@ class DSV4AttnMetadata:
                 "c2_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
+                "cut_flashmla_metadata",
                 # Eager-only lazy caches are assigned, not content-copied.
                 "trtllm_prefill_qmeta",
                 "trtllm_prefill_swa_lens",
@@ -801,6 +814,8 @@ class DSV4AttnMetadata:
                 self.c128_page_indices = _pad_last_dim(c128_page_indices)
 
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
+        if self.cut_swa_page_indices is not None:
+            self.cut_swa_page_indices = _pad_last_dim(self.cut_swa_page_indices)
 
         if 1 in self.low_ratios:
             self.c1_out_loc, self.c1_topk_lengths_clamp1 = (
@@ -832,6 +847,8 @@ class DSV4AttnMetadata:
         "c128_topk_lengths_clamp1",
         "c1_topk_lengths_clamp1",
         "c2_topk_lengths_clamp1",
+        "cut_swa_page_indices",
+        "cut_swa_topk_lengths",
     ]
     _CP_GLOBAL_FIELDS = [
         "raw_out_loc",
@@ -999,6 +1016,40 @@ def _tail_rows(
     return t[token_indices]
 
 
+def decoder_replay_trim_cut_layer(config) -> Optional[int]:
+    """vLLM #59894: the last kv_source layer under decoder SWA bounded replay when
+    it is trimmed -- it writes its KV for every row, then runs as the first tail
+    layer -- or None when the tail starts after it. The model and its attention
+    backend both read this, so they agree on that layer."""
+    if not (
+        envs.SGLANG_OPT_DSV41_DECODER_REPLAY_TRIM_CUT.get()
+        and get_exec().features.enable_decoder_swa_bounded_replay
+        and _is_cuda
+        and getattr(config, "kv_source_layer_ids", None)
+    ):
+        return None
+    # The request-window SWA pool (encoder replay) has no unfloored tail layout.
+    if get_exec().features.enable_encoder_swa_bounded_replay:
+        return None
+    cut = max(config.kv_source_layer_ids)
+    # On the tail the cut layer only scores and attends: it must publish the
+    # top-k / candidates the tail layers read, so it is their (last) source.
+    assert config.compress_ratios[cut] == 1 and cut in config.index_source_layer_ids, (
+        f"trimmed cut layer {cut} must be a ratio-1 index source, got ratio "
+        f"{config.compress_ratios[cut]}, index sources {config.index_source_layer_ids}"
+    )
+    candidate_source = getattr(config, "candidate_source_layer_id", -1)
+    assert candidate_source < 0 or candidate_source == cut, (
+        f"candidate source {candidate_source} is not the trimmed cut layer {cut}"
+    )
+    # Engram mixes every row's inter-layer residual before its layer runs.
+    engram_ids = getattr(config, "engram_layer_ids", None) or ()
+    assert all(i < cut for i in engram_ids), (
+        f"an Engram layer sits at or after the trimmed cut layer {cut}: {engram_ids}"
+    )
+    return cut
+
+
 # Prefill CUDA graph: the ratio-1/2 indexer scores through the paged kernel on
 # a static logits width of cuda_graph_config[prefill].max_seq_len positions
 # (batches with a longer context replay eagerly), in chunks of this many rows.
@@ -1047,6 +1098,9 @@ class DSV4Metadata:
     # Set only on the metadata built for the late layers under decoder SWA
     # bounded replay; None everywhere else.
     late_layer_tail: Optional[LateLayerTail] = None
+    # vLLM #59894: set on the tail metadata once the trimmed cut layer has written
+    # its KV for every row this forward; on the tail that layer only reads it.
+    cut_kv_written_layer_id: Optional[int] = None
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -1286,12 +1340,29 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        # Bumped whenever a ratio 1/2 index_source layer is about to rewrite its
+        # top-k; sparse prefill reuses a combine while the version is unchanged.
+        self._low_ratio_topk_version = 0
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
+        # vLLM #59894: the trimmed cut layer, whose tail window is built unfloored.
+        self.decoder_replay_trim_cut_layer: Optional[int] = (
+            None
+            if self.is_dspark_draft
+            else decoder_replay_trim_cut_layer(model_runner.model_config.hf_text_config)
+        )
+        # vLLM #58631: the DSpark draft rebuilds metadata every decode step; its
+        # max-seq-len sanity assert costs a CPU reduce + .item(), so only run it
+        # under debug logging.
+        self._dspark_skip_seq_len_assert = (
+            self.is_dspark_draft
+            and envs.SGLANG_OPT_DSPARK_DRAFT_HOST_TRIM.get()
+            and not logger.isEnabledFor(logging.DEBUG)
+        )
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
@@ -1448,6 +1519,7 @@ class DeepseekV4AttnBackend(
         swa_replay_start: Optional[torch.Tensor] = None,
         cp_metadata: Optional[InterleaveContextParallelMetadata] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        keep_unfloored_swa: bool = False,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
         cp_active = forward_batch is not None and is_cp_active(forward_batch)
@@ -1488,6 +1560,7 @@ class DeepseekV4AttnBackend(
             num_tokens=num_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
             num_groups=len(extend_seq_lens_cpu),
+            keep_unfloored_swa=keep_unfloored_swa,
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(
@@ -1619,7 +1692,13 @@ class DeepseekV4AttnBackend(
         """Metadata for the layers after the last kv_source layer under decoder
         SWA bounded replay: each request contributes only its last SWA_WINDOW
         extend tokens, and their window is floored at the tail start because
-        window KV before it is never written at those layers."""
+        window KV before it is never written at those layers. With the cut layer
+        trimmed (vLLM #59894) it also carries that layer's unfloored window."""
+        trim_cut = self.decoder_replay_trim_cut_layer is not None
+        # The trtllm-gen tables bake the floored window in at build time.
+        assert not (trim_cut and self.trtllm_attn), (
+            "decoder replay trim cut is not wired for trtllm-gen attention"
+        )
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
@@ -1658,6 +1737,7 @@ class DeepseekV4AttnBackend(
             swa_replay_start=swa_replay_start,
             forward_batch=forward_batch if cp_tail is not None else None,
             cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
+            keep_unfloored_swa=trim_cut,
         )
         swa_out_cache_loc = (
             metadata.core_attn_metadata.request_window_layout.write_loc
@@ -1798,6 +1878,62 @@ class DeepseekV4AttnBackend(
             forward_batch.attn_cp_metadata = tail.cp_metadata
             set_local_dp_buffer_len(sum(tail.cp_metadata.per_rank_actual_token))
         return saved
+
+    def mark_cut_kv_written(self, layer_id: int) -> None:
+        """vLLM #59894: the trimmed cut layer wrote its KV for every row of this
+        forward; on the tail it then skips the stores and attends unfloored."""
+        assert self.decoder_replay_trim_cut_layer == layer_id, (
+            f"{layer_id=} is not the trimmed cut layer "
+            f"{self.decoder_replay_trim_cut_layer}"
+        )
+        self.tail_forward_metadata.cut_kv_written_layer_id = layer_id
+
+    @staticmethod
+    def _carry_source_outputs_to_tail(
+        full_metadata: DSV4Metadata, tail_metadata: DSV4Metadata
+    ) -> None:
+        tail = tail_metadata.late_layer_tail
+        tail_lens_cpu = (
+            tail.local_lens_cpu
+            if tail.cp_metadata is not None
+            else tail.extend_seq_lens_cpu
+        )
+        # TODO(candidate): goes away once the source publishes its tail rows straight
+        # onto the tail metadata (publish_prefill); until then cut the full masks.
+        full_masks = full_metadata.candidate_metadata
+        if isinstance(full_masks, PrefillCandidateBlocks):
+            tail_metadata.candidate_metadata = full_masks.tail(tail_lens_cpu)
+        elif isinstance(full_masks, CandidateMasks) and full_masks.request_masks:
+            tail_metadata.candidate_metadata = CandidateMasks(
+                request_masks=[
+                    mask[mask.shape[0] - t :]
+                    for mask, t in zip(full_masks.request_masks, tail_lens_cpu)
+                ]
+            )
+        # The last index-source layer before the switch published its top-k into
+        # the full metadata's buffers; the consumer layers after the switch read
+        # the tail metadata's, so carry the tail rows over (padding stays -1).
+        full_core = full_metadata.core_attn_metadata
+        tail_core = tail_metadata.core_attn_metadata
+        for ratio in tail_core.low_ratios:
+            for full_buf, tail_buf in (
+                (
+                    full_core.sparse_page_indices(ratio),
+                    tail_core.sparse_page_indices(ratio),
+                ),
+                (
+                    full_core.sparse_topk_lengths(ratio),
+                    tail_core.sparse_topk_lengths(ratio),
+                ),
+                (
+                    full_core.sparse_raw_indices(ratio),
+                    tail_core.sparse_raw_indices(ratio),
+                ),
+            ):
+                if full_buf is None or tail_buf is None:
+                    continue
+                rows = tail.real_rows(full_buf)
+                tail_buf[: rows.shape[0]].copy_(rows)
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
         (
@@ -2271,8 +2407,9 @@ class DeepseekV4AttnBackend(
         chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         if seq_lens_cpu is not None:
             seq_lens_cpu = seq_lens_cpu[:bs]
-            actual_max_seq_len = seq_lens_cpu.max().item()
-            assert actual_max_seq_len <= chosen_max_seq_len
+            if not self._dspark_skip_seq_len_assert:
+                actual_max_seq_len = seq_lens_cpu.max().item()
+                assert actual_max_seq_len <= chosen_max_seq_len
 
         graph_key = bs
         if bucket == _GraphBucket.DECODE_OR_IDLE:
@@ -2494,16 +2631,17 @@ class DeepseekV4AttnBackend(
             )
         )
         if is_cp_active(forward_batch):
-            query_lens = torch.tensor(
-                interleave_rows_per_request(
-                    _as_int_list(extend_seq_lens_cpu),
-                    get_parallel().attn_cp_rank,
-                    get_parallel().attn_cp_size,
-                ),
-                dtype=torch.int32,
-                device=extend_seq_lens.device,
+            query_lens_cpu = interleave_rows_per_request(
+                _as_int_list(extend_seq_lens_cpu),
+                get_parallel().attn_cp_rank,
+                get_parallel().attn_cp_size,
+            )
+            # Pinned staging keeps this off the stream-sync path (pageable copy).
+            query_lens = async_h2d(
+                query_lens_cpu, dtype=torch.int32, device=extend_seq_lens.device
             )
         else:
+            query_lens_cpu = _as_int_list(extend_seq_lens_cpu)
             query_lens = extend_seq_lens.to(torch.int32)
         # padding rows are never combined
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
@@ -2522,6 +2660,8 @@ class DeepseekV4AttnBackend(
             num_qo_tokens=num_qo_tokens,
             max_seq_len=max(seq_lens_cpu_list),
             total_swa=total_swa,
+            seq_lens_cpu=seq_lens_cpu_list,
+            query_lens_cpu=query_lens_cpu,
         )
 
     def _build_forward_metadata(
@@ -2795,6 +2935,8 @@ class DeepseekV4AttnBackend(
             return
         if forward_batch.encoder_swa_replay:
             run_compressor = False
+        if run_indexer and layer.indexer is not None:
+            self._low_ratio_topk_version += 1
         if dsa_use_prefill_cp(forward_batch) and forward_batch.forward_mode.is_extend():
             self._forward_low_ratio_sources_cp(
                 layer=layer,
@@ -4285,6 +4427,7 @@ class DeepseekV4AttnBackend(
         extra_k_cache = None
         extra_page_size = None
         flat_token_ids = None
+        kv_reuse = False
         if compress_ratio == 0:
             workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
             combined_indices = cache.c0_combined_indices
@@ -4310,8 +4453,14 @@ class DeepseekV4AttnBackend(
                     compress_ratio, core_attn_metadata.page_table, extra_page_size
                 )
                 flat_token_ids = gather.flat_token_ids
+                kv_reuse = (
+                    compress_ratio in (1, 2)
+                    and envs.SGLANG_OPT_DSV41_PREFILL_KV_REUSE.get()
+                )
                 combined_indices, combined_lens = cache.combine_compressed(
-                    compress_ratio, raw_indices[: cache.num_qo_tokens]
+                    compress_ratio,
+                    raw_indices[: cache.num_qo_tokens],
+                    topk_version=self._low_ratio_topk_version if kv_reuse else None,
                 )
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(
@@ -4320,7 +4469,42 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if compressed_slice is not None:
+        # vllm#59131: only the kv_source layer writes a ratio 1/2 compressed cache,
+        # so the layers reading it find the same rows the source layer already
+        # gathered at the workspace head.
+        resident = None
+        skip_compressed = False
+        if kv_reuse:
+            src = token_to_kv_pool.source_layer_of(layer_id)
+            resident = (
+                compress_ratio,
+                src,
+                n_compressed,
+                self.sparse_prefill_workspace.generation,
+                workspace.data_ptr(),
+                workspace.dtype,
+            )
+            skip_compressed = src != layer_id and cache.resident == resident
+        cache.resident = resident
+
+        if skip_compressed:
+            log_community_opt_once(
+                "vllm#59131 prefill_compressed_gather_reuse",
+                "layer=%d src=%d rows=%d",
+                layer_id,
+                src,
+                n_compressed,
+            )
+            if envs.SGLANG_COMMUNITY_SELFCHECK_KV_REUSE.get():
+                self._selfcheck_compressed_reuse(
+                    layer_id,
+                    extra_k_cache,
+                    flat_token_ids,
+                    extra_page_size,
+                    token_to_kv_pool,
+                    compressed_slice,
+                )
+        elif compressed_slice is not None and n_compressed > 0:
             dequantize_k_cache_paged(
                 extra_k_cache,
                 flat_token_ids,
@@ -4347,6 +4531,32 @@ class DeepseekV4AttnBackend(
             topk_length=combined_lens,
         )
         return o
+
+    @staticmethod
+    def _selfcheck_compressed_reuse(
+        layer_id, extra_k_cache, flat_token_ids, page_size, pool, reused
+    ) -> None:
+        """SGLANG_COMMUNITY_SELFCHECK_KV_REUSE: gather again into scratch and
+        require the reused workspace rows to match bit for bit."""
+        fresh = dequantize_k_cache_paged(
+            extra_k_cache,
+            flat_token_ids,
+            page_size=page_size,
+            out=torch.empty_like(reused),
+            layout=pool.get_extra_key_layout(layer_id),
+        )
+        if not torch.equal(fresh.view(torch.int16), reused.view(torch.int16)):
+            bad = (fresh.view(torch.int16) != reused.view(torch.int16)).any(-1)
+            raise AssertionError(
+                f"vllm#59131 selfcheck: layer {layer_id} reused compressed KV differs "
+                f"from a fresh gather in {int(bad.sum())}/{reused.shape[0]} rows"
+            )
+        log_community_opt_once(
+            "vllm#59131 selfcheck_kv_reuse",
+            "reused compressed KV matches a fresh gather (first check: layer=%d rows=%d)",
+            layer_id,
+            reused.shape[0],
+        )
 
 
     def _prepare_q8kv8_q_and_sink(
@@ -4463,6 +4673,8 @@ class DeepseekV4AttnBackend(
         extra_k_cache = None
         extra_page_size = None
         flat_token_ids = None
+        # This path rewrites the workspace head as fp8; nothing there is reusable.
+        cache.resident = None
 
         if compress_ratio == 0:
             workspace = self.sparse_prefill_workspace.get(
@@ -4621,8 +4833,10 @@ class DeepseekV4AttnBackend(
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        keep_unfloored_swa: bool = False,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
+        assert not keep_unfloored_swa or swa_replay_start is not None
 
         prep = BuildPageTablePositions.execute(
             req_to_token=req_to_token,
@@ -4636,7 +4850,9 @@ class DeepseekV4AttnBackend(
 
         raw_positions = prep.positions_casual
         request_layout = None
+        cut_swa_page_indices = cut_swa_topk_lengths = None
         if self.token_to_kv_pool.request_window is not None:
+            assert not keep_unfloored_swa, "no unfloored request-window layout"
             from sglang.srt.mem_cache.dsv41_request_window import window_layout
 
             if self.encoder_replay:
@@ -4691,6 +4907,19 @@ class DeepseekV4AttnBackend(
                 swa_replay_start=swa_replay_start,
             )
             swa_topk_lengths = prep.swa_topk_lengths
+            if keep_unfloored_swa:
+                # vLLM #59894: the trimmed cut layer's window, the plain causal
+                # one its full-extend rows would have had.
+                cut_swa_page_indices = BuildCausalSwaPageIndices.execute(
+                    req_to_token=self.req_to_token,
+                    full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
+                    req_pool_indices_repeated=req_pool_indices_repeated,
+                    seq_lens_casual=seq_lens_casual,
+                    swa_window=SWA_WINDOW,
+                    page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+                    swa_replay_start=None,
+                )
+                cut_swa_topk_lengths = prep.swa_topk_lengths
             if swa_replay_start is not None:
                 # Slots below the floor are -1; the valid count shrinks to match.
                 floored = raw_positions - swa_replay_start.to(raw_positions.dtype) + 1
@@ -4716,6 +4945,8 @@ class DeepseekV4AttnBackend(
             swa_out_cache_loc=(
                 request_layout.write_loc if request_layout is not None else None
             ),
+            cut_swa_page_indices=cut_swa_page_indices,
+            cut_swa_topk_lengths=cut_swa_topk_lengths,
         )
 
         if need_compress:
