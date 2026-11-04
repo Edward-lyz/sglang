@@ -37,7 +37,7 @@ struct C2Params {
   const void* __restrict__ raw_out_loc;    // [num_tokens] LocT, the FULL slot; 0 marks a padded row
   uint8_t* __restrict__ kvcache;           // [npages, kPageBytes] uint8
   /// Positions per request slot in the pair-state ring.
-  uint32_t ring_size;
+  device::math::fast_mod_div_u32_t ring_size;
   float eps;
 };
 
@@ -46,7 +46,22 @@ struct C2Params {
 /// is (512 - 64) / 2 = 224 threads, keeping the fp8 amax reduction's full-warp mask valid.
 constexpr uint32_t kC2VecSize = 2;
 
-/// \brief grid = num_tokens, block = kHeadDim / kC2VecSize.
+/// \brief Where a completing row finds its partner, and who parks a pending row.
+enum class C2Mode {
+  /// One row per request: the partner comes from the ring, a pending row parks there.
+  Decode,
+  /// `draft_len` consecutive positions per request: `blockIdx.x` is the position inside the
+  /// block, `blockIdx.y` the request, and every row but the first takes its partner from the
+  /// previous `kv_input` row instead of the ring.
+  Verify,
+  /// Arbitrary extend rows, paired as `_low_ratio_pair_partners` pairs them: the partner is the
+  /// previous row when it is the same request's previous position, else the ring. A pending row
+  /// does nothing here; `c2_prefill_store_kernel` parks the ring rows after this kernel read them.
+  Prefill,
+};
+
+/// \brief grid = num_tokens (Decode, Prefill) or `draft_len x batch` (Verify),
+/// block = kHeadDim / kC2VecSize.
 ///
 /// An odd position completes a group with its even predecessor; an even one
 /// parks itself in the state.
@@ -67,7 +82,7 @@ constexpr uint32_t kC2VecSize = 2;
 /// happens once and no fp8 rounding follows it.
 template <
     bool kStore,
-    bool kVerify,
+    C2Mode kMode,
     int64_t kHeadDim,
     int64_t kRopeDim,
     int32_t kPageBits,
@@ -101,7 +116,7 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
 
   const auto tx = threadIdx.x;
   // Verify gives each request a CTA column; decode a flat grid of one row each.
-  const auto row = kVerify ? blockIdx.y * gridDim.x + blockIdx.x : blockIdx.x;
+  const auto row = kMode == C2Mode::Verify ? blockIdx.y * gridDim.x + blockIdx.x : blockIdx.x;
   // Slots fit in int32 whatever width the scheduler hands them in.
   const auto raw_out_loc = static_cast<int32_t>(static_cast<const LocT*>(params.raw_out_loc)[row]);
   const auto pos = static_cast<const PosT*>(params.positions)[row];
@@ -109,24 +124,39 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   // a pending row writes its own slot, so reads and writes stay disjoint.
   const auto rid = params.req[row];
   PDLWaitPrimary<kUsePDL>();
+  // Prefill rows are many: a padding row, and a pending (even) row whose latent nothing
+  // reads (its index-K slot is -1), exit before any load.
+  if constexpr (kMode == C2Mode::Prefill) {
+    if (raw_out_loc == 0 || (pos & 1) == 0) return PDLTriggerSecondary<kUsePDL>();
+  }
 
   fp32_vec_t kv_new, score_new;
   kv_new.load(params.kv_input + row * kStride, tx);
   score_new.load(params.kv_input + row * kStride, tx + kCTASize);
 
   const auto ring = static_cast<int64_t>(rid) * params.ring_size;
-  const auto read_row = ring + (pos - 1 + params.ring_size) % params.ring_size;
-  const auto write_row = ring + pos % params.ring_size;
+  // One 32-bit magic-number modulo instead of two int64 `%` per row.
+  const auto write_offset = static_cast<uint32_t>(pos) % params.ring_size;
+  const auto read_offset = write_offset == 0 ? params.ring_size - 1 : write_offset - 1;
+  const auto write_row = ring + write_offset;
+  const auto read_row = ring + read_offset;
 
   fp32_vec_t kv_old, score_old;
   const float* partner = params.kv_state + read_row * kStride;
-  if constexpr (kVerify) {
+  if constexpr (kMode == C2Mode::Verify) {
     if (blockIdx.x != 0) partner = params.kv_input + static_cast<int64_t>(row - 1) * kStride;
+  }
+  if constexpr (kMode == C2Mode::Prefill) {
+    const auto* pos_ptr = static_cast<const PosT*>(params.positions);
+    const auto* loc_ptr = static_cast<const LocT*>(params.raw_out_loc);
+    if (row > 0 && params.req[row - 1] == rid && pos_ptr[row - 1] == pos - 1 && loc_ptr[row - 1] != 0) {
+      partner = params.kv_input + static_cast<int64_t>(row - 1) * kStride;
+    }
   }
   kv_old.load(partner, tx);
   score_old.load(partner, tx + kCTASize);
 
-  if ((pos & 1) == 0) {
+  if (kMode != C2Mode::Prefill && (pos & 1) == 0) {
     // padded case
     if (raw_out_loc == 0) return PDLTriggerSecondary<kUsePDL>();
     kv_new.store(params.kv_state + write_row * kStride, tx);
@@ -284,21 +314,61 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   }
 }
 
+/// \brief Prefill ring write-back, launched after `flash_c2_decode_kernel<C2Mode::Prefill>`.
+///
+/// Each request's last `ring_size` rows park their `| kv | score |` at `req * ring_size +
+/// pos % ring_size` for a later step's first partner. It cannot run inside the pooling kernel:
+/// a chunk whose first row is odd and whose last row is even reads and writes the same ring
+/// slot. grid = `ring_size x num_reqs`, CTA (k, i) parks the k-th row from the end of request i,
+/// one float4 per thread; those rows are consecutive positions, so their slots are distinct.
+template <int64_t kHeadDim, typename PosT, typename LocT, bool kUsePDL>
+__global__ __launch_bounds__(kHeadDim / 2) void c2_prefill_store_kernel(
+    const C2Params params, const int32_t* __restrict__ extend_start_loc, const int32_t* __restrict__ extend_seq_lens) {
+  using namespace device;
+  constexpr int64_t kStride = kHeadDim * 2;
+  using vec_t = AlignedVector<float, 4>;
+  static_assert(kStride == 4 * (kHeadDim / 2));
+
+  // The pooling kernel reads the ring rows this one overwrites.
+  PDLWaitPrimary<kUsePDL>();
+  const auto bx = static_cast<int32_t>(blockIdx.x);
+  const auto len = extend_seq_lens[blockIdx.y];
+  const auto start_loc = extend_start_loc[blockIdx.y];
+  if (bx >= len) return;
+  const auto row = start_loc + (len - 1 - bx);
+  const auto rid = params.req[row];
+  const auto out = static_cast<const LocT*>(params.raw_out_loc)[row];
+  const auto pos = static_cast<uint32_t>(static_cast<const PosT*>(params.positions)[row]);
+  const auto dst_row = rid * params.ring_size + pos % params.ring_size;
+  if (out == 0) return;
+  vec_t buf;
+  buf.load(params.kv_input + static_cast<int64_t>(row) * kStride, threadIdx.x);
+  PDLTriggerSecondary<kUsePDL>();
+  buf.store(params.kv_state + dst_row * kStride, threadIdx.x);
+}
+
 template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, deepseek_v4::KVLayout kLayout, bool kUsePDL>
 struct FlashC2DecodeKernel {
   static constexpr uint32_t kBlockSize = kHeadDim / kC2VecSize;
   static constexpr int32_t kPageBits = std::bit_width(kPageSize) - 1;
   static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
   static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584ll * kPageSize, 576) * 576);
-  template <bool kStore, bool kVerify, typename PosT, typename LocT>
+  template <bool kStore, C2Mode kMode, typename PosT, typename LocT>
   static constexpr auto kernel =
-      flash_c2_decode_kernel<kStore, kVerify, kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kUsePDL>;
+      flash_c2_decode_kernel<kStore, kMode, kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kUsePDL>;
+  template <typename PosT, typename LocT>
+  static constexpr auto store_kernel = c2_prefill_store_kernel<kHeadDim, PosT, LocT, kUsePDL>;
 
   /// \brief The (`positions`, `raw_out_loc`) dtype pair, resolved at run time.
-  template <bool kStore, bool kVerify>
+  template <bool kStore, C2Mode kMode>
   static auto select(const bool pos_i32, const bool loc_i32) {
-    if (pos_i32) return loc_i32 ? kernel<kStore, kVerify, int32_t, int32_t> : kernel<kStore, kVerify, int32_t, int64_t>;
-    return loc_i32 ? kernel<kStore, kVerify, int64_t, int32_t> : kernel<kStore, kVerify, int64_t, int64_t>;
+    if (pos_i32) return loc_i32 ? kernel<kStore, kMode, int32_t, int32_t> : kernel<kStore, kMode, int32_t, int64_t>;
+    return loc_i32 ? kernel<kStore, kMode, int64_t, int32_t> : kernel<kStore, kMode, int64_t, int64_t>;
+  }
+
+  static auto select_store(const bool pos_i32, const bool loc_i32) {
+    if (pos_i32) return loc_i32 ? store_kernel<int32_t, int32_t> : store_kernel<int32_t, int64_t>;
+    return loc_i32 ? store_kernel<int64_t, int32_t> : store_kernel<int64_t, int64_t>;
   }
 
   // The sum of squares is reduced through a fixed-size shared array, so the CTA
@@ -364,9 +434,63 @@ struct FlashC2DecodeKernel {
         draft_len);
   }
 
+  /// \brief The extend-batch pooling kernel, then the ring write-back.
+  ///
+  /// Rows may mix requests, prefix offsets and padding; a pending (even) row's `kv_output`
+  /// row is left unwritten. `extend_start_loc` / `extend_seq_lens` are int32 `[num_reqs]`:
+  /// request i owns rows `[start[i], start[i] + len[i])`; zero-length requests are skipped.
+  static void run_prefill_fusion(
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView kv_state,
+      const tvm::ffi::TensorView kv_output,
+      const tvm::ffi::TensorView norm_weight,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView req,
+      const tvm::ffi::TensorView raw_out_loc,
+      const float eps,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView kvcache,
+      const int64_t ring_size,
+      const tvm::ffi::TensorView extend_start_loc,
+      const tvm::ffi::TensorView extend_seq_lens) {
+    using namespace host;
+    auto B = SymbolicSize{"num_reqs"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(extend_start_loc);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(extend_seq_lens);
+    const auto requests = StoreRequests{
+        .extend_start_loc = static_cast<const int32_t*>(extend_start_loc.data_ptr()),
+        .extend_seq_lens = static_cast<const int32_t*>(extend_seq_lens.data_ptr()),
+        .num_reqs = static_cast<uint32_t>(B.unwrap()),
+    };
+    launch(
+        kv_input,
+        kv_state,
+        kv_output,
+        norm_weight,
+        positions,
+        req,
+        raw_out_loc,
+        eps,
+        ring_size,
+        freqs_cis,
+        kvcache,
+        /*draft_len=*/1,
+        &requests);
+  }
+
  private:
   using MaybeTensor = std::optional<tvm::ffi::TensorView>;
 
+  struct StoreRequests {
+    const int32_t* extend_start_loc;
+    const int32_t* extend_seq_lens;
+    uint32_t num_reqs;
+  };
+
+  /// `requests` selects `C2Mode::Prefill` plus the ring write-back; otherwise Decode,
+  /// or Verify when `draft_len > 1`.
   static void launch(
       const tvm::ffi::TensorView kv_input,
       const tvm::ffi::TensorView kv_state,
@@ -379,7 +503,8 @@ struct FlashC2DecodeKernel {
       const int64_t ring_size,
       const MaybeTensor freqs_cis,
       const MaybeTensor kvcache,
-      const int64_t draft_len) {
+      const int64_t draft_len,
+      const StoreRequests* requests = nullptr) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -410,7 +535,9 @@ struct FlashC2DecodeKernel {
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     if (num_tokens == 0) return;
-    const auto is_verify = draft_len > 1;
+    const auto is_prefill = requests != nullptr;
+    const auto is_verify = !is_prefill && draft_len > 1;
+    CHECK_HOST(!is_prefill || store) << "the extend path always writes the cache";
     CHECK_HOST(ring_size > 0 && draft_len >= 1);
     CHECK_HOST(!is_verify || num_tokens % draft_len == 0);
     CHECK_HOST(!is_verify || ring_size > draft_len)
@@ -425,23 +552,32 @@ struct FlashC2DecodeKernel {
         .req = static_cast<const int64_t*>(req.data_ptr()),
         .raw_out_loc = raw_out_loc.data_ptr(),
         .kvcache = store ? static_cast<uint8_t*>(kvcache->data_ptr()) : nullptr,
-        .ring_size = static_cast<uint32_t>(ring_size),
+        .ring_size = device::math::fast_mod_div_u32_t{static_cast<uint32_t>(ring_size)},
         .eps = eps,
     };
     // `LaunchKernel` is move-only, so each arm builds its own.
     const auto pos_i32 = pos_dtype.is_type<int32_t>();
     const auto loc_i32 = loc_dtype.is_type<int32_t>();
-    if (is_verify) {
+    if (is_prefill) {
+      const auto k = select<true, C2Mode::Prefill>(pos_i32, loc_i32);
+      LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
+          .enable_pdl(kUsePDL)(k, params);
+      if (requests->num_reqs == 0) return;
+      const auto store_k = select_store(pos_i32, loc_i32);
+      const auto grid = dim3{static_cast<uint32_t>(ring_size), requests->num_reqs};
+      LaunchKernel(grid, kHeadDim / 2, device_.unwrap())  //
+          .enable_pdl(kUsePDL)(store_k, params, requests->extend_start_loc, requests->extend_seq_lens);
+    } else if (is_verify) {
       const auto block = static_cast<uint32_t>(draft_len);
-      const auto k = select<true, true>(pos_i32, loc_i32);
+      const auto k = select<true, C2Mode::Verify>(pos_i32, loc_i32);
       LaunchKernel(dim3{block, num_tokens / block}, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
     } else if (store) {
-      const auto k = select<true, false>(pos_i32, loc_i32);
+      const auto k = select<true, C2Mode::Decode>(pos_i32, loc_i32);
       LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
     } else {
-      const auto k = select<false, false>(pos_i32, loc_i32);
+      const auto k = select<false, C2Mode::Decode>(pos_i32, loc_i32);
       LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
     }

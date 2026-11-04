@@ -2864,7 +2864,31 @@ class DeepseekV4AttnBackend(
             x_global = cp_materialize_global_token_order(
                 x.contiguous(), forward_batch, torch.cuda.current_stream()
             )[:total]
-            self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+            if (
+                layer.compressor.use_fused_compress
+                and tail is None
+                and envs.SGLANG_OPT_DSV41_FUSED_EXTEND_COMPRESS.get()
+            ):
+                # The global rows are request-major, exactly the layout the
+                # non-CP extend batch hands the fused kernel (#41660).
+                lens = forward_batch.extend_seq_lens.to(torch.int32)
+                self._low_ratio_compress_fused(
+                    layer,
+                    x_global,
+                    req_global,
+                    pos_global,
+                    extend_offsets=(torch.cumsum(lens, 0, dtype=torch.int32) - lens, lens),
+                )
+            else:
+                self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+            # [MEM-R1] x_global is the whole prompt's hidden in global token order
+            # ([total, hidden] = 640 MiB at a 65532-token chunk). The compressor is
+            # its only consumer, but the Python frame keeps it alive through the
+            # indexer call below, where the dense MQA-logits score block and
+            # select_candidate_blocks allocate GiB-scale transients. Dropping the
+            # reference here lets the caching allocator reuse those bytes instead
+            # of stacking them. Pure lifetime change: no math, no layout change.
+            del x_global
         if run_indexer and layer.indexer is not None:
             self._low_ratio_index_topk_dense(
                 layer,
@@ -2872,7 +2896,7 @@ class DeepseekV4AttnBackend(
                 q_lora[:num_local],
                 positions[:num_local].to(torch.int64),
                 forward_batch,
-                torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device),
+                async_h2d(q_lens_cpu, dtype=torch.int32, device=x.device),
                 q_lens_cpu,
             )
 
@@ -2894,6 +2918,23 @@ class DeepseekV4AttnBackend(
             # verify has variable block lengths and must retain the general path.
             self._low_ratio_compress_fused(
                 layer, x, req, pos, draft_len=self.speculative_num_draft_tokens
+            )
+        elif (
+            layer.compressor.use_fused_compress
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.extend_start_loc is not None
+            and envs.SGLANG_OPT_DSV41_FUSED_EXTEND_COMPRESS.get()
+        ):
+            # DP padding extends extend_seq_lens but not extend_start_loc, whose
+            # length is the request count; padded rows belong to no request.
+            start_loc = forward_batch.extend_start_loc
+            seq_lens = forward_batch.extend_seq_lens[: start_loc.shape[0]]
+            self._low_ratio_compress_fused(
+                layer,
+                x,
+                req,
+                pos,
+                extend_offsets=(start_loc.to(torch.int32), seq_lens.to(torch.int32)),
             )
         else:
             self._low_ratio_compress_torch(
@@ -2967,13 +3008,18 @@ class DeepseekV4AttnBackend(
             fuse_index_store=_is_sm100_or_newer(),
         )
 
-    def _low_ratio_compress_fused(self, layer, x, req, pos, *, draft_len=1) -> None:
+    def _low_ratio_compress_fused(
+        self, layer, x, req, pos, *, draft_len=1, extend_offsets=None, projected=None
+    ) -> None:
         """Fused compressor write, index-key projection, then fused index-key write.
         Both write kernels consume metadata dtypes directly and suppress padded stores.
+        Decode or target-verify; an extend batch passes ``extend_offsets``, the int32
+        (first row, row count) of each request.
         """
         from sglang.kernels.ops.attention.dsv4.c1 import c1_decode_norm_rope_store
         from sglang.kernels.ops.attention.dsv4.c2 import (
             c2_decode_or_verify_norm_rope_store,
+            c2_prefill_norm_rope_store,
         )
         from sglang.kernels.ops.attention.dsv4.fp4_rope import (
             index_k_norm_rope_pack_store,
@@ -2991,41 +3037,67 @@ class DeepseekV4AttnBackend(
         # stores the e2m1 codes directly, so the fp4 rounding happens once).
         kv_layout = pool.get_extra_key_layout(layer_id)
         assert kv_cache is not None
+        # The kernels match exactly x's rows; CP extend metadata can be longer.
+        # [fusion-opt] projected: the compressor projection already computed (and
+        # CP-gathered) by the caller; x is unused then.
+        num_rows = projected.shape[0] if projected is not None else x.shape[0]
+        raw_out_loc = core.raw_out_loc[:num_rows]
+        if extend_offsets is not None:
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "#41660 fused_extend_compress",
+                "fused c1/c2 compress for eager extend enabled (rows=%d, reqs=%d)",
+                num_rows,
+                extend_offsets[1].shape[0],
+            )
 
         if layer.compress_ratio == 1:
             # At ratio 1, c1_out_loc equals the int64 raw_out_loc supplied by the scheduler.
             latent = c1_decode_norm_rope_store(
-                compressor.wkv(x),
+                projected if projected is not None else compressor.wkv(x),
                 compressor.norm.weight.data,
                 pos,
-                core.raw_out_loc,
+                raw_out_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
                 page_size=page_size,
                 layout=kv_layout,
             )
-            out_loc = core.c1_out_loc
+            out_loc = core.c1_out_loc[:num_rows]
         else:
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
             state = pool.get_attention_compress_states(layer_id)
-            latent = c2_decode_or_verify_norm_rope_store(
-                compressor.project_fused(x),
+            args = (
+                projected if projected is not None else compressor.project_fused(x),
                 state.kv_score_buffer.kv_score,
                 compressor.norm.weight.data,
                 pos,
                 req,
-                core.raw_out_loc,
+                raw_out_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
-                page_size=page_size,
-                ring_size=state.ring_size,
-                draft_len=draft_len,
-                layout=kv_layout,
             )
-            out_loc = core.c2_out_loc
+            if extend_offsets is None:
+                latent = c2_decode_or_verify_norm_rope_store(
+                    *args,
+                    page_size=page_size,
+                    ring_size=state.ring_size,
+                    draft_len=draft_len,
+                    layout=kv_layout,
+                )
+            else:
+                latent = c2_prefill_norm_rope_store(
+                    *args,
+                    *extend_offsets,
+                    page_size=page_size,
+                    ring_size=state.ring_size,
+                    layout=kv_layout,
+                )
+            out_loc = core.c2_out_loc[:num_rows]
 
         indexer = layer.indexer
         if indexer is not None and indexer.owns_k:

@@ -1791,6 +1791,9 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # Community #41660: fused c1/c2 compressor for eager extend (non-CP and, locally, the CP
+    # global-order path) instead of the torch pair-partner chain.
+    SGLANG_OPT_DSV41_FUSED_EXTEND_COMPRESS = EnvBool(True)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
