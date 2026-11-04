@@ -112,6 +112,7 @@ class TestPrefillAdder(CustomTestCase):
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
+
     def test_async_load_limit_leaves_request_queued_without_reprefill(self):
         from sglang.srt.environ import envs
 
@@ -537,6 +538,36 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
+
+    def test_second_partial_chunk_is_refused_once_the_slot_is_taken(self):
+        """A batch holds at most one partial chunk.
+
+        The scheduler keeps one chunked_req slot: when a long prompt's chunk is
+        clamped below the chunk budget, budget is left over, and a later
+        request that would also be truncated must be refused instead of
+        becoming a second chunked request (sealing asserted on it).
+        """
+        self.mock_token_allocator.available_size.return_value = 10000
+        adder = self.create_adder(
+            self.create_running_batch(), rem_input_tokens=10000, rem_chunk_tokens=512
+        )
+        adder.allow_new_chunk = False
+        req = self.create_mock_req("long", priority=0, max_new_tokens=16)
+        req.host_hit_length = 0
+        req.prefix_indices = []
+        req.full_untruncated_fill_ids = list(range(2048))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(req, "extend_range", Range(start, end))
+        )
+
+        result = adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None)
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(adder.rem_chunk_tokens, 512)
 
     def _build_hybrid_swa_chunked_req(
         self,

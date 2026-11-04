@@ -2514,6 +2514,13 @@ def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
     socket.send(msgpack_encode(obj), flags=flags)
 
 
+def decode_scheduler_input(buffer) -> Any:
+    """Decode one raw scheduler-input frame, as sock_recv would."""
+    if _USE_PICKLE_IPC:
+        return pickle.loads(buffer)
+    return msgpack_decode(buffer)
+
+
 def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
     if _USE_PICKLE_IPC:
         return socket.recv_pyobj(flags=flags)
