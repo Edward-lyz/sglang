@@ -1,0 +1,23 @@
+Global:
+  version: 2.0
+  group_email: zhangwenjing01@baidu.com
+
+Default:
+  profile : [build]
+
+Profiles:
+  - profile:
+    name : build
+    mode: AGENT
+    environment:
+      image: DECK_STD_CENTOS7
+      resourceType: MEDIUM
+      tools:
+        - python: 3.11.2
+    build:
+      command: sh build/build.sh
+    check:
+      - reuse: TASK
+        enable: true
+    artifacts:
+      release: true
