@@ -882,10 +882,68 @@ class ModelRunner:
         if self.server_args.dcp_size > 1 and self.server_args.dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
+    @staticmethod
+    def _gather_block_fp8_q_proj(qp, dcp_group):
+        """Gather a 128x128 block-FP8 q-proj into (full weight, full scale).
+
+        Returns None when the q-proj is not a block-FP8 layer this path can
+        serve, so the caller keeps the per-layer Q all-gather.
+
+        The weight gathers directly (each rank owns whole 128-row blocks), but
+        the scale cannot: once DeepGEMM requantizes it, ``weight_scale_inv`` is
+        a UE8M0-packed int32 tensor in a transposed, TMA-aligned layout, so an
+        all_gather would have to make it contiguous and silently destroy that
+        layout. Unpack to fp32, gather, then repack against the full row count.
+        """
+        from sglang.srt.layers.quantization.fp8_utils import (
+            inverse_transform_scale_ue8m0,
+            transform_scale_ue8m0,
+        )
+
+        quant_method = qp.quant_method
+        if type(quant_method).__name__ != "Fp8LinearMethod" or not getattr(
+            quant_method, "block_quant", False
+        ):
+            return None
+        if qp.weight.dtype != torch.float8_e4m3fn:
+            # e4m3fnuz (ROCm) is not covered: its scales follow a different
+            # normalization and this path is unvalidated there.
+            return None
+        scale = getattr(qp, "weight_scale_inv", None)
+        if scale is None:
+            return None
+        if list(getattr(quant_method, "weight_block_size", None) or []) != [128, 128]:
+            # The only layout the UE8M0 pack/unpack helpers support.
+            return None
+
+        local_n, k = qp.weight.shape
+        full_n = local_n * dcp_group.world_size
+        # DeepGEMM requires N % 64 == 0 and K % 128 == 0; below that the runner
+        # falls back to triton, which wants fp32 scales instead.
+        if local_n % 128 != 0 or k % 128 != 0 or full_n % 64 != 0:
+            return None
+
+        packed = getattr(scale, "format_ue8m0", False)
+        scale_fp32 = (
+            inverse_transform_scale_ue8m0(scale.data, mn=local_n)
+            if packed
+            else scale.data.to(torch.float32)
+        )
+        # fp32 form is (n_blocks, k_blocks) — block-aligned, so a row gather
+        # composes the full weight's scale matrix exactly.
+        if scale_fp32.shape[0] != local_n // 128:
+            return None
+        full_weight = dcp_group.all_gather(qp.weight.data.contiguous(), dim=0)
+        full_scale = dcp_group.all_gather(scale_fp32.contiguous(), dim=0)
+        if packed:
+            full_scale = transform_scale_ue8m0(full_scale, mn=full_n)
+        return full_weight, full_scale
+
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
-        # MLA decode path can skip the per-layer Q all-gather. bf16/fp16 only.
+        # MLA decode path can skip the per-layer Q all-gather. A block-FP8
+        # q-proj stays FP8 and carries its gathered scales alongside.
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -893,34 +951,72 @@ class ModelRunner:
         if dcp_group.world_size <= 1:
             return
         n_prepared = 0
+        n_fp8 = 0
+        n_vc = 0
         for m in self.model.modules():
             if not isinstance(m, DeepseekV2AttentionMLA):
                 continue
             if m.w_kc is None:
                 continue
             qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
-            # q-replicate only supports the unquantized bf16/fp16 absorb path;
-            # quantized q-proj (packed weights) and non-16-bit w_kc keep the
-            # per-layer Q all-gather.
-            if (
-                m.w_kc.dtype not in (torch.bfloat16, torch.float16)
-                or not isinstance(qp.quant_method, UnquantizedLinearMethod)
-                or qp.weight.dtype not in (torch.bfloat16, torch.float16)
-            ):
+            # The absorb bmm consumes w_kc_qrep in 16-bit, so a quantized w_kc
+            # keeps the per-layer Q all-gather.
+            if m.w_kc.dtype not in (torch.bfloat16, torch.float16):
                 logger.warning(
-                    "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
-                    "(bf16/fp16 only); this layer keeps the Q all-gather."
+                    "dcp_replicate_q_proj: skipping layer with %s w_kc "
+                    "(bf16/fp16 only); this layer keeps the Q all-gather.",
+                    m.w_kc.dtype,
                 )
                 continue
+            q_scale = None
+            if isinstance(
+                qp.quant_method, UnquantizedLinearMethod
+            ) and qp.weight.dtype in (torch.bfloat16, torch.float16):
+                q_weight = dcp_group.all_gather(qp.weight.data.contiguous(), dim=0)
+            else:
+                gathered = self._gather_block_fp8_q_proj(qp, dcp_group)
+                if gathered is None:
+                    logger.warning(
+                        "dcp_replicate_q_proj: skipping q-proj quantized as "
+                        "%s/%s (unsupported here); this layer keeps the Q "
+                        "all-gather.",
+                        type(qp.quant_method).__name__,
+                        qp.weight.dtype,
+                    )
+                    continue
+                q_weight, q_scale = gathered
             m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
-            m.q_b_proj_qrep_weight = dcp_group.all_gather(
-                qp.weight.data.contiguous(), dim=0
-            )
+            m.q_b_proj_qrep_weight = q_weight
+            m.q_b_proj_qrep_scale = q_scale
+            if envs.SGLANG_OPT_DCP_VC_BEFORE_A2A.get() and m.w_vc.dtype in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                # [H_local, kv_lora, v_head] -> [H_dcp, kv_lora, v_head], same
+                # rank-major head order as w_kc_qrep and the a2a head split.
+                m.w_vc_qrep = dcp_group.all_gather(m.w_vc.contiguous(), dim=0)
+                n_vc += 1
+            # Only the 16-bit path reclaims the per-rank weights. The FP8 path
+            # leaves qp intact because non-decode forward modes still project Q
+            # through qp itself (see q_b_proj_forward).
+            if envs.SGLANG_K3_DEL_MLA_KVB_DCP.get() and q_scale is None:
+                del m.w_kc
+                del qp.weight
             n_prepared += 1
+            n_fp8 += int(q_scale is not None)
         logger.info(
-            "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
+            "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA "
+            "layers (%d block-FP8, %d 16-bit)",
             n_prepared,
+            n_fp8,
+            n_prepared - n_fp8,
         )
+        if envs.SGLANG_OPT_DCP_VC_BEFORE_A2A.get():
+            logger.info(
+                "SGLANG_OPT_DCP_VC_BEFORE_A2A: gathered full-head w_vc for %d MLA "
+                "layers",
+                n_vc,
+            )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(

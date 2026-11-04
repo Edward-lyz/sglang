@@ -352,7 +352,8 @@ class DeepseekMLAForwardMixin:
             and self._can_fuse_bmm_into_attention(forward_batch)
         )
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
-        # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
+        # weights and skip the per-layer Q all-gather (decode absorb only; the
+        # gathered q-proj may be 16-bit or block-FP8, w_kc is always 16-bit).
         q_replicate_active = (
             get_server_args().dcp_replicate_q_proj
             and _is_dcp_mla_decode_phase(forward_batch)
@@ -490,11 +491,7 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 if q_replicate_active:
                     # full-head Q from the gathered weight (skips Q all-gather)
-                    q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
-                        -1,
-                        self.num_local_heads * get_parallel().attn_dcp_size,
-                        self.qk_head_dim,
-                    )
+                    q = _project_q_replicated(self, q)
                 else:
                     q = self.q_b_proj_forward(q)
 
@@ -519,13 +516,7 @@ class DeepseekMLAForwardMixin:
                         )
         else:
             if q_replicate_active:
-                q = torch.nn.functional.linear(
-                    hidden_states, self.q_b_proj_qrep_weight
-                ).view(
-                    -1,
-                    self.num_local_heads * get_parallel().attn_dcp_size,
-                    self.qk_head_dim,
-                )
+                q = _project_q_replicated(self, hidden_states)
             else:
                 q = self.q_proj(hidden_states)[0].view(
                     -1, self.num_local_heads, self.qk_head_dim
@@ -543,7 +534,6 @@ class DeepseekMLAForwardMixin:
             q_nope_out = (
                 torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
                 .transpose(0, 1)
-                .contiguous()
             )
         elif fusion_plan is not None:
             # The composite split op fills q_nope_out_buf and attention reads
