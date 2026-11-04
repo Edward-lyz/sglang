@@ -56,7 +56,12 @@ def run_markov_block(
     hidden_states: Optional[torch.Tensor],
     sampler: StepSampler,
     collect_corrected: bool = True,
+    corrected_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """``corrected_out`` ([bs, proposal_len, vocab], rows of a step contiguous): the
+    caller's block-logits buffer; each step's corrected logits are written into its
+    slot (by the head itself when it supports ``corrected_dst``) instead of being
+    stacked with a final cat, and the buffer is returned as the corrected logits."""
     batch_size, proposal_len = base_logits.shape[:2]
     if proposal_len == 0:
         empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
@@ -67,20 +72,51 @@ def run_markov_block(
     prev_tokens = first_prev_tokens.long()
     for step_idx in range(proposal_len):
         step_hidden = None if hidden_states is None else hidden_states[:, step_idx, ...]
-        step_logits = head.apply_step_logits(
-            base_logits[:, step_idx, :],
-            token_ids=prev_tokens,
-            hidden_states=step_hidden,
-        )
+        dst = None if corrected_out is None else corrected_out[:, step_idx, :]
+        fused_spec = getattr(sampler, "fused_step_spec", None)
+        if (
+            fused_spec is not None
+            and dst is not None
+            and hasattr(head, "fused_step_sample_applies")
+            and head.fused_step_sample_applies(
+                base_logits[:, step_idx, :], prev_tokens, dst
+            )
+        ):
+            next_tokens = head.apply_step_and_sample(
+                base_logits[:, step_idx, :],
+                token_ids=prev_tokens,
+                corrected_dst=dst,
+                spec=fused_spec,
+                step_idx=step_idx,
+            )
+            sampled_tokens.append(next_tokens)
+            prev_tokens = next_tokens
+            continue
+        if dst is not None and getattr(head, "supports_corrected_dst", False):
+            step_logits = head.apply_step_logits(
+                base_logits[:, step_idx, :],
+                token_ids=prev_tokens,
+                hidden_states=step_hidden,
+                corrected_dst=dst,
+            )
+        else:
+            step_logits = head.apply_step_logits(
+                base_logits[:, step_idx, :],
+                token_ids=prev_tokens,
+                hidden_states=step_hidden,
+            )
+            if dst is not None:
+                dst.copy_(step_logits)
         next_tokens = sampler(step_logits, step_idx)
         sampled_tokens.append(next_tokens)
-        if collect_corrected:
+        if collect_corrected and corrected_out is None:
             corrected_logits.append(step_logits.unsqueeze(1))
         prev_tokens = next_tokens
-    return (
-        torch.stack(sampled_tokens, dim=1),
-        torch.cat(corrected_logits, dim=1) if collect_corrected else None,
-    )
+    if corrected_out is not None:
+        corrected = corrected_out
+    else:
+        corrected = torch.cat(corrected_logits, dim=1) if collect_corrected else None
+    return torch.stack(sampled_tokens, dim=1), corrected
 
 
 class VanillaMarkov(nn.Module):
@@ -139,6 +175,7 @@ class VanillaMarkov(nn.Module):
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
         collect_corrected: bool = True,
+        corrected_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
@@ -147,6 +184,7 @@ class VanillaMarkov(nn.Module):
             hidden_states=hidden_states,
             sampler=sampler,
             collect_corrected=collect_corrected,
+            corrected_out=corrected_out,
         )
 
     def sample_block_greedy_fused(
@@ -326,6 +364,7 @@ class RNNHead(VanillaMarkov):
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
         collect_corrected: bool = True,
+        corrected_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if hidden_states is None:
             raise ValueError("RNNHead requires hidden_states.")
@@ -351,9 +390,13 @@ class RNNHead(VanillaMarkov):
             step_logits = base_logits[:, step_idx, :] + bias
             next_tokens = sampler(step_logits, step_idx)
             sampled_tokens.append(next_tokens)
-            if collect_corrected:
+            if corrected_out is not None:
+                corrected_out[:, step_idx, :].copy_(step_logits)
+            elif collect_corrected:
                 corrected_logits.append(step_logits.unsqueeze(1))
             prev_tokens = next_tokens
+        if corrected_out is not None:
+            return torch.stack(sampled_tokens, dim=1), corrected_out
         return (
             torch.stack(sampled_tokens, dim=1),
             torch.cat(corrected_logits, dim=1) if collect_corrected else None,

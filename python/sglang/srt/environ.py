@@ -579,6 +579,13 @@ class Envs:
     SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    SGLANG_OPT_DSPARK_CORRECTED_INPLACE = EnvBool(True)
+    # DSpark commit-KV projection (target hidden rows -> every draft stage's wkv): with
+    # DeepGEMM MXFP8-ready wkv weights, quantize the rows once and run one DeepGEMM
+    # MXFP8 GEMM per stage instead of the stacked Triton block-fp8 fallback (~236 us ->
+    # ~40 us per step at 1536 rows). Same math, accumulation order differs (draft KV
+    # only; target verify guards correctness).
+    SGLANG_OPT_DSPARK_COMMIT_KV_DEEPGEMM = EnvBool(False)
     # MegaMoE gate path: merge the topk_idx int64->int32 cast and the padded-row
     # mask into one Triton launch (integer-only, bit-identical).
     SGLANG_OPT_MEGA_GATE_CAST_MASK_FUSE = EnvBool(True)
@@ -703,6 +710,21 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    # DSpark draft Markov step: build the step logits (base + w2 bias) and draw the
+    # in-graph inline-RNG token in one kernel, so the fp32 [bs, vocab] step logits are
+    # never written and re-read. Same tokens and block logits as the two-kernel path.
+    SGLANG_OPT_DSPARK_STEP_SAMPLE_FUSE = EnvBool(True)
+    # DSpark target-hidden injection (non-unified-kv path): full->SWA slot gather, commit-length
+    # gate and row_valid gate in one launch instead of ~7 tiny eager kernels (identical ints).
+    SGLANG_OPT_DSPARK_INJECT_LOC_FUSE = EnvBool(True)
+    # DSpark sampling-accept softmax(logits / T): split-vocab Triton kernel that reads the logits in
+    # place (no fp32 convert copy, no repeat_interleave of the temperatures). Agrees with the
+    # flashinfer path to fp32 rounding, not bit-for-bit, so it stays opt-in.
+    SGLANG_OPT_DSPARK_SOFTMAX_SPLIT_TRITON = EnvBool(False)
+    # Host-side scheduling scalars before the draft / verify graph replays: sampling-param staging
+    # (clamp + greedy mask + rng bump) in one launch, local num_token_non_padded in one launch, and
+    # the global_num_tokens fill skipped while the padded bucket is unchanged. Same values.
+    SGLANG_OPT_HOST_SCHED_FUSE = EnvBool(False)
     # Deprecated: the unified radix tree is the default tree cache now, so the
     # registry no longer reads this. Kept because a few model/arch call sites
     # still assert on it; do not use in new code.
@@ -1747,6 +1769,7 @@ class Envs:
     # use multistream to overlap the publish-side with other computation
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP = EnvBool(True)
     SGLANG_OPT_DSV41_INDEXER_REQUEST_GROUPED_ROWS = EnvBool(True)
+    SGLANG_OPT_LOGITS_CAST_TRITON = EnvBool(True)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)

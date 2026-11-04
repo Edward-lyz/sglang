@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
@@ -664,6 +665,28 @@ def build_decode_registry(
             sharded = not enable_prefill_cp and attn_tp_sharded_fn(
                 ctx.padded_num_tokens
             )
+            g = fb.global_num_token_non_padded
+            if (
+                envs.SGLANG_OPT_HOST_SCHED_FUSE.get()
+                and isinstance(g, torch.Tensor)
+                and g.is_cuda
+                and g.numel() == 1
+                and buf.is_cuda
+                and buf.numel() == 1
+            ):
+                # sub + clamp + copy_ -> one launch
+                from sglang.kernels.ops.speculative.dspark.host_sched import (
+                    local_num_token_non_padded_into,
+                )
+                from sglang.srt.model_executor.forward_batch_info import (
+                    _attn_tp_local_shard_bounds,
+                )
+
+                tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(
+                    ctx.padded_num_tokens, sharded=sharded
+                )
+                local_num_token_non_padded_into(buf, g, rank_offset, tokens_per_rank)
+                return
             buf.copy_(
                 compute_local_num_token_non_padded(
                     global_num_token_non_padded=fb.global_num_token_non_padded,
@@ -686,6 +709,7 @@ def build_decode_registry(
     # Computed slots, always exposed by extract_buffer; callers that already set
     # global_num_tokens_* on the batch pass register_global_num_tokens=False.
     if register_global_num_tokens:
+
 
         def _global_num_tokens_post_fill(buf, fb, ctx):
             # Only the gathered (DP) path writes a value; otherwise left as init.

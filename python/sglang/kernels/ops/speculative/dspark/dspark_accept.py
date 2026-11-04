@@ -251,6 +251,10 @@ class SoftmaxTemp:
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_OPT_DSPARK_SOFTMAX_SPLIT_TRITON.get():
+            return softmax_temp_split_triton(*args, **kwargs)
         if _flashinfer_softmax is not None:
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)
@@ -380,6 +384,112 @@ def softmax_temp_triton(
         rows_per_request,
         logits.stride(0),
         BLOCK_V=BLOCK_V,
+    )
+    return out
+
+
+@triton.jit
+def _softmax_split_stats_kernel(
+    logits_ptr,
+    temp_ptr,
+    tile_max_ptr,
+    tile_sum_ptr,
+    vocab,
+    rows_per_request,
+    logits_row_stride,
+    n_tiles,
+    BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    temp = tl.load(temp_ptr + row // rows_per_request).to(tl.float32)
+    offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    vmask = offs < vocab
+    x = tl.load(
+        logits_ptr + row.to(tl.int64) * logits_row_stride + offs,
+        mask=vmask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    x = x / temp
+    m = tl.max(x, axis=0)
+    # A tile whose logits are all -inf (grammar / vocab masks leave most of the vocab at -inf)
+    # has m == -inf and exp(-inf - -inf) = NaN. Shift by 0 there so the tile contributes
+    # sum 0; the norm kernel then weights it by exp(-inf - gmax) = 0.
+    m_safe = tl.where(m == -float("inf"), 0.0, m)
+    e = tl.where(vmask, tl.exp(x - m_safe), 0.0)
+    tl.store(tile_max_ptr + row * n_tiles + tile, m)
+    tl.store(tile_sum_ptr + row * n_tiles + tile, tl.sum(e, axis=0))
+
+
+@triton.jit
+def _softmax_split_norm_kernel(
+    logits_ptr,
+    temp_ptr,
+    tile_max_ptr,
+    tile_sum_ptr,
+    out_ptr,
+    vocab,
+    rows_per_request,
+    logits_row_stride,
+    n_tiles,
+    BLOCK_V: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    temp = tl.load(temp_ptr + row // rows_per_request).to(tl.float32)
+    t = tl.arange(0, BLOCK_T)
+    tmask = t < n_tiles
+    tmax = tl.load(tile_max_ptr + row * n_tiles + t, mask=tmask, other=-float("inf"))
+    tsum = tl.load(tile_sum_ptr + row * n_tiles + t, mask=tmask, other=0.0)
+    gmax = tl.max(tmax, axis=0)
+    gsum = tl.sum(tl.where(tmask, tsum * tl.exp(tmax - gmax), 0.0), axis=0)
+    offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    vmask = offs < vocab
+    x = tl.load(
+        logits_ptr + row.to(tl.int64) * logits_row_stride + offs,
+        mask=vmask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    y = tl.exp(x / temp - gmax) / gsum
+    tl.store(out_ptr + row.to(tl.int64) * vocab + offs, y, mask=vmask)
+
+
+def softmax_temp_split_triton(
+    *,
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    rows_per_request: int,
+) -> torch.Tensor:
+    """softmax(logits / T) over the vocab, split across CTAs (rows x vocab tiles).
+
+    Reads logits in place (any float dtype, any row stride) and writes fp32, so the
+    flashinfer path's `logits.to(float32).contiguous()` copy (34 us at 90 rows x 129k) and
+    the repeat_interleave of the temperatures disappear. Same math as `softmax_temp`;
+    the reduction order differs, so probabilities agree to fp32 rounding, not bit-for-bit.
+    """
+    num_rows, vocab = logits.shape[0], logits.shape[-1]
+    bs = num_rows // rows_per_request
+    assert bs * rows_per_request == num_rows, (
+        f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
+    )
+    if logits.stride(-1) != 1:
+        logits = logits.contiguous()
+    temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
+    block_v = 4096
+    n_tiles = triton.cdiv(vocab, block_v)
+    tile_max = torch.empty((num_rows, n_tiles), dtype=torch.float32, device=logits.device)
+    tile_sum = torch.empty_like(tile_max)
+    out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
+    grid = (num_rows, n_tiles)
+    _softmax_split_stats_kernel[grid](
+        logits, temperatures, tile_max, tile_sum, vocab, rows_per_request,
+        logits.stride(0), n_tiles, BLOCK_V=block_v,
+    )
+    _softmax_split_norm_kernel[grid](
+        logits, temperatures, tile_max, tile_sum, out, vocab, rows_per_request,
+        logits.stride(0), n_tiles, BLOCK_V=block_v,
+        BLOCK_T=triton.next_power_of_2(n_tiles),
     )
     return out
 
@@ -597,6 +707,31 @@ class AcceptGreedy:
         )
 
 
+def _row_argmax(logits: torch.Tensor) -> torch.Tensor:
+    # torch.argmax uses one block per row; tens to hundreds of verify rows over a
+    # wide vocab leave most of the machine idle. The medium split kernel keeps
+    # torch.argmax's NaN priority and lowest-index tie rule, so it is exact.
+    if (
+        logits.is_cuda
+        and logits.dim() == 2
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and 64 < logits.shape[0] <= 384
+        and logits.shape[1] >= 65536
+    ):
+        from sglang.kernels.ops.speculative.row_argmax import row_argmax
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "#39704 medium row_argmax",
+            "split-vocab verify argmax enabled (rows=%d, vocab=%d)",
+            logits.shape[0],
+            logits.shape[1],
+        )
+        return row_argmax(logits)
+    return torch.argmax(logits, dim=-1)
+
+
 def accept_greedy(
     *,
     candidates: torch.Tensor,
@@ -605,7 +740,7 @@ def accept_greedy(
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = torch.argmax(target_logits, dim=-1).view(
+    target_predict = _row_argmax(target_logits).view(
         bs, verify_num_draft_tokens
     )
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
@@ -657,7 +792,7 @@ def accept_greedy_triton(
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = torch.argmax(target_logits, dim=-1).view(
+    target_predict = _row_argmax(target_logits).view(
         bs, verify_num_draft_tokens
     )
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(

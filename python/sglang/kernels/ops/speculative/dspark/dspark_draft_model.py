@@ -22,7 +22,10 @@ class SampleStepTokens:
         step_logits: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
-        exp_noise: torch.Tensor,
+        exp_noise: Optional[torch.Tensor] = None,
+        rng_counter: Optional[torch.Tensor] = None,
+        rng_step: int = 0,
+        rng_num_steps: int = 1,
     ) -> torch.Tensor:
         if step_logits.is_cuda:
             return cls.triton(
@@ -30,12 +33,18 @@ class SampleStepTokens:
                 temperatures=temperatures,
                 greedy_mask=greedy_mask,
                 exp_noise=exp_noise,
+                rng_counter=rng_counter,
+                rng_step=rng_step,
+                rng_num_steps=rng_num_steps,
             )
         return cls.torch(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
             exp_noise=exp_noise,
+            rng_counter=rng_counter,
+            rng_step=rng_step,
+            rng_num_steps=rng_num_steps,
         )
 
     @classmethod
@@ -45,13 +54,19 @@ class SampleStepTokens:
         step_logits: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
-        exp_noise: torch.Tensor,
+        exp_noise: Optional[torch.Tensor] = None,
+        rng_counter: Optional[torch.Tensor] = None,
+        rng_step: int = 0,
+        rng_num_steps: int = 1,
     ) -> torch.Tensor:
         return sample_step_tokens(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
             exp_noise=exp_noise,
+            rng_counter=rng_counter,
+            rng_step=rng_step,
+            rng_num_steps=rng_num_steps,
         )
 
     @classmethod
@@ -61,14 +76,43 @@ class SampleStepTokens:
         step_logits: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
-        exp_noise: torch.Tensor,
+        exp_noise: Optional[torch.Tensor] = None,
+        rng_counter: Optional[torch.Tensor] = None,
+        rng_step: int = 0,
+        rng_num_steps: int = 1,
     ) -> torch.Tensor:
         return sample_step_tokens_triton(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
             exp_noise=exp_noise,
+            rng_counter=rng_counter,
+            rng_step=rng_step,
+            rng_num_steps=rng_num_steps,
         )
+
+
+def _inline_exp_noise_torch(
+    *,
+    shape: torch.Size,
+    device: torch.device,
+    rng_counter: torch.Tensor,
+    rng_step: int,
+    rng_num_steps: int,
+) -> torch.Tensor:
+    """CPU/eager reference for the inline philox noise: Exp(1) drawn as
+    ``-log(u)``, u ~ Uniform(0,1). Distribution-equivalent to the Triton path
+    (both draw iid Exp(1)); the seed folds the per-step index exactly as the
+    kernel does, but values are not bit-identical because torch and Triton use
+    different philox layouts. Only used off CUDA / in the kernel's torch
+    fallback -- the graph path never touches this.
+    """
+    base = int(rng_counter.reshape(-1)[0].item())
+    seed = (base * int(rng_num_steps) + int(rng_step)) & 0xFFFFFFFF
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    u = torch.rand(shape, generator=gen, device=device, dtype=torch.float32)
+    return -torch.log(u.clamp_min(torch.finfo(torch.float32).tiny))
 
 
 def sample_step_tokens(
@@ -76,9 +120,25 @@ def sample_step_tokens(
     step_logits: torch.Tensor,
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
-    exp_noise: torch.Tensor,
+    exp_noise: Optional[torch.Tensor] = None,
+    rng_counter: Optional[torch.Tensor] = None,
+    rng_step: int = 0,
+    rng_num_steps: int = 1,
 ) -> torch.Tensor:
     probs = torch.softmax(step_logits.float() / temperatures[:, None], dim=-1)
+    if rng_counter is not None:
+        # Inline RNG: ignore exp_noise entirely and draw the Exp(1) noise here.
+        exp_noise = _inline_exp_noise_torch(
+            shape=step_logits.shape,
+            device=step_logits.device,
+            rng_counter=rng_counter,
+            rng_step=rng_step,
+            rng_num_steps=rng_num_steps,
+        )
+    else:
+        assert exp_noise is not None, (
+            "sample_step_tokens needs exp_noise unless rng_counter is set"
+        )
     noise = torch.where(greedy_mask[:, None], 1.0, exp_noise)
     return probs.div_(noise).argmax(dim=-1)
 
@@ -89,13 +149,17 @@ def _online_partial_kernel(
     temperatures_ptr,
     greedy_mask_ptr,
     exp_noise_ptr,
+    rng_seed_ptr,
     tile_max_ptr,
     partial_key_ptr,
     partial_idx_ptr,
     V,
     stride_row,
     n_tiles,
+    rng_step,
+    rng_num_steps,
     BLOCK_V: tl.constexpr,
+    INLINE_RNG: tl.constexpr,
 ):
     row = tl.program_id(0)
     tile = tl.program_id(1)
@@ -108,9 +172,27 @@ def _online_partial_kernel(
     s = logits / temperature
     tile_max = tl.max(s, axis=0)
     greedy = tl.load(greedy_mask_ptr + row) != 0
-    noise = tl.load(exp_noise_ptr + row * V + offs, mask=mask, other=1.0)
-    denom = tl.where(greedy, 1.0, noise)
-    key = tl.exp(s - tile_max) / denom
+    if INLINE_RNG:
+        # Inline Gumbel noise: draw uniforms with philox and map u -> -log(u),
+        # i.e. Exp(1) -- the exact noise exponential_() precomputes. fp32
+        # throughout, matching the precomputed buffer's dtype. The seed is read
+        # live from a device counter (graph-safe: the host bumps it each decode
+        # step, so replays redraw), and folds in the per-block step index so the
+        # gamma draft steps -- all baked into one captured graph -- draw
+        # independently. The offset row * V + offs keys noise per (row, vocab).
+        # A greedy row ignores the noise (denominator 1), so its program skips the
+        # Philox + log work altogether: a uniform per-program branch, same key.
+        if greedy:
+            key = tl.exp(s - tile_max)
+        else:
+            base = tl.load(rng_seed_ptr)
+            seed = (base * rng_num_steps + rng_step).to(tl.uint32)
+            u = tl.rand(seed, row * V + offs)
+            key = tl.exp(s - tile_max) / (-tl.log(u))
+    else:
+        noise = tl.load(exp_noise_ptr + row * V + offs, mask=mask, other=1.0)
+        denom = tl.where(greedy, 1.0, noise)
+        key = tl.exp(s - tile_max) / denom
     key = tl.where(mask, key, -1.0)
     tile_best = tl.max(key, axis=0)
     idx = tl.where(key == tile_best, offs, _IDX_SENTINEL)
@@ -155,7 +237,10 @@ def sample_step_tokens_triton(
     step_logits: torch.Tensor,
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
-    exp_noise: torch.Tensor,
+    exp_noise: Optional[torch.Tensor] = None,
+    rng_counter: Optional[torch.Tensor] = None,
+    rng_step: int = 0,
+    rng_num_steps: int = 1,
 ) -> torch.Tensor:
     bs, V = step_logits.shape
     device = step_logits.device
@@ -163,7 +248,31 @@ def sample_step_tokens_triton(
     stride_row = step_logits.stride(0)
     temperatures = temperatures.to(torch.float32).contiguous()
     greedy_mask = greedy_mask.to(torch.int32).contiguous()
-    exp_noise = exp_noise.to(torch.float32).contiguous()
+
+    inline_rng = rng_counter is not None
+    if inline_rng:
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "dspark_online_sampling_greedy_skip",
+            "DSpark draft online sampling skips Philox noise for greedy rows "
+            "(rows=%d, vocab=%d)",
+            bs,
+            V,
+        )
+        # Graph-safe seed: a device counter the host bumps each decode step, so
+        # replays redraw. No [bs, V] noise buffer, no exponential_() launch, and
+        # no read of exp_noise -- its pointer below is dead (the load is behind a
+        # constexpr-False branch) and only kept so the launch signature matches.
+        rng_seed = rng_counter
+        exp_noise_arg = rng_counter
+    else:
+        assert exp_noise is not None, (
+            "sample_step_tokens_triton needs exp_noise unless rng_counter is set"
+        )
+        exp_noise_arg = exp_noise.to(torch.float32).contiguous()
+        # Dead pointer for the (constexpr-False) inline branch; never loaded.
+        rng_seed = greedy_mask
 
     n_tiles = triton.cdiv(V, _BLOCK_V)
     block_tiles = triton.next_power_of_2(n_tiles)
@@ -180,14 +289,18 @@ def sample_step_tokens_triton(
         step_logits,
         temperatures,
         greedy_mask,
-        exp_noise,
+        exp_noise_arg,
+        rng_seed,
         tile_max,
         partial_key,
         partial_idx,
         V,
         stride_row,
         n_tiles,
+        int(rng_step),
+        int(rng_num_steps),
         BLOCK_V=_BLOCK_V,
+        INLINE_RNG=inline_rng,
     )
     _online_combine_kernel[row_grid](
         tile_max,
@@ -421,6 +534,42 @@ def commit_kv_proj_fused(
     main_x: torch.Tensor,
     wkv_linears: list[torch.nn.Module],
 ) -> list[torch.Tensor]:
+    if _commit_kv_deepgemm_applies(main_x=main_x, wkv_linears=wkv_linears):
+        # The draft stages' wkv are MXFP8-ready under DeepGEMM: quantize the target
+        # hidden rows once and run one DeepGEMM MXFP8 GEMM per stage (each output is
+        # already contiguous), instead of the stacked Triton block-fp8 fallback
+        # (236 us for the 1536-row commit vs ~12 us per stage here).
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+            w8a8_mxfp8_matmul_deepgemm,
+        )
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "dspark_commit_kv_deepgemm",
+            "DSpark commit-KV projection runs DeepGEMM MXFP8 GEMMs "
+            "(stages=%d, k=%d)",
+            len(wkv_linears),
+            main_x.shape[-1],
+        )
+        q, sf = sglang_per_token_group_quant_fp8(
+            main_x.contiguous(),
+            32,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+        return [
+            w8a8_mxfp8_matmul_deepgemm(
+                q,
+                linear.weight,
+                sf,
+                linear.weight_scale_inv_deepgemm,
+                output_dtype=torch.bfloat16,
+            )
+            for linear in wkv_linears
+        ]
+
     num_stages = len(wkv_linears)
     stacked = _stacked_wkv_weight(wkv_linears=wkv_linears)
 
@@ -450,6 +599,40 @@ def commit_kv_proj_fused(
         kv_all[:, i * head_dim : (i + 1) * head_dim].contiguous()
         for i in range(num_stages)
     ]
+
+
+_COMMIT_KV_DG_OK: dict[int, bool] = {}
+
+
+def _commit_kv_deepgemm_applies(
+    *, main_x: torch.Tensor, wkv_linears: list[torch.nn.Module]
+) -> bool:
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_DSPARK_COMMIT_KV_DEEPGEMM.get():
+        return False
+    if main_x.dtype != torch.bfloat16 or main_x.dim() != 2 or main_x.shape[0] == 0:
+        return False
+    key = id(wkv_linears[0])
+    ok = _COMMIT_KV_DG_OK.get(key)
+    if ok is None:
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        ok = bool(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)
+        for linear in wkv_linears:
+            quant_method = getattr(linear, "quant_method", None)
+            backend = getattr(quant_method, "mxfp8_dense_backend", None)
+            ok = ok and bool(
+                backend is not None
+                and backend.is_deep_gemm()
+                and getattr(quant_method, "block_fp8_as_mxfp8", False)
+                and getattr(linear, "block_fp8_mxfp8_ready", False)
+                and hasattr(linear, "weight_scale_inv_deepgemm")
+                and linear.weight.shape[0] % 64 == 0
+                and linear.weight.shape[1] % 128 == 0
+            )
+        _COMMIT_KV_DG_OK[key] = ok
+    return ok and main_x.shape[-1] == wkv_linears[0].weight.shape[1]
 
 
 class _StackedWkvWeight(msgspec.Struct):
@@ -590,12 +773,35 @@ class BuildStepLocal:
         return cls.torch(*args, **kwargs)
 
     @classmethod
-    def torch(cls, *, bias: torch.Tensor, base_local: torch.Tensor) -> torch.Tensor:
-        return build_step_local(bias=bias, base_local=base_local)
+    def torch(
+        cls,
+        *,
+        bias: torch.Tensor,
+        base_local: torch.Tensor,
+        corrected_dst: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Torch kernel for build_step_local.
+        """
+        out = build_step_local(bias=bias, base_local=base_local)
+        if corrected_dst is not None:
+            corrected_dst.copy_(out[..., : corrected_dst.shape[-1]])
+        return out
 
     @classmethod
-    def triton(cls, *, bias: torch.Tensor, base_local: torch.Tensor) -> torch.Tensor:
-        return build_step_local_triton(bias=bias, base_local=base_local)
+    def triton(
+        cls,
+        *,
+        bias: torch.Tensor,
+        base_local: torch.Tensor,
+        corrected_dst: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Triton kernel for build_step_local.
+        """
+        return build_step_local_triton(
+            bias=bias, base_local=base_local, corrected_dst=corrected_dst
+        )
 
 
 def build_step_local(*, bias: torch.Tensor, base_local: torch.Tensor) -> torch.Tensor:
@@ -612,35 +818,210 @@ def _build_step_local_kernel(
     bias_ptr,
     base_ptr,
     out_ptr,
+    corr_ptr,
     org_width,
     per_partition,
+    base_stride,
+    corr_stride,
+    corr_width,
     BLOCK: tl.constexpr,
+    WRITE_CORRECTED: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
     offs = tile * BLOCK + tl.arange(0, BLOCK)
     mask = offs < per_partition
-    base = tl.load(base_ptr + row * per_partition + offs, mask=mask, other=0.0).to(
+    base = tl.load(base_ptr + row * base_stride + offs, mask=mask, other=0.0).to(
         tl.float32
     )
     bias = tl.load(
         bias_ptr + row * org_width + offs, mask=offs < org_width, other=0.0
     ).to(tl.float32)
-    tl.store(out_ptr + row * per_partition + offs, base + bias, mask=mask)
+    step = base + bias
+    tl.store(out_ptr + row * per_partition + offs, step, mask=mask)
+    if WRITE_CORRECTED:
+        # the block-logits buffer the sampling accept path reads: the same fp32 sum
+        # rounded once to the buffer dtype (what a later copy_ would do), written
+        # straight into its [row, step] slot instead of a cat + convert pass
+        tl.store(
+            corr_ptr + row * corr_stride + offs,
+            step.to(corr_ptr.dtype.element_ty),
+            mask=offs < corr_width,
+        )
 
 
 def build_step_local_triton(
-    *, bias: torch.Tensor, base_local: torch.Tensor
+    *,
+    bias: torch.Tensor,
+    base_local: torch.Tensor,
+    corrected_dst: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     bs, per_partition = base_local.shape
     org_width = bias.shape[-1]
-    base_local = base_local.contiguous()
+    if base_local.stride(-1) != 1:
+        base_local = base_local.contiguous()
+    # a [bs, step, vocab] block-logits slice keeps its row stride; no copy needed
     bias = bias.contiguous()
     out = torch.empty(
         (bs, per_partition), dtype=torch.float32, device=base_local.device
     )
+    write_corrected = corrected_dst is not None
+    if write_corrected:
+        assert corrected_dst.shape[0] == bs and corrected_dst.stride(-1) == 1
     grid = (bs, triton.cdiv(per_partition, _BLOCK))
     _build_step_local_kernel[grid](
-        bias, base_local, out, org_width, per_partition, BLOCK=_BLOCK
+        bias,
+        base_local,
+        out,
+        corrected_dst if write_corrected else out,
+        org_width,
+        per_partition,
+        base_local.stride(0),
+        corrected_dst.stride(0) if write_corrected else 0,
+        corrected_dst.shape[-1] if write_corrected else 0,
+        BLOCK=_BLOCK,
+        WRITE_CORRECTED=write_corrected,
     )
     return out
+
+
+
+@triton.jit
+def _step_sample_partial_kernel(
+    bias_ptr,
+    base_ptr,
+    corr_ptr,
+    temperatures_ptr,
+    greedy_mask_ptr,
+    rng_seed_ptr,
+    tile_max_ptr,
+    partial_key_ptr,
+    partial_idx_ptr,
+    org_width,
+    V,
+    base_stride,
+    corr_stride,
+    n_tiles,
+    rng_step,
+    rng_num_steps,
+    BLOCK_V: tl.constexpr,
+    WRITE_CORRECTED: tl.constexpr,
+):
+    # _build_step_local_kernel followed by _online_partial_kernel (inline-RNG branch)
+    # in one pass: the fp32 step logits live in registers instead of a [bs, V] tensor
+    # that the sampler would read back. Same fp32 values, same tiling, same noise key
+    # (row * V + offs), so the sampled token is the one the two-kernel path returns.
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    row64 = row.to(tl.int64)
+    offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    mask = offs < V
+    base = tl.load(base_ptr + row64 * base_stride + offs, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    bias = tl.load(
+        bias_ptr + row64 * org_width + offs, mask=mask & (offs < org_width), other=0.0
+    ).to(tl.float32)
+    step = base + bias
+    if WRITE_CORRECTED:
+        tl.store(
+            corr_ptr + row64 * corr_stride + offs,
+            step.to(corr_ptr.dtype.element_ty),
+            mask=mask,
+        )
+    logits = tl.where(mask, step, float("-inf"))
+    temperature = tl.load(temperatures_ptr + row)
+    s = logits / temperature
+    tile_max = tl.max(s, axis=0)
+    greedy = tl.load(greedy_mask_ptr + row) != 0
+    if greedy:
+        key = tl.exp(s - tile_max)
+    else:
+        base_seed = tl.load(rng_seed_ptr)
+        seed = (base_seed * rng_num_steps + rng_step).to(tl.uint32)
+        u = tl.rand(seed, row * V + offs)
+        key = tl.exp(s - tile_max) / (-tl.log(u))
+    key = tl.where(mask, key, -1.0)
+    tile_best = tl.max(key, axis=0)
+    idx = tl.where(key == tile_best, offs, _IDX_SENTINEL)
+    tl.store(tile_max_ptr + row * n_tiles + tile, tile_max)
+    tl.store(partial_key_ptr + row * n_tiles + tile, tile_best)
+    tl.store(partial_idx_ptr + row * n_tiles + tile, tl.min(idx, axis=0))
+
+
+def can_build_step_sample(
+    *, bias: torch.Tensor, base_local: torch.Tensor, corrected_dst, vocab: int
+) -> bool:
+    """BuildStepSample kernel"""
+    return (
+        base_local.is_cuda
+        and base_local.dim() == 2
+        and bias.dim() == 2
+        and vocab <= base_local.shape[-1]
+        and vocab <= bias.shape[-1]
+        and (corrected_dst is None or corrected_dst.shape[-1] == vocab)
+    )
+
+
+def build_step_sample_triton(
+    *,
+    bias: torch.Tensor,
+    base_local: torch.Tensor,
+    corrected_dst: Optional[torch.Tensor],
+    vocab: int,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+    rng_counter: torch.Tensor,
+    rng_step: int,
+    rng_num_steps: int,
+) -> torch.Tensor:
+    """``SampleStepTokens(BuildStepLocal(bias, base_local)[:, :vocab])`` (inline RNG) in
+    one pass, also filling ``corrected_dst`` with the rounded step logits."""
+    assert can_build_step_sample(
+        bias=bias, base_local=base_local, corrected_dst=corrected_dst, vocab=vocab
+    )
+    bs = base_local.shape[0]
+    device = base_local.device
+    if base_local.stride(-1) != 1:
+        base_local = base_local.contiguous()
+    bias = bias.contiguous()
+    temperatures = temperatures.to(torch.float32).contiguous()
+    greedy_mask = greedy_mask.to(torch.int32).contiguous()
+    write_corrected = corrected_dst is not None
+    if write_corrected:
+        assert corrected_dst.stride(-1) == 1
+
+    n_tiles = triton.cdiv(vocab, _BLOCK_V)
+    tile_max = torch.empty((bs, n_tiles), dtype=torch.float32, device=device)
+    partial_key = torch.empty((bs, n_tiles), dtype=torch.float32, device=device)
+    partial_idx = torch.empty((bs, n_tiles), dtype=torch.int32, device=device)
+    next_tokens = torch.empty((bs,), dtype=torch.int64, device=device)
+    _step_sample_partial_kernel[(bs, n_tiles)](
+        bias,
+        base_local,
+        corrected_dst if write_corrected else base_local,
+        temperatures,
+        greedy_mask,
+        rng_counter,
+        tile_max,
+        partial_key,
+        partial_idx,
+        bias.shape[-1],
+        vocab,
+        base_local.stride(0),
+        corrected_dst.stride(0) if write_corrected else 0,
+        n_tiles,
+        int(rng_step),
+        int(rng_num_steps),
+        BLOCK_V=_BLOCK_V,
+        WRITE_CORRECTED=write_corrected,
+    )
+    _online_combine_kernel[(bs,)](
+        tile_max,
+        partial_key,
+        partial_idx,
+        next_tokens,
+        n_tiles,
+        BLOCK_TILES=triton.next_power_of_2(n_tiles),
+    )
+    return next_tokens

@@ -10,6 +10,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
     build_unified_commit_inject_layout,
 )
+from sglang.kernels.ops.speculative.dspark.inject_loc import (
+    can_commit_swa_loc,
+    commit_swa_loc,
+)
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
@@ -32,6 +37,26 @@ class TargetHiddenKvInjector:
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
 
+    def prepare_prefill_swa_loc(self, cache_loc: torch.Tensor) -> Optional[torch.Tensor]:
+        """Snapshot physical SWA locations before target forward can reuse
+        mappings.
+
+        Args:
+            cache_loc: Physical full-cache locations to translate before target
+                forward.
+
+        Returns:
+            Optional[Tensor]: Int32 SWA locations, or None for unsupported
+                pools.
+        """
+        pool = self.draft_model_runner.token_to_kv_pool
+        if (
+            not hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
+            or is_unified_kv_triton()
+        ):
+            return None
+        return pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+
     def inject_target_hidden(
         self,
         *,
@@ -43,6 +68,8 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        row_valid: Optional[torch.Tensor] = None,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         if target_hidden is None or target_hidden.numel() == 0:
             return
@@ -51,7 +78,12 @@ class TargetHiddenKvInjector:
         positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
         target_hidden = target_hidden.to(device=device, non_blocking=True)
         n_real = positions.shape[0]
-        if target_hidden.shape[0] > n_real:
+        # [MEM-P3] row_valid marks the live rows of a rank-major target_hidden
+        # (prefill-CP all-gather, no reorder copy). Its padding rows are
+        # interleaved, not trailing, so trailing truncation would cut real rows;
+        # the padding is dropped by masking swa_loc to -1 instead. cache_loc and
+        # positions were already permuted to match the rows by the caller.
+        if row_valid is None and target_hidden.shape[0] > n_real:
             target_hidden = target_hidden[:n_real]
         if cache_loc_2d is not None:
             cache_loc_2d = cache_loc_2d.to(
@@ -86,8 +118,16 @@ class TargetHiddenKvInjector:
                 commit_lens=commit_lens,
                 state_slot=state_slot,
                 final_pos=final_pos,
+                row_valid=row_valid,
+                swa_loc=swa_loc,
             )
             return
+
+        if row_valid is not None:
+            raise RuntimeError(
+                "Rank-major target hidden (row_valid) is only supported by the "
+                "DSpark MLA KV injection path."
+            )
 
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
@@ -111,6 +151,8 @@ class TargetHiddenKvInjector:
         commit_lens: Optional[torch.Tensor],
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
+        row_valid: Optional[torch.Tensor] = None,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         if is_unified_kv_triton():
             swa_loc = self._unified_inject_loc(
@@ -122,16 +164,41 @@ class TargetHiddenKvInjector:
                 final_pos=final_pos,
             )
         else:
-            swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
-            if commit_lens is not None and cache_loc_2d is not None:
-                bs, verify_len = cache_loc_2d.shape
-                col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
-                committed_mask = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(
-                    -1
-                )
-                swa_loc = torch.where(
-                    committed_mask, swa_loc, torch.full_like(swa_loc, -1)
-                )
+            if swa_loc is not None:
+                # Prefill borrowed a stable snapshot before the target forward;
+                # never translate it through a subsequently reused allocator map.
+                if commit_lens is not None and cache_loc_2d is not None:
+                    verify_len = cache_loc_2d.shape[1]
+                    col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
+                    committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
+                    swa_loc = torch.where(committed, swa_loc, torch.full_like(swa_loc, -1))
+            else:
+                gate_lens = commit_lens if cache_loc_2d is not None else None
+                gate_len = cache_loc_2d.shape[1] if gate_lens is not None else None
+                swa_mapping = getattr(pool, "full_to_swa_index_mapping", None)
+                if envs.SGLANG_OPT_DSPARK_INJECT_LOC_FUSE.get() and can_commit_swa_loc(
+                    swa_mapping, cache_loc, gate_lens, gate_len, row_valid
+                ):
+                    # translate + commit gate + row_valid gate in one launch (identical ints)
+                    swa_loc = commit_swa_loc(
+                        swa_mapping, cache_loc, gate_lens, gate_len, row_valid
+                    )
+                    row_valid = None
+                else:
+                    swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+                    if commit_lens is not None and cache_loc_2d is not None:
+                        bs, verify_len = cache_loc_2d.shape
+                        col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
+                        committed_mask = (
+                            col < commit_lens.to(torch.long).view(-1, 1)
+                        ).reshape(-1)
+                        swa_loc = torch.where(
+                            committed_mask, swa_loc, torch.full_like(swa_loc, -1)
+                        )
+        if row_valid is not None:
+            # [MEM-P3] Rank-major all-gather padding rows: -1 means "do not commit",
+            # the same contract the commit gate above uses.
+            swa_loc = torch.where(row_valid, swa_loc, torch.full_like(swa_loc, -1))
 
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(

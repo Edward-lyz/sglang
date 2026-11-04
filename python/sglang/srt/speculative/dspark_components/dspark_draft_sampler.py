@@ -8,12 +8,18 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
+from sglang.kernels.ops.speculative.dspark.host_sched import (
+    can_stage_sampling_params,
+    stage_sampling_params_fused,
+)
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
+    greedy_step_argmax,
     select_draft_hidden_without_anchor,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.utils.community_opt import log_community_opt_once
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +38,7 @@ def _base_logits_dtype(model) -> torch.dtype:
 
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
     del step_idx
-    return torch.argmax(step_logits, dim=-1)
+    return greedy_step_argmax(step_logits)
 
 
 class DsparkDraftSampler:
@@ -50,6 +56,7 @@ class DsparkDraftSampler:
         confidence_fn=None,
         out=None,
         folded_sampling: bool = True,
+        inline_rng: Optional[bool] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -75,9 +82,20 @@ class DsparkDraftSampler:
         )
         self.folded_sampling = folded_sampling
         self._tp_sync = tp_sync
+        # Propagated from the launcher via the published spec config
+        # (DsparkWorkerV2 passes get_spec().speculative_dspark_fuse_inline_rng).
+        # Fall back to the env var only when constructed without the propagated
+        # value (e.g. a direct/test instantiation) so nothing else breaks; the
+        # env default is off, so inline RNG stays off unless explicitly enabled.
+        self._inline_rng = (
+            bool(inline_rng)
+            if inline_rng is not None
+            else envs.SGLANG_FUSE_DSPARK_INLINE_RNG.get()
+        )
         self.temperatures = None
         self.greedy_mask = None
         self.exp_noise = None
+        self.rng_counter = None
         self.corrected_out = None
         if folded_sampling:
             vocab = int(model.lm_head.org_vocab_size)
@@ -85,9 +103,18 @@ class DsparkDraftSampler:
                 (max_bs,), dtype=torch.float32, device=device
             )
             self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
-            self.exp_noise = torch.empty(
-                (max_bs, vocab), dtype=torch.float32, device=device
-            )
+            if self._inline_rng:
+                # Inline philox: no persistent [max_bs, vocab] noise buffer; a
+                # 1-element device counter seeds the kernel instead. The host
+                # bumps it each decode step (stage_sampling_params) so each graph
+                # replay redraws rather than freezing one captured noise pattern.
+                self.rng_counter = torch.zeros(
+                    (1,), dtype=torch.int64, device=device
+                )
+            else:
+                self.exp_noise = torch.empty(
+                    (max_bs, vocab), dtype=torch.float32, device=device
+                )
             self.corrected_out = torch.empty(
                 (max_bs * self.gamma, vocab),
                 dtype=_base_logits_dtype(model),
@@ -99,6 +126,29 @@ class DsparkDraftSampler:
         the draft graph replay that consumes them."""
         if not self.folded_sampling:
             return
+        if (
+            self._inline_rng
+            and sampling_info is not None
+            and envs.SGLANG_OPT_HOST_SCHED_FUSE.get()
+        ):
+            # counter bump + temperature clamp + greedy mask in one launch (same values)
+            temps_in = sampling_info.temperatures.view(-1)
+            topk_in = sampling_info.top_ks.view(-1)
+            if can_stage_sampling_params(
+                temps_in, topk_in, self.temperatures, self.greedy_mask,
+                self.rng_counter, bs,
+            ):
+                stage_sampling_params_fused(
+                    temps_in, topk_in, self.temperatures, self.greedy_mask,
+                    self.rng_counter, bs,
+                )
+                return
+        if self._inline_rng:
+            # Bump the graph-safe philox counter so this decode step's replay
+            # redraws fresh noise. In-place add on the persistent tensor: the
+            # captured kernel reads the same address live, static grid, no host
+            # sync. (A python-int seed would be frozen into the capture.)
+            self.rng_counter.add_(1)
         if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
@@ -142,7 +192,22 @@ class DsparkDraftSampler:
             if self.folded_sampling:
 
                 def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-                    del step_idx
+                    if self._inline_rng:
+                        # Fused path: the sampling kernel draws its own philox
+                        # noise from rng_counter (bumped per decode step), so no
+                        # exponential_() launch and no [bs, vocab] buffer read.
+                        # step_idx keys the gamma steps apart within one capture.
+                        return self._tp_sync.sync(
+                            SpecTpSyncSite.DSPARK_GRAPH_SAMPLE,
+                            SampleStepTokens.execute(
+                                step_logits=step_logits,
+                                temperatures=self.temperatures[:bs],
+                                greedy_mask=self.greedy_mask[:bs],
+                                rng_counter=self.rng_counter,
+                                rng_step=step_idx,
+                                rng_num_steps=self.gamma,
+                            ),
+                        )
                     # In-graph philox noise: each replay advances the generator
                     # and redraws.
                     noise = self.exp_noise[:bs].exponential_()
@@ -164,14 +229,45 @@ class DsparkDraftSampler:
                         greedy_step_sampler(step_logits, step_idx),
                     )
 
+            if self.folded_sampling and self._inline_rng:
+                # Heads that can build the step logits and draw the token in one kernel
+                # (DSparkV4MarkovHead.apply_step_and_sample) read their inputs from here;
+                # it is the same draw `sampler` above makes.
+                from types import SimpleNamespace
+
+                sampler.fused_step_spec = SimpleNamespace(
+                    temperatures=self.temperatures[:bs],
+                    greedy_mask=self.greedy_mask[:bs],
+                    rng_counter=self.rng_counter,
+                    num_steps=self.gamma,
+                    post=lambda tokens: self._tp_sync.sync(
+                        SpecTpSyncSite.DSPARK_GRAPH_SAMPLE, tokens
+                    ),
+                )
+
+            # Each step writes its corrected logits straight into the static
+            # block-logits buffer (no per-step list + cat + convert-copy pass).
+            corrected_view = None
+            if self.folded_sampling and envs.SGLANG_OPT_DSPARK_CORRECTED_INPLACE.get():
+                corrected_view = self.corrected_out[: bs * self.gamma].view(
+                    bs, self.gamma, -1
+                )
+                log_community_opt_once(
+                    "dspark_corrected_inplace",
+                    "DSpark draft block logits written in place per step "
+                    "(bs=%d, gamma=%d)",
+                    bs,
+                    self.gamma,
+                )
             draft_tokens, corrected_logits = self.markov_head.sample_block(
                 base_logits,
                 first_prev_tokens=anchor,
                 hidden_states=sample_hidden,
                 sampler=sampler,
                 collect_corrected=self.folded_sampling,
+                corrected_out=corrected_view,
             )
-            if self.folded_sampling:
+            if self.folded_sampling and corrected_view is None:
                 self.corrected_out[: bs * self.gamma].copy_(
                     corrected_logits.reshape(bs * self.gamma, -1)
                 )
@@ -228,6 +324,7 @@ def maybe_build_draft_sampler(
     available_memory_gb: float,
     confidence_fn=None,
     out=None,
+    inline_rng: Optional[bool] = None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
     proposal must stay eager."""
@@ -265,4 +362,5 @@ def maybe_build_draft_sampler(
         confidence_fn=confidence_fn,
         out=out,
         folded_sampling=folded_sampling,
+        inline_rng=inline_rng,
     )

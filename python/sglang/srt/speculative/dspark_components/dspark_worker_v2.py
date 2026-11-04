@@ -483,6 +483,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=self.ps.tp_rank,
             tp_sync=self._tp_sync,
             available_memory_gb=available_memory_gb,
+            inline_rng=get_spec().speculative_dspark_fuse_inline_rng,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence
@@ -541,6 +542,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
+        prefill_swa_loc = (
+            self._kv_injector.prepare_prefill_swa_loc(batch.out_cache_loc)
+            if envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+            else None
+        )
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
@@ -560,7 +566,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
-        if logits_output.hidden_states is None:
+        # [MEM-P3] Prefill-CP may hand the aux over rank-major in a dedicated field
+        # (see LogitsProcessorOutput.hidden_states_rank_major); either field counts
+        # as a capture.
+        row_index = logits_output.hidden_states_row_token_index
+        target_hidden = (
+            logits_output.hidden_states_rank_major
+            if row_index is not None
+            else logits_output.hidden_states
+        )
+        if target_hidden is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
@@ -606,20 +621,73 @@ class DSparkWorkerV2(BaseSpecWorker):
         if token_indices is not None:
             cache_loc = cache_loc[token_indices]
             positions = positions[token_indices]
+            if prefill_swa_loc is not None:
+                prefill_swa_loc = prefill_swa_loc[token_indices]
             if state_slot is not None:
                 state_slot = state_slot[token_indices]
                 final_pos = final_pos[token_indices]
+        # [MEM-P3] Rank-major aux rows (row m belongs to global token row_index[m]):
+        # the CP gather skipped the full-size reorder copy, so permute the per-row
+        # metadata instead of the [T, K*hidden] activation, and mask the all-gather
+        # padding rows (row_index past the real token count) out of the commit.
+        row_valid = None
+        if row_index is not None:
+            if row_index.shape[0] != target_hidden.shape[0]:
+                raise RuntimeError(
+                    "Rank-major target hidden row count does not match its row map: "
+                    f"{target_hidden.shape[0]} vs {row_index.shape[0]}."
+                )
+            row_valid = row_index < positions.shape[0]
+            safe_index = torch.where(row_valid, row_index, row_index.new_zeros(()))
+            cache_loc = cache_loc[safe_index]
+            positions = positions[safe_index]
+            if prefill_swa_loc is not None:
+                prefill_swa_loc = prefill_swa_loc[safe_index]
+            if state_slot is not None:
+                state_slot = state_slot[safe_index]
+                final_pos = final_pos[safe_index]
+        commit_mask = logits_output.dspark_commit_mask
+        if (
+            commit_mask is not None
+            and token_indices is None
+            and commit_mask.shape[0] == target_hidden.shape[0]
+        ):
+            # [fusion-opt] SGLANG_FUSE_DSPARK_COMMIT_TAIL_ONLY: under decoder SWA
+            # bounded replay only the late-layer tail rows have a computed aux (the
+            # rest are uninitialized and never read), so compact the commit to those
+            # rows. Stable sort keeps them first; the CPU upper bound avoids a sync.
+            if row_valid is None:
+                n = positions.shape[0]
+                target_hidden = target_hidden[:n]
+                commit_mask = commit_mask[:n]
+                keep = commit_mask
+            else:
+                keep = commit_mask & row_valid
+            ub = min(int(logits_output.dspark_commit_rows_ub), keep.shape[0])
+            idx = torch.argsort((~keep).to(torch.int8), stable=True)[:ub]
+            target_hidden = target_hidden[idx]
+            cache_loc = cache_loc[idx]
+            positions = positions[idx]
+            if state_slot is not None:
+                state_slot = state_slot[idx]
+                final_pos = final_pos[idx]
+            row_valid = keep[idx]
         self._kv_injector.inject_target_hidden(
-            target_hidden=logits_output.hidden_states,
+            target_hidden=target_hidden,
             cache_loc=cache_loc,
             positions=positions,
             state_slot=state_slot,
             final_pos=final_pos,
             target_hidden_is_projected=target_hidden_is_projected,
+            row_valid=row_valid,
+            swa_loc=prefill_swa_loc,
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
         logits_output.hidden_states_token_indices = None
+        logits_output.hidden_states_rank_major = None
+        logits_output.hidden_states_row_token_index = None
+        logits_output.dspark_commit_mask = None
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,

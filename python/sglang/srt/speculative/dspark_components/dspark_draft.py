@@ -19,7 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
@@ -62,6 +62,37 @@ def _make_num_token_non_padded(
         dtype=torch.int32,
         pin_memory=is_pin_memory_available(device),
     ).to(device, non_blocking=True)
+
+
+def greedy_step_argmax(step_logits: torch.Tensor) -> torch.Tensor:
+    """
+    Returns:
+        greedy_tokens: The greedy draft step tokens. [bs, 1]
+    """
+    # vLLM #57770: split-vocab argmax for the greedy draft step. Same gate as
+    # the verify-side row_argmax (#39704): only its medium kernel keeps
+    # torch.argmax's NaN priority and lowest-index tie rule, so it is exact.
+    if (
+        envs.SGLANG_OPT_DSPARK_GREEDY_ROW_ARGMAX.get()
+        and step_logits.is_cuda
+        and step_logits.dim() == 2
+        and step_logits.dtype == torch.float32
+        and step_logits.stride(1) == 1
+        and 64 < step_logits.shape[0] <= 384
+        and step_logits.shape[1] >= 65536
+    ):
+        from sglang.kernels.ops.speculative.row_argmax import row_argmax
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "vllm#57770 dspark_greedy_row_argmax",
+            "DSpark greedy draft step argmax via split-vocab row_argmax "
+            "(rows=%d, vocab=%d)",
+            step_logits.shape[0],
+            step_logits.shape[1],
+        )
+        return row_argmax(step_logits)
+    return torch.argmax(step_logits, dim=-1)
 
 
 class DraftBlockResult(msgspec.Struct, frozen=True):
@@ -141,6 +172,13 @@ def sample_draft_block(
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
     fast_sampling = envs.SGLANG_DSPARK_FAST_SAMPLING.get()
+    # Fuse the exp-noise RNG into the sampling kernel (user knob:
+    # SGLANG_FUSE_DSPARK_INLINE_RNG). Read the launcher-resolved value from the
+    # published spec config rather than the env var directly: under DP / mp-spawn
+    # the worker's os.environ may lack it. Eager fallback path, so no graph-safe
+    # counter plumbing is needed -- a fresh per-call seed suffices.
+    inline_rng = fast_sampling and bool(get_spec().speculative_dspark_fuse_inline_rng)
+    num_steps = base_logits.shape[1]
 
     if sampling_info is None:
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
@@ -154,7 +192,7 @@ def sample_draft_block(
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
             return tp_sync.sync(
-                SpecTpSyncSite.DSPARK_DRAFT_GREEDY, torch.argmax(step_logits, dim=-1)
+                SpecTpSyncSite.DSPARK_DRAFT_GREEDY, greedy_step_argmax(step_logits)
             )
 
     else:
@@ -162,18 +200,39 @@ def sample_draft_block(
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
             if fast_sampling:
-                exp_noise = torch.empty(
-                    step_logits.shape, dtype=torch.float32, device=step_logits.device
-                ).exponential_(1)
-                return tp_sync.sync(
-                    SpecTpSyncSite.DSPARK_DRAFT_SAMPLE,
-                    SampleStepTokens.execute(
+                if inline_rng:
+                    # Draw the Exp(1) noise inside the sampling kernel (philox)
+                    # instead of a separate exponential_() over a fresh
+                    # [bs, vocab] buffer. Eager (no capture), so a fresh random
+                    # counter per call is enough; step_idx keys the steps apart.
+                    rng_counter = torch.randint(
+                        0,
+                        2**31 - 1,
+                        (1,),
+                        dtype=torch.int64,
+                        device=step_logits.device,
+                    )
+                    sampled = SampleStepTokens.execute(
+                        step_logits=step_logits,
+                        temperatures=temperatures,
+                        greedy_mask=greedy_mask,
+                        rng_counter=rng_counter,
+                        rng_step=step_idx,
+                        rng_num_steps=num_steps,
+                    )
+                else:
+                    exp_noise = torch.empty(
+                        step_logits.shape,
+                        dtype=torch.float32,
+                        device=step_logits.device,
+                    ).exponential_(1)
+                    sampled = SampleStepTokens.execute(
                         step_logits=step_logits,
                         temperatures=temperatures,
                         greedy_mask=greedy_mask,
                         exp_noise=exp_noise,
-                    ),
-                )
+                    )
+                return tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT_SAMPLE, sampled)
             else:
                 probs = torch.softmax(
                     step_logits.float() / temperatures[:, None], dim=-1
@@ -230,6 +289,7 @@ class DraftBlockProposer:
             if enable_num_token_non_padded()
             else None
         )
+        self._host_trim = envs.SGLANG_OPT_DSPARK_DRAFT_HOST_TRIM.get()
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -417,6 +477,21 @@ class DraftBlockProposer:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
         draft_num_tokens = bs * query_token_num
+        # With DP-MoE sync, _fill_dp_moe_sync_metadata overwrites this with the
+        # same value, so the first pinned tensor + H2D would be dead work.
+        skip_global_non_padded = (
+            self._host_trim
+            and self._dp_moe_sync
+            and batch.global_num_tokens is not None
+        )
+        if self._host_trim:
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "vllm#58631 dspark_draft_host_trim",
+                "DSpark draft host-side trim enabled (dp_moe_sync=%s)",
+                self._dp_moe_sync,
+            )
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
@@ -431,8 +506,10 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            global_num_token_non_padded=_make_num_token_non_padded(
-                draft_num_tokens, device
+            global_num_token_non_padded=(
+                None
+                if skip_global_non_padded
+                else _make_num_token_non_padded(draft_num_tokens, device)
             ),
             global_num_token_non_padded_cpu=draft_num_tokens,
         )
@@ -503,6 +580,13 @@ class DraftBlockProposer:
         forward_batch.global_num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
+        staged = self._stage_global_num_tokens(gnt, gnt_logprob, device)
+        if staged is not None:
+            (
+                forward_batch.global_num_tokens_gpu,
+                forward_batch.global_num_tokens_for_logprob_gpu,
+            ) = staged
+            return
         pin_memory = is_pin_memory_available(device)
         forward_batch.global_num_tokens_gpu = torch.tensor(
             gnt, dtype=torch.int64, pin_memory=pin_memory
@@ -510,3 +594,24 @@ class DraftBlockProposer:
         forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
             gnt_logprob, dtype=torch.int64, pin_memory=pin_memory
         ).to(device, non_blocking=True)
+
+    def _stage_global_num_tokens(
+        self, gnt: list, gnt_logprob: list, device
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """gnt and gnt_logprob in one pinned tensor + one H2D instead of two.
+
+        The pinned block comes from torch's caching host allocator, which keeps
+        it out of reuse until this non_blocking copy has executed, so the spec
+        v2 overlap cannot overwrite host bytes that are still queued for H2D
+        (a hand-rolled persistent staging slot would need its own event, which
+        measured slower). Returns rows of a fresh device tensor; downstream may
+        write them in place. None keeps the original two-upload path.
+        """
+        if not self._host_trim or len(gnt_logprob) != len(gnt) or not gnt:
+            return None
+        both = torch.tensor(
+            [gnt, gnt_logprob],
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(device),
+        ).to(device, non_blocking=True)
+        return both[0], both[1]

@@ -1,3 +1,5 @@
+"""DeepSeek-V4 / V4.1 DSpark draft model (MoE stages, Markov / confidence heads, ctx-KV commit)."""
+
 from __future__ import annotations
 
 import copy
@@ -16,9 +18,14 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     BuildStepLocal,
     CommitKvProj,
+    build_step_sample_triton,
+    can_build_step_sample,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
+from sglang.srt.distributed.device_communicators.vocab_gather import (
+    LocalVocabGather,
+    make_vocab_gather,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -54,6 +61,7 @@ from sglang.srt.models.dspark import (
     run_markov_block,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_parallel,
     get_platform,
 )
@@ -71,6 +79,12 @@ from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
+
+# [MEM-R5] Row chunk for committing the target hidden into the draft KV (see
+# write_target_hidden_kv). Bounds the projection/quantization transients during a long
+# prefill chunk; 0 disables chunking. Chunks stay large enough that the GEMMs remain
+# compute bound.
+_TARGET_HIDDEN_COMMIT_ROW_CHUNK = 16384
 
 # DSpark confidence is a per-token score that must stay in [0, 1].
 _CONFIDENCE = Invariant(
@@ -474,34 +488,111 @@ class DSparkV4MarkovHead(nn.Module):
         del hidden_states
         return self.project_bias(self.get_prev_embeddings(token_ids))
 
+    # run_markov_block hands this head the block-logits slot of each step
+    supports_corrected_dst = True
+
     def apply_step_logits(
         self,
         logits: torch.Tensor,
         *,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
+        corrected_dst: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``corrected_dst``: [bs, vocab] slot of the caller's block-logits buffer that
+        receives these step logits (rounded once to its dtype)."""
         if self._tp_shard is not None:
             return self._apply_step_logits_sharded(
-                base_local=logits, token_ids=token_ids
+                base_local=logits, token_ids=token_ids, corrected_dst=corrected_dst
             )
-        return logits + self.compute_step_bias(token_ids, hidden_states)
+        out = logits + self.compute_step_bias(token_ids, hidden_states)
+        if corrected_dst is not None:
+            corrected_dst.copy_(out)
+        return out
 
-    def _apply_step_logits_sharded(
-        self, *, base_local: torch.Tensor, token_ids: torch.Tensor
-    ) -> torch.Tensor:
+    def _step_bias_sharded(self, token_ids: torch.Tensor) -> torch.Tensor:
         shard = self._tp_shard
         latent = self.get_prev_embeddings(token_ids)
         weight_local = self.markov_w2.weight[
             shard.org_vocab_start : shard.org_vocab_end
         ]
         if self._opt_markov_w2_bf16:
-            bias = F.linear(latent.to(weight_local.dtype), weight_local)
-        else:
-            bias = F.linear(latent.float(), weight_local)
-        step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
-        full = self._vocab_gather(step_local)
-        return full[..., : self.vocab_size]
+            return F.linear(latent.to(weight_local.dtype), weight_local)
+        return F.linear(latent.float(), weight_local)
+
+    def fused_step_sample_applies(
+        self,
+        logits: torch.Tensor,
+        token_ids: torch.Tensor,
+        corrected_dst: Optional[torch.Tensor],
+    ) -> bool:
+        """Whether apply_step_and_sample() can stand in for apply_step_logits() followed
+        by the in-graph inline-RNG sampler (single-rank vocab group, block-logits slot)."""
+        if (
+            not envs.SGLANG_OPT_DSPARK_STEP_SAMPLE_FUSE.get()
+            or self._tp_shard is None
+            or corrected_dst is None
+            or not isinstance(self._vocab_gather, LocalVocabGather)
+        ):
+            return False
+        shard = self._tp_shard
+        bias_width = shard.org_vocab_end - shard.org_vocab_start
+        return (
+            logits.is_cuda
+            and logits.dim() == 2
+            and self.vocab_size <= logits.shape[-1]
+            and self.vocab_size <= bias_width
+            and corrected_dst.shape[-1] == self.vocab_size
+        )
+
+    def apply_step_and_sample(
+        self,
+        logits: torch.Tensor,
+        *,
+        token_ids: torch.Tensor,
+        corrected_dst: torch.Tensor,
+        spec,
+        step_idx: int,
+    ) -> torch.Tensor:
+        """apply_step_logits(..., corrected_dst) + sampler in one pass: the step logits
+        never exist as a [bs, vocab] fp32 tensor; the block-logits slot is filled and
+        the Gumbel/greedy token is drawn from the same registers."""
+        bias = self._step_bias_sharded(token_ids)
+        tokens = build_step_sample_triton(
+            bias=bias,
+            base_local=logits,
+            corrected_dst=corrected_dst,
+            vocab=self.vocab_size,
+            temperatures=spec.temperatures,
+            greedy_mask=spec.greedy_mask,
+            rng_counter=spec.rng_counter,
+            rng_step=step_idx,
+            rng_num_steps=spec.num_steps,
+        )
+        return spec.post(tokens)
+
+    def _apply_step_logits_sharded(
+        self,
+        *,
+        base_local: torch.Tensor,
+        token_ids: torch.Tensor,
+        corrected_dst: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        bias = self._step_bias_sharded(token_ids)
+        # A group of one gathers nothing, so the step logits are final in step_local
+        # and the block-logits slot can be filled by the same kernel.
+        fuse_dst = corrected_dst is not None and isinstance(
+            self._vocab_gather, LocalVocabGather
+        )
+        step_local = BuildStepLocal.execute(
+            bias=bias,
+            base_local=base_local,
+            corrected_dst=corrected_dst if fuse_dst else None,
+        )
+        full = self._vocab_gather(step_local)[..., : self.vocab_size]
+        if corrected_dst is not None and not fuse_dst:
+            corrected_dst.copy_(full)
+        return full
 
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
@@ -516,6 +607,7 @@ class DSparkV4MarkovHead(nn.Module):
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
         collect_corrected: bool = True,
+        corrected_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
@@ -524,6 +616,7 @@ class DSparkV4MarkovHead(nn.Module):
             hidden_states=hidden_states,
             sampler=sampler,
             collect_corrected=collect_corrected,
+            corrected_out=corrected_out,
         )
 
 
@@ -748,6 +841,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
     uses_own_vocab_modules = _is_npu
+    # Same MegaMoE shared-expert fusion as the target (#39313): target and draft
+    # must agree, or they would size different MegaMoE symm buffers.
+    precompile_kernels_after_loading = (
+        DeepseekV4ForCausalLM.precompile_kernels_after_loading
+    )
+    # vllm#60468: the draft's own MegaMoE / mega gate variants (its own experts
+    # and top-k) are compiled by the same warmup.
+    warmup_deepgemm_mega_kernels = DeepseekV4ForCausalLM.warmup_deepgemm_mega_kernels
+    _warmup_mega_mhc = DeepseekV4ForCausalLM._warmup_mega_mhc
 
     @classmethod
     def shared_experts_fusion_disable_reason(
@@ -910,8 +1012,42 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         positions: torch.Tensor,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
-        main_x = self.project_target_hidden(main_hidden)
         swa_loc = swa_loc.to(torch.int32)
+        rows = main_hidden.shape[0]
+        # [MEM-R5] Commit the target hidden in row chunks. Every step here is
+        # row-independent (main_proj / main_norm / wkv are per-row, the store scatters
+        # by swa_loc), but running the whole prefill chunk at once materializes the
+        # mxfp8 quantized copy of main_hidden plus the projection output for all rows
+        # at the same time as the gathered [rows, hc_mult*hidden] aux buffer is still
+        # live (960 + 640 MiB on top of 1920 MiB at a 65532-token chunk). Chunking
+        # bounds those transients without touching per-row math.
+        chunk = _TARGET_HIDDEN_COMMIT_ROW_CHUNK
+        if chunk <= 0 or rows <= chunk:
+            self._commit_target_hidden_rows(
+                main_hidden=main_hidden,
+                swa_loc=swa_loc,
+                positions=positions,
+                pool=pool,
+            )
+            return
+        for start in range(0, rows, chunk):
+            stop = min(start + chunk, rows)
+            self._commit_target_hidden_rows(
+                main_hidden=main_hidden[start:stop],
+                swa_loc=swa_loc[start:stop],
+                positions=positions[start:stop],
+                pool=pool,
+            )
+
+    def _commit_target_hidden_rows(
+        self,
+        *,
+        main_hidden: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
+        main_x = self.project_target_hidden(main_hidden)
         kvs = CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
@@ -944,6 +1080,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "(call attach_shared_modules first)."
             )
         x = self.embed_tokens(input_ids)
+        if envs.SGLANG_OPT_DSPARK_EMBED_HC_BROADCAST.get():
+            # Same contiguous [T, hc_mult, H] copy as repeat(): the stages'
+            # fused mHC kernels flatten the hc dim, so an expand() view is not
+            # an option.
+            from sglang.kernels.ops.layernorm.mhc import hc_broadcast
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "vllm#53972 dspark_embed_hc_broadcast",
+                "DSpark draft initial mHC residual via Triton hc_broadcast "
+                "(tokens=%d, hc_mult=%d)",
+                x.shape[0],
+                self.hc_mult,
+            )
+            return hc_broadcast(x, self.hc_mult)
         x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
         return x
 
@@ -1108,6 +1259,55 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
+        )
+        if (
+            envs.SGLANG_DSV41_PD_PREFILL_DRAFT_PRUNE.get()
+            and get_disagg().disaggregation_mode == "prefill"
+        ):
+            # params_dict holds every parameter alive; drop it so pruning frees them.
+            del params_dict
+            self.prune_to_ctx_kv_injection()
+
+    def prune_to_ctx_kv_injection(self) -> None:
+        """[luno-5437] SGLANG_DSV41_PD_PREFILL_DRAFT_PRUNE: a PD prefill server never
+        runs the draft; it only commits draft KV from the target aux hidden
+        (project_target_hidden -> each stage's wkv -> kv_norm + RoPE store, see
+        _commit_target_hidden_rows). Drop everything else -- MoE, the attention
+        projections around the KV, the Markov / confidence heads -- right after
+        loading, so the freed HBM is counted when the KV pool is sized. The
+        stages (layer ids, hc params, RadixAttention) and the shared embed /
+        lm_head (target-owned) stay."""
+        before = torch.cuda.memory_allocated()
+        for stage in self.stages:
+            stage.mlp = None
+            attn = stage.self_attn
+            for name in (
+                "wq_a",
+                "wq_b",
+                "wqkv_a",
+                "wo_a",
+                "wo_b",
+                "compressor",
+                "indexer",
+            ):
+                if getattr(attn, name, None) is not None:
+                    setattr(attn, name, None)
+        for head in (self.markov_head, self.confidence_head):
+            if head is None:
+                continue
+            # The worker still reads their config (configure_tp_shard, logging);
+            # only the weights go.
+            for mod in head.modules():
+                for pname, param in list(mod.named_parameters(recurse=False)):
+                    setattr(
+                        mod,
+                        pname,
+                        nn.Parameter(param.new_empty(0), requires_grad=False),
+                    )
+        torch.cuda.empty_cache()
+        logger.info(
+            "DSpark V4 draft pruned to ctx-KV injection (PD prefill): freed %.2f GiB",
+            (before - torch.cuda.memory_allocated()) / (1 << 30),
         )
 
     def _assert_confidence_head_loaded(
