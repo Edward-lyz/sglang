@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
+    ComponentDeviceValueAllocator,
     ComponentType,
     EvictLayer,
     TreeComponent,

@@ -21,11 +21,13 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
+    ComponentDeviceValueAllocator,
     ComponentType,
     EvictLayer,
     LRURefreshPhase,
     PrepareLoadBackResult,
     TreeComponent,
+    UnifiedInsertResult,
     get_and_increase_time_counter,
 )
 from sglang.srt.runtime_context import get_server_args
@@ -41,6 +43,22 @@ if TYPE_CHECKING:
 
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
+
+    def device_value_allocator(self) -> ComponentDeviceValueAllocator:
+        """Describe the pool that owns radix-cached recurrent checkpoints."""
+        pool = self.int8_ckpt_pool
+        if pool is None:
+            pool = self.cache.req_to_token_pool.mamba_allocator
+        return ComponentDeviceValueAllocator(
+            alloc=pool.alloc,
+            free=pool.free,
+            alloc_with_metadata=getattr(pool, "alloc_with_host", None),
+            free_with_metadata=getattr(pool, "free_with_host", None),
+            evict=lambda count: self.cache.evict(
+                EvictParams(num_tokens=0, mamba_num=count)
+            ),
+            available=getattr(pool, "schedulable_available_size", pool.available_size),
+        )
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -160,6 +178,8 @@ class MambaComponent(TreeComponent):
         assert params.mamba_value is not None
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
+            if isinstance(result, UnifiedInsertResult):
+                result.consume_component_value(self.component_type)
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
@@ -168,6 +188,8 @@ class MambaComponent(TreeComponent):
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
+            if isinstance(result, UnifiedInsertResult):
+                result.consume_component_value(self.component_type)
             # move from host LRU to device LRU
             host_lru = self.cache.host_lru_lists[self.component_type]
             if host_lru.in_list(node):
@@ -366,12 +388,7 @@ class MambaComponent(TreeComponent):
         return getattr(self.cache.req_to_token_pool, "mamba_ckpt_pool", None)
 
     def _alloc_int8_ckpt_slot(self) -> torch.Tensor:
-        slot = self.int8_ckpt_pool.alloc(1)
-        if slot is None:
-            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-            slot = self.int8_ckpt_pool.alloc(1)
-            assert slot is not None, "Can not alloc int8 mamba checkpoint slot"
-        return slot
+        return self.device_value_allocator().reserve(1)
 
     def _commit_int8_checkpoint(self, active_slots: torch.Tensor) -> torch.Tensor:
         ckpt_slot = self._alloc_int8_ckpt_slot()
@@ -383,10 +400,7 @@ class MambaComponent(TreeComponent):
         return ckpt_slot
 
     def _free_mamba_value(self, mamba_value: torch.Tensor) -> None:
-        if self.int8_ckpt_pool is not None:
-            self.int8_ckpt_pool.free(mamba_value)
-        else:
-            self.cache.req_to_token_pool.mamba_allocator.free(mamba_value)
+        self.device_value_allocator().free(mamba_value)
 
     def prepare_for_caching_req(
         self,

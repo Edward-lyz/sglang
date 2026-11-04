@@ -48,7 +48,7 @@ lifecycle is owned by the caller via the embedded ``MambaSlotAllocator``.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -229,11 +229,23 @@ class MambaCheckpointPool:
     def alloc(self, n: int = 1):
         return self.allocator.alloc(n)
 
+    def alloc_with_host(self, n: int = 1):
+        """Allocate checkpoint slots with their host-side IDs."""
+        return self.allocator.alloc_with_host(n)
+
     def free(self, slots: torch.Tensor):
         self.allocator.free(slots)
 
+    def free_with_host(self, slots: torch.Tensor, host_ids: Sequence[int]) -> None:
+        """Return checkpoint slots using known host-side IDs."""
+        self.allocator.free_with_host(slots, host_ids)
+
     def available_size(self) -> int:
         return self.allocator.available_size()
+
+    def schedulable_available_size(self) -> int:
+        """Return the number of immediately allocatable slots."""
+        return self.allocator.schedulable_available_size()
 
     def clear(self) -> None:
         """Release every checkpoint slot (radix flush/reset). The int8 qdata is

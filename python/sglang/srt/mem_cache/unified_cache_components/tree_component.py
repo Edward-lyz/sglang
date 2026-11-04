@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 from abc import ABC, abstractmethod
 from enum import Enum, IntFlag
-from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence
 
 import torch
 from numpy import float64
@@ -83,8 +83,222 @@ class PrepareLoadBackResult:
     allocated_mamba_slot: Optional[torch.Tensor] = None
 
 
-class CacheTransferPhase(str, Enum):
+@dataclasses.dataclass(frozen=True)
+class ComponentDeviceValueAllocator:
+    """Device allocation hooks with optional host-side IDs."""
 
+    alloc: Callable[[int], Optional[torch.Tensor]]
+    free: Callable[[torch.Tensor], Any]
+    evict: Optional[Callable[[int], Any]] = None
+    available: Optional[Callable[[], int]] = None
+    eviction_margin: int = 0
+    alloc_with_metadata: Optional[
+        Callable[[int], tuple[Optional[torch.Tensor], Optional[tuple[int, ...]]]]
+    ] = None
+    free_with_metadata: Optional[Callable[[torch.Tensor, Sequence[int]], Any]] = None
+    # FULL reports one host page ID per page_size slots.
+    values_per_host_id: int = 1
+
+    def release(
+        self, value: torch.Tensor, host_value: Optional[Sequence[int]] = None
+    ) -> Any:
+        if host_value is not None and self.free_with_metadata is not None:
+            return self.free_with_metadata(value, host_value)
+        return self.free(value)
+
+    def reserve_with_metadata(
+        self, count: int
+    ) -> tuple[torch.Tensor, Optional[tuple[int, ...]]]:
+        if count <= 0:
+            raise ValueError(
+                f"Component allocation count must be positive, got {count}"
+            )
+
+        def allocate():
+            if self.alloc_with_metadata is not None:
+                return self.alloc_with_metadata(count)
+            return self.alloc(count), None
+
+        value, host_value = allocate()
+        if value is None and self.evict is not None:
+            evict_count = count
+            if self.available is not None:
+                available = self.available()
+                shortfall = count - available
+                if shortfall > 0:
+                    evict_count = shortfall + self.eviction_margin
+            self.evict(evict_count)
+            value, host_value = allocate()
+        if value is None:
+            raise RuntimeError(f"Cannot allocate {count} component device value(s)")
+        if len(value) != count:
+            metadata = (
+                host_value
+                if host_value is not None
+                and len(host_value) * self.values_per_host_id == len(value)
+                else None
+            )
+            self.release(value, metadata)
+            raise RuntimeError(
+                f"Allocated {len(value)} of {count} component device value(s)"
+            )
+        if (
+            host_value is not None
+            and len(host_value) * self.values_per_host_id != count
+        ):
+            self.free(value)
+            raise RuntimeError(
+                f"Allocated {len(host_value)} of {count} host component value ID(s)"
+            )
+        return value, host_value
+
+    def reserve(self, count: int) -> torch.Tensor:
+        """Reserve a component value, discarding optional host metadata."""
+        return self.reserve_with_metadata(count)[0]
+
+
+class ComponentValueAllocation:
+    """A rollback-safe component value whose ownership can move to the tree."""
+
+    def __init__(
+        self,
+        component_type: ComponentType,
+        value: torch.Tensor,
+        allocator: ComponentDeviceValueAllocator,
+        host_value: Optional[tuple[int, ...]] = None,
+    ):
+        self.component_type = component_type
+        self.value = value
+        self.host_value = host_value
+        self._allocator = allocator
+        self._consumed = 0
+        self._closed = False
+
+    def consume_through(self, count: Optional[int] = None) -> None:
+        """Mark a contiguous allocation prefix as consumed by the cache."""
+        if self._closed:
+            raise RuntimeError("Component value allocation is already closed")
+        if count is None:
+            count = len(self.value)
+        if not self._consumed <= count <= len(self.value):
+            raise ValueError(
+                f"Invalid consumed component value count {count}; "
+                f"current={self._consumed}, total={len(self.value)}"
+            )
+        self._consumed = count
+
+    def release(self) -> None:
+        """Return the value to its component pool exactly once."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._consumed < len(self.value):
+            ratio = self._allocator.values_per_host_id
+            host_value = (
+                None
+                if self.host_value is None or self._consumed % ratio
+                else self.host_value[self._consumed // ratio :]
+            )
+            self._allocator.release(self.value[self._consumed :], host_value)
+
+
+class ComponentValueTransaction:
+    """Own component values until insert or rollback."""
+
+    def __init__(self, components: Mapping[ComponentType, TreeComponent]):
+        self._components = components
+        self._allocations: list[ComponentValueAllocation] = []
+        self._closed = False
+
+    def allocate(
+        self, component_type: ComponentType, count: int = 1
+    ) -> ComponentValueAllocation:
+        if self._closed:
+            raise RuntimeError("Component value transaction is already closed")
+        if any(
+            allocation.component_type == component_type
+            for allocation in self._allocations
+        ):
+            raise RuntimeError(
+                f"Transaction already owns a {component_type} component value"
+            )
+        component = self._components.get(component_type)
+        if component is None:
+            raise ValueError(f"Cache has no {component_type} component")
+        allocator = component.device_value_allocator()
+        if allocator is None:
+            raise RuntimeError(
+                f"{type(component).__name__} does not expose a device value allocator"
+            )
+        value, host_value = allocator.reserve_with_metadata(count)
+        allocation = ComponentValueAllocation(
+            component_type,
+            value,
+            allocator,
+            host_value=host_value,
+        )
+        self._allocations.append(allocation)
+        return allocation
+
+    def allocation(
+        self, component_type: ComponentType
+    ) -> Optional[ComponentValueAllocation]:
+        return next(
+            (
+                allocation
+                for allocation in self._allocations
+                if allocation.component_type == component_type
+            ),
+            None,
+        )
+
+    def consume(
+        self, component_type: ComponentType, count: Optional[int] = None
+    ) -> None:
+        allocation = self.allocation(component_type)
+        if allocation is None:
+            raise ValueError(f"Transaction has no {component_type} component value")
+        allocation.consume_through(count)
+
+    def commit_insert(self, result: InsertResult) -> None:
+        """Release values not consumed by the insert."""
+        if (
+            not isinstance(result, UnifiedInsertResult)
+            or result.transaction is not self
+        ):
+            raise ValueError("Insert result does not belong to this transaction")
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for allocation in reversed(self._allocations):
+            allocation.release()
+
+    def __enter__(self) -> ComponentValueTransaction:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
+@dataclasses.dataclass
+class UnifiedInsertResult(InsertResult):
+    """Unified insert result with component value consumption tracking."""
+
+    transaction: Optional[ComponentValueTransaction] = dataclasses.field(
+        default=None, repr=False
+    )
+
+    def consume_component_value(
+        self, component_type: ComponentType, count: Optional[int] = None
+    ) -> None:
+        if self.transaction is not None:
+            self.transaction.consume(component_type, count)
+
+
+class CacheTransferPhase(str, Enum):
     BACKUP_HOST = "backup_host"  # D→H
     LOAD_BACK = "load_back"  # H→D
     BACKUP_STORAGE = "backup_storage"  # H→Storage
@@ -117,6 +331,10 @@ class TreeComponent(ABC):
 
     # Subclasses MUST set this as a class attribute (not @property)
     component_type: ComponentType
+
+    def device_value_allocator(self) -> Optional[ComponentDeviceValueAllocator]:
+        """Return device allocation hooks, if any."""
+        return None
 
     def node_has_component_data(
         self, node: UnifiedTreeNode, target: EvictLayer = EvictLayer.DEVICE

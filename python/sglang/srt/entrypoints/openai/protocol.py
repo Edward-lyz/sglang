@@ -394,6 +394,10 @@ class CompletionRequest(BaseModel):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+    # For AttentionStore (AS) secondary cache
+    kv_transfer_params: Optional[KVTransferParams] = None
+    kv_cache_params: Optional[KVCacheParams] = None
+
 
     @field_validator("max_tokens")
     @classmethod

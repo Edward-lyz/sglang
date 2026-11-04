@@ -259,6 +259,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         metadata: TRTLLMMHAMetadata,
         req_pool_indices: torch.Tensor,
         cache_seqlens: torch.Tensor,
+        cache_locs_are_physical: bool = False,
     ):
         """Build the page table on-device from per-request KV lengths (no sync).
 
@@ -278,7 +279,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             page_size=self.page_size,
             swa_page_table=metadata.swa_page_table if has_swa else None,
             full_to_swa=(
-                self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None
+                None
+                if cache_locs_are_physical
+                else (self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None)
             ),
         )
 
@@ -291,8 +294,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self._swa_kv_pool is not None:
             _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
             if is_swa:
-                return self._swa_kv_pool.translate_loc_from_full_to_swa(
+                return (
                     forward_batch.out_cache_loc
+                    if forward_batch.out_cache_loc_is_physical
+                    else self._swa_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
                 )
         return forward_batch.out_cache_loc
 
@@ -936,7 +943,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else None
         )
         self._fill_page_table_device(
-            metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
+            metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32,
+            cache_locs_are_physical=forward_batch.out_cache_loc_is_physical,
         )
 
         if self._needs_encoder_only_expand(forward_batch.forward_mode, metadata):
@@ -949,7 +957,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.encoder_page_table = metadata.page_table[row_map]
 
         # int64 scatter index (unlike the int32 read page table above).
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+        if (
+            self.use_sliding_window_kv_pool
+            and forward_batch.out_cache_loc is not None
+            and not forward_batch.out_cache_loc_is_physical
+        ):
             metadata.swa_out_cache_loc = (
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc

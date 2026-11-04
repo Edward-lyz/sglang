@@ -1900,9 +1900,40 @@ class KVCacheConfigurator:
                 intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
+                per_slot = per_req + replayssm_ring_per_req
                 server_args.override(
                     "mamba_pool.memory_budget",
-                    max_mamba_cache_size=int((mamba_budget_bytes - per_req) // per_req),
+                    max_mamba_cache_size=int(
+                        (mamba_budget_bytes - per_slot) // per_slot
+                    ),
+                )
+
+        # Sync the solved pool size across PP ranks. Each PP rank hosts a
+        # different number of mamba/KDA layers, so the memory-budget solve above
+        # yields different values per rank. token_capacity is already synced with
+        # an all-reduce MIN (see resolve_token_capacity), but the mamba pool size
+        # was not, which lets the per-rank admission budget (rem_mamba_slots in
+        # schedule_policy) diverge and PP ranks build different-sized batches.
+        if server_args.pp_size > 1 and server_args.max_mamba_cache_size is not None:
+            synced_mamba_cache_size = torch.tensor(
+                int(server_args.max_mamba_cache_size), dtype=torch.int64
+            )
+            torch.distributed.all_reduce(
+                synced_mamba_cache_size,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_world_group().cpu_group,
+            )
+            if int(synced_mamba_cache_size.item()) != int(
+                server_args.max_mamba_cache_size
+            ):
+                logger.warning(
+                    "max_mamba_cache_size synced across PP ranks: %d -> %d",
+                    server_args.max_mamba_cache_size,
+                    int(synced_mamba_cache_size.item()),
+                )
+                server_args.override(
+                    "mamba_pool.pp_sync",
+                    max_mamba_cache_size=int(synced_mamba_cache_size.item()),
                 )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.

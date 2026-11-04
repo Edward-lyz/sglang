@@ -132,11 +132,16 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
-    # MambaRadixCache may alloc mamba state before alloc KV cache
+    # A Mamba-capable cache may allocate recurrent state before KV cache.
     if req.req_pool_idx is None:
+        if not tree_cache.supports_mamba():
+            logger.warning(
+                f"Current cache type {type(tree_cache).__name__}, kv cache has been released for request {req.rid}"
+            )
+            return
         assert (
             tree_cache.supports_mamba()
-        ), "Only MambaRadixCache allow freeing before alloc"
+        ), "Only Mamba-capable caches allow freeing before KV allocation"
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_allocator.free(

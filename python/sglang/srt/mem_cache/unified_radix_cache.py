@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     CacheTransferPhase,
     ComponentData,
     ComponentType,
+    ComponentValueTransaction,
     EvictLayer,
     FullComponent,
     LRURefreshPhase,
@@ -52,6 +53,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     PrepareLoadBackResult,
     SWAComponent,
     TreeComponent,
+    UnifiedInsertResult,
     get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.utils import (
@@ -383,6 +385,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
+    def component_value_transaction(self) -> ComponentValueTransaction:
+        """Start a rollback-safe transaction for external component values."""
+        return ComponentValueTransaction(self.components)
+
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
         for group in (self.attn_cp_group, self.attn_tp_group):
@@ -603,9 +609,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             full_kv_hit_length,
         )
 
-    def insert(self, params: InsertParams) -> InsertResult:
+    def insert(
+        self,
+        params: InsertParams,
+        *,
+        value_transaction: Optional[ComponentValueTransaction] = None,
+    ) -> InsertResult:
+        """Insert a prefix into the unified cache."""
+        result = UnifiedInsertResult(
+            prefix_len=0,
+            transaction=value_transaction,
+        )
         if self.disable:
-            return InsertResult(prefix_len=0)
+            return result
 
         key = params.key
         value = params.value
@@ -616,8 +632,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        result = self._insert_helper(self.root_node, key, value, params)
-        return result
+        if value_transaction is not None:
+            if self.is_eagle:
+                raise ValueError("Component value transactions do not support EAGLE")
+            full_allocation = value_transaction.allocation(BASE_COMPONENT_TYPE)
+            if full_allocation is None:
+                raise ValueError("Transaction has no Full component value")
+            expected_full_values = max(0, len(value) - params.prev_prefix_len)
+            if len(full_allocation.value) != expected_full_values:
+                raise ValueError(
+                    "Full component allocation does not match the insert suffix: "
+                    f"allocated={len(full_allocation.value)}, "
+                    f"expected={expected_full_values}"
+                )
+            if params.mamba_value is not None:
+                mamba_allocation = value_transaction.allocation(ComponentType.MAMBA)
+                if (
+                    mamba_allocation is None
+                    or mamba_allocation.value is not params.mamba_value
+                ):
+                    raise ValueError(
+                        "Mamba component allocation does not match the insert value"
+                    )
+
+        return self._insert_helper(self.root_node, key, value, params, result)
 
     @property
     def is_write_back(self) -> bool:
@@ -1168,14 +1206,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         key: RadixKey,
         value: torch.Tensor,
         params: InsertParams,
+        result: Optional[UnifiedInsertResult] = None,
     ) -> InsertResult:
+        if result is None:
+            result = UnifiedInsertResult(prefix_len=0)
+
+        def consume_full_through(prefix_length: int) -> None:
+            if result.transaction is None:
+                return
+            consumed = max(0, prefix_length - params.prev_prefix_len)
+            result.consume_component_value(BASE_COMPONENT_TYPE, consumed)
+
         priority = params.priority
         if priority is None:
             priority = 0
         self._touch_node(node)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return InsertResult(prefix_len=0, mamba_exist=True)
+            result.mamba_exist = True
+            return result
 
         child_key = key.child_key(self.page_size)
         total_prefix_length = 0
@@ -1223,6 +1272,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             self._inc_hit_count(node, params.chunked)
             total_prefix_length += prefix_len
+            consume_full_through(total_prefix_length)
             key = key[prefix_len:]
             value = value[prefix_len:]
             if len(key):
@@ -1234,14 +1284,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # only a tombstone for this span (e.g. the whole leaf is outside the SWA
         # window). Materialize it anyway so the Full KV stays cacheable.
         if len(key):
+            suffix_len = len(key)
             target_node = self._add_new_node(node, key, value, priority=priority)
+            consume_full_through(total_prefix_length + suffix_len)
             is_new_leaf = True
         else:
             target_node = node
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
-        result = InsertResult(prefix_len=total_prefix_length)
+        result.prefix_len = total_prefix_length
         for component in self._components_tuple:
             component.commit_insert_component_data(
                 node=target_node,

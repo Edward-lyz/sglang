@@ -619,6 +619,20 @@ class PrefillAdder:
 
         return available_and_evictable - self.cur_rem_token_offset
 
+    def _log_evictable_size(self) -> int:
+        """Evictable size for debug logging only.
+
+        `tree_cache.evictable_size()` is NotImplementedError on split-pool caches
+        (MambaRadixCache / SWARadixCache), which expose full_/mamba_/swa_ variants
+        instead. Mirror the `rem_total_tokens` branching so logging never crashes.
+        """
+        if self.is_all_swa:
+            return self.tree_cache.swa_evictable_size()
+        elif self.is_hybrid_swa or self.is_hybrid_ssm_cache:
+            return self.tree_cache.full_evictable_size()
+        else:
+            return self.tree_cache.evictable_size()
+
     def _swa_budget_for_req(
         self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
     ) -> int:

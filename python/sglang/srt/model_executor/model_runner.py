@@ -398,6 +398,10 @@ class ModelRunner:
         self.init_weight_updater()
         self.init_weight_exporter()
 
+        self.model_forward = (
+            self.model if envs.AIAK_ENABLE_MSIT_TRACE.get() else self.model.forward
+        )
+
     def _initialize_elastic_ep_joiner(self) -> None:
         if not (
             self.server_args.elastic_ep_backend is not None
@@ -1536,6 +1540,11 @@ class ModelRunner:
             # global_dp_buffer_len / padded token counts that graph eligibility
             # and the collectives depend on.
             self._prepare_eager_forward_batch(forward_batch)
+
+            if pp_proxy_tensors is not None:
+                pp_proxy_tensors._pad_pp_projected_token_rows(
+                    int(forward_batch.input_ids.shape[0])
+                )
 
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.

@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import math
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -72,6 +73,18 @@ if TYPE_CHECKING:
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
 # ForwardBatch.apply_deprecated_skip_attn_backend_init.
 _skip_attn_backend_init_warned = False
+
+
+def _mlp_sync_token_alignment(
+    *, attn_tp_size: int, forward_mode: "ForwardMode", spec_info
+) -> int:
+    """Keep target-verify padding aligned to complete speculative request rows."""
+    if forward_mode.is_target_verify() and spec_info is not None:
+        tokens_per_req = int(getattr(spec_info, "num_tokens_per_req", 0))
+        if tokens_per_req > 0:
+            return math.lcm(attn_tp_size, tokens_per_req)
+    return attn_tp_size
+
 
 _is_npu = is_npu()
 
@@ -338,7 +351,7 @@ class NgramEmbeddingInfo:
         column_starts=None,
         req_lens=None,
         skip_token_table_update=None,
-    ) -> NgramEmbeddingInfo:
+    ) -> "NgramEmbeddingInfo":
         info = cls(
             token_table=token_table,
             column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
@@ -353,7 +366,8 @@ class NgramEmbeddingInfo:
             info.req_lens[:] = req_lens
         return info
 
-    def slice(self, bs: int) -> NgramEmbeddingInfo:
+    def slice(self, bs: int) -> "NgramEmbeddingInfo":
+        """Return an embedding info restricted to the first ``bs`` requests."""
         return NgramEmbeddingInfo(
             token_table=self.token_table,
             column_starts=self.column_starts[:bs],
@@ -387,6 +401,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     out_cache_loc: torch.Tensor
     # The sum of all sequence lengths
     seq_lens_sum: int
+    out_cache_loc_is_physical: bool = False
 
     # === Borrowed from ScheduleBatch: GPU tensors (cross-stream; clone targets for stream isolation) ===
     # FIXME(lsyin): these are currently aliased by reference from ScheduleBatch. Once
@@ -547,7 +562,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For two-batch overlap
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_padded_len: Optional[int] = None
-    tbo_children: Optional[List[ForwardBatch]] = None
+    tbo_children: Optional[List["ForwardBatch"]] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
@@ -1191,11 +1206,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
+        token_alignment = _mlp_sync_token_alignment(
+            attn_tp_size=attn_tp_size,
+            forward_mode=self.forward_mode,
+            spec_info=self.spec_info,
+        )
 
         for i in range(sync_group_size):
-            # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
+            # Target verify needs complete fixed-width request rows as well as
+            # attention-TP reduce-scatter alignment.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], token_alignment)
 
         # make sure that each rank has the same number of tokens to do collective communication.
         # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
@@ -1607,15 +1628,59 @@ def build_inner_fb_view(
 
 
 class PPProxyTensors:
+    """Carry token-row-aligned model intermediates across PP stages."""
+
     # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
     tensors: Dict[str, torch.Tensor]
 
     def __init__(self, tensors):
+        """Initialize a PP proxy from token-row-aligned tensor fields."""
+
         # manually define this function, so that
         # Dynamo knows `IntermediateTensors()` comes from this file.
         # Otherwise, dataclass will generate this function by evaluating
         # a string, and we will lose the information about the source file.
         self.tensors = tensors
+        self._pp_projected_token_rows: Optional[int] = None
+
+    def _mark_pp_projected_token_rows(self, num_rows: int) -> None:
+        """Mark this proxy as compact real-token rows awaiting local padding."""
+        if num_rows < 0:
+            raise RuntimeError(f"invalid projected PP token rows: {num_rows}")
+        for key, value in self.tensors.items():
+            if not isinstance(value, torch.Tensor) or value.ndim == 0:
+                continue
+            if value.shape[0] != num_rows:
+                raise RuntimeError(
+                    "projected PP proxy tensor is not compact: "
+                    f"key={key} rows={value.shape[0]} expected={num_rows}"
+                )
+        self._pp_projected_token_rows = num_rows
+
+    def _pad_pp_projected_token_rows(self, target_rows: int) -> None:
+        """Append zero tail rows to match the prepared local ForwardBatch."""
+        current_rows = self._pp_projected_token_rows
+        if current_rows is None:
+            return
+        if target_rows < current_rows:
+            raise RuntimeError(
+                "local PP padded token rows are shorter than the survivor proxy: "
+                f"target={target_rows} survivor={current_rows}"
+            )
+        for key, value in tuple(self.tensors.items()):
+            if not isinstance(value, torch.Tensor) or value.ndim == 0:
+                continue
+            if value.shape[0] != current_rows:
+                raise RuntimeError(
+                    "projected PP proxy tensor row count changed before padding: "
+                    f"key={key} rows={value.shape[0]} expected={current_rows}"
+                )
+            if target_rows != current_rows:
+                padding = value.new_zeros(
+                    (target_rows - current_rows, *value.shape[1:])
+                )
+                self.tensors[key] = torch.cat((value, padding), dim=0)
+        self._pp_projected_token_rows = target_rows
 
     def __getitem__(self, key: Union[str, slice]):
         if isinstance(key, str):

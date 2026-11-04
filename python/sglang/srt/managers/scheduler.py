@@ -2198,6 +2198,12 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # Unpack AttentionStore parameters to Req
+            if self.enable_asradix_cache:
+                req.as_block_hashs = recv_req.as_block_hashs
+                req.as_kv_cache_params = recv_req.as_kv_cache_params
+                req.as_max_hit_host_ip = recv_req.as_max_hit_host_ip or []
+                req.as_max_hit_token_len = recv_req.as_max_hit_token_len or []
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (

@@ -369,6 +369,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
 
+    def _release_draft_mapping(self, decode_req: DecodeRequest) -> None:
+        """Release Draft SWA pages acquired before KV transfer completes."""
+        req_pool_idx = decode_req.req.req_pool_idx
+        draft_worker = getattr(self.scheduler, "draft_worker", None)
+        release = getattr(draft_worker, "release_draft_kv", None)
+        if req_pool_idx is not None and callable(release):
+            release(req_pool_idx=int(req_pool_idx))
+
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
             isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
@@ -925,6 +933,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
+                self._release_draft_mapping(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -1194,11 +1203,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                decode_prefix_len=total_prefix_len,
+            draft_dst_kv_indices = None
+            draft_slot_map = getattr(
+                self.draft_token_to_kv_pool, "slot_map", None
             )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
@@ -1667,6 +1674,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self._retired_metadata: List[DecodeRequest] = []
+
+    def _release_draft_mapping(self, decode_req: DecodeRequest) -> None:
+        """Release draft SWA pages when a transferred request is discarded."""
+        req_pool_idx = decode_req.req.req_pool_idx
+        draft_worker = getattr(self.scheduler, "draft_worker", None)
+        release = getattr(draft_worker, "release_draft_kv", None)
+        if req_pool_idx is not None and callable(release):
+            release(req_pool_idx=int(req_pool_idx))
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -1919,6 +1935,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                self._release_draft_mapping(decode_req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 decode_req.kv_receiver.clear()
@@ -1946,6 +1963,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                             decode_req.req
                         )
                     self._clean_hicache_prefetch_resources(decode_req)
+                    self._release_draft_mapping(decode_req)
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                     if self.scheduler.metrics_reporter.enable_metrics:
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()

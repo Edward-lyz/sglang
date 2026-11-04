@@ -7639,6 +7639,31 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.enable_asradix_cache and self.disable_radix_cache:
+            raise ValueError(
+                "AttentionStore (asradix_cache) requires radix cache to be enabled. "
+                "Please do not use --disable-radix-cache together with --enable-asradix-cache."
+            )
+
+        if self.enable_asradix_cache and self.enable_hierarchical_cache:
+            raise ValueError(
+                "HiCache and AttentionStore cannot be enabled simultaneously. "
+                "Please use only one of them."
+            )
+
+        if self.enable_asradix_cache and self.disaggregation_mode == "decode":
+            raise ValueError(
+                "AttentionStore (asradix_cache) is not supported on disaggregation decode instances. "
+                "Please disable --enable-asradix-cache for decode (D) instances."
+            )
+
+        if self.enable_asradix_cache:
+            if self.page_size <= 1:
+                raise ValueError(
+                    "AS KV R/W requires page_size > 1. "
+                    f"Current page_size is {self.page_size}."
+                )
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(

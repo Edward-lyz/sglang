@@ -212,6 +212,8 @@ class GenerateReqInput:
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # Skip radix cache insertion for internal requests (warmup/health) to avoid tree pollution.
+    skip_radix_cache_insert: bool = False
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
@@ -303,6 +305,10 @@ class GenerateReqInput:
     # For Unlimited-OCR
     images_config: Optional[dict] = None
 
+    # AttentionStore (AS) secondary cache parameters
+    as_kv_cache_params: Optional[Union[List[dict], dict]] = None
+    as_max_hit_host_ip: Optional[Union[List[List[str]], List[str]]] = None
+    as_max_hit_token_len: Optional[Union[List[List[int]], List[int]]] = None
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
@@ -462,6 +468,7 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_as_params(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -690,6 +697,69 @@ class GenerateReqInput:
         elif isinstance(self.decode_tp_size, list):
             self.decode_tp_size = self.decode_tp_size * self.parallel_sample_num
 
+    def _normalize_as_params(self, num):
+        """Normalize AttentionStore parameters for batch processing."""
+        if self.as_kv_cache_params is None:
+            self.as_kv_cache_params = [None] * num
+        elif not isinstance(self.as_kv_cache_params, list):
+            self.as_kv_cache_params = [self.as_kv_cache_params] * num
+        else:
+            if len(self.as_kv_cache_params) == self.batch_size:
+                self.as_kv_cache_params = (
+                    self.as_kv_cache_params * self.parallel_sample_num
+                )
+            elif len(self.as_kv_cache_params) == num:
+                pass
+            else:
+                raise ValueError(
+                    "The length of as_kv_cache_params should match the batch size "
+                    "or expanded batch size."
+                )
+
+        if self.as_max_hit_host_ip is None or not self.as_max_hit_host_ip:
+            self.as_max_hit_host_ip = [None] * num
+        elif not isinstance(self.as_max_hit_host_ip[0], list):
+            # Single request: List[str] → wrap as batch
+            self.as_max_hit_host_ip = [self.as_max_hit_host_ip] * num
+        else:
+            if len(self.as_max_hit_host_ip) == self.batch_size:
+                self.as_max_hit_host_ip = (
+                    self.as_max_hit_host_ip * self.parallel_sample_num
+                )
+            elif len(self.as_max_hit_host_ip) == num:
+                pass
+            else:
+                raise ValueError(
+                    "The length of as_max_hit_host_ip should match the batch size "
+                    "or expanded batch size."
+                )
+
+        if self.as_max_hit_token_len is None or not self.as_max_hit_token_len:
+            self.as_max_hit_token_len = [None] * num
+        elif not isinstance(self.as_max_hit_token_len[0], list):
+            # Single request: List[int] → wrap as batch
+            self.as_max_hit_token_len = [self.as_max_hit_token_len] * num
+        else:
+            if len(self.as_max_hit_token_len) == self.batch_size:
+                self.as_max_hit_token_len = (
+                    self.as_max_hit_token_len * self.parallel_sample_num
+                )
+            elif len(self.as_max_hit_token_len) == num:
+                pass
+            else:
+                raise ValueError(
+                    "The length of as_max_hit_token_len should match the batch size "
+                    "or expanded batch size."
+                )
+
+    def _validate_session_params(self):
+        """Validate that session parameters are properly formatted."""
+        if self.session_params is not None:
+            if not isinstance(self.session_params, dict) and not isinstance(
+                self.session_params[0], dict
+            ):
+                raise ValueError("Session params must be a dict or a list of dicts.")
+
     def _get_positional_embed_overrides_item(
         self, i: int
     ) -> Optional[PositionalEmbeds]:
@@ -769,12 +839,29 @@ class GenerateReqInput:
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
+            skip_radix_cache_insert=self.skip_radix_cache_insert,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
             received_time=self.received_time,
+            # AttentionStore parameters (normalized by _normalize_as_params)
+            as_kv_cache_params=(
+                self.as_kv_cache_params[i]
+                if self.as_kv_cache_params is not None
+                else None
+            ),
+            as_max_hit_host_ip=(
+                self.as_max_hit_host_ip[i]
+                if self.as_max_hit_host_ip is not None
+                else None
+            ),
+            as_max_hit_token_len=(
+                self.as_max_hit_token_len[i]
+                if self.as_max_hit_token_len is not None
+                else None
+            ),
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
                 if self.multi_item_delimiter_indices is not None
@@ -858,6 +945,13 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
+    # Skip inserting this request's KV into the radix cache (warmup / health-check fake-transfer reqs).
+    skip_radix_cache_insert: bool = False
+
+    # PP admission decision relay: PP0 decides, downstream ranks follow via this
+    # field instead of recomputing (avoids cross-rank divergence). None=undecided.
+    _pp_admission_decision: Optional[bool] = None
+
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
     # Whether to return entropy
@@ -891,6 +985,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
         self.mm_data_mooncake = unwrap_from_pickle(self.mm_data_mooncake)
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
+    # AttentionStore (AS) secondary cache parameters
+    as_block_hashs: Optional[Any] = None  # Generated by TokenizerManager
+    as_kv_cache_params: Optional[dict] = None  # From request
+    as_max_hit_host_ip: Optional[List[str]] = None  # From request
+    as_max_hit_token_len: Optional[List[int]] = None  # From request
 
 class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized requests
@@ -1417,6 +1516,11 @@ class ClearHiCacheReqOutput(BaseReq, kw_only=True):
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
+    # If True, skip the "no pending requests" gate and best-effort evict all
+    # currently evictable prefix tree blocks (same semantics as the per-step
+    # eviction in run_batch). Used by /clear_all_cache to work even during
+    # live traffic. Default False preserves the original /flush_cache behavior.
+    evict_evictable: bool = False
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):

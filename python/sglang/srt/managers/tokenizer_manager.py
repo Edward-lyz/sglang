@@ -1209,6 +1209,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                skip_radix_cache_insert=obj.skip_radix_cache_insert,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
@@ -1228,10 +1229,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
+                task_results=obj.task_results,
+                # AttentionStore parameters
+                as_kv_cache_params=obj.as_kv_cache_params,
+                as_max_hit_host_ip=obj.as_max_hit_host_ip,
+                as_max_hit_token_len=obj.as_max_hit_token_len,
+                continuation_token_ids=obj.continuation_token_ids,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 mm_data_mooncake=obj.mm_data_mooncake,
                 encoder_urls=obj.encoder_urls,
+                trace_config=obj.trace_config,
             )
+
+            # Generate as_block_hashs from input_ids
+            if self.server_args.enable_asradix_cache:
+                try:
+                    from attentionstore_sdk.sdk import Tokens
+                except ImportError:
+                    logger.warning(
+                        "attentionstore_sdk not available, skipping as_block_hashs generation"
+                    )
+                else:
+                    try:
+                        from sglang.srt.mem_cache.storage.asradix.types import (
+                            AS_BLOCK_SIZE,
+                        )
+
+                        tokenized_obj.as_block_hashs = Tokens(input_ids, AS_BLOCK_SIZE)
+                    except Exception as e:
+                        logger.warning(
+                            "failed to generate as_block_hashs, skipping AS matching: %s",
+                            e,
+                        )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
             positional_embed_overrides = obj.positional_embed_overrides

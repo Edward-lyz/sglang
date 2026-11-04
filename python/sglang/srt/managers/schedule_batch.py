@@ -67,7 +67,7 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -746,6 +746,7 @@ class Req(ReqDllmMixin):
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        skip_radix_cache_insert: bool = False,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -920,6 +921,19 @@ class Req(ReqDllmMixin):
         self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # AttentionStore (AS) parameters
+        self.as_block_hashs = None
+        self.as_kv_cache_params = None
+        self.as_max_hit_host_ip: list = []
+        self.as_max_hit_token_len: list = []
+        self.ever_read_as: bool = False
+        # An AS read only counts once an admission locks the loaded prefix:
+        # a rejected admission leaves it evictable, and a rank that latched
+        # ever_read_as on it would then match a shorter prefix than its peers.
+        self.as_read_pending_lock: bool = False
+        # A short/failed AttentionStore read is fatal for this request under PP;
+        # allowing forward with a different prefix would desynchronize stages.
+        self._as_cache_read_abort_reason: Optional[str] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1058,7 +1072,7 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        self.skip_radix_cache_insert = skip_radix_cache_insert
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
@@ -1529,6 +1543,11 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
+        # The loaded prefix is gone, so a re-prefill must read AttentionStore
+        # again; under PP that joint match is also what caps every stage's local
+        # prefix down to the same absolute terminal block.
+        self.ever_read_as = False
+        self.as_read_pending_lock = False
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.skip_lock_node_ids = {}
@@ -1691,8 +1710,31 @@ class Req(ReqDllmMixin):
 
 class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_mask: bool
-    track_index: int
+    track_index: Union[int, torch.Tensor]
     track_seqlen: int
+
+
+def _latest_checkpoint_in_extend(
+    prefix_len: int, extend_len: int, checkpoint_size: int
+) -> Optional[int]:
+    """Return the deepest absolute checkpoint newly crossed by this extend."""
+    extend_end = prefix_len + extend_len
+    checkpoint = (extend_end // checkpoint_size) * checkpoint_size
+    return checkpoint if checkpoint > prefix_len else None
+
+
+def _can_track_exact_checkpoint(
+    prefix_len: int,
+    extend_len: int,
+    checkpoint: int,
+    state_chunk_size: int,
+    conv_state_len: int,
+) -> bool:
+    """Require both recurrent and conv snapshots to exist in this extend."""
+    relative_len = checkpoint - prefix_len
+    return max(1, conv_state_len) <= relative_len <= extend_len and (
+        relative_len == extend_len or relative_len % state_chunk_size == 0
+    )
 
 
 def mamba_lazy_spec_in_window(
@@ -2429,21 +2471,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if server_args.enable_mamba_extra_buffer():
-            self.mamba_track_indices = torch.tensor(
-                mamba_track_indices_cpu,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            self.mamba_track_mask = torch.tensor(
-                mamba_track_mask_cpu,
-                dtype=torch.bool,
-                device=self.device,
-            )
-            self.mamba_track_seqlens = torch.tensor(
-                mamba_track_seqlens_cpu,
-                dtype=torch.int64,
-                device=self.device,
-            )
+            if mamba_track_indices_cpu and isinstance(
+                mamba_track_indices_cpu[0], torch.Tensor
+            ):
+                # KDA AS tracking uses the same device slot snapshots. Flags and
+                # lengths are already CPU values; pinned uploads preserve stream
+                # order without draining prior GPU work on the scheduler thread.
+                self.mamba_track_indices = torch.stack(mamba_track_indices_cpu).to(
+                    device=self.device, dtype=torch.int64
+                )
+                self.mamba_track_mask = torch.tensor(
+                    mamba_track_mask_cpu, dtype=torch.bool, pin_memory=_pin
+                ).to(device=self.device, non_blocking=True)
+                self.mamba_track_seqlens = torch.tensor(
+                    mamba_track_seqlens_cpu, dtype=torch.int64, pin_memory=_pin
+                ).to(device=self.device, non_blocking=True)
+            else:
+                self.mamba_track_indices = torch.tensor(
+                    mamba_track_indices_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self.mamba_track_mask = torch.tensor(
+                    mamba_track_mask_cpu,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                self.mamba_track_seqlens = torch.tensor(
+                    mamba_track_seqlens_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.mamba_pool_idx is not None for req in reqs):
@@ -2463,53 +2521,64 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
         server_args = get_server_args()
-        mamba_cache_chunk_size = server_args.mamba_cache_chunk_size
+        checkpoint_chunk_size = server_args.mamba_cache_chunk_size
+        from sglang.srt.configs.hybrid_arch import uses_kda_attentionstore_checkpoints
 
-        def _force_track_h(i: int) -> int:
-            assert i % mamba_cache_chunk_size == 0
-            # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
-            # 1) aligned with mamba_cache_chunk_size-> retrieve from last_recurrent_state
-            #    a) is the last position -> retrieve from last_recurrent_state
-            #    b) is NOT the last position -> retrieve from h
-            # 2) unaligned with mamba_cache_chunk_size -> retrieve from h
-            # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
-            # to force the math calculation to retrieve the correct mamba state from h.
-            return i + 1
+        is_kda_attentionstore = uses_kda_attentionstore_checkpoints(
+            server_args, self.model_config
+        )
+        if is_kda_attentionstore:
+            from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE
+            from sglang.srt.mem_cache.storage.asradix.types import AS_BLOCK_SIZE
 
-        mask = req.extend_range.length >= mamba_cache_chunk_size
-        track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+            checkpoint_chunk_size = AS_BLOCK_SIZE
+            conv_state_len = self.req_to_token_pool.mamba_pool.mamba_cache.conv[
+                0
+            ].shape[-2]
+
+        prefix_len = len(req.prefix_indices)
+        extend_end = prefix_len + req.extend_range.length
+
+        # KDA AttentionStore checkpoints are absolute 256-token boundaries,
+        # independent of how dynamic chunked prefill partitions this request.
+        # A short chunk can still cross a boundary, so do not key the mask only
+        # on extend_range.length.
+        if is_kda_attentionstore:
+            checkpoint_target = _latest_checkpoint_in_extend(
+                prefix_len, req.extend_range.length, checkpoint_chunk_size
+            )
+            mask = checkpoint_target is not None and _can_track_exact_checkpoint(
+                prefix_len,
+                req.extend_range.length,
+                checkpoint_target,
+                CHUNK_SIZE,
+                conv_state_len,
+            )
+        else:
+            checkpoint_target = None
+            mask = req.extend_range.length >= checkpoint_chunk_size
+
+        track_slot = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+        # Snapshot the existing device slot on this stream. Keep it on device
+        # through batch construction; no new slot or checkpoint is published.
+        track_index = track_slot.clone() if is_kda_attentionstore else track_slot.item()
         mamba_track_seqlen = -1
         if mask:
-            # mamba_track_seqlen is used to calculate the indices to track in
-            # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
-            # fact that the ssm state between aligned and non-aligned are retrieved differently,
-            # if 1) last pos and 2) is aligned, then retrieved from the last_recurrent_state,
-            # otherwise retrieved from h (i.e. unaligned).
-            # We need to pass the non-aligned seqlen to the calculation. Even though
-            # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-            mamba_track_seqlen = len(req.prefix_indices) + req.extend_range.length
-
-            # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
-            # mamba radix cache to track which seqlen this mamba state should store at.
-            mamba_track_seqlen_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_range.length // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
-            )
-
-            # mamba_track_fla_chunk_aligned is the aligned seqlen based on mamba_cache_chunk_size
-            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
-            # page_size > mamba_cache_chunk_size, we need to force the math calculation to retrieve the correct mamba state from h
-            # by _force_track_h()
-            mamba_track_fla_chunk_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_range.length // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
-            )
-            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
-                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
+            if is_kda_attentionstore:
+                # Pass the exact absolute checkpoint to the KDA backend. It maps
+                # this to either the final recurrent state or the matching
+                # intermediate 64-token h row.
+                mamba_track_seqlen = checkpoint_target
+                mamba_track_seqlen_aligned = checkpoint_target
+            else:
+                # Legacy Mamba/GDN semantics: pass the current extend end and
+                # separately record the last cache-chunk-aligned state.
+                mamba_track_seqlen = extend_end
+                mamba_track_seqlen_aligned = (
+                    prefix_len
+                    + (req.extend_range.length // checkpoint_chunk_size)
+                    * checkpoint_chunk_size
+                )
 
             # In lazy mode, skip the swap — the second ping-pong slot is not
             # allocated yet; it will be allocated on demand at the track boundary
@@ -2520,22 +2589,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.mamba_next_track_idx
                     )
                 )
+
             if req.mamba_branching_seqlen is not None:
-                # track branching point in this forward if the branching point
-                # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
-                    req.mamba_branching_seqlen - len(req.prefix_indices)
-                ) % mamba_cache_chunk_size == 0
+                    req.mamba_branching_seqlen % checkpoint_chunk_size == 0
+                    if is_kda_attentionstore
+                    else (req.mamba_branching_seqlen - prefix_len)
+                    % checkpoint_chunk_size
+                    == 0
+                )
                 if (
-                    req.mamba_branching_seqlen > len(req.prefix_indices)
+                    req.mamba_branching_seqlen > prefix_len
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
+                    and (
+                        not is_kda_attentionstore
+                        or _can_track_exact_checkpoint(
+                            prefix_len,
+                            req.extend_range.length,
+                            req.mamba_branching_seqlen,
+                            CHUNK_SIZE,
+                            conv_state_len,
+                        )
+                    )
                 ):
-                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                    # See _force_track_h() for more details.
-                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
+                    mamba_track_seqlen = req.mamba_branching_seqlen
+                    if not is_kda_attentionstore:
+                        # Legacy backends use an unaligned length to select h
+                        # instead of the final recurrent state.
+                        assert mamba_track_seqlen % checkpoint_chunk_size == 0
+                        mamba_track_seqlen += 1
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(
@@ -3181,5 +3266,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
 
 class NextBatchPlan(msgspec.Struct):
+    """Describe the next runnable batch and request-local PP aborts."""
+
     batch_to_run: Optional[ScheduleBatch]
     running_batch: ScheduleBatch
+    pp_local_aborts: Tuple[Dict[str, Any], ...] = ()

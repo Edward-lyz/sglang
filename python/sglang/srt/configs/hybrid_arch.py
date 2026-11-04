@@ -108,6 +108,20 @@ def kimi_linear_config(model_config: ModelConfig):
     return None
 
 
+def uses_kda_attentionstore_checkpoints(
+    server_args: Any, model_config: ModelConfig
+) -> bool:
+    """Resolve exact AS checkpoint tracking consistently across runtime stages."""
+    if not server_args.enable_asradix_cache or server_args.disable_radix_cache:
+        return False
+    if kimi_linear_config(model_config) is not None:
+        return True
+    spec = linear_attn_model_spec(model_config)
+    return spec is not None and spec.backend_class_name == (
+        "sglang.srt.layers.attention.linear.kda_backend.KDAAttnBackend"
+    )
+
+
 def linear_attn_model_spec(model_config: ModelConfig):
     result = _get_linear_attn_registry_result(model_config)
     return result[0] if result else None

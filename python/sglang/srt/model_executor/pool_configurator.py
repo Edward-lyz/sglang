@@ -173,10 +173,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = scale_kv_cell_size_per_token_for_dflash(
-                    target_cell_size_per_token=self._cell_size,
-                    target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers),
+                minimal_draft_budget = self._minimal_dspark_prefill_draft_budget_bytes(
+                    kvc, int(draft_num_layers)
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
@@ -298,12 +296,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        effective_bytes = available_bytes - self._draft_fixed_budget_bytes
         max_total_num_tokens = (
-            available_bytes // self._cell_size
+            effective_bytes // self._cell_size
             if self._cell_size
             else self._zero_kv_max_tokens
         )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        if self._draft_fixed_budget_bytes > 0 and self._draft_cell_size > 0:
+            merged_cell = self._cell_size + self._draft_cell_size
+            old_draft_bytes = (available_bytes // merged_cell) * self._draft_cell_size
+            reclaimed = old_draft_bytes - self._draft_fixed_budget_bytes
+            if get_parallel().tp_rank == 0:
+                logger.info(
+                    "DSpark SWA draft: reclaimed %.2f GiB for the target KV pool "
+                    "(draft pool now %.2f GiB).",
+                    reclaimed / (1 << 30),
+                    self._draft_fixed_budget_bytes / (1 << 30),
+                )
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
     def calculate_pool_sizes_from_max_tokens(
