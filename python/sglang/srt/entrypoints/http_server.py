@@ -112,6 +112,15 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
+from sglang.srt.entrypoints.warmup_sweep import (
+    claim_sweep_election,
+    mark_sweep_done,
+    reset_sweep_election,
+    resolve_sweep_lens,
+    run_prefill_sweep,
+    sweep_is_enabled,
+    wait_for_sweep_done,
+)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -157,7 +166,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
-from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.observability.func_timer import enable_func_timer, time_func_latency
 from sglang.srt.observability.trace import (
     process_tracing_init,
     set_global_trace_level,
@@ -176,6 +185,7 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.common import node_pp_rank_range
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -644,7 +654,27 @@ async def validate_json_request(raw_request: Request):
 ##### Native API endpoints #####
 
 
+def stopped_by_external():
+    """
+    Check if the stop signal is triggered by reading a signal file.
+    """
+    signal_path = os.environ.get("AIAK_STOP_SIGNAL_DIR", "/run/sglang/stop")
+    if not signal_path:
+        return False
+
+    try:
+        if os.path.exists(signal_path):
+            with open(signal_path, "r") as file:
+                return file.read().strip().lower() == "stop"
+    except Exception as e:
+        logger.info(f"Error reading stop signal file: {e}")
+
+    return False
+
+
+@app.get("/ready")
 @app.get("/health")
+@app.get("/health_forward")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """
@@ -653,6 +683,9 @@ async def health_generate(request: Request) -> Response:
     If the server is running something, this request will be ignored, so it creates zero overhead.
     If the server is not running anything, this request will be run, so we know whether the server is healthy.
     """
+    if request.url.path.rstrip("/") == "/ready" and stopped_by_external():
+        logger.warn("Server is shutting down")
+        return Response(content="Server is shutting down", status_code=507)
 
     if _global_state.tokenizer_manager.gracefully_exit:
         logger.info("Health check request received during shutdown. Returning 503.")
@@ -720,6 +753,50 @@ async def health_generate(request: Request) -> Response:
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
+
+
+@app.get("/get_instance_info")
+async def get_instance_info():
+    "Get the instance information."
+    chunked_prefill_enabled = (
+        _global_state.tokenizer_manager.server_args.chunked_prefill_size != -1
+    )
+    current_input_tokens = 0
+    for state in _global_state.tokenizer_manager.rid_to_state.values():
+        if hasattr(state, "obj") and hasattr(state.obj, "input_ids"):
+            if isinstance(state.obj.input_ids, list):
+                current_input_tokens += len(state.obj.input_ids)
+
+    max_running_requests = None
+    if _global_state.tokenizer_manager.server_args.max_running_requests:
+        max_running_requests = (
+            _global_state.tokenizer_manager.server_args.max_running_requests
+            * _global_state.tokenizer_manager.server_args.dp_size
+        )
+
+    dp_size = _global_state.tokenizer_manager.server_args.dp_size
+    nnodes = _global_state.tokenizer_manager.server_args.nnodes
+    node_rank = _global_state.tokenizer_manager.server_args.node_rank
+    dp_per_node = dp_size // nnodes
+    start = node_rank * dp_per_node
+    pp_size = _global_state.tokenizer_manager.server_args.pp_size
+    pp_rank_range = node_pp_rank_range(pp_size, nnodes, node_rank)
+
+    return {
+        "kv_role": _global_state.tokenizer_manager.server_args.disaggregation_mode,
+        "node_rank": node_rank,
+        "dp_ranks": list(range(start, start + dp_per_node)),
+        "pp_ranks": list(pp_rank_range),
+        "dp_size": dp_size,
+        "tp_size": _global_state.tokenizer_manager.server_args.tp_size,
+        "pp_size": pp_size,
+        "nnodes": nnodes,
+        "chunked_prefill_enabled": chunked_prefill_enabled,
+        "chunked_prefill_size": _global_state.tokenizer_manager.server_args.chunked_prefill_size,
+        "active_request_count": len(_global_state.tokenizer_manager.rid_to_state),
+        "max_running_requests": max_running_requests,
+        "current_input_tokens": current_input_tokens,
+    }
 
 
 @app.get("/get_model_info")
@@ -1880,20 +1957,26 @@ async def continue_generation(
 
 
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
+@time_func_latency
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
+    # Timestamp when the HTTP request is received and handed off to the tokenizer
+    tokenizer_rev_request_time = time.time()
     return await raw_request.app.state.openai_serving_completion.handle_request(
-        request, raw_request
+        request, raw_request, tokenizer_rev_request_time
     )
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
+@time_func_latency
 async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    # Timestamp when the HTTP request is received and handed off to the tokenizer
+    tokenizer_rev_request_time = time.time()
     return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+        request, raw_request, tokenizer_rev_request_time
     )
 
 
@@ -2446,6 +2529,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
         },
+        "is_warmup": True,
     }
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
@@ -2482,6 +2566,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             "max_tokens": max_new_tokens,
             "stream": False,
             "temperature": 0.0,
+            "is_warmup": True,
         }
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
@@ -2509,6 +2594,16 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            # Sweep the real prefill shapes before announcing readiness, so a
+            # load balancer watching /health does not send the first client
+            # request into the JIT/autotune window.
+            _maybe_run_prefill_sweep(
+                server_args=server_args,
+                url=url,
+                headers=headers,
+                ssl_verify=ssl_verify,
+                model_info=model_info,
+            )
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
@@ -2529,6 +2624,13 @@ def _execute_server_warmup(server_args: ServerArgs):
                     server_args.dp_size,
                 )
                 logger.info("End of disaggregation warmup")
+                _maybe_run_prefill_sweep(
+                    server_args=server_args,
+                    url=url,
+                    headers=headers,
+                    ssl_verify=ssl_verify,
+                    model_info=model_info,
+                )
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
@@ -2545,6 +2647,67 @@ def _execute_server_warmup(server_args: ServerArgs):
         return False
 
     return success
+
+
+def _maybe_run_prefill_sweep(
+    *,
+    server_args: ServerArgs,
+    url: str,
+    headers: Dict[str, str],
+    ssl_verify: Union[bool, str],
+    model_info: dict,
+) -> None:
+    """Extend the startup warmup with a sweep over realistic prefill lengths.
+
+    The minimal warmup above only proves liveness; the first real requests still
+    pay DeepGEMM JIT, attention-plan and MoE-buffer setup for their own shapes.
+    Opt in with SGLANG_WARMUP_PREFILL_LENS (see warmup_sweep.py).
+    """
+
+    if not model_info["is_generation"] or not sweep_is_enabled():
+        return
+
+    lens = resolve_sweep_lens(
+        chunked_prefill_size=server_args.chunked_prefill_size,
+        max_prefill_tokens=server_args.max_prefill_tokens,
+        page_size=server_args.page_size,
+        max_req_input_len=_global_state.tokenizer_manager.max_req_input_len,
+    )
+    if not lens:
+        return
+
+    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    timeout = warmup_timeout if warmup_timeout > 0 else 1800
+
+    # One sweep per server, even though every HTTP worker runs a warmup thread.
+    election_key = _sweep_election_key(server_args)
+    if election_key is not None and not claim_sweep_election(election_key):
+        wait_for_sweep_done(election_key, timeout=timeout)
+        return
+
+    try:
+        run_prefill_sweep(
+            url=url,
+            headers=headers,
+            ssl_verify=ssl_verify,
+            timeout=timeout,
+            dp_size=server_args.dp_size,
+            disaggregation_mode=server_args.disaggregation_mode,
+            lens=lens,
+            batch_size=max(envs.SGLANG_WARMUP_BATCH_SIZE.get(), 1),
+            vocab_size=_global_state.tokenizer_manager.model_config.vocab_size,
+        )
+    finally:
+        if election_key is not None:
+            mark_sweep_done(election_key)
+
+
+def _sweep_election_key(server_args: ServerArgs) -> Optional[str]:
+    """Key shared by every HTTP worker of this server, or None when alone."""
+
+    if server_args.tokenizer_worker_num == 1:
+        return None
+    return f"{get_main_process_id()}_{server_args.port}"
 
 
 def _wait_and_warmup(
@@ -2745,6 +2908,9 @@ def _setup_and_run_http_server(
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
             port_args, server_args, scheduler_infos[0]
         )
+        # The workers elect one sweeper among themselves via a marker file keyed
+        # by this pid; clear a stale marker in case the pid was recycled.
+        reset_sweep_election(f"{os.getpid()}_{server_args.port}")
 
     try:
         # Update logging configs

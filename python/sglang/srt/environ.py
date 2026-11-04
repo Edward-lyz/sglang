@@ -925,6 +925,15 @@ class Envs:
     # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging.
     # Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1)
+    # Extra prefill token lengths the PD startup warmup sweeps after the minimal
+    # request, shortest first, e.g. "1024,4096,16384". "auto" derives a
+    # page-aligned sweep from the prefill budget. Unset keeps the minimal
+    # 4-token warmup only. Use this to move DeepGEMM / attention / MoE kernel
+    # JIT and autotuning into startup instead of the first client requests.
+    SGLANG_WARMUP_PREFILL_LENS = EnvStr(None)
+    # Concurrent requests per DP rank for each length in the sweep above, so the
+    # warmup also covers multi-request prefill batches.
+    SGLANG_WARMUP_BATCH_SIZE = EnvInt(1)
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
@@ -1206,6 +1215,9 @@ class Envs:
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
+    # nsa
+    SGLANG_NSA_THRESHOLD_MIN_KVLEN = EnvInt(0)
+
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
@@ -1232,6 +1244,10 @@ class Envs:
     SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
+
+    # msit
+    AIAK_ENABLE_MSIT_TRACE = EnvBool(False)
+    AIAK_MSIT_TRACE_DIR = EnvStr("/workspace/wdump/")
 
 
 envs = Envs()

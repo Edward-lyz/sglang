@@ -58,6 +58,7 @@ from sglang.srt.utils.common import (
     configure_logger,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
+    node_pp_rank_range,
 )
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -621,12 +622,11 @@ class DataParallelController:
 
         scheduler_pipe_readers = []
 
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
+        pp_rank_range = node_pp_rank_range(
+            server_args.pp_size, server_args.nnodes, server_args.node_rank
         )
+        pp_size_per_node = len(pp_rank_range)
+        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
 
         nnodes_per_tp_group = nnodes_per_pp_rank
         tp_size_per_node = server_args.tp_size // nnodes_per_tp_group

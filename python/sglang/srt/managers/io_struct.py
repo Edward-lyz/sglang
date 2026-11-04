@@ -261,6 +261,9 @@ class GenerateReqInput:
     # Internal IPC endpoint of the HTTP/tokenizer worker that owns this request.
     # Used to route outputs back in multi-tokenizer mode.
     http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
+    # Deprecated: use routed_dp_rank instead
+    data_parallel_rank: Optional[int] = None
+    peer_data_parallel_rank: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False

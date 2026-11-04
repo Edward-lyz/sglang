@@ -457,6 +457,9 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
+        # Init inter-process communication
+        self.init_ipc_channels(port_args)
+
         # Init cache and memory pool
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
@@ -2547,6 +2550,11 @@ class Scheduler(
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
+            if not req.rid.startswith("HEALTH_CHECK"):
+                logger.info(
+                    f"[trace] {'' if not is_retracted else 'Retracted '}"
+                    f"Req was added to decode prealloc queue: {req.rid}"
+                )
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
             else:

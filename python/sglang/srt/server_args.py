@@ -2671,7 +2671,12 @@ class ServerArgs:
         NS("memory"),
     ] = None
 
-    # -------------------------------------------------------------------------
+    # AttentionStore (AS) secondary cache
+    enable_asradix_cache: A[
+        bool, "Enable the AttentionStore (asradix) secondary KV cache."
+    ] = False
+    per_node_gpu_num: A[int, "Number of GPUs per node for AttentionStore."] = 8
+
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------
     enable_hisparse: A[bool, "Enable hierarchical sparse attention", NS("memory")] = (
@@ -3034,6 +3039,24 @@ class ServerArgs:
         "Number of optimistic prefill forward passes that skip the bootstrap wait.",
         NS("disagg"),
     ] = 0
+    embedding_ib_device: A[
+        Optional[str],
+        "The InfiniBand device for embedding transfer via mooncake.",
+    ] = None
+    disaggregation_zmq_ports: A[
+        Optional[List[int]],
+        Arg(
+            help="Fixed ZMQ port list for KV Manager ranks on this node "
+            "(Prefill and Decode). Supports range format '30001-30008' "
+            "or comma-separated '30001,30002,30003'. "
+            "Port at index i is assigned to the rank running on GPU i.",
+            type_parser=str,
+        ),
+    ] = None
+    disaggregation_zmq_max_sockets: A[
+        int,
+        "Max number of ZMQ sockets per context for KV transfer. Default is 3000.",
+    ] = 3000
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
@@ -3070,6 +3093,25 @@ class ServerArgs:
         "When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
         NS("disagg"),
     ] = False
+    enable_task_results_pull: A[
+        bool,
+        "Enable task results pull mode for EPD.",
+    ] = False
+    require_encoder_task_results: A[
+        bool,
+        "Reject multimodal requests that carry no encoder task_results instead "
+        "of encoding them locally. Set this on the EPD decode server.",
+        NS("disagg"),
+    ] = False
+    enable_mooncake_in_zmq_mode: A[
+        bool,
+        "Enable mooncake transfer in zmq mode for EPD.",
+    ] = False
+    # Vit server for task fetching
+    vit_server_url: A[
+        Optional[str],
+        "URL of the vit-server for fetching encoding tasks.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # PD-Multiplexing
@@ -3322,6 +3364,10 @@ class ServerArgs:
     debug_tensor_dump_input_file: A[
         Optional[str], "The input filename for dumping tensors", NS("observability")
     ] = None
+    debug_tensor_dump_inject: A[
+        bool,
+        "Inject dumped tensors during forward pass for debugging.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Misc runtime features
@@ -3686,13 +3732,6 @@ class ServerArgs:
         """Resolve model/tokenizer paths backed by remote object stores."""
         if is_runai_obj_uri(self.model_path):
             ObjectStorageModel.download_and_get_path(self.model_path)
-
-        if (
-            self.tokenizer_path is not None
-            and is_runai_obj_uri(self.tokenizer_path)
-            and self.tokenizer_path != self.model_path
-        ):
-            ObjectStorageModel.download_and_get_path(self.tokenizer_path)
 
     def _handle_pd_disaggregation(self):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (

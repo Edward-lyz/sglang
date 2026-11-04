@@ -94,7 +94,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
-from sglang.srt.managers.utils import is_health_check_generate_req
+from sglang.srt.managers.utils import is_health_check_rid
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -2341,6 +2341,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
+                if not rid.startswith("HEALTH_CHECK"):
+                    logger.info(
+                        f"[trace] req {rid} finished in {meta_info['e2e_latency']:.3f}s"
+                    )
+
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
@@ -2954,7 +2959,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         pass
 
     def _handle_abort_req(self, recv_obj: AbortReq):
-        if is_health_check_generate_req(recv_obj):
+        if not recv_obj.rid.startswith("HEALTH_CHECK"):
+            logger.info(
+                f"[trace] tokenizer received aborted {recv_obj.rid} from detokenizer"
+            )
+        if is_health_check_rid(recv_obj.rid):
             return
         # Two scheduler messages can race in handle_loop for the same rid: a
         # batch output that finishes it normally (deletes rid_to_state[rid])
