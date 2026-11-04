@@ -293,7 +293,7 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            grouped_layout=self.m_indices[:m],
         )
 
 
