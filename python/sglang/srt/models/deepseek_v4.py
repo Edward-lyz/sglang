@@ -33,6 +33,9 @@ from sglang.kernels.ops.attention.dsv4 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.dsv4.wo_a_bf16_gemv import wo_a_bf16_gemv
+from sglang.kernels.ops.attention.dsv4.o_proj_mxfp8_fuse import (
+    fused_o_proj_mxfp8_swizzled_input,
+)
 from sglang.kernels.ops.attention.dsv4.wo_a_bf16_small_batch import (
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
@@ -2241,7 +2244,25 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        o, _ = self.wo_b(o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1))
+        if (
+            not isinstance(o, Mxfp8SwizzledInput)
+            and envs.SGLANG_FUSE_O_PROJ_MXFP8_QUANT.get()
+            and not get_forward().sp_active
+            and getattr(self.wo_b.quant_method, "mxfp8_dense_backend", None)
+            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+            and (
+                getattr(self.wo_b.quant_method, "use_mxfp8", False)
+                or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
+            )
+        ):
+            # Fuse op65 (o.flatten(1) strided copy) + op66 (flashinfer cute-dsl mxfp8
+            # swizzled quantize) into one Triton launch; None -> unsupported shape,
+            # fall back to the original flatten + in-wo_b quantize path.
+            fused_in = fused_o_proj_mxfp8_swizzled_input(o)
+            wo_b_input = fused_in if fused_in is not None else o.flatten(1)
+        else:
+            wo_b_input = o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1)
+        o, _ = self.wo_b(wo_b_input)
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 

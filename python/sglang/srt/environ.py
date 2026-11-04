@@ -306,6 +306,11 @@ class Envs:
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # Bitwise-exact, shape-guarded MLA o_proj wo_b-input fusion (DSV4.1 decode):
+    # fuse the strided wo_a output flatten copy + flashinfer cute-dsl mxfp8 swizzled
+    # quantize into one Triton launch feeding the unchanged vendor blockscaled GEMM.
+    # Unsupported shapes fall back to the original flatten + flashinfer path.
+    SGLANG_FUSE_O_PROJ_MXFP8_QUANT = EnvBool(False)
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
@@ -580,6 +585,9 @@ class Envs:
     # MegaMoE gate: image-token mask (input_ids == image_token_id) once per forward
     # instead of per MoE layer (exact).
     SGLANG_OPT_MEGA_GATE_IMAGE_MASK_ONCE = EnvBool(False)
+    # DSV4 fused attention-o decode: cast positions to int32 once per forward
+    # instead of one copy kernel per layer (exact).
+    SGLANG_OPT_FUSED_O_POSITIONS_I32_ONCE = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
