@@ -1109,6 +1109,8 @@ class MqaAttentionBase(nn.Module):
 
 
 class MQALayer(MqaAttentionBase):
+    """DeepSeek-V4 MQA attention: q/kv-a projections, SWA + compressed KV, indexer and output."""
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -1994,6 +1996,7 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """q projection plus every KV store of this layer; returns (q, kv for the backend or None)."""
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -2004,6 +2007,7 @@ class MQALayer(MqaAttentionBase):
 
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
+        swa_finish = None
         # vLLM #59894: the trimmed cut layer wrote this forward's KV for every row
         # (forward_kv); on the late-layer tail it only reads it.
         kv_written = (
@@ -2162,9 +2166,64 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
-            if unified:
+            # [fusion-opt] SGLANG_FUSE_CP_SWA_STORE_OVERLAP: the local-first SWA store
+            # (local norm/RoPE/fp8, CP all-gather, scatter) only needs the kv half of
+            # qkv_a, so issue it on a side stream before the q path and let its
+            # all-gather run under q_norm + wq_b; joined before the next collective.
+            swa_side = None
+            swa_stored = False
+            if (
+                use_cp
+                and not unified
+                and not kv_written
+                and envs.SGLANG_FUSE_CP_SWA_GATHER_PUSH.get()
+                and self._cp_kv_store_local_first_ok(attn_backend)
+            ):
+                # [fusion-opt] SGLANG_FUSE_CP_SWA_GATHER_PUSH: produce the SWA pages on
+                # this stream straight into the symmetric gather buffer and let copy
+                # engines push them during q_norm + wq_b and the compressor / indexer;
+                # the scatter waits at the end of this method, before attention.
+                swa_finish = self._cp_store_swa_kv_local_first(
+                    (
+                        qkv_a[..., self.q_lora_rank :]
+                        if qkv_a is not None
+                        else self.wkv(x_linear)[0]
+                    ),
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    defer=True,
+                )
+                # None: fell back to the synchronous store (already in the cache)
+                swa_stored = swa_finish is None
+            elif (
+                use_cp
+                and not unified
+                and not kv_written
+                and envs.SGLANG_FUSE_CP_SWA_STORE_OVERLAP.get()
+                and self._cp_kv_store_local_first_ok(attn_backend)
+            ):
+                kv_local = (
+                    qkv_a[..., self.q_lora_rank :]
+                    if qkv_a is not None
+                    else self.wkv(x_linear)[0]
+                )
+                swa_side = self._cp_store_swa_kv_local_first_on_side_stream(
+                    kv_local, positions, forward_batch, attn_backend
+                )
+                del kv_local
+            q_lora, q_for_wqb = self._q_norm_for_wq_b(q_lora)
+            if fused_o:
+                q, _ = self.wq_b(q_for_wqb)
+                q = q.view(-1, self.n_local_heads, self.head_dim)
+            else:
+                q = self._compute_q_b(q_for_wqb, positions, q_out)
+            if swa_finish is not None or swa_stored:
+                kv = None
+            elif swa_side is not None:
+                torch.cuda.current_stream().wait_stream(swa_side)
+                kv = None
+            elif unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
@@ -2281,6 +2340,8 @@ class MQALayer(MqaAttentionBase):
                     self.compressor,
                 )
 
+        if swa_finish is not None:
+            swa_finish()
         return q, kv
     def forward_kv(
         self,
