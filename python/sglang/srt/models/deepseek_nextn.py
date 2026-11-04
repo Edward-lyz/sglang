@@ -83,13 +83,13 @@ class DeepseekModelNextN(nn.Module):
             quant_config = None
 
         self.vocab_size = config.vocab_size
-
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            use_attn_tp_group=is_dp_attention_enabled(),
-            prefix=add_prefix("embed_tokens", prefix),
-        )
+        if not envs.SGLANG_MTP_OPT_LOAD.get():
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
+                prefix=add_prefix("embed_tokens", prefix),
+            )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -223,13 +223,14 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.model = DeepseekModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+        if not envs.SGLANG_MTP_OPT_LOAD.get():
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("model.shared_head.head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()

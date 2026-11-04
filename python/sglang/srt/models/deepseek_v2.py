@@ -3070,13 +3070,20 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.do_load_weights(weights, is_nextn)
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        if envs.SGLANG_MTP_OPT_LOAD.get():
+            return self.model.embed_tokens, self.lm_head
+        else:
+            return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        if envs.SGLANG_MTP_OPT_LOAD.get():
+            self.model.embed_tokens = embed
+            self.lm_head = head
+        else:
+            del self.model.embed_tokens.weight
+            del self.lm_head.weight
+            self.model.embed_tokens.weight = embed
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
