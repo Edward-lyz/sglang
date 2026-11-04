@@ -25,6 +25,10 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.kernels.ops.speculative.logits_cast import (
+    can_copy_bf16_to_fp32,
+    copy_bf16_to_fp32,
+)
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
@@ -58,6 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
+from sglang.srt.utils.community_opt import log_community_opt_once
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -66,6 +71,7 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
 # One-time warning latch for the prefill-CP + DP-attention idle-sync guard in
 # _get_pruned_states (avoids per-forward log spam / device syncs).
 _CP_EMPTY_EXTEND_WARNED = False
@@ -227,6 +233,7 @@ class LogitsProcessorOutput:
     # aux was computed (late-layer tail); + CPU upper bound of the True count.
     dspark_commit_mask: Optional[torch.Tensor] = None
     dspark_commit_rows_ub: Optional[int] = None
+
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
@@ -1140,11 +1147,37 @@ class LogitsProcessor(nn.Module):
             logits.shape
         ):
             assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits)
+            if self._use_triton_logits_cast(logits, logits_buffer):
+                copy_bf16_to_fp32(logits, logits_buffer)
+            else:
+                logits_buffer.copy_(logits)
             logits = logits_buffer
+        elif self._use_triton_logits_cast(logits, None):
+            out = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)
+            logits = copy_bf16_to_fp32(logits, out)
         else:
             logits = logits.float()
         return logits
+
+    @staticmethod
+    def _use_triton_logits_cast(
+        logits: torch.Tensor, buffer: Optional[torch.Tensor]
+    ) -> bool:
+        # Exact widening copy at ~3x the bandwidth of PyTorch's direct-copy kernel
+        # on the tall [rows, vocab] speculative-verify logits.
+        if not envs.SGLANG_OPT_LOGITS_CAST_TRITON.get():
+            return False
+        if logits.dtype != torch.bfloat16 or logits.shape[0] < 256:
+            return False
+        if not can_copy_bf16_to_fp32(logits, buffer):
+            return False
+        log_community_opt_once(
+            "logits_cast_triton",
+            "bf16->fp32 logits widening copy via Triton (rows=%d, vocab=%d)",
+            logits.shape[0],
+            logits.shape[1],
+        )
+        return True
 
     def _get_dllm_logits(
         self,
