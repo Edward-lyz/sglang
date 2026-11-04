@@ -257,6 +257,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.cuda_graph_custom_mask = None
+        # DSPARK verifies chain drafts with plain causal attention
+        # (EagleVerifyInput.custom_mask is always None), so the worst-case
+        # tree-mask scratch (max_num_tokens x max_context_len bool, >1 GiB at
+        # 1M context) would never be written or read; skip allocating it.
+        # get_verify_buffers_to_fill_after_draft then returns None, which the
+        # EAGLE build-tree path already handles.
+        self._needs_verify_tree_mask = (
+            not envs.SGLANG_SKIP_DSPARK_VERIFY_TREE_MASK.get()
+            or (model_runner.server_args.speculative_algorithm or "").upper()
+            != "DSPARK"
+        )
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
@@ -455,7 +466,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        if self.num_draft_tokens and not self.skip_prefill and not self.is_draft_runner:
+        if (
+            self.num_draft_tokens
+            and self._needs_verify_tree_mask
+            and not self.skip_prefill
+            and not self.is_draft_runner
+        ):
             # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
             # in-place so the gpu_only path needs no seq_lens_sum.
             self.cuda_graph_custom_mask = torch.zeros(

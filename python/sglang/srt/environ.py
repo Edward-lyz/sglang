@@ -318,6 +318,15 @@ class Envs:
     )
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
+    # Share one static output buffer for the aux-hidden concat across all
+    # captured CUDA graphs (saves ~40 MB x num_graphs in the graph pool).
+    # Set to false to fall back to a per-graph torch.cat allocation.
+    SGLANG_ENABLE_STATIC_AUX_HIDDEN_CAT_BUFFER = EnvBool(False)
+    # Skip allocating the worst-case verify tree-mask scratch
+    # (max_num_tokens x max_context_len bool, >1 GiB at 1M context) under
+    # DSPARK, whose chain verify never reads it. Set to false to restore
+    # the unconditional allocation.
+    SGLANG_SKIP_DSPARK_VERIFY_TREE_MASK = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
