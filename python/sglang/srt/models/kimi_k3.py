@@ -2837,6 +2837,16 @@ class KimiK3LinearModel(nn.Module):
             return hidden_states, aux_hidden_states
         return hidden_states
 
+    def force_weight_shard_finalize(self) -> None:
+        """Finalize Kimi K3 attention + MoE weight shards before graph capture."""
+        if self._weight_shard_finalized:
+            return
+        modules = [module for _, module in self._weight_shard_layers]
+        self._weight_shard_pool = finalize_model_weight_shard(modules, mode="force")
+        self._weight_shard_finalized = True
+        if modules:
+            torch.cuda.empty_cache()
+
     def _dspark_capture_stream(
         self,
         layer_idx: int,
@@ -2902,6 +2912,10 @@ class KimiK3LinearForCausalLM(nn.Module):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def force_weight_shard_finalize(self) -> None:
+        """Finalize MoE weight sharding on the underlying model."""
+        self.model.force_weight_shard_finalize()
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.pp_group.world_size > 1:
@@ -3308,6 +3322,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
         if self.language_model is not None:
             self.language_model.post_load_weights()
+
+    def force_weight_shard_finalize(self) -> None:
+        """Finalize MoE weight sharding on the language model, if present."""
+        if self.language_model is not None:
+            self.language_model.force_weight_shard_finalize()
 
     def precompile_kernels_after_loading(self) -> None:
         if self.config.language_only:

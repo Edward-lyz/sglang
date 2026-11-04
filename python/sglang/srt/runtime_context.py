@@ -1028,6 +1028,11 @@ def reset_context() -> None:
 
     Wrapper subsystems (``parallel``) hold no state and are unaffected.
     """
+    for resource in _CONTEXT.resources.buffers.values():
+        shutdown = getattr(resource, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
+
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
     _CONTEXT._overrides_log = []

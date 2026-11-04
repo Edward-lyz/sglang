@@ -138,6 +138,13 @@ class WeightUpdater:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
+    def _unsupported_weight_update_error(self) -> Optional[str]:
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return error
+        model_check = getattr(self.get_model(), "online_weight_update_error", None)
+        return model_check() if model_check is not None else None
+
     def update_weights_from_disk(
         self: WeightUpdater,
         model_path: str,
@@ -147,7 +154,7 @@ class WeightUpdater:
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         self._assert_weight_cache_inactive("update_weights_from_disk")
-        error = _unsupported_derived_weight_cache_error()
+        error = self._unsupported_weight_update_error()
         if error is not None:
             return False, error
 
@@ -237,7 +244,7 @@ class WeightUpdater:
             shape: the shape of the parameter to be updated.
         """
         self._assert_weight_cache_inactive("update_weights_from_distributed")
-        error = _unsupported_derived_weight_cache_error()
+        error = self._unsupported_weight_update_error()
         if error is not None:
             return False, error
 
@@ -321,7 +328,7 @@ class WeightUpdater:
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
-        error = _unsupported_derived_weight_cache_error()
+        error = self._unsupported_weight_update_error()
         if error is not None:
             return False, error
 
@@ -387,7 +394,7 @@ class WeightUpdater:
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         self._assert_weight_cache_inactive("update_weights_from_ipc")
-        error = _unsupported_derived_weight_cache_error()
+        error = self._unsupported_weight_update_error()
         if error is not None:
             return False, error
 
