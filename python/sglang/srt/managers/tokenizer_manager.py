@@ -81,6 +81,7 @@ from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicat
 from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
     TokenizerManagerMultiItemMixin,
 )
+from sglang.srt.managers.utils import is_health_check_rid
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -909,6 +910,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
+        sampling_kwargs = dict(sampling_kwargs)
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
@@ -942,6 +944,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
                 data_parallel_rank=obj.data_parallel_rank,
+                peer_data_parallel_rank=obj.peer_data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
@@ -1084,6 +1087,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        if self._should_reject_missing_bootstrap_room(tokenized_obj):
+            return self._reject_missing_bootstrap_room(obj, created_time)
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         tokenized_obj = wrap_shm_features(tokenized_obj)
@@ -1120,6 +1125,43 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 [], False, asyncio.Event(), tmp_obj, created_time=created_time
             )
             self.rid_to_state[tmp_obj.rid] = state
+
+    def _should_reject_missing_bootstrap_room(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> bool:
+        if self.server_args.load_balance_method != "follow_bootstrap_room":
+            return False
+        if self.server_args.disaggregation_decode_enable_fake_auto:
+            return False
+        if getattr(tokenized_obj, "bootstrap_room", None) is not None:
+            return False
+        if getattr(tokenized_obj, "data_parallel_rank", None) is not None:
+            return False
+        return True
+
+    def _reject_missing_bootstrap_room(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        created_time: Optional[float] = None,
+    ) -> ReqState:
+        error_msg = (
+            "Invalid request: Disaggregated request received without bootstrap room id."
+        )
+        logger.warning(f"{error_msg} {obj.rid=}")
+        state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+        self.rid_to_state[obj.rid] = state
+        self._handle_abort_req(
+            AbortReq(
+                rid=obj.rid,
+                finished_reason={
+                    "type": "abort",
+                    "message": error_msg,
+                    "status_code": HTTPStatus.BAD_REQUEST,
+                },
+            )
+        )
+        return state
 
     async def _wait_one_response(
         self,
@@ -1512,12 +1554,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             BatchTokenIDOutput,
         ],
     ):
+
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
-                logger.error(
-                    f"Received output for {rid=} but the state was deleted in TokenizerManager."
-                )
+                # Health-check output can arrive after /health has cleaned up state.
+                if not is_health_check_rid(rid):
+                    logger.error(
+                        f"Received output for {rid=} but the state was deleted in TokenizerManager."
+                    )
                 continue
 
             # Build meta_info and return value
@@ -1593,6 +1638,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "text": state.text,
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
+                    "generated_token_num": recv_obj.generated_token_nums[i],
                 }
 
             elif isinstance(recv_obj, BatchTokenIDOutput):
@@ -1975,10 +2021,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if custom_labels
             else self.metrics_collector.labels
         )
-        if (
-            state.first_token_time == 0.0
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
+        if state.first_token_time == 0.0:
             state.first_token_time = state.last_time = time.time()
             state.first_token_time_perf = time.perf_counter()
             state.last_completion_tokens = completion_tokens
@@ -2024,6 +2067,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 retraction_count,
                 cached_tokens_details,
             )
+
 
     def dump_requests(self, state: ReqState, out_dict: dict):
         self.dump_request_list.append(

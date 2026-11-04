@@ -592,6 +592,7 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_draft_tokens,
         )
 
+
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,

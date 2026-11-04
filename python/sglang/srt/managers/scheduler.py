@@ -70,6 +70,8 @@ from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.io_struct import (
+    AbortLowAcceptRateReqInput,
+    AbortLowAcceptRateReqOutput,
     AbortReq,
     ActiveRanksOutput,
     AttachHiCacheStorageReqInput,
@@ -168,7 +170,12 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.managers.utils import (
+    GenerationBatchResult,
+    is_health_check_rid,
+    validate_input_length,
+)
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -349,6 +356,11 @@ class Scheduler(
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
+
+        # Init metrics stats
+
+        # Init inter-process communication
+        self.init_ipc_channels(port_args)
 
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
@@ -932,7 +944,7 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
-        self.return_health_check_ct = 0
+        self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.sessions: Dict[str, Session] = {}
@@ -1220,6 +1232,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
+                (AbortLowAcceptRateReqInput, self.abort_low_accept_rate_requests),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -1483,6 +1496,7 @@ class Scheduler(
                     trace_set_proc_propagate_context(req.rid, req.trace_context)
                     trace_slice_start("", req.rid, anonymous=True)
 
+        if recv_reqs:
             f = lambda r: isinstance(
                 r, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
             )
@@ -1527,7 +1541,9 @@ class Scheduler(
                 or not self.running_batch.is_empty()
                 or len(self.offload_tags) > 0
             ):
-                self.return_health_check_ct += 1
+                self.return_health_check_ipcs.append(
+                    getattr(recv_req, "http_worker_ipc", None)
+                )
                 continue
 
             output = self._request_dispatcher(recv_req)
@@ -1675,6 +1691,7 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 disagg_mode=self.disaggregation_mode,
                 data_parallel_rank=recv_req.data_parallel_rank,
+                peer_data_parallel_rank=recv_req.peer_data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -2421,6 +2438,11 @@ class Scheduler(
                     f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
                 )
             logger.warning(msg_prefix + msg_details)
+            if retracted_reqs:
+                logger.info(
+                    "Retracted request ids: %s",
+                    [req.rid for req in retracted_reqs],
+                )
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
@@ -2641,16 +2663,126 @@ class Scheduler(
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ct:
+        if self.return_health_check_ipcs:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.return_health_check_ct -= 1
-            self.send_to_tokenizer.send_output(HealthCheckOutput())
+            http_worker_ipc = self.return_health_check_ipcs.popleft()
+            self.send_to_tokenizer.send_output(
+                HealthCheckOutput(http_worker_ipc=http_worker_ipc)
+            )
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
-        success = self.flush_cache()
-        return FlushCacheReqOutput(success=success)
+        if getattr(recv_req, "evict_evictable", False):
+            # Best-effort eviction: does not require the scheduler to be idle.
+            # Run 5 rounds with 100ms spacing so blocks freed by requests
+            # finishing between rounds also get reclaimed.
+            ROUNDS = 5
+            INTERVAL_S = 0.1
+            for i in range(1, ROUNDS + 1):
+                evict_size = self.tree_cache.evictable_size()
+                if evict_size > 0:
+                    self.tree_cache.evict(EvictParams(num_tokens=evict_size))
+                if i < ROUNDS:
+                    time.sleep(INTERVAL_S)
+            logger.info("Device cache cleared.")
+            return FlushCacheReqOutput(success=True)
+        if self.flush_cache():
+            return FlushCacheReqOutput(success=True)
+        # The one-shot idle check fails under continuous health probing:
+        # health-check generate requests are transient, but their residue
+        # keeps cur_batch/last_batch (or the overlap result queue) non-empty
+        # at the moment the check runs, even with #queue-req/#running-req
+        # both at 0. Defer the answer instead: retry from the event loop's
+        # idle branch until the pipeline drains. While a flush is pending,
+        # incoming health-check probes are skipped (see
+        # process_input_requests), so the pipeline can actually drain.
+        if not self._pending_flush_cache_reqs:
+            self._pending_flush_cache_deadline = (
+                time.monotonic() + self.FLUSH_CACHE_PENDING_TIMEOUT_S
+            )
+        self._pending_flush_cache_reqs.append(recv_req)
+        return None  # answered later by resolve_pending_flush_cache
+
+    # How long a deferred flush_cache keeps waiting for the pipeline to
+    # drain before giving up and reporting failure.
+    FLUSH_CACHE_PENDING_TIMEOUT_S = 3.0
+
+    def resolve_pending_flush_cache(self):
+        """Complete deferred flush_cache requests from the event-loop idle branch."""
+        # Health-check probes skipped while a flush is pending are normally
+        # acknowledged inside process_batch_result; drain the backlog here so
+        # /health is not stalled while the scheduler is otherwise idle.
+        self.maybe_send_health_check_signal()
+        if not self._pending_flush_cache_reqs:
+            return
+
+        # _is_no_request() is checked first (cheap, silent) so we don't log
+        # the "Cache not flushed" warning on every idle iteration.
+        success = self._is_no_request() and self.flush_cache()
+        if not success and time.monotonic() < self._pending_flush_cache_deadline:
+            return
+
+        if not success:
+            logger.warning(
+                "flush_cache gave up: pipeline still busy after "
+                f"{self.FLUSH_CACHE_PENDING_TIMEOUT_S:.0f}s."
+            )
+        output = FlushCacheReqOutput(success=success)
+        for pending_req in self._pending_flush_cache_reqs:
+            self.send_to_tokenizer.send_output(output, pending_req)
+        self._pending_flush_cache_reqs = []
+        self._pending_flush_cache_deadline = None
+
+    def abort_low_accept_rate_requests(
+        self, recv_req: AbortLowAcceptRateReqInput
+    ) -> AbortLowAcceptRateReqOutput:
+        """Abort running requests with low MTP accept rate and long generated output."""
+        num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
+        if num_guess_tokens <= 0:
+            return AbortLowAcceptRateReqOutput(
+                success=False,
+                message="Speculative decoding is not enabled or speculative_num_draft_tokens is invalid.",
+            )
+
+        if self.cur_batch is self.running_batch or self.cur_batch is None:
+            reqs = self.running_batch.reqs
+        else:
+            reqs = self.running_batch.reqs + self.cur_batch.reqs
+
+        aborted_rids = []
+        seen_rids = set()
+        for req in reqs:
+            if req.finished() or req.rid in seen_rids or req.spec_verify_ct <= 0:
+                continue
+            seen_rids.add(req.rid)
+            total_draft_tokens = req.spec_verify_ct * num_guess_tokens
+            if total_draft_tokens <= 0:
+                continue
+            accept_rate = req.spec_accepted_tokens / total_draft_tokens
+            context_len = len(req.output_ids)
+            if (
+                accept_rate <= recv_req.accept_rate
+                and context_len > recv_req.context_len
+            ):
+                aborted_rids.append(req.rid)
+
+        for rid in aborted_rids:
+            self.abort_request(AbortReq(rid=rid))
+
+        if aborted_rids:
+            logger.info(
+                "Abort low MTP accept rate requests: "
+                f"threshold_accept_rate={recv_req.accept_rate}, "
+                f"threshold_context_len={recv_req.context_len}, "
+                f"aborted_count={len(aborted_rids)}, aborted_rids={aborted_rids}"
+            )
+
+        return AbortLowAcceptRateReqOutput(
+            success=True,
+            aborted_count=len(aborted_rids),
+            aborted_rids=aborted_rids,
+        )
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
@@ -2978,6 +3110,20 @@ class Scheduler(
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
 
+            # Abort requests already retracted to CPU cache
+            if self.disagg_decode_prealloc_queue.retracted_queue:
+                remaining_retracted = []
+                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
+                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
+                        if hasattr(decode_req, "kv_cache_cpu"):
+                            del decode_req.kv_cache_cpu
+                        self.send_to_tokenizer.send_output(
+                            AbortReq(rid=decode_req.rid), decode_req
+                        )
+                    else:
+                        remaining_retracted.append(decode_req)
+                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
             reqs = self.running_batch.reqs
@@ -3165,7 +3311,7 @@ class IdleSleeper:
 
 def is_health_check_generate_req(recv_req):
     rid = getattr(recv_req, "rid", None)
-    return rid is not None and rid.startswith("HEALTH_CHECK")
+    return is_health_check_rid(rid)
 
 
 def is_work_request(recv_req):

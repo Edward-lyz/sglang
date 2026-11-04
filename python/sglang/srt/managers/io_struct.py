@@ -232,6 +232,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    peer_data_parallel_rank: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -731,6 +732,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
+            peer_data_parallel_rank=(
+                self.peer_data_parallel_rank
+                if self.peer_data_parallel_rank is not None
+                else None
+            ),
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
@@ -803,6 +809,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    peer_data_parallel_rank: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
@@ -1019,6 +1026,7 @@ class TokenizedEmbeddingReqInput(BaseReq):
     sampling_params: SamplingParams
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    peer_data_parallel_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
@@ -1255,12 +1263,44 @@ class ClearHiCacheReqOutput(BaseReq):
 
 @dataclass
 class FlushCacheReqInput(BaseReq):
-    pass
+    # If True, skip the "no pending requests" gate and best-effort evict all
+    # currently evictable prefix tree blocks (same semantics as the per-step
+    # eviction in run_batch). Used by /clear_all_cache to work even during
+    # live traffic. Default False preserves the original /flush_cache behavior.
+    evict_evictable: bool = False
 
 
 @dataclass
 class FlushCacheReqOutput(BaseReq):
     success: bool
+
+
+@dataclass
+class AbortLowAcceptRateReqInput(BaseReq):
+    """Request to abort low MTP accept rate requests with long generated output."""
+
+    accept_rate: float
+    context_len: int
+
+    def __post_init__(self):
+        if not 0 <= self.accept_rate <= 1:
+            raise ValueError(
+                f"Invalid accept_rate: {self.accept_rate!r}. Expected value in [0, 1]."
+            )
+        if self.context_len < 0:
+            raise ValueError(
+                f"Invalid context_len: {self.context_len!r}. Expected non-negative value."
+            )
+
+
+@dataclass
+class AbortLowAcceptRateReqOutput(BaseReq):
+    """Response for aborting low MTP accept rate requests."""
+
+    success: bool
+    aborted_count: int = 0
+    aborted_rids: List[str] = field(default_factory=list)
+    message: str = ""
 
 
 @dataclass

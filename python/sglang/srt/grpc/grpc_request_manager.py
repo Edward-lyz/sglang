@@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.utils import is_health_check_rid
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_or_create_event_loop, get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
@@ -484,7 +485,7 @@ class GrpcRequestManager:
         to stop processing any further outputs from the scheduler.
         """
         # Skip aborting health check requests (they clean themselves up)
-        if request_id.startswith("HEALTH_CHECK"):
+        if is_health_check_rid(request_id):
             return False
 
         # Mark state as finished immediately to stop processing scheduler outputs
@@ -817,7 +818,7 @@ class GrpcRequestManager:
         (priority preemption, queue full, KV cache pressure, etc).
         """
         # Skip health check requests
-        if recv_obj.rid.startswith("HEALTH_CHECK"):
+        if is_health_check_rid(recv_obj.rid):
             return
 
         # Check if request still exists

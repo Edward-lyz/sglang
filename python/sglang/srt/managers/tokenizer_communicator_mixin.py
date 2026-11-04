@@ -23,6 +23,8 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    AbortLowAcceptRateReqInput,
+    AbortLowAcceptRateReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     CheckWeightsReqInput,
@@ -203,6 +205,9 @@ class TokenizerCommunicatorMixin:
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.abort_low_accept_rate_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -304,6 +309,10 @@ class TokenizerCommunicatorMixin:
                     self.flush_cache_communicator.handle_recv,
                 ),
                 (
+                    AbortLowAcceptRateReqOutput,
+                    self.abort_low_accept_rate_communicator.handle_recv,
+                ),
+                (
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
@@ -334,8 +343,36 @@ class TokenizerCommunicatorMixin:
             ]
         )
 
-    async def flush_cache(self: TokenizerManager) -> FlushCacheReqOutput:
-        return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+    async def flush_cache(
+        self: TokenizerManager, evict_evictable: bool = False
+    ) -> FlushCacheReqOutput:
+        """Flush the cache, optionally evicting evictable entries."""
+        return (
+            await self.flush_cache_communicator(
+                FlushCacheReqInput(evict_evictable=evict_evictable)
+            )
+        )[0]
+
+    async def abort_low_accept_rate_requests(
+        self: TokenizerManager, accept_rate: float, context_len: int
+    ) -> AbortLowAcceptRateReqOutput:
+        """Abort requests with low MTP accept rate and long generated output on all DP schedulers."""
+        results = await self.abort_low_accept_rate_communicator(
+            AbortLowAcceptRateReqInput(accept_rate=accept_rate, context_len=context_len)
+        )
+        all_success = all(r.success for r in results)
+        aborted_rids = []
+        messages = []
+        for result in results:
+            aborted_rids.extend(result.aborted_rids)
+            if result.message:
+                messages.append(result.message)
+        return AbortLowAcceptRateReqOutput(
+            success=all_success,
+            aborted_count=len(aborted_rids),
+            aborted_rids=aborted_rids,
+            message=" | ".join(messages),
+        )
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

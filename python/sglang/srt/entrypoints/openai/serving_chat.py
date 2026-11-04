@@ -306,6 +306,7 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
             data_parallel_rank=request.data_parallel_rank,
+            peer_data_parallel_rank=request.peer_data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,

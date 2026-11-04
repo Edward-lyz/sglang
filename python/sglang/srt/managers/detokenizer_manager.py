@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
+from sglang.srt.managers.utils import is_health_check_rid
 from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -236,7 +237,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
-                if not self.is_health_check_request(rid):
+                if not is_health_check_rid(rid):
                     # for health check requests, we do not store the decode status
                     self.decode_status[rid] = s
             else:
@@ -297,7 +298,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         output_strs = []
         for i in range(bs):
             rid = recv_obj.rids[i]
-            if self.is_health_check_request(rid):
+            key = status_keys[i]
+            if is_health_check_rid(rid):
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=recv_obj.decode_ids[i],

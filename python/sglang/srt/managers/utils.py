@@ -21,6 +21,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def is_health_check_rid(rid: Optional[str]) -> bool:
+    """Return whether the request id is an internal health-check request."""
+    return isinstance(rid, str) and rid.startswith("HEALTH_CHECK")
+
+
 @dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None

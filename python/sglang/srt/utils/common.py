@@ -1491,8 +1491,7 @@ def get_zmq_socket_on_host(
     Returns:
         Tuple of (port, socket) where port is the assigned TCP port.
     """
-    socket = context.socket(socket_type)
-    # Bind to random TCP port
+    socket: zmq.Socket = context.socket(socket_type)
     config_socket(socket, socket_type)
     bind_host = f"tcp://{host}" if host else "tcp://*"
 
@@ -2701,6 +2700,16 @@ def configure_ipv6(dist_init_addr):
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):
+    """Launch a lightweight health check server for non-master nodes.
+
+    Non-master nodes (node_rank >= 1) do not run the full http_server, so this
+    dummy server only exposes liveness/readiness probe endpoints.
+
+    Args:
+        host: The host address to bind the server.
+        port: The port number to bind the server.
+        enable_metrics: Whether to enable the prometheus metrics middleware.
+    """
     import asyncio
 
     import uvicorn
@@ -2723,6 +2732,27 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         """Check the health of the http server."""
         return Response(status_code=200)
 
+    @app.get("/health_forward")
+    async def health_forward():
+        """Non-master node readiness: forward the check to the master node.
+
+        Non-master nodes have no tokenizer/scheduler forward chain, so they
+        cannot perform a real forward health check themselves. Instead they
+        proxy the master node's /health_forward and mirror its result.
+        """
+        import os
+        import urllib.request
+
+        master = os.environ.get("MASTER_IP", host)
+        try:
+            resp = urllib.request.urlopen(
+                f"http://{master}:{port}/health_forward", timeout=10
+            )
+            if resp.status != 200:
+                return Response(status_code=503)
+        except Exception:
+            return Response(status_code=503)
+        return Response(status_code=200)
     # Add prometheus middleware
     if enable_metrics:
         add_prometheus_middleware(app)
@@ -2735,7 +2765,7 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         timeout_keep_alive=5,
         loop="auto",
         log_config=None,
-        log_level="warning",
+        log_level="info",
     )
     server = uvicorn.Server(config=config)
 

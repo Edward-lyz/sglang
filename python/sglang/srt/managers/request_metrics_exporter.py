@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Optional, Union
 
+from sglang.srt.managers.utils import is_health_check_rid
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.server_args import ServerArgs
 
@@ -127,7 +128,7 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], out_dict: dict
     ):
         # Do not log health check requests, since they don't represent real user requests.
-        if isinstance(obj.rid, str) and "HEALTH_CHECK" in obj.rid:
+        if is_health_check_rid(obj.rid):
             return
 
         try:

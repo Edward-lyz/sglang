@@ -6,7 +6,6 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -157,6 +156,7 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
+
 
             hidden_state_offset = 0
 
@@ -1154,6 +1154,9 @@ class SchedulerOutputProcessorMixin:
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
+
+            # decode may too noisy
+
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,

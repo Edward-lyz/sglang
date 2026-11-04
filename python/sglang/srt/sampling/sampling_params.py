@@ -61,6 +61,8 @@ class SamplingParams:
         spaces_between_special_tokens: bool = True,
         no_stop_trim: bool = False,
         custom_params: Optional[Dict[str, Any]] = None,
+        # Only limits tokens inside <think>...</think>
+        # Must NOT include </think>; server will append end token when injecting.
         stream_interval: Optional[int] = None,
         logit_bias: Optional[Dict[str, float]] = None,
         sampling_seed: Optional[int] = None,

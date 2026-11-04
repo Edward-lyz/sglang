@@ -252,6 +252,7 @@ class Envs:
     SGLANG_QUEUED_TIMEOUT_MS = EnvInt(-1)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     SGLANG_FORWARD_TIMEOUT_MS = EnvInt(-1)
+    SGLANG_ENABLE_OPT_PREBUILT_BATCH = EnvBool(True)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")

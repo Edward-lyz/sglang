@@ -385,6 +385,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 spec_steps=self.spec_steps,
             )
 
+
         unfinished_index = []
         unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()

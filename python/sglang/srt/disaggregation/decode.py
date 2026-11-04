@@ -362,12 +362,25 @@ class DecodePreallocQueue:
                     self.transfer_backend, KVClassType.RECEIVER
                 )
 
-            kv_receiver = kv_receiver_class(
-                mgr=self.kv_manager,
-                bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
-                bootstrap_room=req.bootstrap_room,
-                prefill_dp_rank=req.data_parallel_rank,
-            )
+            try:
+                kv_receiver = kv_receiver_class(
+                    mgr=self.kv_manager,
+                    bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+                    bootstrap_room=req.bootstrap_room,
+                    prefill_dp_rank=req.peer_data_parallel_rank,
+                )
+            except Exception as e:
+                message = f"Failed to create kv_receiver for request {req.rid}: {e}"
+                logger.error(message)
+                # Clean up leaked required_prefill_response_num_table entry
+                self.kv_manager.required_prefill_response_num_table.pop(
+                    req.bootstrap_room, None
+                )
+                prepare_abort(
+                    req, message, status_code=HTTPStatus.REQUEST_TIMEOUT
+                )
+                self.scheduler.stream_output([req], req.return_logprob)
+                return
 
             req.add_latency(RequestStage.DECODE_PREPARE)
             trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)

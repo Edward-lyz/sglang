@@ -323,6 +323,9 @@ class CompletionRequest(BaseModel):
     kv_cache_params: Optional[KVCacheParams] = None
 
     # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
+    peer_data_parallel_rank: Optional[int] = None
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -642,6 +645,9 @@ class ChatCompletionRequest(BaseModel):
     kv_cache_params: Optional[KVCacheParams] = None
 
     # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
+    peer_data_parallel_rank: Optional[int] = None
+
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 

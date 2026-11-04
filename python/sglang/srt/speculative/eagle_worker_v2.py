@@ -356,6 +356,7 @@ class EagleDraftWorker(BaseDraftWorker):
             position_buf,
         )
 
+
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,

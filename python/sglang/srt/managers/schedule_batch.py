@@ -45,12 +45,10 @@ import time
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
-from itertools import chain
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
-
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -538,6 +536,7 @@ class Req(ReqDllmMixin):
         bootstrap_room: Optional[int] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         data_parallel_rank: Optional[int] = None,
+        peer_data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -597,6 +596,8 @@ class Req(ReqDllmMixin):
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        # The thinking-related fields are mutated in the scheduler event loop.
+        # They are not designed for concurrent multi-thread mutation.
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -794,6 +795,7 @@ class Req(ReqDllmMixin):
 
         # For data parallel rank routing
         self.data_parallel_rank: Optional[int] = data_parallel_rank
+        self.peer_data_parallel_rank: Optional[int] = peer_data_parallel_rank
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -1241,10 +1243,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    dp_global_num_tokens_for_metric: Optional[List[int]] = None
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
+
+    # DP all_gather latency for this batch
 
     # For processing logprobs
     return_logprob: bool = False
@@ -2253,6 +2258,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            dp_global_num_tokens_for_metric=self.dp_global_num_tokens_for_metric,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
