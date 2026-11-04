@@ -85,3 +85,70 @@ def situ_and_mul(
         has_linear_beta,
     )
     return out
+
+
+@cache_once
+def _jit_situ_and_mul_quant_module() -> Module:
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        _make_name("situ_and_mul_quant"),
+        *args,
+        cuda_files=["kimi_k3/situ_and_mul_quant.cuh"],
+        cuda_wrappers=[("run", f"SituMulQuantKernel<{args}>::run")],
+        # Precise math: the activation must stay bit-identical to situ_and_mul.
+        extra_cuda_cflags=_fast_math_flags(),
+    )
+
+
+def situ_and_mul_quant_supported(input: torch.Tensor) -> bool:
+    """Host-side guard for situ_and_mul_quant; False means run the unfused
+    situ_and_mul + per-token-group quant pair."""
+    return (
+        input.dim() == 2
+        and input.dtype == torch.bfloat16
+        and input.stride(1) == 1
+        and input.stride(0) % 8 == 0
+        and input.data_ptr() % 16 == 0
+        and (input.shape[1] // 2) % 512 == 0
+    )
+
+
+def situ_and_mul_quant(
+    input: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SiTU-and-mul fused with the DeepGEMM input quant of the next linear.
+
+    Returns ``(q, scale)``: fp8_e4m3 ``[T, D]`` and the column-major,
+    TMA-aligned UE8M0 scale (int32, 4 groups per word) that
+    ``sglang_per_token_group_quant_fp8(column_major_scales=True,
+    scale_tma_aligned=True, scale_ue8m0=True)`` produces for group 128.
+    Bit-identical to ``situ_and_mul`` followed by that quant. Caller must
+    have checked ``situ_and_mul_quant_supported``.
+    """
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        create_per_token_group_quant_fp8_output_scale,
+    )
+
+    hidden_size = input.shape[-1] // 2
+    out_shape = (input.shape[0], hidden_size)
+    q = torch.empty(out_shape, device=input.device, dtype=torch.float8_e4m3fn)
+    scale = create_per_token_group_quant_fp8_output_scale(
+        x_shape=out_shape,
+        device=input.device,
+        group_size=128,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
+    has_linear_beta = linear_beta is not None
+    _jit_situ_and_mul_quant_module().run(
+        input,
+        q,
+        scale,
+        float(beta),
+        float(linear_beta) if has_linear_beta else 0.0,
+        has_linear_beta,
+    )
+    return q, scale
