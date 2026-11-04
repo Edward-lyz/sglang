@@ -1507,6 +1507,32 @@ class MQALayer(MqaAttentionBase):
         )
         return ok
 
+    def _cp_store_swa_kv_local_first(
+        self, kv_local, positions, forward_batch, attn_backend, defer: bool = False
+    ):
+        """[fusion-opt] Local-first CP SWA store of this layer; with ``defer`` returns
+        the ``finish()`` of SGLANG_FUSE_CP_SWA_GATHER_PUSH (None once stored)."""
+        from sglang.kernels.ops.attention.dsv4.cp_kv_store import (
+            cp_store_swa_kv_local_first,
+        )
+
+        pool = get_token_to_kv_pool()
+        parallel = get_parallel()
+        return cp_store_swa_kv_local_first(
+            kvcache=pool.get_swa_raw_buffer(self.layer_id),
+            page_size=pool.swa_page_size,
+            layout=pool.kv_layout,
+            kv_local=kv_local,
+            positions_local=positions,
+            swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+            forward_batch=forward_batch,
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
+            cp_rank=parallel.attn_cp_rank,
+            cp_size=parallel.attn_cp_size,
+            defer=defer,
+        )
     def _compute_kv_bf16(
         self,
         x: torch.Tensor,
