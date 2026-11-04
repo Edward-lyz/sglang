@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_data,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
+    cp_split_and_rebuild_position,
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.dp_attention import (
@@ -159,15 +160,23 @@ class DeepseekModelNextN(nn.Module):
 
         if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual = self.decoder(
+            hidden_states, residual, topk_indices = self.decoder(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
                 zero_allocator,
+                prev_topk_indices=(
+                    forward_batch.topk_indices
+                    if forward_batch.reuse_mtp_topk_indices
+                    else None
+                ),
             )
+            if forward_batch.reuse_mtp_topk_indices:
+                forward_batch.topk_indices = topk_indices
 
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:

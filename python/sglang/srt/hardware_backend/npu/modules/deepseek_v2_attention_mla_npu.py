@@ -285,6 +285,7 @@ def forward_dsa_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
+    prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
     if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
@@ -352,9 +353,12 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
-    topk_indices = m.indexer(
-        hidden_states, q_lora, positions, forward_batch, m.layer_id, dynamic_scale
-    )
+    if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
+        topk_indices = m.indexer(
+            hidden_states, q_lora, positions, forward_batch, m.layer_id, dynamic_scale
+        )
+    else:
+        topk_indices = prev_topk_indices
 
     return (
         q_pe,

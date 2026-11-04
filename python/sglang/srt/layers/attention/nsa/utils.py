@@ -148,9 +148,6 @@ class NSAContextParallelMetadata:
 def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if is_nsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
@@ -163,6 +160,10 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
         and forward_batch.forward_mode.is_context_parallel_extend()
         and is_nsa_enable_prefill_cp()
     ):
+        if is_nsa_prefill_cp_round_robin_split():
+            assert (
+                seq_len % cp_size == 0
+            ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
         return True
     else:
         return False
@@ -214,15 +215,14 @@ def nsa_cp_round_robin_split_q_seqs_kernel(
     cp_rank: tl.constexpr,
 ):
     extra_seq = 0
-    bs_idx = 0
     for bs in range(tokens):
         cur_len = tl.load(in_seqs_ptr + bs)
         cur_len += extra_seq
         cur_seq = cur_len // cp_size + (cur_len % cp_size > cp_rank)
-        if cur_seq > 0:
-            tl.store(bs_idx_ptr + bs_idx, bs)
-            tl.store(out_seqs_ptr + bs_idx, cur_seq)
-            bs_idx += 1
+        # Always store, including 0-length entries, to keep batch dimension
+        # consistent across all CP ranks.
+        tl.store(bs_idx_ptr + bs, bs)
+        tl.store(out_seqs_ptr + bs, cur_seq)
         extra_seq = cur_len - cur_seq * cp_size
 
 
@@ -236,8 +236,11 @@ def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
         cur_seq = cur_len // cp_size + int(cur_len % cp_size > cp_rank)
         q_seqs.append(cur_seq)
         extra_seq = cur_len - cur_seq * cp_size
-    bs_idx = list([i for i, x in enumerate(q_seqs) if x > 0])
-    q_seqs = [q_len for q_len in q_seqs if q_len > 0]
+    # Keep all requests (including 0-length ones) to maintain consistent
+    # batch dimensions across all CP ranks. Filtering here would cause
+    # different ranks to have different batch sizes, leading to downstream
+    # dimension mismatches in _cal_indexer_k_start_end and _forward_standard_mha.
+    bs_idx = list(range(len(q_seqs)))
     return q_seqs, bs_idx
 
 
@@ -248,24 +251,26 @@ def nsa_cp_round_robin_split_q_seqs(
     round-robin-split distributes tokens across ranks based on token_idx % cp_size.
 
     Return:
-    ret_q_lens_cpu(List) and ret_q_lens(torch.Tensor): the partitioned length (excluding zeros) on the current cp rank
-        for each sequence after distribution across cp ranks.
-    bs_idx_cpu(List) and bs_idx(torch.Tensor): marks which sequences are ultimately selected,
-        i.e., those with a partitioned length greater than zero.
+    ret_q_lens_cpu(List) and ret_q_lens(torch.Tensor): the partitioned length on the current cp rank
+        for each sequence after distribution across cp ranks. May contain 0 for sequences
+        that have no tokens on this rank.
+    bs_idx_cpu(List) and bs_idx(torch.Tensor): indices of all sequences (always [0, 1, ..., N-1])
+        to maintain consistent batch dimensions across CP ranks.
     """
     cp_size = get_attention_tp_size()
     cp_rank = get_attention_tp_rank()
-    # len(ret_q_lens_cpu) == len(bs_idx_cpu)
     ret_q_lens_cpu, bs_idx_cpu = nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
+    # Allocate full-size output tensors (no filtering)
+    num_seqs = len(extend_seqs)
     ret_q_lens = torch.empty(
-        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=extend_seqs.dtype
+        (num_seqs,), device=extend_seqs.device, dtype=extend_seqs.dtype
     )
     bs_idx = torch.empty(
-        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
+        (num_seqs,), device=extend_seqs.device, dtype=torch.int32
     )
     grid = (1,)
     nsa_cp_round_robin_split_q_seqs_kernel[grid](
-        extend_seqs, ret_q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
+        extend_seqs, ret_q_lens, bs_idx, num_seqs, cp_size, cp_rank
     )
     return ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx
 
