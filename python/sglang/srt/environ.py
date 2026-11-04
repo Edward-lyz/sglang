@@ -1811,6 +1811,16 @@ class Envs:
     # non-blocking H2D, host-sized repeat_interleave) so the next batch's host prep
     # overlaps the previous forward instead of waiting for it to drain.
     SGLANG_FUSE_TAIL_META_NO_SYNC = EnvBool(False)
+    # [fusion-opt] TileKernels (deepseek-ai/TileKernels, TileLang JIT) activation casts
+    # for the DeepGEMM MXFP8 linear route (SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM):
+    # per_token_cast replaces the per-32 ue8m0 group quant in front of every such GEMM;
+    # norm_forward_and_per_token_cast fuses q_norm with wq_b's input cast (and keeps the
+    # bf16 normed q_lora for the indexer). Falls back to the stock kernels when
+    # tile_kernels cannot be imported. SGLANG_TILE_KERNELS_PATH is prepended to
+    # sys.path for a source checkout (no wheel needed).
+    SGLANG_OPT_TK_PER_TOKEN_CAST = EnvBool(False)
+    SGLANG_OPT_TK_QNORM_CAST = EnvBool(False)
+    SGLANG_TILE_KERNELS_PATH = EnvStr("")
     # DeepGEMM mega mHC: one `deep_gemm.mega_mhc` launch replaces the whole
     # attn->FFN mHC boundary of the DeepSeek-V4.1 predecessor-pre scheme
     # (hc_post + hc_combine + the sublayer input RMSNorm + the next pre-norm
