@@ -3617,6 +3617,21 @@ class DeepseekV4DecoderLayer(nn.Module):
             and envs.SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM.get()
         ):
             return False
+        # wqkv_a itself must run the DeepGEMM MXFP8 route (as in _tk_qnorm_cast_ok);
+        # any other route would not take the prequantized input.
+        wqkv_a = self.self_attn.wqkv_a
+        qm = wqkv_a.quant_method
+        if not (
+            getattr(qm, "mxfp8_dense_backend", None) == Mxfp8DenseGemmBackend.DEEP_GEMM
+            and (
+                getattr(qm, "use_mxfp8", False)
+                or (
+                    getattr(qm, "block_fp8_as_mxfp8", False)
+                    and getattr(wqkv_a, "block_fp8_mxfp8_ready", False)
+                )
+            )
+        ):
+            return False
         from sglang.srt.layers import deep_gemm_wrapper
 
         return bool(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)

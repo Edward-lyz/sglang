@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import atexit
 import ctypes
+import errno
 import logging
 import os
 import pickle
@@ -118,17 +119,43 @@ def _map_for(handle: int, size: int, device: int) -> int:
     return ptr.value
 
 
-def _steal_fd(pid: int, fd: int) -> int:
-    """Duplicate another process's fd (pidfd_getfd: same user + ptrace access)."""
+def _proc_start_time(pid: int) -> Optional[int]:
+    """Start time (clock ticks since boot) of `pid`, None if it does not exist.
+
+    Together with the pid it identifies a process: kill -9 skips atexit, and after a
+    container restart pids are handed out from 1 again, so a bare pid in a stale record
+    can name an unrelated live process.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read()
+    except OSError:
+        return None
+    # comm may contain spaces / parens: fields resume after the last ')'.
+    return int(stat[stat.rindex(b")") + 2 :].split()[19])
+
+
+def _steal_fd(pid: int, fd: int, start_time: int) -> Optional[int]:
+    """Duplicate another process's fd (pidfd_getfd: same user + ptrace access).
+
+    None if `pid` is gone or is no longer the process started at `start_time`.
+    """
     global _libc
     if _libc is None:
         _libc = ctypes.CDLL(None, use_errno=True)
     pidfd = _libc.syscall(_SYS_PIDFD_OPEN, pid, 0)
     if pidfd < 0:
+        if ctypes.get_errno() == errno.ESRCH:
+            return None
         raise OSError(ctypes.get_errno(), f"pidfd_open({pid})")
     try:
+        # The pidfd pins the process; re-check it is still the publisher.
+        if _proc_start_time(pid) != start_time:
+            return None
         nfd = _libc.syscall(_SYS_PIDFD_GETFD, pidfd, fd, 0)
         if nfd < 0:
+            if ctypes.get_errno() == errno.ESRCH:
+                return None
             raise OSError(
                 ctypes.get_errno(),
                 f"pidfd_getfd({pid}, {fd}); the instances need the same PID namespace "
@@ -156,6 +183,14 @@ def peer_instances() -> int:
     return n if n and n > 1 else 0
 
 
+def _checkpoint_id() -> Optional[str]:
+    """Resolved checkpoint path, so instances of different models never share shards."""
+    try:
+        from sglang.srt.runtime_context import get_model
+
+        return os.path.realpath(get_model().model_path)
+    except Exception:
+        return None
 
 
 class EngramPeerTable:
@@ -261,6 +296,7 @@ class EngramPeerTable:
 
     def _meta(self) -> dict:
         return {
+            "model": _checkpoint_id(),
             "num_embeddings": self.num_embeddings,
             "dim": self.dim,
             "block": self.block,
@@ -276,6 +312,7 @@ class EngramPeerTable:
         torch.cuda.synchronize(self.device)
         record = {
             "pid": os.getpid(),
+            "start_time": _proc_start_time(os.getpid()),
             "device": self.device,
             "fd": self.fd,
             "nbytes": self.nbytes,
@@ -299,7 +336,9 @@ class EngramPeerTable:
                 peer = self._read_peer(s)
                 if peer is None:
                     continue
-                nfd = _steal_fd(peer["pid"], peer["fd"])
+                nfd = _steal_fd(peer["pid"], peer["fd"], peer["start_time"])
+                if nfd is None:
+                    continue
                 remote = ctypes.c_uint64()
                 try:
                     _check(
@@ -345,7 +384,11 @@ class EngramPeerTable:
         except (FileNotFoundError, EOFError, pickle.UnpicklingError):
             return None
         # A file left by a dead process holds a stale handle: wait for its successor.
-        if not os.path.exists(f"/proc/{peer['pid']}"):
+        # The pid alone is not enough (kill -9 leaves the file, and the pid can be
+        # reused after a container restart), so the start time must match too.
+        if peer.get("start_time") is None or _proc_start_time(
+            peer["pid"]
+        ) != peer.get("start_time"):
             return None
         mine = self._meta()
         if any(peer.get(k) != v for k, v in mine.items()):

@@ -1688,6 +1688,7 @@ class SchedulerDisaggregationPrefillMixin:
         """Run the deferred work that must land before the next forward is
         submitted; return the chunk finalizes that may instead overlap it."""
         overlap_finalize: List[_DeferredChunkFinalize] = []
+        repointed = False
         for item in deferred_finalize:
             if not isinstance(item, _DeferredChunkFinalize):
                 item()
@@ -1697,6 +1698,15 @@ class SchedulerDisaggregationPrefillMixin:
                 overlap_finalize.append(item)
             else:
                 self._finalize_prefill_chunk(item.req, chunk_range=item.chunk_range)
+                repointed = True
+        if repointed:
+            # The dedup repoint rewrote req_to_token rows on schedule_stream after
+            # the worker recorded prep_done_event for the previous batch; the
+            # send_kv / early-send page gathers fence only on that event and would
+            # read the pre-repoint rows (slots the insert just freed). Re-record it
+            # behind the rewrite. This waits the previous forward (the WAR barrier
+            # is on schedule_stream), but only on iterations that repointed.
+            self.prep_done_event.record(self.schedule_stream)
         return overlap_finalize
 
     def _chunk_finalize_keeps_row(self: Scheduler, req: Req, *, chunk_range) -> bool:
