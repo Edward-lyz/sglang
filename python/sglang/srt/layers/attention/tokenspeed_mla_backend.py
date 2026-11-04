@@ -627,6 +627,54 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+
+        # Env-gated equivalent replacement: route decode and target-verify to the
+        # FlashMLA dense FP8 kernel. Only the cases FlashMLA dense covers 1:1 are
+        # routed; everything else stays on tokenspeed_mla_decode.
+        #   * no decode-context-parallel (cp_world == 1, causal_seqs is None)
+        #   * page_size == 64 (FlashMLA requires page_block_size % 64 == 0)
+        #   * query is dense [b, s_q, h_q, head_dim] with a uniform per-request
+        #     q_len. s_q==1 (regular decode, non-causal) is always safe; s_q>1
+        #     (target-verify, intra-window causal) is only routed when
+        #     forward_extend marked it uniform+non-DCP (self._fm_route_ok).
+        #     Ragged verify / draft-extend keep a padded q_len and stay on
+        #     tokenspeed.
+        if (
+            envs.SGLANG_ENABLE_TOKENSPEED_MLA_DECODE_BALANCED.get()
+            and cp_world == 1
+            and causal_seqs is None
+            and self.page_size == 64
+            and query.dim() == 4
+            and query.shape[0] == seq_lens_i32.shape[0]
+            and (query.shape[1] == 1 or getattr(self, "_fm_route_ok", False))
+        ):
+            out = self._run_decode_kernel_flashmla_dense(
+                query=query,
+                kv_cache=kv_cache,
+                block_tables=block_tables,
+                seq_lens=seq_lens_i32,
+                layer=layer,
+                softmax_scale=softmax_scale,
+                output_scale=output_scale,
+                return_lse=return_lse,
+            )
+            if out is not None:
+                return out
+
+        if self._kvb_decoder is not None and cp_world > 1:
+            res = self._kvb_decoder.decode(
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens_i32,
+                causal_seqs,
+                softmax_scale,
+                output_scale,
+                layer.layer_id,
+            )
+            if res is not None:
+                return res if return_lse else res[0]
+
         return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
