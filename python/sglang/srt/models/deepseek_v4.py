@@ -3606,6 +3606,21 @@ class DeepseekV4DecoderLayer(nn.Module):
             fp8_out=fp8_out,
         )
 
+    def _mega_mhc_attn_input_fp8_ok(self, forward_batch: ForwardBatch) -> bool:
+        """[fusion-opt] Gate of SGLANG_FUSE_MEGA_MHC_FP8_ATTN_INPUT: the FFN->attn
+        mega_mhc also writes the attention input as mxfp8 for wqkv_a, which then takes
+        it pre-quantized (DeepGEMM per-32 ue8m0 route only)."""
+        if not (
+            envs.SGLANG_FUSE_MEGA_MHC_FP8_ATTN_INPUT.get()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and getattr(self.self_attn, "fuse_wqa_wkv", False)
+            and envs.SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM.get()
+        ):
+            return False
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        return bool(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)
+
     def write_kv(
         self,
         positions: torch.Tensor,
