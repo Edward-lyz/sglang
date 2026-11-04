@@ -146,6 +146,8 @@ def _jit_module(world_size: int) -> Module:
         cuda_files=["kimi_k3/comm/sp_collective.cuh"],
         cuda_wrappers=[
             ("reduce_scatter_res", f"{cls}::reduce_scatter_res"),
+            ("reduce_scatter_poll", f"{cls}::reduce_scatter_poll"),
+            ("push_layout", f"{cls}::push_layout"),
             ("reduce_scatter_pull", f"{cls}::reduce_scatter_pull"),
             ("all_gather", f"{cls}::all_gather"),
             ("all_gather_add3", f"{cls}::all_gather_add3"),
@@ -183,6 +185,69 @@ def _reduce_scatter_res_op(
         num_blocks,
         block_size,
     )
+
+
+@register_custom_op(mutates_args=["output"])
+def _reduce_scatter_poll_op(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    residual_is_local: bool,
+    num_blocks: int,
+    block_size: int,
+) -> None:
+    _jit_module(world_size).reduce_scatter_poll(
+        _COMM_MAP[world_size],
+        input.view(-1),
+        output.view(-1),
+        None if residual is None else residual.view(-1),
+        residual_is_local,
+        num_blocks,
+        block_size,
+    )
+
+
+class PushLayout(NamedTuple):
+    """Producer-slot layout of the registered communicator: per-rank push
+    workspace addresses, the counter address, the slot stride and this rank."""
+
+    push_workspaces: tuple
+    counter_ptr: int
+    stride_bytes: int
+    rank: int
+
+
+def push_layout(world_size: int) -> PushLayout:
+    """Producer-slot addresses of the registered communicator, for a kernel
+    that writes the push half of reduce_scatter_res itself."""
+    out = torch.empty(world_size + 3, dtype=torch.int64)
+    _jit_module(world_size).push_layout(_COMM_MAP[world_size], out)
+    v = out.tolist()
+    return PushLayout(tuple(v[:world_size]), v[world_size], v[world_size + 1], v[world_size + 2])
+
+
+def reduce_scatter_poll(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    *,
+    tuning: Tuning = DEFAULT_TUNING,
+) -> torch.Tensor:
+    """reduce_scatter_res whose producer slots were filled by the preceding
+    push-RS GEMM; ``input`` is that GEMM's unwritten output (shape only)."""
+    residual_is_local = residual is not None and residual.numel() == output.numel()
+    _reduce_scatter_poll_op(
+        world_size,
+        input,
+        output,
+        residual,
+        residual_is_local,
+        tuning.num_blocks,
+        tuning.block_size,
+    )
+    return output
 
 
 @register_custom_op(mutates_args=["output"])
