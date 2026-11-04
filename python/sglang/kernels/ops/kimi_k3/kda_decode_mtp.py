@@ -61,6 +61,8 @@ def kda_decode_mtp_kernel(
     ring_beta: cute.Tensor,
     onorm_g: cute.Tensor,
     onorm_weight: cute.Tensor,
+    q_out: cute.Tensor,
+    q_scale: cute.Tensor,
     smem_qk_layout: cute.Layout,
     smem_state_layout: cute.Layout,
     ssm_state_indices: cute.Tensor,
@@ -72,6 +74,8 @@ def kda_decode_mtp_kernel(
     CACHE_RING: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
+    APPLY_QUANT: cutlass.Constexpr[bool],
+    Q_SCALE_GROUP_STRIDE: cutlass.Constexpr[int],
 ):
     """KDA MTP decode — SMEM pre-compute + register-resident state.
 
@@ -575,6 +579,9 @@ def kda_decode_mtp_kernel(
                     sumsq, offset=offset, mask=-1, mask_and_clamp=31
                 )
             rms = cute.math.rsqrt(sumsq / cutlass.Float32(V) + onorm_eps, fastmath=True)
+            r_onorm = cute.make_rmem_tensor(
+                cute.make_layout((V // 32,), stride=(1,)), cutlass.Float32
+            )
             for i in range(V // 32):
                 v_idx = i * 32 + in_warp_tid
                 raw_o = sOall[i_t * V + v_idx]
@@ -583,10 +590,50 @@ def kda_decode_mtp_kernel(
                 gate = cute.arch.rcp_approx(
                     cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
                 )
+                normed = cutlass.BFloat16(
+                    raw_o * rms * cutlass.Float32(onorm_weight[v_idx]) * gate
+                )
+                r_onorm[i] = cutlass.Float32(normed)
                 if i_t < n_tok:
-                    o[0, bos + i_t, i_hv, v_idx] = cutlass.BFloat16(
-                        raw_o * rms * cutlass.Float32(onorm_weight[v_idx]) * gate
+                    o[0, bos + i_t, i_hv, v_idx] = normed
+            if cutlass.const_expr(APPLY_QUANT):
+                # DeepGEMM input quant of this token's head (one 128-wide
+                # group == one warp), bit-identical to per_token_group_quant
+                # (UE8M0, column-major) on o: absmax of the bf16 outputs,
+                # scale = 2^ceil(log2(absmax / 448)) from the fp32 bits, and
+                # the power-of-two multiply is exact, so fp32 matches its
+                # bf16-domain multiply.
+                amax = cutlass.Float32(0.0)
+                for i in range(V // 32):
+                    amax = cute.arch.fmax(
+                        amax, cute.arch.fmax(r_onorm[i], -r_onorm[i])
                     )
+                for offset in [16, 8, 4, 2, 1]:
+                    amax = cute.arch.fmax(
+                        amax,
+                        cute.arch.shuffle_sync_bfly(
+                            amax, offset=offset, mask=-1, mask_and_clamp=31
+                        ),
+                    )
+                amax = cute.arch.fmax(amax, cutlass.Float32(1e-10))
+                raw_bits = (amax * cutlass.Float32(1.0 / 448.0)).bitcast(cutlass.Int32)
+                exp = (raw_bits >> 23) & 0xFF
+                if (raw_bits & 0x7FFFFF) != 0:
+                    exp = exp + 1
+                inv_scale = ((254 - exp) << 23).bitcast(cutlass.Float32)
+                if i_t < n_tok:
+                    for i in range(V // 32):
+                        v_idx = i * 32 + in_warp_tid
+                        qv = cute.arch.fmin(r_onorm[i] * inv_scale, cutlass.Float32(448.0))
+                        q_out[0, bos + i_t, i_hv, v_idx] = cutlass.Float8E4M3FN(
+                            qv
+                        ).bitcast(cutlass.Uint8)
+                    if in_warp_tid == 0:
+                        q_scale[
+                            (i_hv // 4) * Q_SCALE_GROUP_STRIDE
+                            + (bos + i_t) * 4
+                            + i_hv % 4
+                        ] = cutlass.Uint8(exp)
 
 
 @cute.jit
@@ -619,6 +666,8 @@ def _run_kda_decode_mtp_dspark(
     ring_beta: cute.Tensor,
     onorm_g: cute.Tensor,
     onorm_weight: cute.Tensor,
+    q_out: cute.Tensor,
+    q_scale: cute.Tensor,
     scale: cutlass.Constexpr[float],
     H: cutlass.Constexpr[int],
     N: cutlass.Constexpr[int],
@@ -628,6 +677,8 @@ def _run_kda_decode_mtp_dspark(
     CACHE_RING: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
+    APPLY_QUANT: cutlass.Constexpr[bool],
+    Q_SCALE_GROUP_STRIDE: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     """Launch the fixed Kimi-K3/DSpARK bonus + NUM_SPEC-draft specialization."""
@@ -688,6 +739,8 @@ def _run_kda_decode_mtp_dspark(
         ring_beta,
         onorm_g,
         onorm_weight,
+        q_out,
+        q_scale,
         smem_qk_layout,
         smem_state_layout,
         ssm_state_indices,
@@ -699,6 +752,8 @@ def _run_kda_decode_mtp_dspark(
         CACHE_RING,
         APPLY_ONORM,
         onorm_eps,
+        APPLY_QUANT,
+        Q_SCALE_GROUP_STRIDE,
     ).launch(
         grid=(H, N, 1),
         block=[BLOCK_THREADS, 1, 1],
@@ -797,6 +852,7 @@ def fused_kda_decode_mtp_dspark(
     onorm_gate=None,
     onorm_weight=None,
     onorm_eps=None,
+    quant_out=False,
 ):
     """Run Kimi-K3 KDA verify while preserving DSpARK rollback semantics.
 
@@ -813,7 +869,11 @@ def fused_kda_decode_mtp_dspark(
     None.
 
     Passing all three onorm_* arguments fuses gated RMSNorm into the recurrence
-    kernel.
+    kernel. With quant_out=True (requires the fused norm and H % 4 == 0) the
+    kernel also emits the DeepGEMM block-FP8 input quant of the normed output
+    viewed as [T, H * 128] and the call returns ``(out, q, scale)``: q is
+    fp8_e4m3 [T, H * 128] and scale the group-128 UE8M0 column-major
+    TMA-aligned int32 layout, bit-identical to per_token_group_quant on out.
     """
     import torch
 
@@ -898,8 +958,32 @@ def fused_kda_decode_mtp_dspark(
             raise ValueError(f"expected output-norm weight shape {(TILE_K,)}")
         if onorm_gate.dtype != torch.bfloat16 or onorm_weight.dtype != torch.float32:
             raise ValueError("expected output-norm gate=bf16 and weight=fp32")
+    if quant_out and (not apply_onorm or H % 4 != 0):
+        raise ValueError("quant_out requires the fused output norm and H % 4 == 0")
     block_threads = _block_threads(H=H, N=N)
     out = torch.empty_like(x_v)
+    if quant_out:
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            create_per_token_group_quant_fp8_output_scale,
+        )
+
+        q_out = torch.empty((T, H * TILE_K), dtype=torch.float8_e4m3fn, device=x_v.device)
+        q_scale = create_per_token_group_quant_fp8_output_scale(
+            x_shape=q_out.shape,
+            device=x_v.device,
+            group_size=TILE_K,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+        q_scale_group_stride = q_scale.stride(1) * 4
+        # Kernel views: q as [1, T, H, 128] bytes, the scale as its flat bytes.
+        q_out_arg = q_out.view(torch.uint8).view(1, T, H, TILE_K)
+        q_scale_arg = torch.as_strided(
+            q_scale, (q_scale.stride(1) * (H // 4),), (1,), q_scale.storage_offset()
+        ).view(torch.uint8)
+    else:
+        q_scale_group_stride = 0
     args = (
         recurrent_state,
         x_q,
@@ -930,6 +1014,9 @@ def fused_kda_decode_mtp_dspark(
         replayssm_beta if cache_ring else intermediate_conv_q[..., 0],
         onorm_gate if apply_onorm else x_v,
         onorm_weight if apply_onorm else dt_bias,
+        # Fused quant outputs; same placeholder trick when quant_out is off.
+        q_out_arg if quant_out else x_v,
+        q_scale_arg if quant_out else dt_bias,
     )
     key = (
         H,
@@ -939,6 +1026,8 @@ def fused_kda_decode_mtp_dspark(
         cache_ring,
         apply_onorm,
         float(onorm_eps) if apply_onorm else 0.0,
+        bool(quant_out),
+        q_scale_group_stride,
         float(scale),
         float(lower_bound),
         *(_tensor_layout_key(tensor) for tensor in args),
@@ -959,6 +1048,8 @@ def fused_kda_decode_mtp_dspark(
             CACHE_RING=cache_ring,
             APPLY_ONORM=apply_onorm,
             onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
+            APPLY_QUANT=bool(quant_out),
+            Q_SCALE_GROUP_STRIDE=q_scale_group_stride,
             stream=stream,
         )
         _DSPARK_COMPILED[key] = compiled
@@ -966,4 +1057,6 @@ def fused_kda_decode_mtp_dspark(
         *(_cute_tensor(tensor) for tensor in args),
         stream,
     )
+    if quant_out:
+        return out, q_out, q_scale
     return out

@@ -1964,6 +1964,16 @@ class KimiK3DeltaAttention(nn.Module):
         if fused_onorm:
             self.attn._k3_onorm_gate = g_proj_states
             self.attn._k3_onorm_consumed = False
+            if not hasattr(self.attn, "_k3_onorm_quant"):
+                # The fused verify kernel can also emit o_proj's input quant.
+                self.attn._k3_onorm_quant = (
+                    envs.SGLANG_K3_KDA_ONORM_QUANT.get()
+                    and consumes_prequantized_input(self.o_proj)
+                )
+                global _KDA_ONORM_QUANT_LOGGED
+                if self.attn._k3_onorm_quant and not _KDA_ONORM_QUANT_LOGGED:
+                    _KDA_ONORM_QUANT_LOGGED = True
+                    logger.info("K3 KDA output norm + o_proj quant fusion active")
 
         core_attn_out = self.attn(
             forward_batch,

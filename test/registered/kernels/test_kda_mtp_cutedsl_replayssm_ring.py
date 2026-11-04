@@ -40,7 +40,7 @@ K = 128
 W = 4  # KERNEL_WIDTH
 
 
-def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
+def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False, quant_out=False):
     torch.manual_seed(seed)
     T = N * (1 + num_spec)
     num_slots = N + 2
@@ -107,6 +107,8 @@ def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
             onorm_weight=norm["weight"],
             onorm_eps=norm["eps"],
         )
+    if quant_out:
+        kwargs.update(quant_out=True)
     if arm == "baseline":
         inter = torch.zeros(N, 1 + num_spec, H, K, K, device=DEV, dtype=torch.float32)
         out = fused_kda_decode_mtp_dspark(intermediate_ssm=inter, **kwargs)
@@ -171,6 +173,33 @@ def test_cutedsl_fused_output_norm(N):
     ref = ref * torch.rsqrt(ref.square().mean(dim=-1, keepdim=True) + norm["eps"])
     ref = ref * norm["weight"] * torch.sigmoid(norm["gate"].float())
     torch.testing.assert_close(fused.float(), ref, rtol=2e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize("N,H,num_spec", [(4, 4, 2), (32, 12, 5), (64, 12, 5)])
+def test_cutedsl_fused_output_norm_quant(N, H, num_spec):
+    """quant_out leaves the normed output bit-identical and its fp8/UE8M0
+    pair bit-identical to per_token_group_quant on that output."""
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    seed = 3
+    ref, _ = _run("baseline", N=N, H=H, num_spec=num_spec, seed=seed, onorm=True)
+    (out, q, s), _ = _run(
+        "baseline", N=N, H=H, num_spec=num_spec, seed=seed, onorm=True, quant_out=True
+    )
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    T = N * (1 + num_spec)
+    q_ref, s_ref = sglang_per_token_group_quant_fp8(
+        out.view(T, H * K),
+        128,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
+    assert s.shape == s_ref.shape and s.stride() == s_ref.stride()
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s, s_ref)
 
 
 @pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])
