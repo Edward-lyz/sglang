@@ -25,6 +25,11 @@ import numpy as np
 import pytest
 import torch
 
+from types import SimpleNamespace
+
+from sglang.srt.environ import envs
+from sglang.srt.managers import scheduler_pp_mixin
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.chunk_cost_model import ChunkCostModel
 from sglang.srt.managers.chunk_flops_estimator import (
     aggregate_stage_flops,
@@ -314,3 +319,96 @@ def test_weight_walk_flops_accounting():
     )
     assert buckets["flops"] == pytest.approx(expected)
     assert buckets["mla_layers"] == 0.0
+
+
+class _FakePPGroup:
+    def __init__(self, is_first_rank):
+        self.is_first_rank = is_first_rank
+
+
+class _FakeParallelState:
+    attn_tp_size = 1
+    attn_cp_size = 1
+    pp_size = 16
+
+
+class _FakeScheduler(SchedulerPPMixin):
+    """Only the attributes profile_and_init_predictor reads before it fails."""
+
+    def __init__(self, is_first_rank=True):
+        self.pp_group = _FakePPGroup(is_first_rank)
+        self.ps = _FakeParallelState()
+        self.chunked_prefill_size = 24576
+        self.enable_dynamic_chunking = True
+        self.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(model_config=SimpleNamespace())
+        )
+        self.model_config = SimpleNamespace(hf_config=SimpleNamespace())
+
+
+def test_pp0_profiling_failure_degrades_instead_of_hanging(monkeypatch):
+    """A profiling forward can fail on a constraint only PP0 exercises, because
+    it is the only rank that runs one. If that exception escapes, every other
+    rank stays parked in the broadcast that publishes PP0's samples, which is a
+    startup hang. The failure has to come back as a disabled feature."""
+    monkeypatch.setattr(
+        envs.SGLANG_DYNAMIC_CHUNKING_COST_MODEL, "get", lambda: False
+    )
+    # Not initialized here, so the single-process path runs and the failure has
+    # to be handled without a collective.
+    assert not torch.distributed.is_initialized()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("num_experts exceeds maximum (256)")
+
+    monkeypatch.setattr(scheduler_pp_mixin, "Req", _boom)
+
+    sched = _FakeScheduler(is_first_rank=True)
+    sched.profile_and_init_predictor()  # must not raise
+
+    assert sched.enable_dynamic_chunking is False
+    assert sched.length_predictor is None
+    assert sched.chunk_cost_model is None
+
+
+class _PackedParam(_FakeParam):
+    """A packed parameter that declares how many values a stored element holds."""
+
+    def __init__(self, shape, packed_factor, dtype=torch.uint8):
+        super().__init__(shape, dtype)
+        self.packed_factor = packed_factor
+
+
+def test_declared_packed_factor_beats_the_dtype_guess():
+    """A byte-typed tensor does not say how many values it packs. Guessing 4-bit
+    from `uint8` doubles that stage's count, and since stages can carry
+    different quantization the error does not cancel in the max-over-stages
+    normalization -- it moves the chunk. A declared factor must win."""
+    # 8-bit weights that happen to be stored untyped: one value per element.
+    eight_bit = [("model.layers.0.self_attn.o_proj.weight",
+                  _PackedParam((7168, 16384), packed_factor=1))]
+    buckets = estimate_stage_flops_per_token(_FakeModel(eight_bit), _FakeConfig())
+    assert buckets["flops"] == pytest.approx(2.0 * 7168 * 16384)
+
+    # Four values per element, e.g. a 4-bit scheme packed into int16-sized words.
+    four_per = [("model.layers.0.self_attn.o_proj.weight",
+                 _PackedParam((7168, 4096), packed_factor=4))]
+    buckets = estimate_stage_flops_per_token(_FakeModel(four_per), _FakeConfig())
+    assert buckets["flops"] == pytest.approx(2.0 * 7168 * 4096 * 4)
+
+    # No declaration: uint8 still falls back to the 4-bit assumption, which is
+    # what mxfp4 needs, while int8 and float8 count one value per element.
+    for dtype, expected_factor in (
+        (torch.uint8, 2.0),
+        (torch.int8, 1.0),
+        (torch.float8_e4m3fn, 1.0),
+        (torch.bfloat16, 1.0),
+    ):
+        params = [("model.layers.0.self_attn.o_proj.weight",
+                   _FakeParam((512, 512), dtype))]
+        buckets = estimate_stage_flops_per_token(_FakeModel(params), _FakeConfig())
+        assert buckets["flops"] == pytest.approx(
+            2.0 * 512 * 512 * expected_factor
+        ), dtype
+
+

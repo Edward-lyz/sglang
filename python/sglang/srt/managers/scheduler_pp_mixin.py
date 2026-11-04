@@ -1948,135 +1948,152 @@ class SchedulerPPMixin:
                 max_new_tokens=1,
             )
             # Create and profile requests
-            for i, input_ids in enumerate(
-                tqdm(
-                    input_ids_list,
-                    desc="Profiling prefill latency for dynamic chunking",
-                )
-            ):
-                req = Req(
-                    rid=str(i),
-                    origin_input_text="",
-                    origin_input_ids=input_ids,
-                    sampling_params=sampling_params,
-                )
-                req.full_untruncated_fill_ids = req.origin_input_ids
-                req.logprob_start_len = -1
-                req.set_extend_range(
-                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-                )
-
-                # Prepare batch
-                batch = ScheduleBatch.init_new(
-                    [req],
-                    self.req_to_token_pool,
-                    self.token_to_kv_pool_allocator,
-                    self.tree_cache,
-                    self.model_config,
-                    False,
-                    self.spec_algorithm,
-                )
-
-                current_seq_len = req.extend_range.end
-
-                if is_dp_attention_enabled():
-                    # For profiling, we only have one request on PP0
-                    # Set global_num_tokens to indicate this rank has tokens, others have 0
-                    dp_size = get_attention_dp_size()
-                    global_num_tokens = [0] * dp_size
-                    dp_rank = get_attention_dp_rank()
-                    global_num_tokens[dp_rank] = current_seq_len
-                    batch.global_num_tokens = global_num_tokens
-                    batch.global_num_tokens_for_logprob = global_num_tokens
-
-                hs = (
-                    getattr(model_config, "hc_hidden_size", None)
-                    or model_config.hidden_size
-                )
-                proxy_tensors = {
-                    "hidden_states": torch.zeros(
-                        (current_seq_len, hs),
-                        dtype=model_config.dtype,
-                        device=self.device,
-                    ),
-                    "residual": torch.zeros(
-                        (current_seq_len, model_config.hidden_size),
-                        dtype=model_config.dtype,
-                        device=self.device,
-                    ),
-                }
-                pp_proxy_topk_size = model_runner.get_pp_proxy_topk_size()
-                if pp_proxy_topk_size is not None:
-                    proxy_tensors["topk_indices"] = torch.zeros(
-                        (current_seq_len, pp_proxy_topk_size),
-                        dtype=torch.int32,
-                        device=self.device,
+            # A profiling forward can fail on model/kernel constraints that
+            # only PP0 exercises (it is the only rank that runs one). Letting
+            # that exception escape leaves every other rank parked in the
+            # broadcast below, which is a startup hang with no diagnostic, so
+            # the failure is caught here and published as data instead.
+            try:
+                for i, input_ids in enumerate(
+                    tqdm(
+                        input_ids_list,
+                        desc="Profiling prefill latency for dynamic chunking",
+                    )
+                ):
+                    req = Req(
+                        rid=str(i),
+                        origin_input_text="",
+                        origin_input_ids=input_ids,
+                        sampling_params=sampling_params,
+                    )
+                    req.full_untruncated_fill_ids = req.origin_input_ids
+                    req.logprob_start_len = -1
+                    req.set_extend_range(
+                        len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                     )
 
-                pp_proxy = PPProxyTensors(proxy_tensors)
-
-                # Measure latency with device synchronization for accurate timing
-                device_module = get_device_module()
-                # Synchronize before starting timing to ensure clean measurement
-                device_module.synchronize()
-
-                start = time.perf_counter()
-                batch.prepare_for_extend()
-
-                # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
-                if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
-                    batch.input_ids = batch.prefill_input_ids_cpu.to(
-                        self.device, non_blocking=True
+                    # Prepare batch
+                    batch = ScheduleBatch.init_new(
+                        [req],
+                        self.req_to_token_pool,
+                        self.token_to_kv_pool_allocator,
+                        self.tree_cache,
+                        self.model_config,
+                        False,
+                        self.spec_algorithm,
                     )
-                    batch.prefill_input_ids_cpu = None
 
-                forward_batch = ForwardBatch.init_new(
-                    batch,
-                    model_runner,
-                    return_hidden_states_before_norm=False,
+                    current_seq_len = req.extend_range.end
+
+                    if is_dp_attention_enabled():
+                        # For profiling, we only have one request on PP0
+                        # Set global_num_tokens to indicate this rank has tokens, others have 0
+                        dp_size = get_attention_dp_size()
+                        global_num_tokens = [0] * dp_size
+                        dp_rank = get_attention_dp_rank()
+                        global_num_tokens[dp_rank] = current_seq_len
+                        batch.global_num_tokens = global_num_tokens
+                        batch.global_num_tokens_for_logprob = global_num_tokens
+
+                    hs = (
+                        getattr(model_config, "hc_hidden_size", None)
+                        or model_config.hidden_size
+                    )
+                    proxy_tensors = {
+                        "hidden_states": torch.zeros(
+                            (current_seq_len, hs),
+                            dtype=model_config.dtype,
+                            device=self.device,
+                        ),
+                        "residual": torch.zeros(
+                            (current_seq_len, model_config.hidden_size),
+                            dtype=model_config.dtype,
+                            device=self.device,
+                        ),
+                    }
+                    pp_proxy_topk_size = model_runner.get_pp_proxy_topk_size()
+                    if pp_proxy_topk_size is not None:
+                        proxy_tensors["topk_indices"] = torch.zeros(
+                            (current_seq_len, pp_proxy_topk_size),
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+
+                    pp_proxy = PPProxyTensors(proxy_tensors)
+
+                    # Measure latency with device synchronization for accurate timing
+                    device_module = get_device_module()
+                    # Synchronize before starting timing to ensure clean measurement
+                    device_module.synchronize()
+
+                    start = time.perf_counter()
+                    batch.prepare_for_extend()
+
+                    # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
+                    if (
+                        batch.input_ids is None
+                        and batch.prefill_input_ids_cpu is not None
+                    ):
+                        batch.input_ids = batch.prefill_input_ids_cpu.to(
+                            self.device, non_blocking=True
+                        )
+                        batch.prefill_input_ids_cpu = None
+
+                    forward_batch = ForwardBatch.init_new(
+                        batch,
+                        model_runner,
+                        return_hidden_states_before_norm=False,
+                    )
+                    set_is_extend_in_batch(batch.forward_mode.is_extend())
+
+                    _ = model_runner.forward(
+                        forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
+                    )
+
+                    # Synchronize after forward to ensure GPU operations complete
+                    device_module.synchronize()
+
+                    latency_seconds = time.perf_counter() - start
+                    latency_ms = latency_seconds * 1e3  # Convert to milliseconds
+                    seq_lens.append(len(input_ids))
+                    latencies.append(latency_ms)
+
+                    # Release KV and Mamba cache
+                    if req.req_pool_idx is not None:
+                        kv_indices = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, : req.extend_range.end
+                        ]
+                        self.token_to_kv_pool_allocator.free(kv_indices)
+                        if req.mamba_pool_idx is not None:
+                            self.req_to_token_pool.free_mamba_cache(req)
+                        self.req_to_token_pool.free(req)
+                        req.kv = None
+
+                logger.info(
+                    f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
+                    f"seq_lens={seq_lens}, latencies_ms={latencies}"
                 )
-                set_is_extend_in_batch(batch.forward_mode.is_extend())
-
-                _ = model_runner.forward(
-                    forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
+            except Exception as e:
+                profile_ok = False
+                seq_lens, latencies = [], []
+                logger.warning(
+                    "[PP Dynamic Chunk] [PP0] Prefill latency profiling failed: "
+                    "%s. Disabling dynamic chunking on every PP rank.",
+                    e,
                 )
-
-                # Synchronize after forward to ensure GPU operations complete
-                device_module.synchronize()
-
-                latency_seconds = time.perf_counter() - start
-                latency_ms = latency_seconds * 1e3  # Convert to milliseconds
-                seq_lens.append(len(input_ids))
-                latencies.append(latency_ms)
-
-                # Release KV and Mamba cache
-                if req.req_pool_idx is not None:
-                    kv_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : req.extend_range.end
-                    ]
-                    self.token_to_kv_pool_allocator.free(kv_indices)
-                    if req.mamba_pool_idx is not None:
-                        self.req_to_token_pool.free_mamba_cache(req)
-                    self.req_to_token_pool.free(req)
-                    req.kv = None
-
-            logger.info(
-                f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
-                f"seq_lens={seq_lens}, latencies_ms={latencies}"
-            )
 
             if self.ps.attn_tp_size > 1:
-                data_to_sync_tp = [seq_lens, latencies]
+                data_to_sync_tp = [profile_ok, seq_lens, latencies]
                 data_to_sync_tp = broadcast_pyobj(
                     data_to_sync_tp,
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
-                seq_lens, latencies = data_to_sync_tp
+                profile_ok, seq_lens, latencies = data_to_sync_tp
 
             if self.ps.attn_cp_size > 1:
-                data_to_sync_tp = [seq_lens, latencies]
+                data_to_sync_tp = [profile_ok, seq_lens, latencies]
                 data_to_sync_tp = broadcast_pyobj(
                     data_to_sync_tp,
                     self.attn_cp_group.rank,
@@ -2084,11 +2101,17 @@ class SchedulerPPMixin:
                     src=self.attn_cp_group.ranks[0],
                 )
 
-        # Broadcast data to all ranks
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            data_to_sync = [seq_lens, latencies]
+        # Broadcast data to all ranks. `profile_ok` rides along so the ranks
+        # that never ran a forward learn PP0's outcome; without it a PP0
+        # failure is invisible here and only PP0 would degrade.
+        if (
+            not use_cost_model
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            data_to_sync = [profile_ok, seq_lens, latencies]
             self.pp_group.broadcast_object_list(data_to_sync, src=0)
-            seq_lens, latencies = data_to_sync
+            profile_ok, seq_lens, latencies = data_to_sync
 
         if not profile_ok:
             # Every rank reaches this with the same value, so the whole PP group
