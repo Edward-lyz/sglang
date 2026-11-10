@@ -1,6 +1,7 @@
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
+from sglang.srt.utils.common import to_device_nonblocking
 
 
 class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
@@ -14,18 +15,17 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         )
 
     def _prepare(self):
-        self.min_new_tokens = torch.tensor(
-            data=[
-                req.sampling_params.min_new_tokens for req in self.orchestrator.reqs()
-            ],
-            dtype=torch.int32,
-            device=self.orchestrator.device,
+        # Non-blocking H2D (runs when requests are admitted / merged).
+        self.min_new_tokens = to_device_nonblocking(
+            [req.sampling_params.min_new_tokens for req in self.orchestrator.reqs()],
+            torch.int32,
+            self.orchestrator.device,
         ).unsqueeze_(1)
 
         padded_stop_token_ids = torch.nn.utils.rnn.pad_sequence(
             sequences=[
-                torch.tensor(
-                    data=(
+                to_device_nonblocking(
+                    (
                         list(
                             (req.sampling_params.stop_token_ids or set())
                             | (req.tokenizer.additional_stop_token_ids or set())
@@ -36,8 +36,8 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                             )
                         )
                     ),
-                    dtype=torch.int64,
-                    device=self.orchestrator.device,
+                    torch.int64,
+                    self.orchestrator.device,
                 )
                 for req in self.orchestrator.reqs()
             ],

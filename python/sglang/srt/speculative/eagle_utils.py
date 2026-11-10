@@ -874,6 +874,16 @@ def eagle_sample(
     # path with the transition prompt before KV commit.  This keeps output ids,
     # accepted lengths, and the next draft input consistent with one another.
     for i, req in enumerate(batch.reqs):
+        # Only a request with an active think budget (>= 0) can be changed by
+        # this loop: inject_thinking_prompt_tokens is a no-op unless the budget
+        # is exactly 0, and update_thinking_state returns early for None / < 0.
+        # Skip the rest early, because the boolean indexing and .cpu() below
+        # force a GPU->CPU sync per request on every verify step. That sync
+        # serializes the overlap scheduler: scheduling CPU work (e.g. admitting
+        # a 60k-token request) is then exposed on that DP rank, and the other
+        # ranks wait for it inside the MoE all-to-all (bimodal slow steps).
+        if req.thinking_budget is None or req.thinking_budget < 0:
+            continue
         accepted_path = accept_index[i][accept_index[i] >= 0]
         if accepted_path.numel() == 0:
             continue

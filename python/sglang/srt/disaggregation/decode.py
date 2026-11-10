@@ -89,6 +89,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import get_num_new_pages, is_npu
+from sglang.srt.utils.common import to_device_nonblocking
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -96,6 +97,16 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+def _start_page_indices_d2h(kv_indices: torch.Tensor, page_size: int) -> torch.Tensor:
+    """Async ``kv_to_page_indices``: returns a pinned host tensor that is valid
+    once a CUDA event recorded after this call has completed."""
+    pages = kv_indices[::page_size] // page_size
+    host = torch.empty(pages.shape, dtype=pages.dtype, pin_memory=True)
+    host.copy_(pages, non_blocking=True)
+    return host
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -349,6 +360,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
+        # Pre-allocated requests whose page-index D2H copy is still in flight;
+        # their send_metadata is issued by flush_pending_send_metadata().
+        self._pending_send_metadata: List[tuple] = []
         self._ensure_retry_count: Dict[str, int] = {}
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
@@ -874,6 +888,58 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return ready, remaining
 
+    def _can_defer_send_metadata(
+        self, decode_req: DecodeRequest, state_types, kv_indices
+    ) -> bool:
+        """Whether pop_preallocated may send this request's metadata later.
+
+        Only the plain paged path whose state payloads are page indices of the
+        main KV (DSA indexer) is deferred; every other path keeps the original
+        synchronous ordering.
+        """
+        return (
+            isinstance(kv_indices, torch.Tensor)
+            and kv_indices.is_cuda
+            and not self.scheduler.enable_hisparse
+            and not decode_req.is_rebootstrap
+            and not (
+                self.transfer_queue.enable_staging
+                and getattr(decode_req.kv_receiver, "require_staging", False)
+            )
+            and not hasattr(self.req_to_token_pool, "req_to_token_c4")
+            and all(
+                st in (StateType.DSA, StateType.MINIMAX_INDEX_K) for st in state_types
+            )
+        )
+
+    def flush_pending_send_metadata(self) -> None:
+        """Send metadata for pre-allocated requests whose page-index copy landed.
+
+        The copy is enqueued on the scheduler stream behind the WAR barrier, so
+        it completes together with the in-flight forward; by the next scheduler
+        iteration it is normally done and this never blocks.
+        """
+        if not self._pending_send_metadata:
+            return
+        remaining = []
+        for entry in self._pending_send_metadata:
+            decode_req, pages, states, kwargs, copy_done = entry
+            if not copy_done.query():
+                remaining.append(entry)
+                continue
+            if decode_req.kv_receiver is None or isinstance(
+                decode_req.req.finished_reason, FINISH_ABORT
+            ):
+                # Aborted / cleaned up while the copy was in flight.
+                continue
+            decode_req.kv_receiver.send_metadata(
+                pages.numpy().astype(np.int32),
+                decode_req.metadata_buffer_index,
+                [x.numpy() if isinstance(x, torch.Tensor) else x for x in states],
+                **kwargs,
+            )
+        self._pending_send_metadata = remaining
+
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
         if not self.pending_reqs:
@@ -1264,18 +1330,41 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=total_prefix_len,
                     )
                 )
-            state_indices: Optional[List] = [
-                payloads[st]() if st in payloads else None for st in state_types
-            ]
+            # Deferred path: start the page-index D2H copies now and send the
+            # metadata on a later iteration (flush_pending_send_metadata), so
+            # the scheduler never blocks on the in-flight forward here.
+            defer_metadata = self._can_defer_send_metadata(
+                decode_req, state_types, kv_indices
+            )
+            if defer_metadata:
+                # Same content as _dsa_payload, copied without blocking.
+                dsa_kv_full = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx, :seq_len
+                ]
+                state_indices = [
+                    _start_page_indices_d2h(
+                        dsa_kv_full, self.token_to_kv_pool.page_size
+                    )
+                    for _ in state_types
+                ]
+            else:
+                state_indices: Optional[List] = [
+                    payloads[st]() if st in payloads else None for st in state_types
+                ]
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
             # int32 for ZMQ serialization -- from_zmq reads np.int32.
-            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
-                np.int32
-            )
+            if defer_metadata:
+                page_indices = _start_page_indices_d2h(
+                    kv_indices, kv_transfer_page_size
+                )
+            else:
+                page_indices = kv_to_page_indices(
+                    kv_indices, kv_transfer_page_size
+                ).astype(np.int32)
             device_page_indices = None
             if (
                 self.scheduler.enable_hisparse
@@ -1312,12 +1401,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                **metadata_kwargs,
-            )
+            if defer_metadata:
+                copy_done = torch.cuda.Event()
+                copy_done.record()
+                self._pending_send_metadata.append(
+                    (
+                        decode_req,
+                        page_indices,
+                        state_indices,
+                        metadata_kwargs,
+                        copy_done,
+                    )
+                )
+            else:
+                decode_req.kv_receiver.send_metadata(
+                    page_indices,
+                    decode_req.metadata_buffer_index,
+                    state_indices,
+                    **metadata_kwargs,
+                )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
@@ -1732,7 +1834,7 @@ def alloc_for_decode_prealloc(
         last_loc = (
             prefix_indices[-1:].to(dtype=torch.int64, device=device)
             if prefix_len > 0
-            else torch.tensor([-1], dtype=torch.int64, device=device)
+            else to_device_nonblocking([-1], torch.int64, device)
         )
         extra_kwargs = {}
         dsv4_unwrap_prealloc = None
@@ -1756,9 +1858,9 @@ def alloc_for_decode_prealloc(
             # alloc_extend which allocates SWA at full page count; the
             # SWA budget in that case may slightly under-estimate.
             kv_loc = allocator.alloc_extend_swa_tail(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens=to_device_nonblocking([0], torch.int64, device),
                 prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens=to_device_nonblocking([fill_len], torch.int64, device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
                 extend_num_tokens=fill_len,
@@ -1768,11 +1870,11 @@ def alloc_for_decode_prealloc(
             req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
         else:
             kv_loc = allocator.alloc_extend(
-                prefix_lens=torch.tensor(
-                    [total_prefix_len], dtype=torch.int64, device=device
+                prefix_lens=to_device_nonblocking(
+                    [total_prefix_len], torch.int64, device
                 ),
                 prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens=to_device_nonblocking([fill_len], torch.int64, device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
                 extend_num_tokens=delta_len,
@@ -2490,6 +2592,7 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        self.disagg_decode_prealloc_queue.flush_pending_send_metadata()
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 

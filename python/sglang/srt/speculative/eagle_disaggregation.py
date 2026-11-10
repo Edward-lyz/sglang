@@ -7,6 +7,7 @@ import torch
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.utils.common import to_device_nonblocking
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -24,39 +25,47 @@ def build_eagle_disagg_draft_input(
     if server_args.enable_multi_layer_eagle:
         num_states *= server_args.speculative_num_steps
 
-    topk_p = torch.stack(
-        [
-            torch.as_tensor(
-                req.output_topk_p[:num_states],
-                device=batch.device,
-                dtype=torch.float32,
-            )
-            for req in batch.reqs
-        ],
-        dim=0,
+    # Stack on the host and copy once without blocking: per-request
+    # pageable H2D copies would each synchronize the scheduler stream.
+    topk_p = to_device_nonblocking(
+        torch.stack(
+            [
+                torch.as_tensor(req.output_topk_p[:num_states], dtype=torch.float32)
+                for req in batch.reqs
+            ],
+            dim=0,
+        ),
+        torch.float32,
+        batch.device,
     )
-    topk_index = torch.stack(
-        [
-            torch.as_tensor(
-                req.output_topk_index[:num_states],
-                device=batch.device,
-                dtype=torch.int64,
-            )
-            for req in batch.reqs
-        ],
-        dim=0,
+    topk_index = to_device_nonblocking(
+        torch.stack(
+            [
+                torch.as_tensor(req.output_topk_index[:num_states], dtype=torch.int64)
+                for req in batch.reqs
+            ],
+            dim=0,
+        ),
+        torch.int64,
+        batch.device,
     )
 
-    hidden_states = torch.stack(
-        [req.hidden_states_tensor for req in batch.reqs], dim=0
-    ).to(batch.device)
+    hidden_states = to_device_nonblocking(
+        torch.stack([req.hidden_states_tensor for req in batch.reqs], dim=0),
+        None,
+        batch.device,
+    )
 
     dsa_topk_indices = None
     dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
     if dsa_indices_list and all(t is not None for t in dsa_indices_list):
-        dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
-        if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():
+        # Check validity where the data lives (host for PD transfers) before
+        # the copy, so .item() does not wait on the scheduler stream.
+        dsa_stacked = torch.stack(dsa_indices_list, dim=0)
+        if torch.any(torch.all(dsa_stacked < 0, dim=1)).item():
             dsa_topk_indices = None
+        else:
+            dsa_topk_indices = to_device_nonblocking(dsa_stacked, None, batch.device)
 
     spec_info = EagleDraftInput(
         topk_p=topk_p,

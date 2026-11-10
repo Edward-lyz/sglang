@@ -11,6 +11,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils.common import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -77,18 +78,18 @@ class ScheduleBatchDisaggregationDecodeMixin:
             pre_lens.append(pre_len)
 
         # Set fields
-        self.input_ids = torch.tensor(
-            sum(input_ids, array("q")), dtype=torch.int32, device=self.device
+        # Non-blocking H2D: this runs on the overlap scheduler stream while
+        # the previous forward is in flight (see to_device_nonblocking).
+        self.input_ids = to_device_nonblocking(
+            sum(input_ids, array("q")), torch.int32, self.device
         )
-        self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
+        self.req_pool_indices = to_device_nonblocking(
+            req_pool_indices, torch.int64, self.device
         )
         self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.seq_lens = to_device_nonblocking(seq_lens, torch.int64, self.device)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
-        )
+        self.orig_seq_lens = to_device_nonblocking(seq_lens, torch.int32, self.device)
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 
@@ -138,8 +139,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        last_tokens_tensor = torch.tensor(
-            last_tokens, dtype=torch.int64, device=self.device
+        last_tokens_tensor = to_device_nonblocking(
+            last_tokens, torch.int64, self.device
         )
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(

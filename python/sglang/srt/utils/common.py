@@ -1207,6 +1207,23 @@ class Range(NamedTuple):
         return self.end - self.start
 
 
+def to_device_nonblocking(data, dtype=None, device="cuda") -> torch.Tensor:
+    """``torch.tensor(data, dtype=dtype, device=device)`` without a host sync.
+
+    A host->device copy from pageable memory synchronizes the current stream.
+    On the overlap scheduler's stream (ordered behind the WAR barrier) that
+    blocks the CPU until the in-flight forward finishes. Staging through
+    pinned memory keeps the same stream ordering without blocking the host.
+    """
+    t = data if isinstance(data, torch.Tensor) else torch.tensor(data, dtype=dtype)
+    if dtype is not None and t.dtype != dtype:
+        t = t.to(dtype)
+    dev = torch.device(device)
+    if t.device == dev or dev.type != "cuda" or t.device.type == "cuda":
+        return t.to(dev)
+    return t.pin_memory().to(dev, non_blocking=True)
+
+
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
     """Flatten array.array('q') buffers into one int64 CPU tensor.
 
