@@ -1109,73 +1109,107 @@ async def clear_hicache_storage_backend():
 
 
 # example usage:
+#   # Clear device and memory caches:
 #   curl -X POST http://127.0.0.1:30000/clear_all_cache
-# Clears both the device KV cache (RadixCache + KV pool) and the host-side
-# AIBrix/BZZ KV cache service co-located on the same pod.
-# The host-side service port defaults to 8080 and can be overridden via the
-# AIAK_HOST_CACHE_PORT environment variable.
+#   # Clear only the memory cache on every node of this instance:
+#   curl -X POST 'http://127.0.0.1:30000/clear_all_cache?memory_only=true'
+#
+# The memory-cache service port defaults to 8080 and can be overridden via
+# AIAK_HOST_CACHE_PORT. In a federated deployment, FED_MEMBER_FILE points to a
+# file containing all member IPs; single-node deployments fall back to
+# ``hostname -i``.
 @app.api_route("/clear_all_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def clear_all_cache():
-    """Clear both device KV cache and host (AIBrix/BZZ) KV cache."""
+async def clear_all_cache(
+    memory_only: bool = Query(
+        False, description="Only clear the memory cache; keep the device KV cache."
+    ),
+):
+    """Clear caches, optionally clearing only memory caches on all nodes."""
     lines = []
     all_ok = True
 
-    logger.info("[/clear_all_cache] received request, starting cache clear")
+    logger.info("[/clear_all_cache] received request, memory_only=%s", memory_only)
 
-    # 1. Device cache: scheduler-side does 5 rounds / 100ms spacing.
-    logger.info("[/clear_all_cache] step 1/2: clearing device cache ...")
-    try:
-        device_ret = await _global_state.tokenizer_manager.flush_cache(
-            evict_evictable=True
-        )
-        device_ok = bool(device_ret.success)
-    except Exception as e:
-        device_ok = False
-        lines.append(f"[device] exception: {e}")
-        logger.exception("[/clear_all_cache] device cache clear raised")
-    if device_ok:
-        lines.append("[device] evicted evictable blocks (5 rounds)")
-        logger.info("[/clear_all_cache] device cache evict done")
+    # Device cache: scheduler-side does 5 rounds / 100ms spacing. In
+    # memory-only mode it must be retained for callers that need independent
+    # control of the two cache tiers.
+    if memory_only:
+        lines.append("[device] skipped (memory_only=true)")
     else:
-        lines.append("[device] evict failed; see backend logs")
-        logger.warning("[/clear_all_cache] device cache evict failed")
-        all_ok = False
+        logger.info("[/clear_all_cache] clearing device cache ...")
+        try:
+            device_ret = await _global_state.tokenizer_manager.flush_cache(
+                evict_evictable=True
+            )
+            device_ok = bool(device_ret.success)
+        except Exception as e:
+            device_ok = False
+            lines.append(f"[device] exception: {e}")
+            logger.exception("[/clear_all_cache] device cache clear raised")
+        if device_ok:
+            lines.append("[device] evicted evictable blocks (5 rounds)")
+        else:
+            lines.append("[device] evict failed; see backend logs")
+            all_ok = False
 
-    # 2. Host cache: call co-located AIBrix/BZZ via HTTP.
-    # All synchronous I/O is offloaded via asyncio.to_thread so the
-    # FastAPI event loop stays responsive.
-    logger.info("[/clear_all_cache] step 2/2: clearing host cache ...")
+    # Memory cache: federated instances expose all DP member IPs through the
+    # file referenced by FED_MEMBER_FILE. Clear those nodes concurrently;
+    # ``hostname -i`` is only a fallback for deployments without federation.
+    logger.info("[/clear_all_cache] clearing memory cache on all nodes ...")
     host_port = os.environ.get("AIAK_HOST_CACHE_PORT", "8080")
-    host_ip = None
+    fed_member_file = os.environ.get("FED_MEMBER_FILE")
     try:
-        raw = await asyncio.to_thread(
-            subprocess.check_output, ["hostname", "-i"], timeout=5
+        if fed_member_file:
+
+            def _read_member_file() -> str:
+                """Read the federated member list from its mounted file."""
+                with open(fed_member_file, encoding="utf-8") as member_file:
+                    return member_file.read()
+
+            raw_members = await asyncio.to_thread(_read_member_file)
+            # The current format is comma-separated, e.g.
+            # ``10.95.253.147,10.95.251.218``. Also accept whitespace/newlines
+            # so a harmless formatting change in the mounted file still works.
+            host_ips = re.findall(r"[^,\s]+", raw_members)
+            discovery_source = f"FED_MEMBER_FILE={fed_member_file}"
+        else:
+            raw = await asyncio.to_thread(
+                subprocess.check_output, ["hostname", "-i"], timeout=5
+            )
+            host_ips = raw.decode().strip().split()
+            discovery_source = "hostname -i"
+
+        host_ips = list(dict.fromkeys(host_ips))
+        if not host_ips:
+            raise RuntimeError(f"{discovery_source} returned no node IP")
+        logger.info(
+            "[/clear_all_cache] discovered memory-cache nodes from %s: %s",
+            discovery_source,
+            host_ips,
         )
-        host_ip = raw.decode().strip().split()[0]
+        lines.append(f"[memory] nodes ({discovery_source}): {host_ips}")
     except Exception as e:
-        lines.append(f"[host] hostname -i failed: {e}")
-        logger.exception("[/clear_all_cache] hostname -i failed")
+        host_ips = []
+        lines.append(f"[memory] failed to discover instance nodes: {e}")
+        logger.exception("[/clear_all_cache] failed to discover instance nodes")
         all_ok = False
 
-    if host_ip:
+    # AIBrix /debug/GetIndexSize returns plain text lines like:
+    #   "ns: <namespace> idx size <N>"
+    size_line = re.compile(r"ns:\s*(\S+)\s+idx\s+size\s+(\d+)")
+
+    def _parse_index_size(text: str) -> dict:
+        """Parse namespace sizes returned by the memory-cache service."""
+        return {m.group(1): int(m.group(2)) for m in size_line.finditer(text or "")}
+
+    async def _clear_memory_cache(host_ip: str) -> tuple[list[str], bool]:
+        """Clear one node; blocking requests calls run outside the event loop."""
         base = f"http://{host_ip}:{host_port}"
-        logger.info(f"[/clear_all_cache] host cache service base={base}")
+        node_lines = []
+        node_ok = True
+        logger.info("[/clear_all_cache] memory cache service base=%s", base)
 
-        # AIBrix /debug/GetIndexSize returns plain text lines like:
-        #   "ns: <namespace> idx size <N>"
-        # (note: the endpoint 301-redirects to a trailing-slash URL; requests
-        #  follows redirects by default, but we request the canonical URL to
-        #  avoid the extra round-trip.)
-        _SIZE_LINE = re.compile(r"ns:\s*(\S+)\s+idx\s+size\s+(\d+)")
-
-        def _parse_index_size(text: str) -> dict:
-            return {
-                m.group(1): int(m.group(2)) for m in _SIZE_LINE.finditer(text or "")
-            }
-
-        # BEFORE sizes.
-        sizes_before = {}
         try:
             resp = await asyncio.to_thread(
                 requests.get, f"{base}/debug/GetIndexSize/", timeout=10
@@ -1183,57 +1217,68 @@ async def clear_all_cache():
             resp.raise_for_status()
             sizes_before = _parse_index_size(resp.text)
         except Exception as e:
-            lines.append(f"[host] GetIndexSize (before) failed: {e}")
-            logger.exception("[/clear_all_cache] GetIndexSize before failed")
-            all_ok = False
+            node_lines.append(f"[memory:{host_ip}] GetIndexSize before failed: {e}")
+            logger.exception("[/clear_all_cache] GetIndexSize before failed: %s", base)
+            return node_lines, False
 
-        namespaces = list(sizes_before.keys())
-        lines.append(f"[host] before: {sizes_before}")
-        logger.info(f"[/clear_all_cache] host cache sizes BEFORE evict: {sizes_before}")
-        if not namespaces:
-            lines.append("[host] no namespace found, skip evictBlocks")
-
-        for ns in namespaces:
+        namespaces = list(sizes_before)
+        node_lines.append(f"[memory:{host_ip}] before: {sizes_before}")
+        for namespace in namespaces:
             try:
-                r = await asyncio.to_thread(
+                resp = await asyncio.to_thread(
                     requests.get,
                     f"{base}/op/evictBlocks",
                     params={
-                        "namespace": ns,
+                        "namespace": namespace,
                         "clearCacheWithExpireAt": "true",
                     },
                     timeout=30,
                 )
-                if r.status_code == 200:
-                    lines.append(f"[host] evicted namespace={ns}")
-                else:
-                    lines.append(
-                        f"[host] evictBlocks namespace={ns} "
-                        f"status={r.status_code} body={r.text[:200]}"
+                if resp.status_code == 200:
+                    node_lines.append(
+                        f"[memory:{host_ip}] evicted namespace={namespace}"
                     )
-                    all_ok = False
+                else:
+                    node_lines.append(
+                        f"[memory:{host_ip}] evictBlocks namespace={namespace} "
+                        f"status={resp.status_code} body={resp.text[:200]}"
+                    )
+                    node_ok = False
             except Exception as e:
-                lines.append(f"[host] evictBlocks namespace={ns} error: {e}")
-                all_ok = False
-
-        # AFTER sizes.
-        if namespaces:
-            try:
-                resp = await asyncio.to_thread(
-                    requests.get, f"{base}/debug/GetIndexSize/", timeout=10
+                node_lines.append(
+                    f"[memory:{host_ip}] evictBlocks namespace={namespace} error: {e}"
                 )
-                resp.raise_for_status()
-                sizes_after = _parse_index_size(resp.text)
-                lines.append(f"[host] after:  {sizes_after}")
-                logger.info(
-                    f"[/clear_all_cache] host cache sizes AFTER  evict: "
-                    f"{sizes_after}"
-                )
-            except Exception as e:
-                lines.append(f"[host] GetIndexSize (after) failed: {e}")
-                all_ok = False
+                node_ok = False
 
-    logger.info(f"[/clear_all_cache] done, overall_success={all_ok}")
+        # Read back the sizes so a successful HTTP call cannot mask a failed
+        # eviction. Keep the values in the response for operational diagnosis.
+        try:
+            resp = await asyncio.to_thread(
+                requests.get, f"{base}/debug/GetIndexSize/", timeout=10
+            )
+            resp.raise_for_status()
+            sizes_after = _parse_index_size(resp.text)
+            node_lines.append(f"[memory:{host_ip}] after: {sizes_after}")
+            if any(sizes_after.get(ns, 0) > 0 for ns in namespaces):
+                node_lines.append(
+                    f"[memory:{host_ip}] cache is not empty after eviction"
+                )
+                node_ok = False
+        except Exception as e:
+            node_lines.append(f"[memory:{host_ip}] GetIndexSize after failed: {e}")
+            node_ok = False
+
+        return node_lines, node_ok
+
+    if host_ips:
+        node_results = await asyncio.gather(
+            *(_clear_memory_cache(host_ip) for host_ip in host_ips)
+        )
+        for node_lines, node_ok in node_results:
+            lines.extend(node_lines)
+            all_ok = all_ok and node_ok
+
+    logger.info("[/clear_all_cache] done, overall_success=%s", all_ok)
     return Response(
         content="\n".join(lines) + "\n",
         status_code=200 if all_ok else HTTPStatus.MULTI_STATUS,
