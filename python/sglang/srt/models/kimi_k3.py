@@ -525,6 +525,8 @@ def _add3(
 
 # One-shot log guard: proves the merged front is live (see _ep_front).
 _EP_FRONT_LOGGED = False
+# One-shot log guard for the mixed-dtype front overlap (see _ep_front_overlap).
+_EP_FRONT_OVERLAP_LOGGED = False
 
 
 class KimiK3MoE(nn.Module):
@@ -888,6 +890,7 @@ class KimiK3MoE(nn.Module):
             "_eligible_for_fused_front",
             "_routing_contract_ok",
             "_ep_front_eligible",
+            "_ep_front_overlap_unmerged",
         ):
             self.__dict__.pop(prop, None)
 
@@ -1057,6 +1060,20 @@ class KimiK3MoE(nn.Module):
             and self._routing_contract_ok
         )
 
+    @cached_property
+    def _ep_front_overlap_unmerged(self) -> bool:
+        """SGLANG_K3_FRONT_OVERLAP: EP a2a front whose gate and latent down-proj
+        could not be merged (mixed dtype, e.g. FP8 down-proj + bf16 gate). The
+        overlap runs the same gate / top-k / down-proj ops, so routing and the
+        routed input are unchanged; only the streams they run on differ."""
+        return (
+            envs.SGLANG_K3_FRONT_OVERLAP.get()
+            and self.use_latent_moe
+            and self.routed_expert_down_proj is not None
+            and self._front_w is None
+            and not get_moe_a2a_backend().is_none()
+        )
+
     def _ep_front(self, hidden_states: torch.Tensor):
         """Merged front: returns ``(topk_output, routed_input)``, or None when the
         shape is not covered and the caller should run the unmerged path."""
@@ -1104,19 +1121,29 @@ class KimiK3MoE(nn.Module):
         The side stream is joined before returning. It is then free for the
         existing shared-expert overlap, which is deliberately issued later.
         """
-        if (
-            not self._ep_front_eligible
-            or self.alt_stream is None
-            or hidden_states.shape[0] == 0
-        ):
+        if self.alt_stream is None or hidden_states.shape[0] == 0:
             return None
-        from sglang.kernels.ops.moe import moe_front
+        if self._ep_front_eligible:
+            from sglang.kernels.ops.moe import moe_front
 
-        if (
-            moe_front.get_front_strategy(hidden_states.shape[0], hidden_states.device)
-            != "overlap"
-        ):
+            if (
+                moe_front.get_front_strategy(
+                    hidden_states.shape[0], hidden_states.device
+                )
+                != "overlap"
+            ):
+                return None
+        elif not self._ep_front_overlap_unmerged:
             return None
+
+        global _EP_FRONT_OVERLAP_LOGGED
+        if not _EP_FRONT_OVERLAP_LOGGED and not self._ep_front_eligible:
+            _EP_FRONT_OVERLAP_LOGGED = True
+            logger.info(
+                "K3 MoE front overlap active (unmerged gate %s / latent down-proj %s)",
+                self.gate.weight.dtype,
+                self.routed_expert_down_proj.weight.dtype,
+            )
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)

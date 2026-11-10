@@ -952,6 +952,11 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # EP a2a K3 MoE front when the merged front cannot be built (FP8 latent
+    # down-proj next to a bf16 router gate): run the exact gate + top-k on the
+    # side stream, overlapped with the latent down-proj GEMM. The ops are
+    # unchanged, so routing is bit-identical to the serial front. Default off.
+    SGLANG_K3_FRONT_OVERLAP = EnvBool(False)
     # Keep only one shard-group rank's row slice of Kimi K3's replicated
     # weights, reconstructing each layer's full set with one lookahead
     # AllGather. Covers latent-MoE, TP1 shared-expert, and DP-attention
