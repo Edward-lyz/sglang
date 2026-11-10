@@ -668,6 +668,101 @@ class SchedulerPPMixin:
         self._pp_validate_authoritative_plan_schema(int(plan["mb_id"]), outgoing)
         return outgoing
 
+    def _pp_note_bootstrap_abort(self, req: Req, reason: str) -> None:
+        """Record a bootstrap / KV-transfer abort that raced an in-flight plan.
+
+        The AttentionStore PP protocol lets PP0 (first rank) author the roster a
+        microbatch must run. A downstream rank can locally abort a request for a
+        prefill bootstrap / KV-transfer failure after PP0 has already emitted a
+        plan referencing it -- the abort has not yet travelled the ring, so the
+        arriving plan still lists the now-gone rid. Remember it here so
+        ``_pp_project_pending_bootstrap_aborts`` can project it out of the plan
+        instead of the install guard raising a fatal invariant error. First rank
+        never needs this: it authors the plan and simply omits the aborted rid.
+        """
+        if (
+            self.pp_size <= 1
+            or not self.enable_asradix_cache
+            or self.pp_group.is_first_rank
+        ):
+            return
+        self._pp_pending_bootstrap_aborts[req.rid] = {
+            "rid": req.rid,
+            "origin_pp_rank": int(self.ps.pp_rank),
+            "reason_code": "PREFILL_BOOTSTRAP_FAILED",
+            "reason": reason,
+        }
+
+    def _pp_project_pending_bootstrap_aborts(
+        self, plan: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Project an arriving plan past requests this rank already aborted for
+        a prefill bootstrap / KV-transfer failure before the plan reached it."""
+        if not self._pp_pending_bootstrap_aborts:
+            return plan
+
+        # Drop ledger entries once an upstream plan already carries the abort:
+        # PP0 has folded it in, so the ring will flush the rid uniformly and this
+        # rank no longer needs to project it out.
+        acknowledged_rids = {
+            str(record.get("rid", "")) for record in plan.get("aborts", ())
+        }
+        for rid in acknowledged_rids.intersection(self._pp_pending_bootstrap_aborts):
+            del self._pp_pending_bootstrap_aborts[rid]
+        if not self._pp_pending_bootstrap_aborts:
+            return plan
+
+        referenced_rids = {
+            str(entry.get("rid"))
+            for key in ("admissions", "requests")
+            for entry in plan.get(key, ())
+            if entry.get("rid") is not None
+        }
+        referenced_rids.update(str(rid) for rid in plan["contract"].get("rids", ()))
+        aborted_rids = set(self._pp_pending_bootstrap_aborts).intersection(
+            referenced_rids
+        )
+        if not aborted_rids:
+            return plan
+
+        active_rids = tuple(
+            rid for rid in plan["contract"].get("rids", ()) if rid not in aborted_rids
+        )
+        current_batch_plan_id = int(plan["pp_batch_plan_id"])
+        current_aborts = tuple(
+            {
+                **self._pp_pending_bootstrap_aborts[rid],
+                "pp_batch_plan_id": current_batch_plan_id,
+            }
+            for rid in sorted(aborted_rids)
+        )
+        outgoing = dict(plan)
+        outgoing["admissions"] = tuple(
+            entry
+            for entry in plan.get("admissions", ())
+            if entry.get("rid") not in aborted_rids
+        )
+        outgoing["requests"] = tuple(
+            entry
+            for entry in plan.get("requests", ())
+            if entry.get("rid") not in aborted_rids
+        )
+        outgoing["contract"] = _pp_project_contract(plan["contract"], active_rids)
+        transition = plan.get("chunked_transition", {})
+        if transition.get("rid") in aborted_rids:
+            outgoing["chunked_transition"] = {"rid": None, "action": "none"}
+        outgoing["aborts"] = _pp_merge_abort_records(
+            tuple(plan.get("aborts", ())), current_aborts
+        )
+        logger.error(
+            "PP projected plan past locally bootstrap-aborted requests: "
+            "pp_batch_plan_id=%s rids=%s",
+            current_batch_plan_id,
+            tuple(sorted(aborted_rids)),
+        )
+        self._pp_validate_authoritative_plan_schema(int(plan["mb_id"]), outgoing)
+        return outgoing
+
     def _pp_defer_chunked_cache_read_abort(
         self, req: Req, record: Dict[str, Any]
     ) -> None:
@@ -1200,6 +1295,9 @@ class SchedulerPPMixin:
                             authoritative_plan
                         )
                     )
+                    authoritative_plan = self._pp_project_pending_bootstrap_aborts(
+                        authoritative_plan
+                    )
                     self._pp_install_authoritative_batch_plan(mb_id, authoritative_plan)
 
                 prior_chunked_req = self.chunked_req
@@ -1683,6 +1781,10 @@ class SchedulerPPMixin:
         self._pp_abort_tombstones: Dict[Tuple[int, str], Dict[str, Any]] = {}
         self._pp_local_chunk_abort_records: Dict[str, Dict[str, Any]] = {}
         self._pp_pending_cache_read_aborts: Dict[int, Tuple[Req, Dict[str, Any]]] = {}
+        # Requests this rank already aborted for a prefill bootstrap / KV-transfer
+        # failure whose abort PP0 has not yet folded into an authoritative plan.
+        # Keyed by rid; projected out of arriving plans until acknowledged.
+        self._pp_pending_bootstrap_aborts: Dict[str, Dict[str, Any]] = {}
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
 

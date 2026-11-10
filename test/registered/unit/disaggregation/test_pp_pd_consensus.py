@@ -469,5 +469,146 @@ class TestPPPreallocConsensusContract(CustomTestCase):
             queue.pop_preallocated(rids_to_check=["a"], pp_good_rids=[], pp_bad_rids=[])
 
 
+class TestPPBootstrapAbortPlanRace(CustomTestCase):
+    """A downstream bootstrap abort must not crash the authoritative install.
+
+    Regression: PP0 authors the roster a microbatch runs and broadcasts it down
+    the ring. A downstream rank can locally abort a request for a prefill
+    bootstrap / KV-transfer failure *after* PP0 emitted a plan referencing that
+    rid but *before* the rank installs it (the abort has not yet travelled the
+    ring). `_pp_install_authoritative_batch_plan` treated the now-missing rid as
+    a fatal invariant break and raised `PP batch plan references unavailable
+    rid=...`, which SIGQUITs the scheduler and cascades a whole PP prefill
+    instance down. The fix ledgers the local abort and projects it out of the
+    arriving plan before the guard runs, while still raising for a genuinely
+    unexplained missing rid.
+    """
+
+    @staticmethod
+    def _make_plan(rids, *, pp_batch_plan_id=1, mb_id=0, aborts=()):
+        rids = tuple(rids)
+        admissions = [
+            {"rid": rid, "source": "waiting", "extend_range": (0, 3)} for rid in rids
+        ]
+        contract = {
+            "version": 4,
+            "mb_id": mb_id,
+            "rids": rids,
+            "prefix_lens": tuple(0 for _ in rids),
+            "extend_ranges": tuple((0, 3) for _ in rids),
+            "extend_num_tokens": 3 * len(rids),
+            "chunked_rid": None,
+            "as_decisions": (),
+        }
+        return {
+            "version": 4,
+            "mb_id": mb_id,
+            "pp_batch_plan_id": pp_batch_plan_id,
+            "maintenance_round": 0,
+            "transport": True,
+            "chunked_transition": {"action": "none", "rid": None},
+            "admissions": admissions,
+            "requests": [{"rid": rid, "as_match": None} for rid in rids],
+            "contract": contract,
+            "aborts": tuple(aborts),
+        }
+
+    class _Harness(SchedulerPPMixin):
+        def __init__(self, waiting, ledger=None):
+            self.waiting_queue = list(waiting)
+            self.running_batch = SimpleNamespace(reqs=[])
+            self.chunked_req = None
+            self._pp_current_cache_maintenance_round = None
+            self._pp_last_received_batch_plan_id = -1
+            self._pp_pending_bootstrap_aborts = dict(ledger or {})
+
+    @staticmethod
+    def _ledger_record(rid):
+        return {
+            "rid": rid,
+            "origin_pp_rank": 8,
+            "reason_code": "PREFILL_BOOTSTRAP_FAILED",
+            "reason": "Prefill bootstrap failed for request",
+        }
+
+    def test_plan_referencing_locally_bootstrap_aborted_rid_no_longer_crashes(self):
+        good = SimpleNamespace(rid="req-good")
+        plan = self._make_plan(["req-good", "req-bad"])
+
+        # Pre-fix behaviour is pinned: installing the raw plan when the local
+        # abort removed "req-bad" from every queue is a fatal invariant break.
+        harness = self._Harness([good])
+        with self.assertRaisesRegex(RuntimeError, "unavailable rid=req-bad"):
+            harness._pp_install_authoritative_batch_plan(0, plan)
+
+        # With the ledger populated, the projection removes "req-bad" up front so
+        # the guard only sees survivors and the install succeeds.
+        harness = self._Harness(
+            [good], ledger={"req-bad": self._ledger_record("req-bad")}
+        )
+        projected = harness._pp_project_pending_bootstrap_aborts(plan)
+        harness._pp_install_authoritative_batch_plan(0, projected)
+
+        self.assertEqual(
+            [entry["rid"] for entry in projected["requests"]], ["req-good"]
+        )
+        self.assertTrue(good._as_pp_match_decision_required)
+
+    def test_projection_routes_the_abort_into_the_plan_for_ring_propagation(self):
+        """The projected-out rid must reappear as an abort record.
+
+        Ranks upstream (in plan-flow order) already ran the request, so the
+        output-finalization contract check needs abort evidence stamped with the
+        current plan id; dropping it silently would desync the ring.
+        """
+        harness = self._Harness(
+            [], ledger={"req-bad": self._ledger_record("req-bad")}
+        )
+        plan = self._make_plan(["req-good", "req-bad"], pp_batch_plan_id=7)
+
+        projected = harness._pp_project_pending_bootstrap_aborts(plan)
+
+        self.assertNotIn("req-bad", projected["contract"]["rids"])
+        self.assertEqual(
+            [(r["rid"], r["pp_batch_plan_id"]) for r in projected["aborts"]],
+            [("req-bad", 7)],
+        )
+        # Unacknowledged: the entry survives so later plans stay projected too.
+        self.assertIn("req-bad", harness._pp_pending_bootstrap_aborts)
+
+    def test_acknowledged_bootstrap_abort_is_dropped_from_the_ledger(self):
+        """Once an arriving plan carries the abort, PP0 owns it and the local
+        ledger entry must be released instead of projecting forever."""
+        harness = self._Harness(
+            [], ledger={"req-bad": self._ledger_record("req-bad")}
+        )
+        plan = self._make_plan(
+            ["req-good"], aborts=(self._ledger_record_with_seq("req-bad", 1),)
+        )
+
+        projected = harness._pp_project_pending_bootstrap_aborts(plan)
+
+        self.assertEqual(projected, plan)
+        self.assertNotIn("req-bad", harness._pp_pending_bootstrap_aborts)
+
+    def test_unexplained_missing_rid_still_raises(self):
+        """The guard must stay fatal for a rid with no local abort evidence, so
+        the fix does not degrade the invariant into a blanket fail-open."""
+        harness = self._Harness([SimpleNamespace(rid="req-good")])
+        plan = self._make_plan(["req-good", "req-ghost"])
+
+        # Empty ledger: projection is a no-op and the guard fires as before.
+        projected = harness._pp_project_pending_bootstrap_aborts(plan)
+        self.assertEqual(projected, plan)
+        with self.assertRaisesRegex(RuntimeError, "unavailable rid=req-ghost"):
+            harness._pp_install_authoritative_batch_plan(0, projected)
+
+    @staticmethod
+    def _ledger_record_with_seq(rid, seq):
+        record = TestPPBootstrapAbortPlanRace._ledger_record(rid)
+        record["pp_batch_plan_id"] = seq
+        return record
+
+
 if __name__ == "__main__":
     unittest.main()

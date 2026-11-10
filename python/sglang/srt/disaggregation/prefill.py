@@ -1222,6 +1222,10 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.REQUEST_TIMEOUT)
         self.output_streamer.stream_output([req], req.return_logprob)
+        # A downstream PP rank may abort here after PP0 already emitted an
+        # authoritative plan referencing this rid; ledger it so the install
+        # guard projects it out instead of raising a fatal invariant error.
+        self._pp_note_bootstrap_abort(req, error_message)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         if self.enable_hicache_storage:
