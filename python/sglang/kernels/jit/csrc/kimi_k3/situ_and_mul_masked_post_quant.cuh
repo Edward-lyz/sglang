@@ -2,6 +2,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -10,6 +11,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
+#include <algorithm>
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <type_traits>
@@ -29,15 +31,10 @@ struct SituMulQuantVarlenParams {
   int64_t hidden_dim;
   uint32_t num_tokens;
   uint32_t num_experts;
+  uint32_t max_rows;  // num_tokens * topk: rows beyond this are dropped
 };
 
 constexpr uint32_t kMaxExperts = 256;
-
-struct alignas(16) CTAWork {
-  uint32_t expert_id;
-  uint32_t expert_token_id;
-  bool valid;
-};
 
 SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
   static_assert(device::kWarpThreads == 32);
@@ -74,18 +71,13 @@ situ_and_mul(DType2 gate, DType2 up, float beta, float inv_beta, float linear_be
   }
 }
 
-[[maybe_unused]]
-SGL_DEVICE CTAWork get_work(const SituMulQuantVarlenParams& params) {
-  // Preconditions:
-  // 1. blockDim.x >= params.num_experts
-  // 2. params.num_experts <= kMaxExperts
+// Inclusive prefix sum of masked_m into s_end[0, num_experts); returns the total.
+// Preconditions: blockDim.x >= params.num_experts, params.num_experts <= kMaxExperts.
+SGL_DEVICE uint32_t scan_masked_m(const SituMulQuantVarlenParams& params, uint32_t* s_end) {
   using namespace device;
   static_assert(kWarpThreads == 32);
 
   static __shared__ uint32_t s_warp_sum[32];
-  static __shared__ CTAWork result;
-
-  result.valid = false;
 
   const uint32_t tx = threadIdx.x;
   const uint32_t lane_id = tx % kWarpThreads;
@@ -95,24 +87,20 @@ SGL_DEVICE CTAWork get_work(const SituMulQuantVarlenParams& params) {
 
   // Per-warp inclusive scan of masked_m.
   const uint32_t warp_inclusive = warp_inclusive_sum(lane_id, val);
-  const uint32_t warp_exclusive = warp_inclusive - val;
 
   // Write each warp total.
   if (lane_id == kWarpThreads - 1) s_warp_sum[warp_id] = warp_inclusive;
   __syncthreads();
   const auto tmp_val = lane_id < warp_id ? s_warp_sum[lane_id] : 0u;
-  const auto prefix_exclusive = warp::reduce_sum(tmp_val) + warp_exclusive;
-  const auto bx = blockIdx.x;
-  if (prefix_exclusive <= bx && bx < prefix_exclusive + val) {
-    result = {tx, bx - prefix_exclusive, true};
-  }
+  const auto prefix_inclusive = warp::reduce_sum(tmp_val) + warp_inclusive;
+  if (tx < params.num_experts) s_end[tx] = prefix_inclusive;
   __syncthreads();
-  return result;
+  return s_end[params.num_experts - 1];
 }
 
-template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL>
-__global__ __launch_bounds__(1024, 2) void  // maximize occupancy
-    situ_mul_quant_varlen_kernel(const SituMulQuantVarlenParams __grid_constant__ params) {
+// One CTA = one (expert, token) row of hidden_dim outputs.
+template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle>
+SGL_DEVICE void situ_mul_quant_row(const SituMulQuantVarlenParams& params, uint32_t expert_id, uint32_t token_id) {
   using namespace device;
 
   constexpr uint32_t kGroupSize = 128u;
@@ -121,11 +109,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   using InputVec = AlignedVector<bf16x2_t, 4>;
   using OutputVec = AlignedVector<fp8x2_e4m3_t, 4>;
   static_assert(8 * kWorkThreads == 128, "Invalid tiling");
-  static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
-
-  const auto [expert_id, token_id, valid] = get_work(params);
-
-  if (!valid) return;
 
   const auto work_id = threadIdx.x / kWorkThreads;
 
@@ -151,8 +134,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   const float linear_beta = params.linear_beta;
   const float inv_beta = 1.0f / beta;
   const float inv_linear_beta = 1.0f / linear_beta;
-
-  PDLWaitPrimary<kUsePDL>();
 
   InputVec gate_vec, up_vec;
   if constexpr (kSwizzle) {
@@ -201,13 +182,41 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     out_vec[i] = pack_fp8(scaled_val0, scaled_val1);
   }
 
-  PDLTriggerSecondary<kUsePDL>();
-
   out_vec.store(output, threadIdx.x);
   if constexpr (kTransposed) {
     *output_scale = ue8m0_exp;
   } else {
     *output_scale = scale;
+  }
+}
+
+// Persistent grid: each CTA scans masked_m once, then strides over the packed
+// (expert, token) rows instead of launching one mostly-idle CTA per padded row.
+template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL>
+__global__ __launch_bounds__(1024, 2) void  // maximize occupancy
+    situ_mul_quant_varlen_kernel(const SituMulQuantVarlenParams __grid_constant__ params) {
+  using namespace device;
+  static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
+
+  __shared__ uint32_t s_end[kMaxExperts];
+  const uint32_t num_rows = min(scan_masked_m(params, s_end), params.max_rows);
+
+  PDLWaitPrimary<kUsePDL>();
+  PDLTriggerSecondary<kUsePDL>();
+
+  for (uint32_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
+    // first expert whose inclusive end exceeds row
+    uint32_t lo = 0, hi = params.num_experts - 1;
+    while (lo < hi) {
+      const uint32_t mid = (lo + hi) / 2;
+      if (s_end[mid] > row) {
+        hi = mid;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    const uint32_t start = lo == 0 ? 0u : s_end[lo - 1];
+    situ_mul_quant_row<kScaleUE8M0, kTransposed, kSwizzle>(params, lo, row - start);
   }
 }
 
@@ -228,7 +237,8 @@ struct SituAndMulMaskedPostQuantKernel {
       const uint32_t topk,
       const bool transposed,
       const double beta,
-      const double linear_beta) {
+      const double linear_beta,
+      const bool persistent) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -286,13 +296,21 @@ struct SituAndMulMaskedPostQuantKernel {
         .hidden_dim = hidden_dim,
         .num_tokens = num_tokens,
         .num_experts = num_experts,
+        .max_rows = num_tokens * topk,
     };
 
     const auto num_threads = hidden_dim / 8;
     RuntimeCheck(num_threads % device::kWarpThreads == 0);
     RuntimeCheck(num_threads >= num_experts);
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
-    LaunchKernel(num_tokens * topk, num_threads, device.unwrap())  //
+    // persistent=false: one CTA per (padded) row, each CTA handles at most one row.
+    uint32_t num_ctas = params.max_rows;
+    if (persistent) {
+      const auto device_id = device.unwrap().device_id;
+      const auto max_ctas = runtime::get_sm_count(device_id) * runtime::get_blocks_per_sm(kernel, num_threads);
+      num_ctas = std::min<uint32_t>(params.max_rows, max_ctas);
+    }
+    LaunchKernel(num_ctas, num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };

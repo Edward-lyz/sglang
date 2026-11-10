@@ -434,6 +434,9 @@ class Envs:
     SGLANG_K3_KDA_ONORM_QUANT = EnvBool(False)
     # SP-MoE: fold the MoE add3 tail into the push row all-gather.
     SGLANG_K3_SP_AG_ADD3 = EnvBool(False)
+    # Routed SiTU+quant varlen kernel: persistent grid striding over the packed
+    # (expert, token) rows instead of one CTA per padded row.
+    SGLANG_K3_SITU_QUANT_PERSISTENT_GRID = EnvBool(False)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)

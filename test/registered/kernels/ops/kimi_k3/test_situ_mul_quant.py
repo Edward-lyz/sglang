@@ -20,6 +20,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.kimi_k3 import situ_and_mul_masked_post_quant
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -135,9 +136,12 @@ class TestSituMulQuantVarlen(CustomTestCase):
         # (E, N, D, topk, mm_max): small shape + the target-model decode
         # shape (112 local experts under EP8, D = 2 x moe_intermediate_size).
         # mm_max keeps sum(masked_m) <= N * topk, the kernel's grid extent.
+        # The third case has far more valid rows than the persistent grid
+        # has CTAs, so each CTA strides over several (expert, token) rows.
         cases = [
             (8, 64, 1024, 16, 64),
             (112, 64, 6144, 16, 6),
+            (48, 960, 1024, 8, 160),
         ]
         for E, N, D, topk, mm_max in cases:
             gate_up = (
@@ -152,15 +156,25 @@ class TestSituMulQuantVarlen(CustomTestCase):
             masked_m[-1] = N
             self.assertLessEqual(int(masked_m.sum().item()), N * topk)
 
-            for scale_ue8m0, transposed in [(False, False), (True, True)]:
-                with self.subTest(
-                    E=E, N=N, D=D, scale_ue8m0=scale_ue8m0, transposed=transposed
-                ):
-                    output, scales = self._run_kernel(
-                        gate_up, masked_m, topk, scale_ue8m0, transposed
-                    )
-                    self._assert_matches_reference(gate_up, masked_m, output, scales)
-                    self._assert_padding_untouched(output, masked_m)
+            for persistent in (False, True):
+                for scale_ue8m0, transposed in [(False, False), (True, True)]:
+                    with self.subTest(
+                        E=E,
+                        N=N,
+                        D=D,
+                        scale_ue8m0=scale_ue8m0,
+                        transposed=transposed,
+                        persistent=persistent,
+                    ), envs.SGLANG_K3_SITU_QUANT_PERSISTENT_GRID.override(
+                        persistent
+                    ):
+                        output, scales = self._run_kernel(
+                            gate_up, masked_m, topk, scale_ue8m0, transposed
+                        )
+                        self._assert_matches_reference(
+                            gate_up, masked_m, output, scales
+                        )
+                        self._assert_padding_untouched(output, masked_m)
 
     def test_softcap_saturation(self):
         # Extreme inputs must saturate to the softcap bound instead of
