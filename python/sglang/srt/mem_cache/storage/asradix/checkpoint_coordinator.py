@@ -73,6 +73,7 @@ class _KDAWriteTask:
     producer_ready: Any = None
     request: Any = None
     write_key: Optional[tuple[int, int]] = None
+    page_write_start: int = 0
     release_after_write: Callable[[], None] = _noop_release
     release: Callable[[], None] = _noop_release
     owner: Optional[AttentionStoreWriteOwner] = None
@@ -492,6 +493,26 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
 
     write_thread_name = "as_kda_writer"
 
+    @staticmethod
+    def _published_page_prefix(cache, node, hashes, cache_len: int) -> int:
+        """Return the longest confirmed AttentionStore block prefix on this path."""
+        block_size = cache.attention_store_block_size
+        prefix_tokens = cache_len
+        current = node
+        while current is not None and current is not cache.root_node:
+            published_hash = current.component_data[ComponentType.MAMBA].metadata.get(
+                _KDA_PUBLISHED_HASH
+            )
+            if published_hash is not None and prefix_tokens % block_size == 0:
+                block_count = prefix_tokens // block_size
+                if 0 < block_count <= len(hashes) and int(
+                    hashes[block_count - 1]
+                ) == int(published_hash):
+                    return block_count
+            prefix_tokens -= len(current.key)
+            current = current.parent
+        return 0
+
     def capture_finished(
         self, cache, req, is_insert: bool
     ) -> AttentionStoreWriteContext:
@@ -584,6 +605,9 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 self.enqueue_dummy(cache, req.rid)
                 return
             checkpoint_slot = self.prepare_checkpoint_slot(mamba_data.value)
+            page_write_start = self._published_page_prefix(
+                cache, node, hashes, cache_len
+            )
             # WAR fix: gather from the tree's canonical, ref-protected slots
             # (match.device_indices), NOT the pre-commit request snapshot.
             # super().cache_finished_req (run between capture and this enqueue)
@@ -592,7 +616,9 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             # overwrites them before the async writer's gather runs, so gathering
             # from `snapshot` reads corrupted (reused) KV. inc_lock_ref(node)
             # below protects device_indices, so page_ids must come from there.
-            page_ids = self.prepare_page_ids(cache, match.device_indices)
+            page_ids = self.prepare_page_ids(
+                cache, match.device_indices[page_write_start * block_size : cache_len]
+            )
             # Producer fence is recorded in do_write right before the gather; an
             # enqueue-time event is too early to cover a still-draining write.
             producer_ready = None
@@ -611,6 +637,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 params=getattr(req, "as_kv_cache_params", None) or {},
                 request=req,
                 write_key=write_key,
+                page_write_start=page_write_start,
                 release_after_write=release_staging,
             )
             task.release = _acquire_node_release(cache, node)
@@ -658,6 +685,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 timeout=1.0,
                 params=task.params,
                 producer_ready=producer_ready,
+                page_write_start=task.page_write_start,
             )
             cache._log_as_result(
                 "write",

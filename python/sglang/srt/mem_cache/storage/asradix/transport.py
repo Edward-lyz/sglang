@@ -292,9 +292,7 @@ class _BufferPageIO:
     @property
     def _pages_per_block(self) -> int:
         return (
-            1
-            if self._block_size is None
-            else self._block_size // self._local_page_size
+            1 if self._block_size is None else self._block_size // self._local_page_size
         )
 
     def _logical_blocks(self, block_hash_ids, page_ids):
@@ -688,14 +686,28 @@ class CheckpointedPageStore:
         timeout: float = 1.0,
         params: Optional[dict] = None,
         producer_ready=None,
+        page_write_start: int = 0,
     ) -> int:
-        """Write pages and their terminal checkpoint as one unit."""
+        """Write suffix page IDs and the full prefix's terminal checkpoint."""
         if not block_hash_ids:
             return 0
+        if not 0 <= page_write_start <= len(block_hash_ids):
+            raise ValueError(
+                f"page_write_start={page_write_start} is outside "
+                f"[0, {len(block_hash_ids)}]"
+            )
         wait_for_producer = getattr(self.checkpoint_store, "wait_for_producer", None)
         if wait_for_producer is not None:
             wait_for_producer(producer_ready, timeout=timeout)
-        self.page_store.write(block_hash_ids, page_ids, timeout=timeout, params=params)
+        page_hashes = block_hash_ids[page_write_start:]
+        # SDK counts newly written blocks; deduplicated pages/checkpoints return
+        # fewer blocks (possibly zero), while write failures raise an exception.
+        if page_hashes:
+            page_result = self.page_store.write(
+                page_hashes, page_ids, timeout=timeout, params=params
+            )
+            if page_result < 0:
+                return -1
         checkpoint_result = self.checkpoint_store.write(
             int(block_hash_ids[-1]),
             checkpoint_slot,
@@ -703,7 +715,7 @@ class CheckpointedPageStore:
             params=params,
             producer_ready=producer_ready,
         )
-        return len(block_hash_ids) if checkpoint_result == 1 else -1
+        return len(block_hash_ids) if checkpoint_result in (0, 1) else -1
 
     def stop(self) -> None:
         """Stop both the page and checkpoint stores."""
