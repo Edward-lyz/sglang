@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import time
 from array import array
@@ -23,6 +24,11 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     UnifiedTreeNode,
 )
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_OPERATIONS_ENABLED,
+    operations_nvtx_range,
+    profile_method,
+)
 
 from .checkpoint_binding import PackedStateSnapshot
 from .coordinator import (
@@ -39,11 +45,40 @@ from .types import (
     AttentionStoreWriteContext,
     AttentionStoreWriteOwner,
 )
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
 _KDA_PENDING_HASH = "as_kda_pending_hash"
 _KDA_PUBLISHED_HASH = "as_kda_published_hash"
+
+
+@dataclass
+class _SPLoadBackTask:
+    """One deferred SPA/SPAG load-back, split across two threads.
+
+    The scheduler thread builds this at admission (``_submit_load_back``:
+    evict, allocate, hand over the node hold), a single background thread runs
+    the SDK read (``_run_load_back_read``: prepare + plain full ``ascli.read``,
+    no torch.distributed), and the scheduler thread commits the result at the
+    next loop top (``commit_load_backs``: future.result, one ``_as_min``,
+    insert).
+
+    - submit (scheduler): rid, load_info, loaded, requested, local_hit_len,
+      started, lock (the node hold taken at submit and released at commit).
+    - background read: future result = read_count on success, or the read error.
+    - commit (scheduler): consumes the fields, then the task is dropped.
+    """
+
+    rid: str
+    req: Any
+    load_info: dict
+    loaded: torch.Tensor
+    requested: int
+    local_hit_len: int
+    started: float
+    lock: Callable[[], None]
+    future: Any = None
 
 
 @dataclass
@@ -105,6 +140,268 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
     """Coordinate SPA page writes with a stable endpoint checkpoint snapshot."""
 
     write_thread_name = "as_spa_writer"
+    load_back_thread_name = "as_load_back_reader"
+
+    def _ensure_load_back_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Single-reader lane for deferred load-back reads."""
+        if self._closed:
+            raise RuntimeError("AttentionStore coordinator is already closed")
+        if self._load_back_executor is None:
+            self._load_back_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=self.load_back_thread_name,
+            )
+        return self._load_back_executor
+
+    def _discard_load_back(
+        self, cache, task: _SPLoadBackTask, error: Exception
+    ) -> None:
+        """Release a submitted load-back's resources and report the failure."""
+        self._free_loaded_pages(cache, task.loaded, start_pos=task.local_hit_len)
+        task.lock()
+        cache._log_as_failure(
+            "load_back",
+            rid=task.rid,
+            requested=task.requested,
+            error=error,
+            started=task.started,
+        )
+
+    def _submit_load_back(
+        self, cache, req, load_info, anchor
+    ) -> Optional[_SPLoadBackTask]:
+        """Evict, allocate, and hold the node; IO happens on the reader thread."""
+        requested = int(load_info["block_count"])
+        started = time.perf_counter()
+        token_count = requested * cache.page_size
+        with operations_nvtx_range("radix.as.lb.evict"):
+            available = cache.token_to_kv_pool_allocator.available_size()
+            if available < token_count and cache.full_evictable_size() > 0:
+                cache.evict(
+                    EvictParams(
+                        num_tokens=token_count - available + cache.page_size,
+                        swa_num_tokens=cache.page_size,
+                    )
+                )
+        local_hit_len = int(load_info["start_block"]) * cache.page_size
+        device = cache.token_to_kv_pool_allocator.device
+        prefix_cpu = torch.tensor([local_hit_len], dtype=torch.int64)
+        seq_cpu = torch.tensor([local_hit_len + token_count], dtype=torch.int64)
+        # The allocator consumes a one-element tensor; keep an existing index on device.
+        last_loc = req.prefix_indices[-1].reshape(1) if local_hit_len else None
+        with operations_nvtx_range("radix.as.lb.alloc"):
+            try:
+                loaded = cache.token_to_kv_pool_allocator.alloc_extend_swa_tail(
+                    prefix_cpu.to(device),
+                    prefix_cpu,
+                    seq_cpu.to(device),
+                    seq_cpu,
+                    (
+                        last_loc.to(device=device, dtype=torch.int64)
+                        if last_loc is not None
+                        else torch.tensor([-1], dtype=torch.int64, device=device)
+                    ),
+                    token_count,
+                    # One whole SWA page, even though a plan may restore only its
+                    # upper half: alloc_extend_swa_tail maps the *last* swa_tail_len
+                    # full slots onto the freshly allocated SWA page, so asking for
+                    # less than a page would land the restored window in the page's
+                    # lower half and desynchronize it from the stored byte offset.
+                    min(token_count, cache.page_size),
+                )
+            except Exception as exc:
+                cache._log_as_failure(
+                    "load_back",
+                    rid=req.rid,
+                    requested=requested,
+                    error=exc,
+                    started=started,
+                )
+                cache._as_min(0)
+                return None
+        if loaded is None:
+            cache._log_as_failure(
+                "load_back",
+                rid=req.rid,
+                requested=requested,
+                error=RuntimeError(f"cannot allocate {token_count} tokens"),
+                started=started,
+            )
+            cache._as_min(0)
+            return None
+        # All-rank alloc gate, before the task exists: ranks whose alloc
+        # failed pair their _as_min(0) with this _as_min(1), and unless every
+        # rank allocated, no rank submits -- the request falls back to
+        # re-prefill this round, exactly like the sync path's pre-read gate.
+        if cache._as_min(1) == 0:
+            self._free_loaded_pages(cache, loaded, start_pos=local_hit_len)
+            return None
+        lock = _acquire_node_release(cache, anchor)
+        task = _SPLoadBackTask(
+            rid=req.rid,
+            req=req,
+            load_info=load_info,
+            loaded=loaded,
+            requested=requested,
+            local_hit_len=local_hit_len,
+            started=started,
+            lock=lock,
+        )
+        try:
+            task.future = self._ensure_load_back_executor().submit(
+                self._run_load_back_read, cache, task
+            )
+        except Exception as exc:
+            self._discard_load_back(cache, task, exc)
+            return None
+        self._pending_load_backs.append(task)
+        return task
+
+    def _run_load_back_read(self, cache, task: _SPLoadBackTask):
+        """Reader thread: prepare + one plain full read; no torch.distributed.
+
+        The sharded read + NVLink diffuse path issues CP-group barriers around
+        the read, so the async mode always takes the full read (each CP rank
+        reads the whole block set). Page IDs are resolved here because
+        ``_prepare_read`` ends in a device sync, which is exactly the wait the
+        scheduler thread must not pay.
+        """
+        with operations_nvtx_range("radix.as.lb.read"):
+            try:
+                page_ids, read_args, read_kwargs = self._prepare_read(
+                    cache, task.req, task.load_info, task.loaded
+                )
+            except Exception as exc:
+                return exc
+            try:
+                return cache.ascli.read(
+                    task.load_info["hashes"],
+                    page_ids,
+                    *read_args,
+                    timeout=5.0,
+                    remote_addrs=task.load_info.get("remote_addrs") or None,
+                    **read_kwargs,
+                )
+            except Exception as exc:
+                return exc
+
+    def _release_task_requests(self, tasks: list) -> None:
+        """Drop the submit-side flags so the waiting request re-admits."""
+        for task in tasks:
+            req = task.req
+            if getattr(req, "_as_pending_load_back", None) is task:
+                req._as_pending_load_back = None
+
+    @staticmethod
+    def _drain_task_result(task: _SPLoadBackTask) -> Any:
+        """Block on one read future; an executor-level failure becomes the error."""
+        if task.future is None:
+            return None
+        try:
+            return task.future.result()
+        except Exception as exc:
+            return exc
+
+    def commit_load_backs(self, cache) -> None:
+        """Drain deferred load-backs: one batched _as_min, then free or insert.
+
+        Called at the scheduler loop top. Blocks on each future in submission
+        order: every rank drains the same task list at the same loop position,
+        so the batched ``_as_min`` (one all-reduce for the whole drain, element
+        per task) pairs across ranks exactly like the sync path's inline gates
+        would. A read that outruns the loop top only delays this drain (reads
+        finish in ~25ms vs the ~356ms forward period).
+        """
+        if not self._pending_load_backs:
+            return
+        pending, self._pending_load_backs = self._pending_load_backs, []
+        # One collective for the whole drain: MIN over ranks per task slot.
+        # Ranks submit identical task counts at the same loop position, so the
+        # stacked vectors pair element-wise without a length handshake.
+        drained = [self._drain_task_result(task) for task in pending]
+        read_counts = [
+            0 if isinstance(r, BaseException) else int(r or 0) for r in drained
+        ]
+        stacked = torch.tensor(read_counts, dtype=torch.int64)
+        cache._all_reduce_attn_groups(stacked, torch.distributed.ReduceOp.MIN)
+        for task, result, read_count in zip(pending, drained, stacked.tolist()):
+            read_error = result if isinstance(result, BaseException) else None
+            read_count = int(read_count)
+            if read_error is None:
+                cache._log_as_result(
+                    "load_back",
+                    rid=task.rid,
+                    requested=task.requested,
+                    result=read_count,
+                    started=task.started,
+                )
+            else:
+                cache._log_as_failure(
+                    "load_back",
+                    rid=task.rid,
+                    requested=task.requested,
+                    error=read_error,
+                    started=task.started,
+                )
+            if read_error is not None or read_count != task.requested:
+                self._free_loaded_pages(
+                    cache, task.loaded, start_pos=task.local_hit_len
+                )
+                task.lock()
+                self._release_task_requests([task])
+                continue
+            token_count = task.requested * cache.page_size
+            self._insert_loaded_prefix(cache, task, token_count)
+            task.lock()
+            self._release_task_requests([task])
+
+    def _insert_loaded_prefix(
+        self, cache, task: _SPLoadBackTask, token_count: int
+    ) -> None:
+        """Publish a finished read into the tree and arm the read latch."""
+        req = task.req
+        total_prefix_len = task.local_hit_len + token_count
+        token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
+        values = torch.cat([req.prefix_indices, task.loaded]).to(dtype=torch.int64)
+        restored_swa_len = self._restored_swa_len(cache, token_count)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(
+                    token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
+                ),
+                value=values,
+                prev_prefix_len=task.local_hit_len,
+                # Everything before the restored window is an SWA tombstone. This
+                # must describe the bytes actually read back, not the SWA pages
+                # allocated: over-claiming makes the tree serve uninitialized SWA.
+                swa_evicted_seqlen=task.local_hit_len
+                + max(0, token_count - restored_swa_len),
+            )
+        )
+        match = UnifiedRadixCache.match_prefix(
+            cache,
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
+                ),
+                req=req,
+            ),
+        )
+        tree_indices = match.device_indices[task.local_hit_len:total_prefix_len]
+        if len(tree_indices) != token_count:
+            logger.warning(
+                "AS cache insert: cache_plan=%s rid=%s status=error "
+                "reason=shortened_prefix expected_tokens=%s actual_tokens=%s",
+                cache.attention_store_plan.name,
+                task.rid,
+                token_count,
+                len(tree_indices),
+            )
+        # Do NOT repoint req.last_node here: the req may hold a lock receipt
+        # anchored on its admission-time node, and repointing without a new
+        # receipt breaks dec_lock_ref's anchor assert. The next admission's
+        # match_prefix repoints it with a fresh receipt.
+        req.as_read_pending_lock = True
 
     def capture_finished(
         self, cache, req, is_insert: bool
@@ -399,6 +696,7 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
             )
             return None
 
+    @profile_method("radix.as.load_back", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def init_load_back(
         self,
         cache,
@@ -414,52 +712,73 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
         if cache.ascli is None or load_info is None or req is None:
             return empty, anchor
 
+        if (
+            envs.SGLANG_ENABLE_AS_LOAD_BACK_ASYNC.get()
+            # PP stages admit independently, so the deferred publish cannot keep
+            # the wrapper's cross-stage length check satisfied; sync mode only.
+            and cache.pp_world_size <= 1
+        ):
+            task = self._submit_load_back(cache, req, load_info, anchor)
+            # The request stays in the waiting queue this round (admission sees
+            # an empty splice); the committed prefix is published by
+            # commit_load_backs at the next loop top, and a later admission
+            # match_prefix picks it up as an ordinary device hit.
+            if task is None:
+                # Submit failed and already reported the failure; the request
+                # re-prefills from its device-resident prefix this round.
+                req._as_pending_load_back = None
+            else:
+                req._as_pending_load_back = task
+            return empty, anchor
+
         requested = int(load_info["block_count"])
         started = time.perf_counter()
         token_count = requested * cache.page_size
-        available = cache.token_to_kv_pool_allocator.available_size()
-        if available < token_count and cache.full_evictable_size() > 0:
-            cache.evict(
-                EvictParams(
-                    num_tokens=token_count - available + cache.page_size,
-                    swa_num_tokens=cache.page_size,
+        with operations_nvtx_range("radix.as.lb.evict"):
+            available = cache.token_to_kv_pool_allocator.available_size()
+            if available < token_count and cache.full_evictable_size() > 0:
+                cache.evict(
+                    EvictParams(
+                        num_tokens=token_count - available + cache.page_size,
+                        swa_num_tokens=cache.page_size,
+                    )
                 )
-            )
         local_hit_len = int(load_info["start_block"]) * cache.page_size
         device = cache.token_to_kv_pool_allocator.device
         prefix_cpu = torch.tensor([local_hit_len], dtype=torch.int64)
         seq_cpu = torch.tensor([local_hit_len + token_count], dtype=torch.int64)
         # The allocator consumes a one-element tensor; keep an existing index on device.
         last_loc = req.prefix_indices[-1].reshape(1) if local_hit_len else None
-        try:
-            loaded = cache.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-                prefix_cpu.to(device),
-                prefix_cpu,
-                seq_cpu.to(device),
-                seq_cpu,
-                (
-                    last_loc.to(device=device, dtype=torch.int64)
-                    if last_loc is not None
-                    else torch.tensor([-1], dtype=torch.int64, device=device)
-                ),
-                token_count,
-                # One whole SWA page, even though a plan may restore only its
-                # upper half: alloc_extend_swa_tail maps the *last* swa_tail_len
-                # full slots onto the freshly allocated SWA page, so asking for
-                # less than a page would land the restored window in the page's
-                # lower half and desynchronize it from the stored byte offset.
-                min(token_count, cache.page_size),
-            )
-        except Exception as exc:
-            cache._log_as_failure(
-                "load_back",
-                rid=req.rid,
-                requested=requested,
-                error=exc,
-                started=started,
-            )
-            cache._as_min(0)
-            return empty, anchor
+        with operations_nvtx_range("radix.as.lb.alloc"):
+            try:
+                loaded = cache.token_to_kv_pool_allocator.alloc_extend_swa_tail(
+                    prefix_cpu.to(device),
+                    prefix_cpu,
+                    seq_cpu.to(device),
+                    seq_cpu,
+                    (
+                        last_loc.to(device=device, dtype=torch.int64)
+                        if last_loc is not None
+                        else torch.tensor([-1], dtype=torch.int64, device=device)
+                    ),
+                    token_count,
+                    # One whole SWA page, even though a plan may restore only its
+                    # upper half: alloc_extend_swa_tail maps the *last* swa_tail_len
+                    # full slots onto the freshly allocated SWA page, so asking for
+                    # less than a page would land the restored window in the page's
+                    # lower half and desynchronize it from the stored byte offset.
+                    min(token_count, cache.page_size),
+                )
+            except Exception as exc:
+                cache._log_as_failure(
+                    "load_back",
+                    rid=req.rid,
+                    requested=requested,
+                    error=exc,
+                    started=started,
+                )
+                cache._as_min(0)
+                return empty, anchor
         if loaded is None:
             cache._log_as_failure(
                 "load_back",
@@ -470,23 +789,24 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
             )
             cache._as_min(0)
             return empty, anchor
-        try:
-            page_ids, read_args, read_kwargs = self._prepare_read(
-                cache, req, load_info, loaded
-            )
-        except Exception as exc:
-            # Validation may have failed on malformed indices or a missing SWA
-            # mapping, so keep the arbitrary-index cleanup for this branch.
-            cache.token_to_kv_pool_allocator.free(loaded)
-            cache._log_as_failure(
-                "load_back",
-                rid=req.rid,
-                requested=requested,
-                error=exc,
-                started=started,
-            )
-            cache._as_min(0)
-            return empty, anchor
+        with operations_nvtx_range("radix.as.lb.prepare"):
+            try:
+                page_ids, read_args, read_kwargs = self._prepare_read(
+                    cache, req, load_info, loaded
+                )
+            except Exception as exc:
+                # Validation may have failed on malformed indices or a missing SWA
+                # mapping, so keep the arbitrary-index cleanup for this branch.
+                cache.token_to_kv_pool_allocator.free(loaded)
+                cache._log_as_failure(
+                    "load_back",
+                    rid=req.rid,
+                    requested=requested,
+                    error=exc,
+                    started=started,
+                )
+                cache._as_min(0)
+                return empty, anchor
         if cache._as_min(1) == 0:
             self._free_loaded_pages(cache, loaded, start_pos=local_hit_len)
             return empty, anchor
@@ -497,18 +817,19 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
                 cache, diffuser, load_info, page_ids, read_args, read_kwargs, requested
             )
         else:
-            try:
-                read_count = cache.ascli.read(
-                    load_info["hashes"],
-                    page_ids,
-                    *read_args,
-                    timeout=5.0,
-                    remote_addrs=load_info.get("remote_addrs") or None,
-                    **read_kwargs,
-                )
-            except Exception as exc:
-                read_error = exc
-                read_count = 0
+            with operations_nvtx_range("radix.as.lb.read"):
+                try:
+                    read_count = cache.ascli.read(
+                        load_info["hashes"],
+                        page_ids,
+                        *read_args,
+                        timeout=5.0,
+                        remote_addrs=load_info.get("remote_addrs") or None,
+                        **read_kwargs,
+                    )
+                except Exception as exc:
+                    read_error = exc
+                    read_count = 0
         read_count = cache._as_min(read_count)
         if read_error is None:
             cache._log_as_result(
@@ -531,47 +852,49 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
             return empty, anchor
 
         total_prefix_len = local_hit_len + token_count
-        token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
-        values = torch.cat([req.prefix_indices, loaded]).to(dtype=torch.int64)
-        restored_swa_len = self._restored_swa_len(cache, token_count)
-        cache.insert(
-            InsertParams(
-                key=RadixKey(
-                    token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
-                ),
-                value=values,
-                prev_prefix_len=local_hit_len,
-                # Everything before the restored window is an SWA tombstone. This
-                # must describe the bytes actually read back, not the SWA pages
-                # allocated: over-claiming makes the tree serve uninitialized SWA.
-                swa_evicted_seqlen=local_hit_len
-                + max(0, token_count - restored_swa_len),
+        with operations_nvtx_range("radix.as.lb.insert"):
+            token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
+            values = torch.cat([req.prefix_indices, loaded]).to(dtype=torch.int64)
+            restored_swa_len = self._restored_swa_len(cache, token_count)
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(
+                        token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
+                    ),
+                    value=values,
+                    prev_prefix_len=local_hit_len,
+                    # Everything before the restored window is an SWA tombstone. This
+                    # must describe the bytes actually read back, not the SWA pages
+                    # allocated: over-claiming makes the tree serve uninitialized SWA.
+                    swa_evicted_seqlen=local_hit_len
+                    + max(0, token_count - restored_swa_len),
+                )
             )
-        )
-        match = UnifiedRadixCache.match_prefix(
-            cache,
-            MatchPrefixParams(
-                key=RadixKey(
-                    token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
+            match = UnifiedRadixCache.match_prefix(
+                cache,
+                MatchPrefixParams(
+                    key=RadixKey(
+                        token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
+                    ),
+                    req=req,
                 ),
-                req=req,
-            ),
-        )
-        tree_indices = match.device_indices[local_hit_len:total_prefix_len].to(
-            dtype=loaded.dtype
-        )
-        if len(tree_indices) != token_count:
-            logger.warning(
-                "AS cache insert: cache_plan=%s rid=%s status=error "
-                "reason=shortened_prefix expected_tokens=%s actual_tokens=%s",
-                cache.attention_store_plan.name,
-                req.rid,
-                token_count,
-                len(tree_indices),
             )
+            tree_indices = match.device_indices[local_hit_len:total_prefix_len].to(
+                dtype=loaded.dtype
+            )
+            if len(tree_indices) != token_count:
+                logger.warning(
+                    "AS cache insert: cache_plan=%s rid=%s status=error "
+                    "reason=shortened_prefix expected_tokens=%s actual_tokens=%s",
+                    cache.attention_store_plan.name,
+                    req.rid,
+                    token_count,
+                    len(tree_indices),
+                )
         req.as_read_pending_lock = True
         return tree_indices, match.last_device_node
 
+    @profile_method("radix.as.diffuse", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def _diffuse_read(
         self, cache, diffuser, load_info, page_ids, read_args, read_kwargs, requested
     ):
@@ -981,6 +1304,7 @@ class SPAGCacheCoordinator(SPACacheCoordinator):
             chunks.append((tail_start, page_count, (), None))
         return chunks
 
+    @profile_method("radix.as.write", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def do_write(self, cache, task: _SPAWriteTask) -> int:
         """Write SPAG page blocks together with their embedded SWA windows."""
         if not task.block_hash_ids:

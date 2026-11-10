@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.environ import envs
+from sglang.srt.utils.nvtx_utils import NVTX_OPERATIONS_ENABLED, profile_method
 
 from .coordinator import AttentionStoreCoordinator
 from .plans import AttentionStoreCachePlan
@@ -280,6 +281,7 @@ class AttentionStoreIntegrationMixin:
             )
         return matched
 
+    @profile_method("radix.as.match", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def _match_checkpointed_page_prefix(
         self,
         params: MatchPrefixParams,
@@ -290,6 +292,7 @@ class AttentionStoreIntegrationMixin:
         if (
             req is None
             or req.ever_read_as
+            or req.as_read_pending_lock
             or not req.as_block_hashs
             or self.ascli is None
         ):
@@ -596,6 +599,19 @@ class AttentionStoreIntegrationMixin:
     def check_ascache_events(self, maintenance_round: Optional[int] = None) -> None:
         """Retire writes from earlier cache maintenance rounds."""
         self.attention_store_coordinator.check_events(self, maintenance_round)
+
+    def commit_ascache_load_backs(self) -> None:
+        """Commit finished deferred load-backs (async mode only).
+
+        Called at the scheduler loop top, before admission matching. Tasks
+        carry their own submitting request; a task fails or commits as a
+        whole.
+        """
+        self.attention_store_coordinator.commit_load_backs(self)
+
+    def has_pending_ascache_load_backs(self) -> bool:
+        """Whether any deferred load-back read is still in flight."""
+        return bool(self.attention_store_coordinator._pending_load_backs)
 
     def drain_attention_store_writes(self) -> None:
         """Wait for all pending AttentionStore writes."""

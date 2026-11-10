@@ -57,6 +57,38 @@ def _copy_swa_page_half_kernel(
         tl.store(dst_start + idxs, data, mask=mask)
 
 
+@triton.jit
+def _copy_swa_page_half_batch_kernel(
+    dst_ptrs,  # [layer_num] dst base pointers
+    src_ptrs,  # [layer_num] src base pointers
+    dst_offsets,  # [num_copies] byte offset of each dst slot
+    src_offsets,  # [num_copies] byte offset of each src half-page
+    copy_idx,  # [num_rows, 2] (layer, slot) pairs, flattened
+    num_rows,  # rows in copy_idx (= grid size)
+    slot_elems: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Each program instance copies one (slot, layer) pair. pid flattens the
+    num_copies x layer_num grid via a precomputed (layer, slot) index table,
+    so one launch covers a whole request's checkpoints."""
+    row = tl.program_id(0)
+    if row >= num_rows:
+        return
+    layer_idx = tl.load(copy_idx + row * 2)
+    slot_idx = tl.load(copy_idx + row * 2 + 1)
+
+    dst_base = tl.load(dst_ptrs + layer_idx).to(tl.pointer_type(tl.float32))
+    src_base = tl.load(src_ptrs + layer_idx).to(tl.pointer_type(tl.float32))
+    dst_start = dst_base + tl.load(dst_offsets + slot_idx) // 4
+    src_start = src_base + tl.load(src_offsets + slot_idx) // 4
+
+    for off in range(0, slot_elems, BLOCK_SIZE):
+        idxs = off + tl.arange(0, BLOCK_SIZE)
+        mask = idxs < slot_elems
+        data = tl.load(src_start + idxs, mask=mask)
+        tl.store(dst_start + idxs, data, mask=mask)
+
+
 class ChunkTailSWAPool:
     """Backup storage for chunk-tail SWA KV data in DeepSeekV4 chunked prefill.
 
@@ -199,7 +231,7 @@ class ChunkTailSWAPool:
     ) -> None:
         """Copy one half of a SWA page into slot_id.
 
-        If SGLANG_copy_swa_page_half_TRITON=1, uses triton kernel (61 layers parallel).
+        If SGLANG_COPY_SWA_PAGE_HALF_TRITON=1, uses triton kernel (61 layers parallel).
         Otherwise falls back to per-layer copy_().
         """
         if _USE_TRITON_COPY:
@@ -212,6 +244,63 @@ class ChunkTailSWAPool:
                     swa_kv_pool.kv_buffer[layer_idx][swa_page_idx, byte_start:byte_end]
                 )
 
+    def copy_swa_page_half_batch(
+        self, slot_ids, swa_page_idxs, swa_kv_pool, half: int = 1
+    ) -> None:
+        """Stage many slots with one triton launch (see the kernel docstring).
+
+        Falls back to the per-slot path when triton copy is disabled. The
+        caller must have validated every full->swa mapping already.
+        """
+        if not slot_ids:
+            return
+        if not _USE_TRITON_COPY:
+            for slot_id, swa_page_idx in zip(slot_ids, swa_page_idxs):
+                self.copy_swa_page_half(slot_id, swa_kv_pool, swa_page_idx, half)
+            return
+        n = len(slot_ids)
+        self._init_copy_swa_page_half_triton_ptrs(swa_kv_pool)
+        if n == 1:
+            self._copy_swa_page_half_triton(
+                slot_ids[0], swa_kv_pool, swa_page_idxs[0], half
+            )
+            return
+        device = self.device
+        # One pinned, async upload carries both offset tables. torch.tensor(
+        # ..., device=...) would cudaMemcpyAsync + cudaStreamSynchronize the
+        # current stream, which sits behind the scheduler's WAR barrier during
+        # process_batch_result: the sync drained the in-flight forward,
+        # ~18ms per swa_stage call before this fix.
+        host = torch.tensor(
+            [s * self.slot_bytes for s in slot_ids]
+            + [
+                p * swa_kv_pool.bytes_per_page_padded + half * self.slot_bytes
+                for p in swa_page_idxs
+            ],
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        dev = host.to(device, non_blocking=True)
+        dst_offsets = dev[:n]
+        src_offsets = dev[n:]
+        layer_col = torch.arange(self.layer_num, device=device).repeat(n)
+        slot_col = torch.arange(n, device=device).repeat_interleave(self.layer_num)
+        # Row r = (layer = r % layer_num, slot = r // layer_num): one dense
+        # int32 table so every program id maps to a real (slot, layer) copy.
+        copy_idx = (
+            torch.stack((layer_col, slot_col), dim=1).reshape(-1).to(torch.int32)
+        )
+        _copy_swa_page_half_batch_kernel[(n * self.layer_num,)](
+            self._copy_swa_dst_ptrs,
+            self._copy_swa_src_ptrs,
+            dst_offsets,
+            src_offsets,
+            copy_idx,
+            n * self.layer_num,
+            slot_elems=self.slot_bytes // 4,
+            BLOCK_SIZE=1024,
+        )
+
     def _copy_swa_page_half_triton(self, slot_id, swa_kv_pool, swa_page_idx, half):
         """Triton path: single launch, one block per layer."""
         self._init_copy_swa_page_half_triton_ptrs(swa_kv_pool)
@@ -219,7 +308,7 @@ class ChunkTailSWAPool:
             self._copy_swa_dst_ptrs,
             self._copy_swa_src_ptrs,
             slot_id * self.slot_bytes,
-            (swa_page_idx * 2 + half) * self.slot_bytes,
+            swa_page_idx * swa_kv_pool.bytes_per_page_padded + half * self.slot_bytes,
             slot_elems=self.slot_bytes // 4,
             BLOCK_SIZE=1024,
         )

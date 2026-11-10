@@ -1349,6 +1349,13 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
+            # The lock now protects a prefix an AS read published, so the
+            # one-shot read latch is safe to arm (30e32bfbf6 semantics):
+            # until admission locks it, a rejected schedule must stay free to
+            # match and load again.
+            if req.as_read_pending_lock:
+                req.ever_read_as = True
+                req.as_read_pending_lock = False
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
@@ -1404,6 +1411,14 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.kv.cache_protected_len = prefix_len
+
+                # Async submit deferred the publish to a later loop top
+                # (commit_load_backs). Admitting here would re-prefill the
+                # whole span now; skip this round instead. CONTINUE (not
+                # OTHER) so the waiting-queue loop keeps admitting the
+                # requests behind this one.
+                if req._as_pending_load_back is not None:
+                    return AddReqResult.CONTINUE
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)

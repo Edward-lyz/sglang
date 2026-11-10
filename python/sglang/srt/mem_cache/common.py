@@ -44,6 +44,31 @@ def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
     return (kv_indices[::page_size] // page_size).cpu().numpy()
 
 
+def kv_to_page_indices_pinned(
+    kv_indices: torch.Tensor,
+    page_size: int,
+    *,
+    stream: torch.cuda.Stream,
+    host_buf: torch.Tensor,
+) -> np.ndarray:
+    """kv_to_page_indices without a host-blocking D2H on the caller's stream.
+
+    The strided-slice gather and the D2H are enqueued on ``stream`` (the caller
+    runs inside its context); completion is the caller's job -- record an event
+    on ``stream`` after this returns and ``synchronize()`` it before reading.
+    The caller-owned pinned ``host_buf`` must be at least
+    ``kv_indices.numel() // page_size`` elements; the returned view is only
+    valid until the buffer is reused, and the consuming sender must snapshot
+    it (np.copy / torch tensor) before the next call reuses the buffer.
+    """
+    num_pages = kv_indices.numel() // page_size
+    dev_pages = (kv_indices[::page_size] // page_size).to(host_buf.dtype)
+    host_buf[:num_pages].copy_(dev_pages, non_blocking=True)
+    kv_indices.record_stream(stream)
+    dev_pages.record_stream(stream)
+    return host_buf[:num_pages].numpy()
+
+
 def kv_to_page_num(num_kv_indices: int, page_size: int):
     return (num_kv_indices + page_size - 1) // page_size
 

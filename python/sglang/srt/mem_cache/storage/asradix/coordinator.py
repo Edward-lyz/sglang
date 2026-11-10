@@ -213,6 +213,12 @@ class AttentionStoreCoordinator:
         """Initialize an idle asynchronous write coordinator."""
         self._write_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._pending_writes: list[_PendingWrite] = []
+        # Deferred load-back lane (SGLANG_ENABLE_AS_LOAD_BACK_ASYNC): the
+        # reader thread runs the SDK read, the scheduler thread commits.
+        # Both fields are scheduler-thread-only; the reader thread sees the
+        # task object, never this queue.
+        self._load_back_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._pending_load_backs: list[Any] = []
         self._page_id_copy_stream = None
         self._closed = False
         # Synchronous cache commit hooks use this only for dummy tasks and for
@@ -362,6 +368,14 @@ class AttentionStoreCoordinator:
     ) -> Tuple[torch.Tensor, Any]:
         """Restore an L2 hit into the components declared by the cache plan."""
         raise NotImplementedError
+
+    def commit_load_backs(self, cache) -> None:
+        """Drain finished deferred load-back reads (async mode).
+
+        The default is a no-op: only the checkpointed-page coordinators
+        implement the deferred-read lane; other plans never queue tasks.
+        """
+        return
 
     def do_write(self, cache, task) -> int:
         """Execute one payload-specific AttentionStore write."""
@@ -782,13 +796,19 @@ class AttentionStoreCoordinator:
         )
 
     def shutdown(self, cache) -> None:
-        """Drain writes and stop the background executor."""
+        """Drain writes and stop the background executors."""
         try:
             # atexit is not ordered across PP processes. Agent only publishes a
             # block after every shard is complete, so local retirement is safe.
             self._drain(cache, synchronize=False)
         finally:
             self._closed = True
+            if self._load_back_executor is not None:
+                # Pending reads have no scheduler loop to commit them anymore;
+                # wait for the in-flight read, then let the task objects go.
+                self._load_back_executor.shutdown(wait=True)
+                self._load_back_executor = None
+                self._pending_load_backs = []
             if self._write_executor is not None:
                 self._write_executor.shutdown(wait=True)
                 self._write_executor = None

@@ -142,6 +142,11 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_OPERATIONS_ENABLED,
+    operations_nvtx_range,
+    profile_method,
+)
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
@@ -1058,6 +1063,13 @@ class Req(ReqDllmMixin):
         self.as_max_hit_host_ip: List[str] = []
         self.as_max_hit_token_len: List[int] = []
         self.ever_read_as: bool = False
+        # An AS read only counts once an admission locks the loaded prefix:
+        # a rejected admission leaves it evictable, and a rank that latched
+        # ever_read_as on it would then match a shorter prefix than its peers.
+        self.as_read_pending_lock: bool = False
+        # Deferred AS load-back task in flight (async mode): set from submit
+        # until the scheduler-thread commit publishes or frees the prefix.
+        self._as_pending_load_back: Optional[Any] = None
         # AS SWA chunk-tail KV pool (mem_cache/chunk_tail_swa_pool.py) slot IDs for
         # the full lifecycle of this request. One slot per swa_step checkpoint
         # crossed; populated by _alloc_chunk_tail_slots_for_batch. A value of -1 is
@@ -1909,6 +1921,11 @@ class Req(ReqDllmMixin):
         self.kv.cache_protected_len = 0
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
+        # The loaded prefix is gone, so a re-prefill must read AttentionStore
+        # again; under PP that joint match is also what caps every stage's
+        # local prefix down to the same absolute terminal block.
+        self.ever_read_as = False
+        self.as_read_pending_lock = False
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
         self.swa_branching_seqlen = None
@@ -2650,6 +2667,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
+    @profile_method("sched.prepare_extend", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -2715,9 +2733,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 r.kv.req_pool_idx is None or r.is_retracted for r in reqs
             ]
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
-        )
+        with operations_nvtx_range("sched.prepare_extend.alloc"):
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                alloc_for_extend(self)
+            )
 
         # Set fields
         input_embeds = []

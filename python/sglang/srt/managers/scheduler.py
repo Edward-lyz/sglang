@@ -351,6 +351,11 @@ from sglang.srt.utils.hf_transformers_utils import (
     resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_OPERATIONS_ENABLED,
+    operations_nvtx_range,
+    profile_method,
+)
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import (
@@ -1620,6 +1625,19 @@ class Scheduler(
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
+            # Benchmark-only fake-transfer shortcut (see
+            # disaggregation/prefill.py: _sendkv_fake_transfer). Never on for
+            # real PD: requires the env gate AND fake bootstrap hosts.
+            self._fake_transfer_bypass = (
+                os.environ.get("SGLANG_PREFILL_FAKE_FREE_KV", "0") == "1"
+            )
+
+            # Side-stream page-index staging for send_kv (see
+            # disaggregation/prefill.py: _sendkv_pinned_pages).
+            self._sendkv_pinned: Optional[torch.Tensor] = None
+            self._sendkv_gather_done: Optional[torch.cuda.Event] = None
+            self._sendkv_gather_live = False
+
         if (
             self.enable_unified_memory
             and self.disaggregation_mode != DisaggregationMode.NULL
@@ -1693,6 +1711,13 @@ class Scheduler(
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
         )
+        # Barrier-free lane for swa_stage's probe D2H
+        # (detect_and_may_copy_as_swa): unlike schedule_stream, nothing chains
+        # this stream behind forward_stream, so a host sync here returns once
+        # its own gather completes instead of draining the in-flight forward
+        # (the coarse WAR barrier stall, measured 55ms per call).
+        self.swa_copy_stream: CudaStream = self.device_module.Stream()
+        self.prep_done_event = self.device_module.Event()
 
         if not self.enable_overlap:
             return
@@ -2129,6 +2154,7 @@ class Scheduler(
                 f"target={target_tail.num_pages}, draft={draft_tail.num_pages}"
             )
 
+    @profile_method("radix.as.swa_stage", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def detect_and_may_copy_as_swa(self, req: Req) -> None:
         """Rescue the tail SWA window at every swa_step checkpoint this request
         has now committed.
@@ -2152,31 +2178,54 @@ class Scheduler(
         # here would count tokens of later chunks as committed and stage a window
         # whose KV has not been written yet.
         committed_len = len(req.get_fill_ids())
-        req_to_token = self.req_to_token_pool.req_to_token
         draft_pool = (
             self.draft_worker.primary_draft_kv_pool if self.draft_worker else None
         )
         draft_tail = getattr(draft_pool, "chunk_tail_swa_pool", None)
 
+        first = req.as_swa_copy_count
         while req.as_swa_copy_count < len(req.as_swa_kv_slots):
             checkpoint_no = req.as_swa_copy_count
             checkpoint_pos = policy.checkpoint_pos(checkpoint_no)
             if checkpoint_pos > committed_len:
                 # Not committed yet; a later chunk will pick it up.
                 break
-            slot_id = req.as_swa_kv_slots[checkpoint_no]
-            if slot_id == -1:
-                req.as_swa_copy_count += 1
-                continue
-            # The last swa_win tokens before checkpoint_pos live in the UPPER half
-            # (half=1) of their SWA page — guaranteed by the
-            # swa_step % swa_page_size == 0 assert in init_as_swa_pool. Resolve the
-            # physical page through req_to_token -> full_to_swa rather than
-            # tail_start_pos // swa_page_size, which would be wrong whenever this
-            # request's SWA pages do not start at physical page 0.
-            tail_start_pos = checkpoint_pos - swa_win
-            full_slot = int(req_to_token[req.kv.req_pool_idx, tail_start_pos].item())
-            swa_slot = int(kvcache.full_to_swa_index_mapping[full_slot].item())
+            req.as_swa_copy_count += 1
+
+        # Batched staging: resolve every committed checkpoint's physical page
+        # with ONE gather + ONE host sync, then one kernel launch per pool.
+        # Per-checkpoint .item() syncs were the dominant swa_stage cost.
+        last = req.as_swa_copy_count
+        live_nos = [
+            no
+            for no in range(first, last)
+            if req.as_swa_kv_slots[no] != -1
+        ]
+        if not live_nos:
+            return
+        tail_starts = [policy.checkpoint_pos(no) - swa_win for no in live_nos]
+        # The gather + D2H runs on a side stream, NOT the schedule stream:
+        # _apply_war_barrier chained schedule_stream behind the in-flight
+        # forward, so a host sync there drains the forward (measured 55ms per
+        # call). The probe fences on prep_done_event (recorded on
+        # schedule_stream at run_batch entry, i.e. after this batch's prep
+        # writes but with no forward dependency), so the sync ends in
+        # microseconds. Values are stable: the probed req_to_token rows and
+        # full_to_swa entries cover this req's committed prefix, which stays
+        # tree-locked (and its SWA pages un-evicted) until the AS write
+        # releases it -- no later clear can race this probe.
+        self.swa_copy_stream.wait_event(self.prep_done_event)
+        with self.device_module.stream(self.swa_copy_stream):
+            full_slots = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, torch.tensor(tail_starts, dtype=torch.int64)
+            ]
+            swa_slots = kvcache.full_to_swa_index_mapping[full_slots]
+            swa_slots_host = swa_slots.cpu().tolist()
+
+        slot_ids = []
+        swa_page_idxs = []
+        for no, swa_slot in zip(live_nos, swa_slots_host):
+            slot_id = req.as_swa_kv_slots[no]
             if swa_slot == 0:
                 # Slot 0 is the reserved SWA padding sink and is never handed out
                 # (see allocator/swa.py:25-27), so reading it back means
@@ -2185,29 +2234,30 @@ class Scheduler(
                 # the padding page's garbage and AS would serve it as valid KV.
                 # Degrade to the -1 sentinel and recycle the staging slot.
                 logger.warning(
-                    "chunk_tail_swa: rid=%s checkpoint#%d pos=%d tail_start=%d "
-                    "full_slot=%d has no live full->swa mapping (window already "
-                    "evicted); skipping this checkpoint",
+                    "chunk_tail_swa: rid=%s checkpoint#%d has no live full->swa "
+                    "mapping (window already evicted); skipping this checkpoint",
                     req.rid,
-                    checkpoint_no,
-                    checkpoint_pos,
-                    tail_start_pos,
-                    full_slot,
+                    no,
                 )
-                req.as_swa_kv_slots[checkpoint_no] = -1
+                req.as_swa_kv_slots[no] = -1
                 free_chunk_tail_swa_slots(kvcache, [slot_id])
-                req.as_swa_copy_count += 1
                 continue
-            swa_page_idx = swa_slot // kvcache.swa_page_size
-            pool.copy_swa_page_half(slot_id, kvcache.swa_kv_pool, swa_page_idx, half=1)
-            if draft_tail is not None:
-                # Same slot_id and same swa_page_idx: the draft shares the target's
-                # slot-id space and the very same full_to_swa_index_mapping object
-                # (asserted in _assert_draft_swa_geometry).
-                draft_tail.copy_swa_page_half(
-                    slot_id, draft_pool.swa_kv_pool, swa_page_idx, half=1
-                )
-            req.as_swa_copy_count += 1
+            slot_ids.append(slot_id)
+            swa_page_idxs.append(swa_slot // kvcache.swa_page_size)
+        # The triton copy launches on the scheduler thread's current stream (the
+        # schedule stream): it reads SWA pages this forward wrote, and the next
+        # run_batch's forward_stream.wait_stream(schedule_stream) orders the next
+        # forward behind it, so no extra fence is needed.
+        pool.copy_swa_page_half_batch(
+            slot_ids, swa_page_idxs, kvcache.swa_kv_pool, half=1
+        )
+        if draft_tail is not None and slot_ids:
+            # Same slot_ids and swa_page_idxs: the draft shares the target's
+            # slot-id space and the very same full_to_swa_index_mapping object
+            # (asserted in _assert_draft_swa_geometry).
+            draft_tail.copy_swa_page_half_batch(
+                slot_ids, swa_page_idxs, draft_pool.swa_kv_pool, half=1
+            )
 
     def retire_ascache_writes(self) -> None:
         """Retire completed AttentionStore async writes in submission order.
@@ -2221,6 +2271,7 @@ class Scheduler(
             self.tree_cache, "check_ascache_events"
         ):
             self.tree_cache.check_ascache_events()
+            self.tree_cache.commit_ascache_load_backs()
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -2391,17 +2442,18 @@ class Scheduler(
         value exists for the pipeline stages that relay requests onward.
         """
         local_reqs = []
-        if (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
-        ):
-            local_reqs = self._poll_timeout_aborts()
-        recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
-        if recv_reqs:
-            self.metrics_reporter.record_scheduler_active()
-        self.process_input_requests(recv_reqs)
-        return recv_reqs
+        with operations_nvtx_range("sched.recv_req"):
+            if (
+                self.ps.pp_rank == 0
+                and self.ps.attn_tp_rank == 0
+                and self.ps.attn_cp_rank == 0
+            ):
+                local_reqs = self._poll_timeout_aborts()
+            recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+            if recv_reqs:
+                self.metrics_reporter.record_scheduler_active()
+            self.process_input_requests(recv_reqs)
+            return recv_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
@@ -4277,6 +4329,11 @@ class Scheduler(
         for req in candidate_reqs:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
+            # Deferred AS load-back in flight: commit_load_backs publishes the
+            # prefix at a loop top; until then this request must neither
+            # re-prefill nor block admission of the requests behind it.
+            if req._as_pending_load_back is not None:
+                continue
 
             running_bs = len(running_batch.reqs)
             candidate_beam_width = (
@@ -4672,6 +4729,10 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_active()
         self.metrics_reporter.iter_forward_start_time = time.perf_counter()
         self.forward_ct += 1
+        # Encode this forward's new-token count into the run_batch NVTX name so
+        # equal-token batches can be matched across captures (e.g. a 0%-hit and
+        # an 80%-hit run both have full prefill chunks of the same size).
+        _rb_label = f"sched.run_batch.nt{batch.extend_num_tokens or 0}"
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
@@ -4737,9 +4798,10 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
+                        with operations_nvtx_range(_rb_label):
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
+                            )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4809,9 +4871,10 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch, pp_proxy_tensors=pp_proxy_tensors
-                    )
+                    with operations_nvtx_range(_rb_label):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -4837,9 +4900,10 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
+                with operations_nvtx_range(_rb_label):
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
@@ -4896,6 +4960,12 @@ class Scheduler(
 
         self._maybe_report_active_ranks()
 
+        # Fence point for the side-stream probe in detect_and_may_copy_as_swa:
+        # ordering against schedule_stream as a whole would transitively wait
+        # the in-flight forward (the WAR barrier chains schedule_stream behind
+        # it), so the probe instead waits on this event, which is recorded
+        # after this batch's prep writes but before _apply_war_barrier runs.
+        self.prep_done_event.record()
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
@@ -5013,6 +5083,7 @@ class Scheduler(
             batch_result.logits_output.next_token_logits = None
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
+    @profile_method("sched.proc_result", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def process_batch_result(
         self,
         batch: ScheduleBatch,
@@ -5022,14 +5093,15 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
-        # Router-facing gauge on the dedicated PUB socket, reusing the
-        # snapshot above rather than walking the queues again.
-        self.load_publisher.publish_load_stat(
-            self.load_inquirer.get_loads,
-            force=batch.forward_mode.is_extend(),
-            snapshot=snapshot,
-        )
+        with operations_nvtx_range("sched.pr.load_pub"):
+            snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+            # Router-facing gauge on the dedicated PUB socket, reusing the
+            # snapshot above rather than walking the queues again.
+            self.load_publisher.publish_load_stat(
+                self.load_inquirer.get_loads,
+                force=batch.forward_mode.is_extend(),
+                snapshot=snapshot,
+            )
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)

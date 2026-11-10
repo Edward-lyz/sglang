@@ -699,6 +699,16 @@ class Envs:
     # SM footprint so it does not starve forward's latency-bound collectives.
     SGLANG_ENABLE_AS_READ_DIFFUSE = EnvBool(False)
     SGLANG_AS_READ_DIFFUSE_BLOCKS = EnvInt(32)
+    # Run AttentionStore load_back on a background executor instead of blocking
+    # scheduler admission. Admission only allocates and submits (no IO); the
+    # next loop top drains the finished read and inserts the prefix. The
+    # background thread runs the SDK read with NO torch.distributed calls:
+    # concurrent collectives on the same gloo group from two threads have no
+    # cross-rank pairing guarantee. For the same reason the async path always
+    # takes the plain full read (the sharded read + NVLink diffuse path issues
+    # CP-group barriers around the read and cannot move off the scheduler
+    # thread); each CP rank reads the full block set.
+    SGLANG_ENABLE_AS_LOAD_BACK_ASYNC = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime

@@ -26,6 +26,7 @@ ops, and the speculative-decoding / forward spans -- share one primitive.
 """
 
 import logging
+import os
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Optional
@@ -35,6 +36,16 @@ import torch
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+# SGLANG_ENABLE_NVTX_OPERATIONS is set in the launch shell but does not survive
+# the scheduler-process spawn (it is dropped from the child's environment before
+# this module is imported). Under an active Nsight Systems capture, nsys injects
+# NVTX_INJECTION64_PATH into every traced process -- schedulers included -- so
+# re-arm the gate here, before it is read below, so per-forward operation ranges
+# emit in the child processes too. setdefault preserves an explicit opt-out
+# (SGLANG_ENABLE_NVTX_OPERATIONS=0); no effect outside an nsys trace.
+if os.environ.get("NVTX_INJECTION64_PATH"):
+    os.environ.setdefault("SGLANG_ENABLE_NVTX_OPERATIONS", "1")
 
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
 _OPERATIONS_NVTX = envs.SGLANG_ENABLE_NVTX_OPERATIONS.get()

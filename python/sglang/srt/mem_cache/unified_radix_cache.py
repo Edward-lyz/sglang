@@ -96,6 +96,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
@@ -539,22 +540,23 @@ class UnifiedRadixCache(BasePrefixCache):
         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        result = self.session.try_match_prefix(params)
-        if result is not None:
+        with operations_nvtx_range("radix.match_prefix"):
+            result = self.session.try_match_prefix(params)
+            if result is not None:
+                return result
+            if self.disable:
+                return self.tree_core.empty_match_result
+            result = self.tree_core.match_prefix(params)
+            # Apply the walk's actions (e.g. a pending write-through relocation on
+            # a split) before the finalizers, which can evict or raise.
+            self._apply_cache_actions(result.cache_actions)
+            for component in self._components_tuple:
+                result = component.finalize_match_result_in_cache(params, result)
+            # Finalizers must not emit actions; the walk's were applied above.
+            assert not result.cache_actions
+            if self.linker is not None and params.req is not None:
+                result = self.linker.match(params.key, params.req, result)
             return result
-        if self.disable:
-            return self.tree_core.empty_match_result
-        result = self.tree_core.match_prefix(params)
-        # Apply the walk's actions (e.g. a pending write-through relocation on
-        # a split) before the finalizers, which can evict or raise.
-        self._apply_cache_actions(result.cache_actions)
-        for component in self._components_tuple:
-            result = component.finalize_match_result_in_cache(params, result)
-        # Finalizers must not emit actions; the walk's were applied above.
-        assert not result.cache_actions
-        if self.linker is not None and params.req is not None:
-            result = self.linker.match(params.key, params.req, result)
-        return result
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -565,21 +567,22 @@ class UnifiedRadixCache(BasePrefixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
-        # Fail fast on re-entrancy without touching the in-flight walk.
-        assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
-        # Pump the resumable insert, applying each step's actions at its barrier.
-        try:
-            step = self.tree_core.begin_insert(params)
-            while True:
-                self._apply_cache_actions(step.actions)
-                if step.result is not None:
-                    # Walk actions flow through the steps; the result is action-free.
-                    assert not step.result.cache_actions
-                    return step.result
-                step = self.tree_core.resume_insert()
-        finally:
-            # Drain still-pending actions so frees reach the allocator on abort.
-            self._apply_cache_actions(self.tree_core.end_insert())
+        with operations_nvtx_range("radix.insert"):
+            # Fail fast on re-entrancy without touching the in-flight walk.
+            assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
+            # Pump the resumable insert, applying each step's actions at its barrier.
+            try:
+                step = self.tree_core.begin_insert(params)
+                while True:
+                    self._apply_cache_actions(step.actions)
+                    if step.result is not None:
+                        # Walk actions flow through the steps; the result is action-free.
+                        assert not step.result.cache_actions
+                        return step.result
+                    step = self.tree_core.resume_insert()
+            finally:
+                # Drain still-pending actions so frees reach the allocator on abort.
+                self._apply_cache_actions(self.tree_core.end_insert())
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
@@ -688,29 +691,30 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> EvictResult:
         if self.disable:
             return EvictResult()
-        start_time = time.perf_counter()
-        tracker = {ct: 0 for ct in self.tree_components}
+        with operations_nvtx_range("radix.evict"):
+            start_time = time.perf_counter()
+            tracker = {ct: 0 for ct in self.tree_components}
 
-        request_by_type = self._evict_request_by_type(params)
-        self._evict_components(
-            request_by_type,
-            tracker,
-            available_size_targets=available_size_targets,
-        )
+            request_by_type = self._evict_request_by_type(params)
+            self._evict_components(
+                request_by_type,
+                tracker,
+                available_size_targets=available_size_targets,
+            )
 
-        if (
-            self.cache_controller is not None
-            and self.cache_controller.write_policy == "write_back"
-        ):
-            self.writing_check(write_back=True)
+            if (
+                self.cache_controller is not None
+                and self.cache_controller.write_policy == "write_back"
+            ):
+                self.writing_check(write_back=True)
 
-        # Report full-layer tokens only
-        self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
-        return EvictResult(
-            num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
-            swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
-            mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
-        )
+            # Report full-layer tokens only
+            self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
+            return EvictResult(
+                num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
+                swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
+                mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
+            )
 
     def _free_values(
         self,
