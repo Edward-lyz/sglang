@@ -41,6 +41,11 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mooncake.target_parallel_transfer import (
+    PerTargetKVChunk,
+    enqueue_target_parallel_chunks,
+    process_target_parallel_chunk,
+)
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
@@ -233,6 +238,11 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            # Opt-in per-destination fan-out; see mooncake/target_parallel_transfer.py.
+            # Off means the whole-room path below runs exactly as before.
+            self.enable_target_parallel_transfer = (
+                envs.SGLANG_PP_PD_KV_TRANSFER_TARGET_PARALLEL.get()
+            )
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -244,13 +254,19 @@ class MooncakeKVManager(CommonKVManager):
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
-            assert transfer_thread_pool_size >= transfer_queue_size, (
-                f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
-                f"greater than or equal to SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
-            )
+            if transfer_thread_pool_size < transfer_queue_size:
+                # Only a soft constraint: the executors are per-layer helpers, while
+                # the queues each own a worker thread. Under-provisioning the pool
+                # just means one helper thread per queue, so warn instead of
+                # refusing to boot -- the per-target fan-out wants many queues.
+                logger.warning(
+                    f"SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} is "
+                    f"smaller than SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}; "
+                    "each transfer queue falls back to a single-thread executor."
+                )
             self.executors = [
                 concurrent.futures.ThreadPoolExecutor(
-                    transfer_thread_pool_size // transfer_queue_size
+                    max(1, transfer_thread_pool_size // transfer_queue_size)
                 )
                 for _ in range(transfer_queue_size)
             ]
@@ -1701,6 +1717,29 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if isinstance(kv_chunk, PerTargetKVChunk):
+                    # Per-destination work unit: handled by the parallel path in
+                    # target_parallel_transfer.py. Everything below is the untouched
+                    # legacy whole-room path, reached whenever the fan-out flag is
+                    # off. Kept inside the same `try` so a unit still gets the
+                    # legacy exception handling (fail the room, drop its infos).
+                    if (
+                        self.enable_staging
+                        and staging_strategy is None
+                        and staging_buffer is not None
+                    ):
+                        staging_strategy = self._try_create_staging_strategy(
+                            staging_buffer
+                        )
+                    process_target_parallel_chunk(
+                        self,
+                        kv_chunk=kv_chunk,
+                        executor=executor,
+                        queue=queue,
+                        staging_strategy=staging_strategy,
+                    )
+                    continue
+
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2287,15 +2326,29 @@ class MooncakeKVManager(CommonKVManager):
             # add further chunks into the transfer queue.
             return
 
+        if trace_ctx is None:
+            trace_ctx = TraceNullContext()
+
+        if self.enable_target_parallel_transfer:
+            enqueue_target_parallel_chunks(
+                self,
+                bootstrap_room=bootstrap_room,
+                kv_indices=kv_indices,
+                index_slice=index_slice,
+                is_last_chunk=is_last_chunk,
+                aux_index=aux_index,
+                state_indices=state_indices,
+                num_kv_tokens=num_kv_tokens,
+                trace_ctx=trace_ctx,
+            )
+            return
+
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
-
-        if trace_ctx is None:
-            trace_ctx = TraceNullContext()
 
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(

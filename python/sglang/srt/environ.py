@@ -414,6 +414,13 @@ class Envs:
     # First phase supports mooncake only, without speculative decoding,
     # return_logprob, return_sampling_mask or grammar.
     SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK = EnvBool(False)
+    # PP + PD prefill (mooncake): expand a chunk's multi-destination fan-out into
+    # one transfer queue entry per decode destination, so the fan-out runs on
+    # several worker threads instead of serially inside one. Also replaces the
+    # legacy shard key (sum of destination rpc ports), which is constant for a
+    # fixed decode fleet and collapses every room onto one queue. Kill-switch: set
+    # to 0 to restore the byte-identical legacy whole-room path.
+    SGLANG_PP_PD_KV_TRANSFER_TARGET_PARALLEL = EnvBool(False)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
