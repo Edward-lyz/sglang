@@ -1,3 +1,79 @@
+#!/bin/bash
+# ============================================================================
+# GLM W4 Decode 节点启动脚本
+#
+# 用法:
+#   bash start_glm_w4_decode.sh [选项]
+#
+# 选项:
+#   --bench-mode  压测/基准测试模式，额外传入:
+#                   --disaggregation-transfer-backend fake
+#                   --ep-dispatch-algorithm fake
+#   -h, --help    显示本帮助信息并退出。
+#
+# 说明:
+#   decode 节点始终使用 --disable-radix-cache（prefix cache 关闭）。
+#
+# 依赖的环境变量:
+#   MODEL_PATH        模型权重路径 (必填)
+#   MODEL_ID          served-model-name (必填)
+#   HTTP_PORT         服务监听端口 (必填, 仅做存在性校验)
+#   FED_MEMBER_FILE   集群成员列表文件，取第一项作为 MASTER_IP
+#   FED_POD_INDEX     当前节点 rank (传给 --node-rank)
+#
+# 示例:
+#   bash start_glm_w4_decode.sh
+#   bash start_glm_w4_decode.sh --bench-mode
+# ============================================================================
+
+usage() {
+    cat <<'EOF'
+GLM W4 Decode 节点启动脚本
+
+用法:
+  bash start_glm_w4_decode.sh [选项]
+
+选项:
+  --bench-mode  压测/基准测试模式，额外传入:
+                  --disaggregation-transfer-backend fake
+                  --ep-dispatch-algorithm fake
+  -h, --help    显示本帮助信息并退出。
+
+说明:
+  decode 节点始终使用 --disable-radix-cache（prefix cache 关闭）。
+
+依赖的环境变量:
+  MODEL_PATH        模型权重路径 (必填)
+  MODEL_ID          served-model-name (必填)
+  HTTP_PORT         服务监听端口 (必填, 仅做存在性校验)
+  FED_MEMBER_FILE   集群成员列表文件，取第一项作为 MASTER_IP
+  FED_POD_INDEX     当前节点 rank (传给 --node-rank)
+
+示例:
+  bash start_glm_w4_decode.sh
+  bash start_glm_w4_decode.sh --bench-mode
+EOF
+}
+
+BENCH_ARGS=()
+
+for arg in "$@"; do
+    case "$arg" in
+        --bench-mode)
+            BENCH_ARGS=(--disaggregation-transfer-backend fake --ep-dispatch-algorithm fake)
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "警告: 未知参数 '$arg'，已忽略。使用 --help 查看用法。" >&2
+            ;;
+    esac
+done
+
+echo "Bench mode: ${BENCH_ARGS[*]:-disabled}"
+
 . ~/.bashrc
 
 export AIAK_DEBUG_SUBMODULE="0"
@@ -27,12 +103,6 @@ export EP_STATS_DUMP_THRESH="0.95"
 export GC_COLLECT_GEN_STEP="10000"
 export GROUPED_GEMM_EXPECTED_M="4096"
 export LD_LIBRARY_PATH=/usr/local/lib/:/usr/lib/x86_64-linux-gnu:/usr/local/nvshmem/lib:${LD_LIBRARY_PATH}
-export MOONCAKE_ASYNC_SEND="FALSE"
-export MOONCAKE_META_SERVER_PASSWORD=test-deepseek
-export MOONCAKE_META_SERVER_URL=redis://10.220.21.235:6379
-export MOONCAKE_REMOTE_TP_SIZE="1"
-export MOONCAKE_SEND_RECV_TIMEOUT="10"
-export MOONCAKE_USE_RDMA="TRUE"
 export NCCL_BUFFSIZE="524288"
 export NCCL_DEBUG="INFO"
 export NCCL_IB_ADAPTIVE_ROUTING="1"
@@ -138,6 +208,7 @@ python3 -m sglang.launch_server \
     --node-rank $FED_POD_INDEX \
     --tp-size $TP_SIZE \
     --disable-radix-cache \
+    ${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"} \
     --kv-cache-dtype fp8_e4m3 \
     --max-running-requests $((64 * DP_SIZE)) \
     --mem-fraction-static 0.89 \

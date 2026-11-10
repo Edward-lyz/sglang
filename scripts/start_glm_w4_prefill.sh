@@ -1,3 +1,82 @@
+#!/bin/bash
+# ============================================================================
+# GLM W4 Prefill 节点启动脚本
+#
+# 用法:
+#   bash start_glm_w4_prefill.sh [选项]
+#
+# 选项:
+#   --no-cache    关闭 prefix cache。默认使用 --enable-asradix-cache，
+#                 传入该参数后替换为 --disable-radix-cache。
+#   --bench-mode  压测/基准测试模式，额外传入 --ep-dispatch-algorithm fake。
+#   -h, --help    显示本帮助信息并退出。
+#
+# 依赖的环境变量:
+#   MODEL_PATH        模型权重路径 (必填)
+#   MODEL_ID          served-model-name (必填)
+#   HTTP_PORT         服务监听端口 (必填)
+#   FED_MEMBER_FILE   集群成员列表文件，取第一项作为 MASTER_IP
+#   FED_POD_INDEX     当前节点 rank (传给 --node-rank)
+#
+# 示例:
+#   bash start_glm_w4_prefill.sh
+#   bash start_glm_w4_prefill.sh --no-cache
+#   bash start_glm_w4_prefill.sh --bench-mode
+#   bash start_glm_w4_prefill.sh --no-cache --bench-mode
+# ============================================================================
+
+usage() {
+    cat <<'EOF'
+GLM W4 Prefill 节点启动脚本
+
+用法:
+  bash start_glm_w4_prefill.sh [选项]
+
+选项:
+  --no-cache    关闭 prefix cache。默认使用 --enable-asradix-cache，
+                传入该参数后替换为 --disable-radix-cache。
+  --bench-mode  压测/基准测试模式，额外传入 --ep-dispatch-algorithm fake。
+  -h, --help    显示本帮助信息并退出。
+
+依赖的环境变量:
+  MODEL_PATH        模型权重路径 (必填)
+  MODEL_ID          served-model-name (必填)
+  HTTP_PORT         服务监听端口 (必填)
+  FED_MEMBER_FILE   集群成员列表文件，取第一项作为 MASTER_IP
+  FED_POD_INDEX     当前节点 rank (传给 --node-rank)
+
+示例:
+  bash start_glm_w4_prefill.sh
+  bash start_glm_w4_prefill.sh --no-cache
+  bash start_glm_w4_prefill.sh --bench-mode
+  bash start_glm_w4_prefill.sh --no-cache --bench-mode
+EOF
+}
+
+CACHE_ARGS=(--enable-asradix-cache)
+BENCH_ARGS=()
+
+for arg in "$@"; do
+    case "$arg" in
+        --no-cache)
+            CACHE_ARGS=(--disable-radix-cache)
+            ;;
+        --bench-mode)
+            BENCH_ARGS=(--ep-dispatch-algorithm fake)
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "警告: 未知参数 '$arg'，已忽略。使用 --help 查看用法。" >&2
+            ;;
+    esac
+done
+
+echo "Prefix cache: ${CACHE_ARGS[*]}"
+echo "Bench mode: ${BENCH_ARGS[*]:-disabled}"
+
 . ~/.bashrc
 
 export AIAK_ENABLE_EXPERT_TRACE="0"
@@ -21,11 +100,6 @@ export ENABLE_W8A8_BLOCK_FP8_GROUPED_GEMM_TMA="FALSE"
 export ENABLE_W8A8_BLOCK_FP8_GROUPED_GEMM_TUNED="1"
 export EP_STATS_DUMP_THRESH="0.95"
 export LD_LIBRARY_PATH=/usr/local/lib/:/usr/lib/x86_64-linux-gnu:/usr/local/nvshmem/lib:${LD_LIBRARY_PATH}
-export MOONCAKE_ASYNC_SEND="TRUE"
-export MOONCAKE_META_SERVER_PASSWORD=test-deepseek
-export MOONCAKE_META_SERVER_URL=redis://10.220.21.235:6379
-export MOONCAKE_SEND_RECV_TIMEOUT="60"
-export MOONCAKE_USE_RDMA="TRUE"
 export NCCL_DEBUG="INFO"
 export NCCL_IB_ADAPTIVE_ROUTING="1"
 export NCCL_IB_GID_INDEX="3"
@@ -122,7 +196,8 @@ python3 -m sglang.launch_server \
     --per-node-gpu-num 8 \
     --tp-size 8 \
     --disable-cuda-graph \
-    --enable-asradix-cache \
+    "${CACHE_ARGS[@]}" \
+    ${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"} \
     --max-prefill-tokens 196608 \
     --max-running-requests 256 \
     --max-total-tokens 1056768 \

@@ -1168,6 +1168,10 @@ class Scheduler(
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        # Deferred flush_cache requests waiting for the pipeline to drain
+        # (see flush_cache_wrapped / resolve_pending_flush_cache).
+        self._pending_flush_cache_reqs: List[FlushCacheReqInput] = []
+        self._pending_flush_cache_deadline: Optional[float] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
