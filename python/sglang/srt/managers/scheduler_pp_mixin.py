@@ -1168,6 +1168,16 @@ class SchedulerPPMixin:
             dtype=torch.int64,
             non_blocking=True,
         )
+        # Fail loud on a PP batch divergence: if the last stage sampled a
+        # different number of tokens than this rank's batch holds, the relay
+        # below would either raise an opaque broadcast error or, when the two
+        # sizes happen to match with different members, silently write tokens
+        # into the wrong slots.
+        assert next_token_ids.shape[0] == batch.req_pool_indices.shape[0], (
+            "PP batch size mismatch between stages: "
+            f"next_token_ids={next_token_ids.shape[0]} "
+            f"req_pool_indices={batch.req_pool_indices.shape[0]}"
+        )
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).

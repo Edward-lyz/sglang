@@ -1907,6 +1907,34 @@ class KVCacheConfigurator:
                     ),
                 )
 
+        # Sync the solved pool size across PP ranks. Each PP rank hosts a
+        # different number of mamba/KDA layers, so the memory-budget solve above
+        # yields different values per rank. token_capacity is already synced with
+        # an all-reduce MIN (see resolve_token_capacity), but the mamba pool size
+        # was not, which lets the per-rank admission budget (rem_mamba_slots in
+        # schedule_policy) diverge and PP ranks build different-sized batches.
+        if server_args.pp_size > 1 and server_args.max_mamba_cache_size is not None:
+            synced_mamba_cache_size = torch.tensor(
+                int(server_args.max_mamba_cache_size), dtype=torch.int64
+            )
+            torch.distributed.all_reduce(
+                synced_mamba_cache_size,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_world_group().cpu_group,
+            )
+            if int(synced_mamba_cache_size.item()) != int(
+                server_args.max_mamba_cache_size
+            ):
+                logger.warning(
+                    "max_mamba_cache_size synced across PP ranks: %d -> %d",
+                    server_args.max_mamba_cache_size,
+                    int(synced_mamba_cache_size.item()),
+                )
+                server_args.override(
+                    "mamba_pool.pp_sync",
+                    max_mamba_cache_size=int(synced_mamba_cache_size.item()),
+                )
+
         # Validate: max_mamba_cache_size must be positive after memory allocation.
         # A non-positive value means GPU memory is insufficient for the requested
         # configuration. Fail fast with actionable advice instead of silently
