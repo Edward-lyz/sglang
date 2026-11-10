@@ -26,7 +26,18 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -3918,7 +3929,9 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
-    def process_pending_chunked_abort(self) -> None:
+    def process_pending_chunked_abort(
+        self, *, deferred_release: Optional[List[Callable[[], None]]] = None
+    ) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
 
         ``abort_request`` only records the target in ``_pending_chunked_abort_req``
@@ -3931,6 +3944,11 @@ class Scheduler(
         ``process_batch_result_prefill`` via its chunked branch (the finished req
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
+
+        ``deferred_release`` (threaded AHEAD prefill loop only): queue the KV
+        release there instead of running it now -- the launched chunk's forward
+        may still be mid-launch with no WAR barrier, and freeing its slots now
+        would let this step's admission reuse them under it.
         """
         req = self._pending_chunked_abort_req
         if req is None:
@@ -3958,7 +3976,12 @@ class Scheduler(
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req.rid)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if deferred_release is not None:
+            deferred_release.append(
+                partial(release_kv_cache, req, self.tree_cache, is_insert=False)
+            )
+        else:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -4759,6 +4782,16 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    @staticmethod
+    def _snapshot_extend_input_lens(batch: ScheduleBatch) -> Optional[List[int]]:
+        """Per-req extend lengths for output processing (None when unused)."""
+        if not (batch.return_logprob or batch.return_hidden_states):
+            return None
+        return [
+            req.extend_range.length if req.extend_range is not None else 0
+            for req in batch.reqs
+        ]
+
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
@@ -4766,6 +4799,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         *,
         early_send_prefix: bool = True,
+        extend_input_len_per_req: Optional[List[int]] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.metrics_reporter.record_scheduler_active()
@@ -4961,13 +4995,14 @@ class Scheduler(
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
-            if batch.return_logprob or batch.return_hidden_states:
-                batch_result.extend_input_len_per_req = [
-                    req.extend_range.length if req.extend_range is not None else 0
-                    for req in batch.reqs
-                ]
-            else:
-                batch_result.extend_input_len_per_req = None
+            # The threaded prefill loop precomputes extend_input_len_per_req on
+            # the scheduler thread: by the time the worker gets here, admission
+            # may already have advanced a chunked req's extend_range.
+            batch_result.extend_input_len_per_req = (
+                extend_input_len_per_req
+                if extend_input_len_per_req is not None
+                else self._snapshot_extend_input_lens(batch)
+            )
 
             if batch.return_logprob:
                 batch_result.extend_logprob_start_len_per_req = (

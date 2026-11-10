@@ -24,8 +24,9 @@ import hashlib
 import logging
 from array import array
 from collections import deque
+from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import numpy as np
 import torch
@@ -584,8 +585,11 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
+        *,
+        deferred_finalize: Optional[List[Callable[[], None]]] = None,
     ) -> NextBatchPlan:
-        self.process_pending_chunked_abort()
+        """``deferred_finalize``: see process_prefill_chunk (threaded AHEAD loop)."""
+        self.process_pending_chunked_abort(deferred_release=deferred_finalize)
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
@@ -593,7 +597,11 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.resolve_waiting_queue_bootstrap()
 
-        self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
+        self.process_prefill_chunk(
+            last_batch=last_batch,
+            running_batch=running_batch,
+            deferred_finalize=deferred_finalize,
+        )
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
@@ -729,9 +737,13 @@ class SchedulerDisaggregationPrefillMixin:
             item = self._fwd_in_q.get()
             if item is None:  # shutdown sentinel
                 return
-            batch, early_send_prefix = item
+            batch, early_send_prefix, extend_input_len_per_req = item
             try:
-                result = self.run_batch(batch, early_send_prefix=early_send_prefix)
+                result = self.run_batch(
+                    batch,
+                    early_send_prefix=early_send_prefix,
+                    extend_input_len_per_req=extend_input_len_per_req,
+                )
                 self._apply_war_barrier()
                 # Snapshot on the worker, after the forward's in-place SB edits
                 # and while only this thread owns the batch (the scheduler has
@@ -741,10 +753,16 @@ class SchedulerDisaggregationPrefillMixin:
             except BaseException as exc:  # relay to the scheduler thread
                 self._fwd_out_q.put((None, None, exc))
 
-    def _fwd_submit(self: Scheduler, batch, *, early_send_prefix: bool = True) -> None:
+    def _fwd_submit(
+        self: Scheduler,
+        batch,
+        *,
+        early_send_prefix: bool = True,
+        extend_input_len_per_req: Optional[List[int]] = None,
+    ) -> None:
         """Hand a batch to the forward thread (non-blocking)."""
         self._ensure_prefill_fwd_thread()
-        self._fwd_in_q.put((batch, early_send_prefix))
+        self._fwd_in_q.put((batch, early_send_prefix, extend_input_len_per_req))
 
     def _fwd_collect(self: Scheduler):
         """Block for the oldest submitted forward; return (result, batch_copy)
@@ -818,8 +836,18 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
+            # AHEAD: admission below runs while the previous forward may still be
+            # launching on the worker (no WAR barrier on schedule_stream yet), so
+            # the work that reads / frees that forward's in-flight KV (the
+            # chunked req's chunk finalize, a chunked abort's KV release) is
+            # queued here and run once the forward is collected.
+            deferred_finalize: Optional[List[Callable[[], None]]] = (
+                [] if ahead else None
+            )
             plan = self.get_next_disagg_prefill_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
+                running_batch=self.running_batch,
+                last_batch=self.last_batch,
+                deferred_finalize=deferred_finalize,
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
@@ -847,7 +875,9 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
 
             # Step 2: admit-ahead. This iteration's retire / ingest / get_next
-            # above already ran WHILE the previous batch's forward was in flight.
+            # above already ran WHILE the previous batch's forward was in flight;
+            # what of it touches that forward's in-flight KV was deferred (see
+            # deferred_finalize) and runs right after the collect below.
             # Only sampling must run with the worker idle: it uses forward_stream
             # and future_map, which run_batch (worker) uses too. So: collect the
             # previous forward, sample it, launch this batch's forward, and only
@@ -867,6 +897,16 @@ class SchedulerDisaggregationPrefillMixin:
                 # filtered its live batch.
                 self.launch_batch_sample_if_needed(prev_result, prev_snap)
 
+            # The previous forward is now fully enqueued and its WAR barrier is
+            # on schedule_stream (the worker applies it before handing back the
+            # result), and the worker is idle until the submit below. That is
+            # exactly where the base loop runs this work (its admission follows
+            # run_batch + barrier), so it is ordered after the previous forward
+            # on the GPU, and its req_to_token repoints land before the next
+            # forward reads them.
+            for finalize in deferred_finalize:
+                finalize()
+
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
@@ -876,7 +916,13 @@ class SchedulerDisaggregationPrefillMixin:
                 # process_batch_result below issues for a continuing chunked req.
                 for req in snap.reqs:
                     self.maybe_send_cached_prefix_chunk(req)
-                self._fwd_submit(snap, early_send_prefix=False)
+                self._fwd_submit(
+                    snap,
+                    early_send_prefix=False,
+                    # Read on this thread: the next admission may advance a
+                    # chunked req's extend_range while the worker is mid-run_batch.
+                    extend_input_len_per_req=self._snapshot_extend_input_lens(snap),
+                )
                 new_inflight = snap
             else:
                 new_inflight = None
@@ -1438,16 +1484,35 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         last_batch: Optional[ScheduleBatch],
         running_batch: ScheduleBatch,
+        *,
+        deferred_finalize: Optional[List[Callable[[], None]]] = None,
     ) -> None:
+        """``deferred_finalize`` (threaded AHEAD loop only): instead of
+        finalizing the chunk the previous forward computed (SWA checkpoint
+        staging + tree insert / AttentionStore write / dedup / out-of-window SWA
+        free), queue it there. That forward may still be launching on the worker
+        with no WAR barrier yet, so those reads and frees of its in-flight KV
+        must wait until the caller has collected it."""
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
-            # Strictly before maybe_cache_unfinished_req: that call evicts SWA
-            # beyond pre_len - max(sliding_window, page_size), which is exactly the
-            # window these checkpoints need. The commit that follows submits them,
-            # because cache_unfinished_req runs the AttentionStore write path.
-            self.detect_and_may_copy_as_swa(req)
-            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            if deferred_finalize is not None:
+                deferred_finalize.append(
+                    partial(
+                        self._finalize_prefill_chunk,
+                        req,
+                        chunk_range=req.extend_range,
+                    )
+                )
+                # The next chunk's admission needs the full computed prefix;
+                # take it from the req's own row (the tree insert that would
+                # normally provide it is deferred). The deferred finalize then
+                # repoints it exactly as cache_unfinished_req does in-line.
+                req.prefix_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, : req.extend_range.end
+                ].to(dtype=torch.int64, copy=True)
+            else:
+                self._finalize_prefill_chunk(req, chunk_range=req.extend_range)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
@@ -1481,6 +1546,29 @@ class SchedulerDisaggregationPrefillMixin:
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
+
+    def _finalize_prefill_chunk(self: Scheduler, req: Req, *, chunk_range) -> None:
+        """Commit the chunk of ``req`` ending at ``chunk_range.end``: stage its
+        SWA checkpoints, then insert it into the tree (which also submits the
+        AttentionStore write and frees out-of-window SWA).
+
+        Deferred (threaded AHEAD loop), this runs after the next chunk was
+        already admitted, so ``req.extend_range`` points one chunk ahead; both
+        callees size the committed prefix by ``get_fill_ids()``, so rewind the
+        range to the computed chunk for the duration. The forward thread is idle
+        at this point, so nothing else observes the rewind.
+        """
+        live_range = req.extend_range
+        req.extend_range = chunk_range
+        try:
+            # Strictly before maybe_cache_unfinished_req: that call evicts SWA
+            # beyond pre_len - max(sliding_window, page_size), which is exactly the
+            # window these checkpoints need. The commit that follows submits them,
+            # because cache_unfinished_req runs the AttentionStore write path.
+            self.detect_and_may_copy_as_swa(req)
+            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+        finally:
+            req.extend_range = live_range
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
