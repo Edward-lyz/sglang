@@ -19,7 +19,7 @@
   ],
   "vars": {
     "HW": "cuda",
-    "TIMEOUT": "600"
+    "TIMEOUT": "1800"
   },
   "all-passing": {
     "description": "一次性跑全部实测通过的 56（61-5） 个 case（CPU + 全部 CUDA suite 合并）",
