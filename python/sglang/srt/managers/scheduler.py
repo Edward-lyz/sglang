@@ -2965,6 +2965,59 @@ class Scheduler(
             return self._process_and_broadcast_mm_inputs(mm_inputs)
         return MultimodalInputs.from_processor_output(mm_inputs)
 
+    def _refresh_as_block_hashs(self, req: Req) -> None:
+        """Refresh AttentionStore hashes after scheduler-side token rewrites.
+
+        TokenizerManager computes hashes before prefill-side multimodal expansion.
+        If the scheduler later rebinds origin_input_ids (MM padding, automatic
+        truncation, etc.), the old hashes describe a different token sequence.
+        Recompute once from the final scheduler-visible input so AS match and write
+        use the same key space.
+        """
+        if (
+            not self.enable_asradix_cache
+            or req.origin_input_ids is req.origin_input_ids_unpadded
+        ):
+            return
+
+        old_count = (
+            len(req.as_block_hashs.hash_ids)
+            if req.as_block_hashs is not None
+            and hasattr(req.as_block_hashs, "hash_ids")
+            else 0
+        )
+        try:
+            from attentionstore_sdk.sdk import Tokens
+
+            from sglang.srt.mem_cache.storage.asradix.types import AS_BLOCK_SIZE
+
+            req.as_block_hashs = Tokens(req.origin_input_ids, AS_BLOCK_SIZE)
+        except ImportError:
+            logger.warning(
+                "attentionstore_sdk not available while refreshing AS block hashes "
+                "for rid=%s; disabling AS matching for this request",
+                req.rid,
+            )
+            req.as_block_hashs = None
+            return
+        except Exception as exc:
+            logger.warning(
+                "failed to refresh AS block hashes after input rewrite for rid=%s: %s",
+                req.rid,
+                exc,
+            )
+            req.as_block_hashs = None
+            return
+
+        logger.debug(
+            "Refreshed AS block hashes after input rewrite: rid=%s old_blocks=%d "
+            "new_blocks=%d input_tokens=%d",
+            req.rid,
+            old_count,
+            len(req.as_block_hashs.hash_ids),
+            len(req.origin_input_ids),
+        )
+
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
         """setup origin_input_ids with trying to reuse existing MultimodalInputs.padded_input_ids first,
@@ -3410,6 +3463,8 @@ class Scheduler(
                 req.set_finish_with_abort(error_msg)
                 self._add_request_to_queue(req)
                 return
+
+        self._refresh_as_block_hashs(req)
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
