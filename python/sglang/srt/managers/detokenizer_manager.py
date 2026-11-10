@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import os
 import signal
+import time
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -119,6 +120,21 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Init dispatcher
         self.init_request_dispatcher()
+
+        self.enable_metrics = server_args.enable_metrics
+        self.metrics_collector = None
+        if self.enable_metrics:
+            from sglang.srt.observability.metrics_collector import (
+                DetokenizerMetricsCollector,
+            )
+
+            self.metrics_collector = DetokenizerMetricsCollector(
+                labels={
+                    "model_name": server_args.served_model_name,
+                    "node_rank": str(server_args.node_rank),
+                    "dp_rank": "0",
+                }
+            )
 
     def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):
         context = zmq.Context(2)
@@ -444,6 +460,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         if rids := traced_rids(recv_obj.rids):
             trace(logger, "detokenizer received %s from the scheduler", rids)
+        start = time.perf_counter()
         # Beam decoding is additive: a batch may mix beam leaders with normal
         # requests, so every item still goes through the standard decode.
         if is_beam_search_batch(recv_obj):
@@ -461,6 +478,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
+        detokenize_completed_perf = time.perf_counter()
+        if self.enable_metrics and self.metrics_collector is not None:
+            self.metrics_collector.observe_detokenizer_time(
+                detokenize_completed_perf - start
+            )
+
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
@@ -503,6 +526,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,
             customized_info=recv_obj.customized_info,
+            trace_infos=recv_obj.trace_infos,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
@@ -511,6 +535,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
+            # Wall clock, not perf_counter: the tokenizer manager subtracts this
+            # in another process, where a perf_counter reading means nothing.
+            detokenize_completed_time=time.time(),
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
@@ -546,7 +573,7 @@ def run_detokenizer_process(
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
-    configure_logger(server_args)
+    configure_logger(server_args, " Detokenizer")
     publish(server_args, role="detokenizer")
     parent_process = psutil.Process().parent()
 

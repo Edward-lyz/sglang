@@ -1,3 +1,4 @@
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -97,6 +98,30 @@ class TestSchedulerStageMetricsRecorder(CustomTestCase):
 
         wall_ns = recorder.drain(wall_ns=50)
         self.assertEqual(wall_ns, {"other": 20, "run_batch": 30})
+
+    def test_off_thread_stage_does_not_sample(self):
+        """A stage method run on the prefill forward thread must not touch the
+        scheduler thread's clock; the unsynchronized interleave went negative."""
+        recorder = SchedulerStageMetricsRecorder(enabled=True)
+        recorder.start(wall_ns=0)
+
+        class SchedulerLike:
+            scheduler_stage_metrics = recorder
+
+            @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
+            def run_batch(self):
+                with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_PROCESS_QUEUE):
+                    pass
+
+        with patch(
+            "sglang.srt.observability.scheduler_stage_metrics.time.monotonic_ns",
+            side_effect=[10, 20, 30, 40],
+        ):
+            worker = threading.Thread(target=SchedulerLike().run_batch)
+            worker.start()
+            worker.join()
+
+        self.assertEqual(recorder.drain(wall_ns=100), {"other": 100})
 
     def test_trace_spans_do_not_require_python_stacks(self):
         recorder = SchedulerStageMetricsRecorder(enabled=False)

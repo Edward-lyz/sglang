@@ -85,6 +85,7 @@ from sglang.srt.managers.io_struct import (
     ShutdownReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TraceReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     async_sock_recv,
@@ -863,7 +864,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
-                    tokenized_obj = await self._tokenize_one_request(obj)
+                    tokenized_obj = await self._tokenize_one_request(
+                        obj, tokenizer_rev_request_time=time.time()
+                    )
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -1012,6 +1015,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        tokenizer_rev_request_time: Optional[float] = None,
     ):
         """Tokenize one request."""
         # Tokenize
@@ -1208,6 +1212,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         log_input_ids(logger, obj.rid, "tokenized", input_ids)
 
         self._validate_one_request(obj, input_ids)
+        if tokenizer_rev_request_time is not None and self.enable_metrics:
+            self.metrics_collector.observe_request_time_to_tokenizer_ready(
+                max(0.0, time.time() - tokenizer_rev_request_time)
+            )
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -1664,6 +1672,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 task_results=obj.task_results,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 encoder_urls=obj.encoder_urls,
+                trace_config=obj.trace_config
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1818,6 +1827,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.time_stats.set_api_server_dispatch_time()
             if rid := traced_rid(tokenized_obj.rid):
                 trace(logger, "tokenizer sent request %s to the scheduler", rid)
+            if isinstance(tokenized_obj, TokenizedGenerateReqInput):
+                # Only the generate struct declares the field, and a msgspec
+                # Struct rejects an undeclared attribute, so an embedding or
+                # rerank request would raise here. Same guard as the batch path.
+                # Wall clock, because the scheduler that subtracts this may run
+                # on another host, where perf_counter has a different origin.
+                tokenized_obj.dispatch_to_scheduler_time = time.time()
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
@@ -1860,6 +1876,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
+            # Wall clock; see the note in _send_one_request.
+            dispatch_time = time.time()
+            for tokenized_obj in tokenized_objs:
+                if isinstance(tokenized_obj, TokenizedGenerateReqInput):
+                    tokenized_obj.dispatch_to_scheduler_time = dispatch_time
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
             for tokenized_obj in tokenized_objs:
                 tokenized_obj.wrap_pickle_fields()
@@ -2257,11 +2278,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state is not None:
                 state.abort_sent = False
             raise
-        if self.enable_metrics:
-            # TODO: also use custom_labels from the request
-            self.metrics_collector.observe_one_aborted_request(
-                self.metrics_collector.labels
-            )
+        # The counter is bumped in _handle_abort_req, where the abort actually
+        # took effect. Asking for an abort is not the same as a request being
+        # aborted: with several tokenizer workers this process forwards rids it
+        # does not own, and the scheduler may find nothing left to abort.
+
+    def trace_request(self, rid: str = ""):
+        """Send a trace request to scheduler. Scheduler will parse trace_config from Req."""
+        if not rid:
+            return
+        req = TraceReq(rid=rid)
+        self._dispatch_to_scheduler(req)
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
@@ -2587,6 +2614,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["audio_tokens"] = audio_tokens_list[i]
                 if video_tokens_list and video_tokens_list[i]:
                     meta_info["video_tokens"] = video_tokens_list[i]
+
+            # Add trace_info from scheduler trace if available
+            if (
+                hasattr(recv_obj, "trace_infos")
+                and recv_obj.trace_infos
+                and i < len(recv_obj.trace_infos)
+                and recv_obj.trace_infos[i] is not None
+            ):
+                meta_info["trace_info"] = recv_obj.trace_infos[i]
 
             if getattr(recv_obj, "output_hidden_states", None):
                 hidden_states = recv_obj.output_hidden_states[i]
@@ -3164,6 +3200,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or obj.sampling_params.get("structural_tag", None)
         )
 
+    def _build_metrics_labels(self, state: ReqState) -> Dict[str, str]:
+        """Per-request metric labels: collector defaults plus request overrides."""
+        labels = dict(self.metrics_collector.labels)
+        custom_labels = getattr(state.obj, "custom_labels", None)
+        if custom_labels:
+            labels.update(custom_labels)
+        if self.enable_priority_scheduling:
+            priority = getattr(state.obj, "priority", None)
+            if priority is not None:
+                labels["priority"] = str(priority)
+        return labels
+
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
@@ -3171,18 +3219,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else 0
         )
 
-        custom_labels = getattr(state.obj, "custom_labels", None)
-        labels = dict(self.metrics_collector.labels)
-        if custom_labels:
-            labels.update(custom_labels)
-        if self.enable_priority_scheduling:
-            priority = getattr(state.obj, "priority", None)
-            if priority is not None:
-                labels["priority"] = str(priority)
-        if (
-            not state.ttft_observed
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
+        labels = self._build_metrics_labels(state)
+        if not state.ttft_observed:
             state.ttft_observed = True
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
@@ -3190,9 +3228,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.get_first_token_latency(),
                 stream=getattr(state.obj, "stream", False),
             )
-        else:
+        elif self.disaggregation_mode != DisaggregationMode.PREFILL:
+            # ITL only has meaning where tokens are generated. On a PREFILL node
+            # the interval spans a KV handoff, which used to be reported as
+            # inter-token latency and skewed the decode-side histogram.
             num_new_tokens = completion_tokens - state.last_completion_tokens
-            if num_new_tokens:
+            if num_new_tokens > 0:
                 self.metrics_collector.observe_inter_token_latency(
                     labels,
                     state.time_stats.get_interval(),
@@ -3228,6 +3269,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 cached_tokens_details,
                 spec_verify_ct=spec_verify_ct,
                 is_streaming=getattr(state.obj, "stream", False),
+                is_multimodal=state.obj.contains_mm_input(),
+            )
+
+        if recv_obj.detokenize_completed_time is not None:
+            # Measured against now, not last_receive_tstamp: that field is
+            # refreshed by every message on the socket, so it hid the queueing
+            # delay this metric exists to expose.
+            self.metrics_collector.observe_detokenizer_to_tokenizer_time(
+                labels, real_time() - recv_obj.detokenize_completed_time
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
@@ -3545,6 +3595,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if state.prompt_token_ids is not None:
             out["prompt_token_ids"] = state.prompt_token_ids
         del self.rid_to_state[recv_obj.rid]
+
+        # This request really was aborted and it ends here: the scheduler dropped
+        # it before it could produce a batch output, so collect_metrics never
+        # sees it.
+        if self.enable_metrics and getattr(state.obj, "log_metrics", True):
+            self.metrics_collector.observe_one_aborted_request(
+                self._build_metrics_labels(state)
+            )
 
         state.out_list.append(out)
         state.event.set()

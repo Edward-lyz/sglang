@@ -47,7 +47,6 @@ class AttentionStoreIntegrationMixin:
     _as_plan: Optional[AttentionStoreCachePlan] = None
 
     def get_as_trace_recorder(self, req):
-        """Return the request-scoped AttentionStore trace recorder."""
         if req is None:
             return None
         from sglang.srt.mem_cache.as_trace import get_recorder

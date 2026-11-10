@@ -2428,6 +2428,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         trace(logger, "request %s failed its kv cache transfer", rid)
                 else:
                     transferred_reqs.append(decode_req.req)
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        # How long the request waited in the decode transfer
+                        # queue for its KV cache. The prefill side reports the
+                        # same family for the send, so the page can compare
+                        # the two ends of one transfer.
+                        self.scheduler.metrics_collector.observe_kvcache_transfer_time(
+                            time.perf_counter()
+                            - decode_req.req.time_stats.decode_transfer_queue_entry_time
+                        )
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -2536,6 +2545,7 @@ class SchedulerDisaggregationDecodeMixin:
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
+            self.metrics_reporter.iter_start_time = time.perf_counter()
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:
@@ -2579,6 +2589,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            self.metrics_reporter.iter_start_time = time.perf_counter()
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:
@@ -2726,7 +2737,15 @@ class SchedulerDisaggregationDecodeMixin:
         if len(can_run_list) == 0:
             return None
 
+        newly_forwarded_reqs = [
+            req for req in can_run_list if req.time_stats.forward_entry_time == 0
+        ]
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if self.metrics_reporter.enable_metrics:
+            for req in newly_forwarded_reqs:
+                self.metrics_collector.observe_request_waiting_time(
+                    req.time_stats.get_request_waiting_time()
+                )
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

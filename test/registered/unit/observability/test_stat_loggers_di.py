@@ -206,7 +206,7 @@ class TestHiCacheMetrics(unittest.TestCase):
             metric_labels["cache_source"]: value
             for metric_labels, value in collector.cached_tokens_total.increments
         }
-        self.assertEqual(by_source, {"device": 3, "host": 4, "storage": 5})
+        self.assertEqual(by_source, {"device": 3, "host": 4, "storage_BackendShim": 5})
 
     def test_storage_prefetch_lifecycle_metrics(self):
         labels = {"model_name": "test"}
@@ -221,6 +221,34 @@ class TestHiCacheMetrics(unittest.TestCase):
         self.assertEqual(
             collector.storage_prefetch_unfulfilled_tokens_total.increments,
             [({**labels, "reason": "storage_transfer"}, 4)],
+        )
+
+    def test_dashboard_compatibility_metrics(self):
+        labels = {"model_name": "test"}
+        with get_context().override_server_args(
+            prompt_tokens_buckets=None,
+            generation_tokens_buckets=None,
+        ):
+            collector = _RecordingTokenizerMetricsCollector(labels=labels)
+
+        collector.observe_one_finished_request(
+            labels=labels,
+            prompt_tokens=20,
+            generation_tokens=3,
+            cached_tokens=0,
+            e2e_latency=0.1,
+            has_grammar=False,
+            is_multimodal=True,
+        )
+
+        self.assertEqual(collector.num_mm_requests_total.increments[-1], (labels, 1))
+        self.assertEqual(
+            collector.per_prompt_len.observations[-1],
+            (labels, 20.0),
+        )
+        self.assertEqual(
+            collector.per_prompt_gen_len.observations[-1],
+            (labels, 3.0),
         )
 
 

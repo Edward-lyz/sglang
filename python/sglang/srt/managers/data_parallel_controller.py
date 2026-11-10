@@ -852,7 +852,7 @@ def run_data_parallel_controller_process(
 
     # This process reads the config namespaces before spawning schedulers.
     publish(server_args, role="dp_controller")
-    configure_logger(server_args)
+    configure_logger(server_args, " DPController")
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,

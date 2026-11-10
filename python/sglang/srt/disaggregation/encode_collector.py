@@ -10,7 +10,11 @@ including mm_cache hit rate tracking and Prometheus metric definitions.
 # at module load time.
 from __future__ import annotations
 
+import threading
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Dict, Optional
 
 if TYPE_CHECKING:
@@ -60,7 +64,13 @@ class CacheStats:
 
 
 class EncoderMetricsCollector:
-    """Prometheus metrics collector for the disaggregated encoder."""
+    """Prometheus metrics collector for the disaggregated encoder.
+
+    Emits the metric families of the 厂内 Grafana "Encoder监控" dashboard:
+    request counters, embed-cache hit counters, the four pipeline stages
+    (mm_loader / mm_process / mm_embed / mooncake_transfer) and the
+    /epd/transfer endpoint latency.
+    """
 
     def __init__(self, labels: Optional[Dict[str, str]] = None):
         """Build the encoder Prometheus metrics under an optional label set."""
@@ -108,18 +118,9 @@ class EncoderMetricsCollector:
             labelnames=[*self._label_keys, "source"],
             multiprocess_mode="mostrecent",
         )
-        self.cache_entries = Gauge(
-            name="sglang:encoder_cache_entries",
-            documentation="Current number of entries in mm_cache.",
-            labelnames=self._label_keys,
-            multiprocess_mode="mostrecent",
-        )
-        self.cache_used_bytes = Gauge(
-            name="sglang:encoder_cache_used_bytes",
-            documentation="Current bytes used by mm_cache.",
-            labelnames=self._label_keys,
-            multiprocess_mode="mostrecent",
-        )
+        # Cache size gauges come from the community observability
+        # EncoderMetricsCollector (sglang:encoder_cache_entries); registering
+        # the same name twice raises in prometheus_client.
 
         # --- request counters ---
         self.num_requests_total = Counter(
@@ -151,6 +152,15 @@ class EncoderMetricsCollector:
         ):
             for source in ("workflow", "transfer"):
                 self._inc_counter(counter, 0, source=source)
+
+        # --- pipeline stages and /epd/transfer endpoint ---
+        self.loader_stage = BatchExecutorCollector("mm_loader", labels=labels)
+        self.process_stage = BatchExecutorCollector("mm_process", labels=labels)
+        self.embed_stage = BatchExecutorCollector("mm_embed", labels=labels)
+        self.transfer_stage = BatchExecutorCollector(
+            "mooncake_transfer", labels=labels
+        )
+        self.transfer_endpoint = TransferEndpointCollector(labels=labels)
 
     # ---- helpers to handle optional labels ----
 
@@ -191,11 +201,6 @@ class EncoderMetricsCollector:
         self._inc_counter(self.cache_total_bytes_total, nbytes, source=source)
         self._set_gauge(self.cache_req_hit_rate, stats.req_hit_rate, source=source)
         self._set_gauge(self.cache_byte_hit_rate, stats.byte_hit_rate, source=source)
-
-    def set_cache_state(self, num_entries: int, used_bytes: int):
-        """Update cache state metrics."""
-        self._set_gauge(self.cache_entries, num_entries)
-        self._set_gauge(self.cache_used_bytes, used_bytes)
 
     def observe_one_finished_request(self):
         """Record one finished encode request."""
@@ -379,6 +384,7 @@ class BatchExecutorCollector:
             name=f"sglang:{name}_queue_wait_num_reqs",
             documentation=f"Number of requests waiting in {name} queue.",
             labelnames=labels.keys(),
+            multiprocess_mode="livesum",
         )
         self.sched_bubble_sec = Histogram(
             name=f"sglang:{name}_sched_bubble_seconds",
@@ -387,6 +393,9 @@ class BatchExecutorCollector:
             labelnames=labels.keys(),
         )
         self.labels = labels
+        # Backlog for queue_enter/queue_leave; callers run on worker threads.
+        self._queue_lock = threading.Lock()
+        self._queue_len = 0
 
     def observe_sched_bubble_seconds(self, cost: float):
         """Record scheduling bubble time."""
@@ -429,3 +438,129 @@ class BatchExecutorCollector:
             self.queue_wait_num_reqs.labels(**self.labels).set(num)
         else:
             self.queue_wait_num_reqs.set(num)
+
+    def observe_batch(self, cost: float, batch_size: int, num_tokens: int):
+        """Record one executed batch: run time, batch size and token (or byte) count."""
+        self.observe_run_batch_seconds(cost)
+        if batch_size and num_tokens:
+            self.observe_batch_size(batch_size)
+            self.observe_num_tokens(num_tokens)
+
+    def queue_enter(self, num_reqs: int = 1):
+        """Count requests that start waiting in this stage queue (thread-safe)."""
+        with self._queue_lock:
+            self._queue_len += num_reqs
+            self.set_queue_wait_num_reqs(self._queue_len)
+
+    def queue_leave(self, num_reqs: int = 1, wait_seconds: Optional[float] = None):
+        """Count requests that leave the queue; observe their wait when known."""
+        with self._queue_lock:
+            self._queue_len -= num_reqs
+            self.set_queue_wait_num_reqs(self._queue_len)
+        if wait_seconds is not None:
+            for _ in range(num_reqs):
+                self.observe_queue_wait_seconds(wait_seconds)
+
+
+class StageReadyMark:
+    """Track one encode batch from "inputs ready" to "stage started".
+
+    Worker threads call ``mark`` when a preprocess job of the batch finishes;
+    the first call puts the batch in the stage queue and the last call sets
+    the ready time. The event loop calls ``start`` right before the stage runs
+    and ``discard`` when the batch fails first. A blocking forward also blocks
+    the event loop, so only a thread-side ``mark`` can count waiting batches.
+    """
+
+    def __init__(self, stage: BatchExecutorCollector, num_reqs: int):
+        """Bind the mark to one stage collector and one batch size."""
+        self._stage = stage
+        self._num_reqs = num_reqs
+        self._lock = threading.Lock()
+        self._ready_at: Optional[float] = None
+        self._queued = False
+        self._closed = False
+
+    def mark(self):
+        """Record that one input job of the batch finished."""
+        with self._lock:
+            if self._closed:
+                return
+            self._ready_at = time.perf_counter()
+            if self._queued:
+                return
+            self._queued = True
+        self._stage.queue_enter(self._num_reqs)
+
+    def start(self):
+        """Leave the queue and observe the wait since the batch became ready."""
+        now = time.perf_counter()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            # No worker-thread job (inline preprocess): ready means now.
+            wait = now - self._ready_at if self._ready_at is not None else 0.0
+            queued = self._queued
+        if queued:
+            self._stage.queue_leave(self._num_reqs, wait_seconds=wait)
+            return
+        for _ in range(self._num_reqs):
+            self._stage.observe_queue_wait_seconds(wait)
+
+    def discard(self):
+        """Drop the batch from the queue without a wait sample (failure path)."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            queued = self._queued
+        if queued:
+            self._stage.queue_leave(self._num_reqs)
+
+
+class QueueMeteredExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor that reports its queue to a stage collector.
+
+    ``stage`` (set when metrics are on) gets the backlog and the submit ->
+    start wait of every job. With ``ready_mark_var`` each finished job also
+    marks the StageReadyMark held by that ContextVar at submit time.
+    ``submit`` runs in the caller's context, also for ``loop.run_in_executor``.
+    """
+
+    def __init__(
+        self,
+        *args,
+        ready_mark_var: Optional[ContextVar[Optional[StageReadyMark]]] = None,
+        **kwargs,
+    ):
+        """Create the pool; ``stage`` stays None until metrics are attached."""
+        super().__init__(*args, **kwargs)
+        self.stage: Optional[BatchExecutorCollector] = None
+        self._ready_mark_var = ready_mark_var
+
+    def submit(self, fn, /, *args, **kwargs):
+        """Submit ``fn`` and account its queue wait when metrics are on."""
+        stage = self.stage
+        mark = self._ready_mark_var.get() if self._ready_mark_var else None
+        if stage is None and mark is None:
+            return super().submit(fn, *args, **kwargs)
+
+        enqueued = time.perf_counter()
+        if stage is not None:
+            stage.queue_enter()
+
+        def run():
+            if stage is not None:
+                stage.queue_leave(wait_seconds=time.perf_counter() - enqueued)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if mark is not None:
+                    mark.mark()
+
+        future = super().submit(run)
+        if stage is not None:
+            # Only a job that never started can be cancelled; ``run`` skipped.
+            future.add_done_callback(lambda f: f.cancelled() and stage.queue_leave())
+        return future

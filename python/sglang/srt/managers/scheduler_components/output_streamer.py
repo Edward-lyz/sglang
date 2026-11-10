@@ -184,6 +184,11 @@ class SchedulerOutputStreamer:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
+            if req.finished() and req.defer_finish_output:
+                # The online AS trace is still waiting for AS writes to retire;
+                # TraceManager resends this finish output once trace_info is set.
+                req.finish_output_deferred = True
+                continue
 
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
@@ -384,6 +389,7 @@ class _GenerationStreamAccumulator:
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
     rust_server_mode: bool = False
+    trace_infos: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.return_hidden_states:
@@ -697,6 +703,7 @@ class _GenerationStreamAccumulator:
             self.indexer_topk.append(
                 req.indexer_topk if req.return_indexer_topk else None
             )
+        self.trace_infos.append(req.trace_info)
 
         current_output_len = len(self.output_ids[-1])
         if req.customized_info is not None:
@@ -788,6 +795,11 @@ class _GenerationStreamAccumulator:
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            trace_infos=(
+                self.trace_infos
+                if any(info is not None for info in self.trace_infos)
+                else None
+            ),
             retraction_counts=self.retraction_counts,
             # All-None means no beam item in this batch; drop the list so
             # non-beam traffic pays no carrier cost.

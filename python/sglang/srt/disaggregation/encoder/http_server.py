@@ -422,6 +422,18 @@ async def handle_epd_transfer_request(request: dict):
     the rows it is holding for ``task_id`` there and acks. Wire-compatible with
     ``factory_transport.build_epd_transfer_payload`` / ``epd_transfer_error``.
     """
+    start = time.perf_counter()
+    response = await _epd_transfer(request)
+    metrics = getattr(encoder, "metrics_collector", None)
+    if metrics is not None:
+        metrics.transfer_endpoint.on_request_end(
+            str(response.status_code), time.perf_counter() - start
+        )
+    return response
+
+
+async def _epd_transfer(request: dict) -> ORJSONResponse:
+    """Run one /epd/transfer request and build its ack response."""
     task_id = request.get("task_id")
     req_id = request.get("req_id")
     ack = {"req_id": req_id, "task_id": task_id, "part_idx": request.get("part_idx", 0)}

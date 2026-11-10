@@ -2111,6 +2111,46 @@ class EncoderDispatchErrorReq(BaseReq, kw_only=True):
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
 
+class TraceType:
+    """Trace action types.
+    """
+
+    KV = "kv"
+    METADATA = "metadata"
+    PROMPT = "prompt"
+    SAMPLE = "sample"
+    LOGPROBS = "logprobs"
+    ALL = "all"
+    AS_CACHE = "as_cache"
+
+class TraceTrigger:
+    """When to trigger a trace action."""
+
+    IMMEDIATE = "immediate"
+    ON_FINISH = "on_finish"
+
+class TraceReq(BaseReq):
+    """Request to trigger KV cache or metadata tracing."""
+
+    # Directory to dump KV metadata to. If None, use default path.
+    dump_dir: Optional[str] = None
+    # Which trace mode to execute; see TraceType for valid values.
+    trace_type: str = TraceType.KV
+    # When to trigger the trace; see TraceTrigger for valid values.
+    trigger: str = TraceTrigger.IMMEDIATE
+    # Optional JSON-serializable payload for prompt/sample trace data.
+    payload: Optional[Dict[str, Any]] = None
+    # Whether to include logprobs data in the trace output.
+    return_logprob: bool = False
+    # Whether to return trace data online via the response
+    return_online: bool = False
+    # Deterministic request id shared by normal trace and AS trace. Minted at
+    # Req init (build_trace_req); downstream (TraceManager, ASCache) reads it here.
+    unique_trace_id: Optional[str] = None
+
+    def __post_init__(self):
+        if self.rid is None:
+            self.rid = ""
 
 class TraceType:
     """Trace action types.
