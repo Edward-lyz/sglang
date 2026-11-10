@@ -114,6 +114,7 @@ from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
+    AbortLowAcceptRateReqInput,
     AbortReq,
     AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
@@ -168,6 +169,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
+    configure_logger,
     delete_directory,
     get_bool_env_var,
     is_mps,
@@ -236,6 +238,13 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
+
+    # Configure logger to align with other sglang subprocess entry points;
+    # uvicorn spawns this worker via multiprocessing.get_context("spawn"),
+    # so without this call the worker inherits whatever (mis)configuration
+    # the parent left on the root logger after re-import.
+    configure_logger(server_args, f" Tokenizer {os.getpid()}")
+
     logger.info(
         f"Start multi-tokenizer worker process {os.getpid()}, "
         f"ipc_name={port_args.tokenizer_ipc_name}"
@@ -321,7 +330,9 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        _global_state.tokenizer_manager,
+        fast_api_app.state.openai_serving_chat,
+        fast_api_app.state.openai_serving_completion,
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
@@ -522,7 +533,7 @@ def _anthropic_error_response(*, status_code: int, error_type: str, message: str
 
 
 @app.exception_handler(HTTPException)
-async def validation_exception_handler(request: Request, exc: HTTPException):
+async def http_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
 
     For /v1/responses, emit OpenAI-style nested error envelope:
@@ -579,7 +590,9 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
 
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
+async def request_validation_exception_handler(
+    request: Request, exc: RequestValidationError
+):
     """Override FastAPI's default 422 validation error with 400.
 
     For /v1/messages, emit Anthropic-style envelope and scrub the message so
@@ -642,8 +655,27 @@ async def validate_json_request(raw_request: Request):
 
 ##### Native API endpoints #####
 
+def stopped_by_external():
+    """
+    Check if the stop signal is triggered by reading a signal file.
+    """
+    signal_path = os.environ.get("AIAK_STOP_SIGNAL_DIR", "/run/sglang/stop")
+    if not signal_path:
+        return False
 
+    try:
+        if os.path.exists(signal_path):
+            with open(signal_path, 'r') as file:
+                return file.read().strip().lower() == "stop"
+    except Exception as e:
+        logger.info(f"Error reading stop signal file: {e}")
+
+    return False
+
+
+@app.get("/ready")
 @app.get("/health")
+@app.get("/health_forward")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """
@@ -652,6 +684,10 @@ async def health_generate(request: Request) -> Response:
     If the server is running something, this request will be ignored, so it creates zero overhead.
     If the server is not running anything, this request will be run, so we know whether the server is healthy.
     """
+
+    if request.url.path.rstrip("/") == "/ready" and stopped_by_external():
+        logger.warn("Server is shutting down")
+        return Response(content="Server is shutting down", status_code=507)
 
     if _global_state.tokenizer_manager.gracefully_exit:
         logger.info("Health check request received during shutdown. Returning 503.")
@@ -718,6 +754,39 @@ async def health_generate(request: Request) -> Response:
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
+
+
+@app.get("/get_instance_info")
+async def get_instance_info():
+    "Get the instance information."
+    chunked_prefill_enabled = (
+        _global_state.tokenizer_manager.server_args.chunked_prefill_size != -1
+    )
+    current_input_tokens = 0
+    for state in _global_state.tokenizer_manager.rid_to_state.values():
+        if hasattr(state, "obj") and hasattr(state.obj, "input_ids"):
+            if isinstance(state.obj.input_ids, list):
+                current_input_tokens += len(state.obj.input_ids)
+
+    max_running_requests = None
+    if _global_state.tokenizer_manager.server_args.max_running_requests:
+        max_running_requests = (
+            _global_state.tokenizer_manager.server_args.max_running_requests
+            * _global_state.tokenizer_manager.server_args.dp_size
+        )
+
+    return {
+        "kv_role": _global_state.tokenizer_manager.server_args.disaggregation_mode,
+        "dp_ranks": list(range(_global_state.tokenizer_manager.server_args.dp_size)),
+        "dp_size": _global_state.tokenizer_manager.server_args.dp_size,
+        "tp_size": _global_state.tokenizer_manager.server_args.tp_size,
+        "nnodes": _global_state.tokenizer_manager.server_args.nnodes,
+        "chunked_prefill_enabled": chunked_prefill_enabled,
+        "chunked_prefill_size": _global_state.tokenizer_manager.server_args.chunked_prefill_size,
+        "active_request_count": len(_global_state.tokenizer_manager.rid_to_state),
+        "max_running_requests": max_running_requests,
+        "current_input_tokens": current_input_tokens,
+    }
 
 
 @app.get("/get_model_info")
@@ -1597,6 +1666,30 @@ async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
         return _create_error_response(e)
 
 
+@app.post("/abort_low_accept_rate_requests")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def abort_low_accept_rate_requests(
+    obj: AbortLowAcceptRateReqInput, request: Request
+):
+    """Abort requests whose MTP accept rate is low and generated output length is long."""
+    try:
+        ret = await _global_state.tokenizer_manager.abort_low_accept_rate_requests(
+            accept_rate=obj.accept_rate,
+            context_len=obj.context_len,
+        )
+        return ORJSONResponse(
+            {
+                "success": ret.success,
+                "aborted_count": ret.aborted_count,
+                "aborted_rids": ret.aborted_rids,
+                "message": ret.message,
+            },
+            status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+        )
+    except ValueError as e:
+        return _create_error_response(e)
+
+
 @app.post("/parse_function_call")
 async def parse_function_call_request(
     obj: Annotated[ParseFunctionCallReq, Body()], request: Request
@@ -1694,8 +1787,9 @@ async def continue_generation(
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
+    tokenizer_rev_request_time = time.time()
     return await raw_request.app.state.openai_serving_completion.handle_request(
-        request, raw_request
+        request, raw_request, tokenizer_rev_request_time
     )
 
 
@@ -1704,8 +1798,9 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    tokenizer_rev_request_time = time.time()
     return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+        request, raw_request, tokenizer_rev_request_time
     )
 
 
@@ -1729,6 +1824,32 @@ async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
 async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
     """OpenAI-compatible classification endpoint."""
     return await raw_request.app.state.openai_serving_classify.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/chat/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_chat_tokenize(request: ChatCompletionRequest, raw_request: Request):
+    """Return scheduler-finalized prompt IDs for a chat request."""
+    return await raw_request.app.state.openai_serving_tokenize.handle_chat_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/completions/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_completions_tokenize(
+    request: CompletionRequest, raw_request: Request
+):
+    """Return scheduler-finalized prompt IDs for a completion request."""
+    return await raw_request.app.state.openai_serving_tokenize.handle_completions_request(
         request, raw_request
     )
 

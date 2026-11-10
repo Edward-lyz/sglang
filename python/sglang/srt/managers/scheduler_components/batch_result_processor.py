@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -16,6 +17,7 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import TraceTrigger
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_MATCHED_TOKEN,
@@ -58,6 +60,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
+    from sglang.srt.managers.trace_manager import TraceManager
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.managers.utils import (
         EmbeddingBatchResult,
@@ -92,6 +95,16 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    trace_manager: Optional[TraceManager] = None
+
+    def _fire_pending_trace(self, req: Req) -> None:
+        """Run a request trace deferred until the request finishes."""
+        trace_req = getattr(req, "to_trace_req", None)
+        if trace_req is None or trace_req.trigger != TraceTrigger.ON_FINISH:
+            return
+        req.to_trace_req = None
+        if self.trace_manager is not None:
+            self.trace_manager.run_trace(trace_req, req)
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -105,6 +118,7 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                self._fire_pending_trace(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -224,6 +238,14 @@ class SchedulerBatchResultProcessor:
 
             self._validate_pp_skip_output_comm(batch, result)
 
+            if self.server_args.enable_metrics:
+                self.metrics_reporter.iter_forward_finish_time = time.time()
+                run_batch_time = (
+                    self.metrics_reporter.iter_forward_finish_time
+                    - self.metrics_reporter.iter_forward_start_time
+                )
+                self.metrics_reporter.stats.run_batch_time = run_batch_time
+
             hidden_state_offset = 0
             prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(
                 batch,
@@ -272,8 +294,13 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
+                        self._fire_pending_trace(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        if self.server_args.enable_metrics:
+                            self.metrics_collector.observe_request_first_token_forward_time(
+                                req.time_stats.get_request_first_token_forward_time()
+                            )
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
@@ -351,6 +378,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
+                        self._fire_pending_trace(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
@@ -632,8 +660,6 @@ class SchedulerBatchResultProcessor:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
-        result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
         block_accept_lens = (
             result.block_accept_lens.tolist()
@@ -645,6 +671,22 @@ class SchedulerBatchResultProcessor:
         )
         cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
         result.num_cap_tokens = sum(cap_lens) if cap_lens else 0
+
+        # In adaptive spec-v2, the worker state may already have switched when this
+        # delayed result is processed. Use the draft token count recorded on result.
+        stride = result.speculative_num_draft_tokens
+        assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+
+        # Trim stop/EOS suffixes before any grammar, KV, or speculative-metric
+        # processing. The same accepted prefix must be visible to every consumer.
+        for i, req in enumerate(batch.reqs):
+            accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
+            stop_idx = req.find_stop_token_index(accept_tokens)
+            if stop_idx != -1:
+                accept_lens[i] = stop_idx + 1
+
+        result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
+        result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
@@ -661,11 +703,6 @@ class SchedulerBatchResultProcessor:
         self.advance_grammar_fsm(result, batch)
 
         predict_tokens = []
-        # In adaptive spec-v2, the worker state may already have switched when this
-        # delayed result is processed. Use the draft token count recorded on result.
-        stride = result.speculative_num_draft_tokens
-        assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
-
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
@@ -839,6 +876,8 @@ class SchedulerBatchResultProcessor:
                 value=can_run_cuda_graph
             )
 
+        self.metrics_reporter.iter_forward_finish_time = time.time()
+
         self.token_to_kv_pool_allocator.free_group_begin()
 
         for i, req in enumerate(batch.reqs):
@@ -856,10 +895,19 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
+            if not is_spec:
+                next_token_id = [req.maybe_inject_thinking_token(next_token_id[0])]
+
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
+            # Speculative verification updates the budget at acceptance time
+            # inside eagle_sample, before the next overlapped draft launches.
+            # Ordinary decode has no earlier acceptance hook, so account for it
+            # here.
+            if not is_spec:
+                req.update_thinking_state(next_token_id)
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
@@ -1040,9 +1088,11 @@ class SchedulerBatchResultProcessor:
 
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
+                self._fire_pending_trace(req)
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
+                self._fire_pending_trace(req)
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 prepare_release = getattr(

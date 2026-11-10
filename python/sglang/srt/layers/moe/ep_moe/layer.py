@@ -32,6 +32,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config, Mxfp4MoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -157,7 +158,7 @@ class DeepEPMoE(FusedMoE):
             self.use_fp8_w8a8 = True
             self.fp8_dtype = torch.float8_e4m3fn
             self.use_w4afp8 = False
-        elif isinstance(quant_config, W4AFp8Config):
+        elif isinstance(quant_config, (W4AFp8Config, Mxfp4Config)):
             self.use_w4afp8 = True
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
@@ -292,12 +293,19 @@ class DeepEPMoE(FusedMoE):
                     "Unquantized DeepEP MoE currently supports low_latency mode only"
                 )
             elif self.use_w4afp8:
+                if isinstance(self.quant_config, Mxfp4Config):
+                    raise NotImplementedError(
+                        "DeepGEMM MXFP4 supports DeepEP low-latency mode only."
+                    )
                 output = self.forward_cutlass_w4afp8(dispatch_output)
             else:
                 assert False, "forward_deepgemm_contiguous is deprecated"
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if self.use_w4afp8:
-                output = self.forward_cutlass_w4afp8_masked(dispatch_output)
+                if isinstance(self.quant_config, Mxfp4Config):
+                    output = self.forward_deep_gemm_mxfp4_masked(dispatch_output)
+                else:
+                    output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
 
@@ -344,6 +352,18 @@ class DeepEPMoE(FusedMoE):
     ):
         assert self.moe_runner_config.activation in ("silu", "situ")
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
+        return self.quant_method.apply_deepep_ll(
+            layer=self,
+            dispatch_output=dispatch_output,
+        )
+
+    def forward_deep_gemm_mxfp4_masked(
+        self,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ):
+        """Run the DeepGEMM MXFP4 masked expert-parallel forward pass."""
+        assert self.moe_runner_config.activation == "silu"
+        assert isinstance(self.quant_method, Mxfp4MoEMethod)
         return self.quant_method.apply_deepep_ll(
             layer=self,
             dispatch_output=dispatch_output,

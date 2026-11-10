@@ -318,7 +318,10 @@ class BatchResponse(BaseModel):
 
 
 def _migrate_deprecated_dp_rank(values: dict) -> dict:
-    if isinstance(values, dict) and values.get("data_parallel_rank") is not None:
+    if not isinstance(values, dict):
+        return values
+
+    if values.get("data_parallel_rank") is not None:
         import warnings
 
         warnings.warn(
@@ -328,6 +331,14 @@ def _migrate_deprecated_dp_rank(values: dict) -> dict:
         )
         if values.get("routed_dp_rank") is None:
             values["routed_dp_rank"] = values["data_parallel_rank"]
+
+    # Keep the pre-0.5.16 request name as an API compatibility alias while the
+    # runtime uses the target branch's disaggregation-specific field.
+    if (
+        values.get("peer_data_parallel_rank") is not None
+        and values.get("disagg_prefill_dp_rank") is None
+    ):
+        values["disagg_prefill_dp_rank"] = values["peer_data_parallel_rank"]
     return values
 
 
@@ -380,6 +391,10 @@ class CompletionRequest(BaseModel):
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
+    # Thinking budget (only limits <think>...</think>)
+    thinking_budget: Optional[int] = None
+    # Must NOT include </think>; server will append end token when injecting.
+    thinking_prompt_token_ids: Optional[List[int]] = None
 
     images_config: Optional[Dict] = None
 
@@ -394,6 +409,8 @@ class CompletionRequest(BaseModel):
     disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
+    # Deprecated: use disagg_prefill_dp_rank instead
+    peer_data_parallel_rank: Optional[int] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -406,6 +423,7 @@ class CompletionRequest(BaseModel):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+    trace_config: Optional[Dict[str, Any]] = None
 
     # For AttentionStore (AS) secondary cache
     kv_transfer_params: Optional[KVTransferParams] = None
@@ -472,6 +490,7 @@ class CompletionResponse(BaseModel):
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -484,6 +503,7 @@ class CompletionResponse(BaseModel):
 class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
+    tokens: int
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
@@ -511,6 +531,7 @@ class CompletionStreamResponse(BaseModel):
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -778,6 +799,7 @@ class ChatCompletionRequest(BaseModel):
         "including visible output tokens and reasoning tokens. Input tokens are not included. ",
     )
     n: int = 1
+    parallel_tool_calls: bool = True
     presence_penalty: float = 0.0
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     seed: Optional[int] = None
@@ -853,6 +875,10 @@ class ChatCompletionRequest(BaseModel):
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
+    # Thinking budget (only limits <think>...</think>)
+    thinking_budget: Optional[int] = None
+    # Must NOT include </think>; server will append end token when injecting.
+    thinking_prompt_token_ids: Optional[List[int]] = None
 
     # Pre-computed prompt token IDs: when provided, bypasses chat template
     # tokenization entirely.  Messages are still used to derive stop tokens
@@ -883,6 +909,9 @@ class ChatCompletionRequest(BaseModel):
     disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
+    # Deprecated: use disagg_prefill_dp_rank instead
+    peer_data_parallel_rank: Optional[int] = None
+    trace_config: Optional[Dict[str, Any]] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -1070,6 +1099,10 @@ class ChatCompletionRequest(BaseModel):
             "sampling_seed": self.seed,
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }
+        if self.thinking_budget is not None:
+            sampling_params["thinking_budget"] = self.thinking_budget
+        if self.thinking_prompt_token_ids is not None:
+            sampling_params["thinking_prompt_token_ids"] = self.thinking_prompt_token_ids
 
         if self.response_format and self.response_format.type == "json_schema":
             # strict=false may only go unconstrained when the renderer forwards
@@ -1163,6 +1196,7 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -1178,6 +1212,7 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
+    tokens: Optional[int] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -1216,6 +1251,7 @@ class ChatCompletionStreamResponse(BaseModel):
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
+    trace_info: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -1401,7 +1437,7 @@ class TokenizeRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str = DEFAULT_MODEL_NAME
-    prompt: Optional[Union[str, List[str]]] = None
+    prompt: Optional[Union[str, List[str], List[int], List[List[int]]]] = None
     messages: Optional[List[ChatCompletionMessageParam]] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (

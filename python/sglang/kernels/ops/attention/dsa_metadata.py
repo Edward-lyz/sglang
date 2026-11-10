@@ -205,6 +205,7 @@ def fused_dsa_decode_metadata(
         "page_table_stride_0",
         "real_page_table_stride_0",
         "max_seqlen_k",
+        "max_context_len",
     ]
 )
 def _fused_dsa_target_verify_metadata_kernel(
@@ -234,6 +235,7 @@ def _fused_dsa_target_verify_metadata_kernel(
     dsa_index_topk: tl.constexpr,
     real_page_size: tl.constexpr,
     next_n: tl.constexpr,
+    max_context_len,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGED_MQA_CTX_LENS: tl.constexpr,
     HAS_PAGE_TABLE_1: tl.constexpr,
@@ -248,7 +250,7 @@ def _fused_dsa_target_verify_metadata_kernel(
         offs_b = tl.arange(0, BLOCK_BS)
         mask_b = offs_b < bs
         seq = tl.load(seq_lens + offs_b * seq_lens_stride, mask=mask_b, other=0)
-        cache_seq = seq.to(tl.int32) + next_n
+        cache_seq = tl.minimum(seq.to(tl.int32) + next_n, max_context_len)
         cu = tl.cumsum(cache_seq, 0)
 
         tl.store(cache_seqlens + offs_b, cache_seq, mask=mask_b)
@@ -259,12 +261,14 @@ def _fused_dsa_target_verify_metadata_kernel(
         mask_e = offs_e < expanded_size
         req_row = offs_e // next_n
         draft_off = offs_e - req_row * next_n
-        base_seq = tl.load(
-            seq_lens + req_row * seq_lens_stride,
+        # Match the eager path: expand from the already-clamped total cache
+        # length, rather than clamping each draft position independently.
+        clamped_cache_seq = tl.load(
+            cache_seqlens + req_row,
             mask=mask_e,
             other=0,
         ).to(tl.int32)
-        expanded_seq = base_seq + draft_off + 1
+        expanded_seq = clamped_cache_seq - next_n + draft_off + 1
         expanded_seq = tl.where(mask_e, expanded_seq, 0)
         dsa_seq = tl.minimum(expanded_seq, dsa_index_topk)
         dsa_cu = tl.cumsum(dsa_seq, 0)
@@ -279,7 +283,7 @@ def _fused_dsa_target_verify_metadata_kernel(
                 paged_mqa_ctx_lens_2d
                 + req_row * paged_mqa_ctx_lens_stride_0
                 + draft_off * paged_mqa_ctx_lens_stride_1,
-                base_seq + next_n,
+                clamped_cache_seq,
                 mask=mask_e,
             )
         return
@@ -354,6 +358,7 @@ def fused_dsa_target_verify_metadata(
     real_page_size: int,
     next_n: int,
     paged_mqa_ctx_lens_2d: torch.Tensor = None,
+    max_context_len: Optional[int] = None,
 ) -> None:
     assert seq_lens.is_cuda
     assert req_pool_indices.is_cuda
@@ -369,6 +374,8 @@ def fused_dsa_target_verify_metadata(
         dsa_cu_seqlens_k[:1].zero_()
         return
     assert next_n > 0
+    if max_context_len is None:
+        max_context_len = req_to_token.shape[1]
 
     has_real_page_table = real_page_size > 1
     if has_real_page_table:
@@ -431,6 +438,7 @@ def fused_dsa_target_verify_metadata(
         dsa_index_topk,
         real_page_size,
         next_n,
+        max_context_len,
         has_real_page_table,
         has_paged_mqa_ctx_lens,
         has_page_table_1,

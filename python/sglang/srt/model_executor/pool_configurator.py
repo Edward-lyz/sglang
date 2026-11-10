@@ -119,7 +119,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
-        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -132,17 +131,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
-        has_kv_on_another_pp_stage = (
-            self._cell_size == 0
-            and mambaish is not None
-            and bool(mambaish.full_attention_layer_ids)
-            and kvc.ps.pp_size > 1
-        )
-        self._zero_kv_max_tokens = (
-            torch.iinfo(torch.int64).max
-            if has_kv_on_another_pp_stage
-            else kvc.server_args.max_total_tokens or kvc.model_config.context_len
-        )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -177,7 +165,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
+                    draft_num_layers=int(draft_num_layers),
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
@@ -197,16 +185,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_parallel().attn_tp_size
 
         if kvc.use_mla_backend:
-            from sglang.srt.mem_cache.kv_cache_configurator import (
-                calculate_mla_kv_cache_dim,
-            )
-
             cell_size = (
-                calculate_mla_kv_cache_dim(
-                    model_config=model_config,
-                    kv_cache_dtype=kv_cache_dtype,
-                    server_args=kvc.server_args,
-                )
+                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                 * effective_num_layers
                 * kv_size
             )
@@ -232,18 +212,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                indexer_ratio = 1
-                if kvc.server_args.enable_hisparse:
-                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-                    indexer_ratio = parse_hisparse_config(
-                        kvc.server_args
-                    ).host_to_device_ratio
-                cell_size += int(
-                    indexer_size_per_token
-                    * effective_num_layers
-                    * element_size
-                    * indexer_ratio
+                indexer_num_layers = effective_num_layers
+                if (
+                    envs.SGLANG_INDEXER_CACHE_OPT.get()
+                    and not kvc.server_args.enable_dsa_cache_layer_split
+                ):
+                    pattern = getattr(
+                        model_config.hf_text_config, "index_topk_pattern", None
+                    )
+                    if pattern is None:
+                        pattern = getattr(
+                            model_config.hf_config, "index_topk_pattern", None
+                        )
+                    if pattern is not None:
+                        start = kvc.layer_info.start_layer
+                        local_pattern = pattern[start : start + num_layers]
+                        if len(local_pattern) == num_layers:
+                            indexer_num_layers = sum(
+                                str(item).lower() not in ("s", "shared")
+                                for item in local_pattern
+                            )
+                cell_size += (
+                    indexer_size_per_token * indexer_num_layers * element_size
                 )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
@@ -305,7 +295,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 # FP4 prefill uses one shared FP8 dequant workspace across layers.
                 cell_size += n * k * 2 * kv_size
-            elif self.kv_cache_dtype_str == "mxfp8":
+            elif kvc.server_args.kv_cache_dtype == "mxfp8":
                 scale_block_size = 32
                 n = model_config.get_num_kv_heads(tp_size)
                 cell_size += (
@@ -317,11 +307,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = (
-            available_bytes // self._cell_size
-            if self._cell_size
-            else self._zero_kv_max_tokens
-        )
+        max_total_num_tokens = available_bytes // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
@@ -340,7 +326,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
-        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -370,7 +355,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
-        if self.kv_cache_dtype_str == "mxfp8":
+        if kvc.server_args.kv_cache_dtype == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
                 model_config.get_num_kv_heads(tp_size)
@@ -503,7 +488,6 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
-        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         super().__init__(kvc)
         assert self._full_layers_num > 0
 
@@ -616,7 +600,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
-        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         cfg = kvc.model_config
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim

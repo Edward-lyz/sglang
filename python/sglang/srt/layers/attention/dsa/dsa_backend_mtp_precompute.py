@@ -237,7 +237,11 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         seq_lens_cpu: torch.Tensor,
     ) -> PrecomputedMetadata:
         """Precompute metadata for target verify mode."""
-        max_seqlen_k = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
+        page_table_1 = self.decode_cuda_graph_metadata[bs].page_table_1
+        max_seqlen_k = min(
+            page_table_1.shape[1] if page_table_1 is not None else self.req_to_token.shape[1],
+            self.max_context_len,
+        )
         seqlens_expanded_size = bs * self.speculative_num_draft_tokens
 
         if _is_cuda and not _is_hip:
@@ -293,6 +297,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 dsa_index_topk=self.dsa_index_topk,
                 real_page_size=self.real_page_size,
                 next_n=self.speculative_num_draft_tokens,
+                max_context_len=self.max_context_len,
             )
 
             flashmla_metadata = None
@@ -318,6 +323,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
 
         # Cache seqlens with draft tokens
         cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(torch.int32)
+        cache_seqlens.clamp_(max=self.max_context_len)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
 
         # Page indices (repeated for each draft token)
@@ -340,6 +346,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             bs * self.speculative_num_draft_tokens,
             self.speculative_num_draft_tokens,
         )
+        seqlens_expanded.clamp_(max=self.max_context_len)
 
         # Compute DSA seqlens
         dsa_cache_seqlens = compute_dsa_seqlens(seqlens_expanded, self.dsa_index_topk)

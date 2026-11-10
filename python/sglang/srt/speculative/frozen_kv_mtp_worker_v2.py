@@ -495,6 +495,18 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             self.speculative_num_draft_tokens,
         )
 
+        # Frozen-KV-MTP reuses the EAGLE verify sampler.  Mirror any pending
+        # thinking-budget transition tokens in the draft tree before target
+        # verify, otherwise the sampler's rewritten output would diverge from
+        # the token IDs used for verification and KV accounting.
+        for i, req in enumerate(batch.reqs):
+            req.inject_thinking_prompt_tokens(
+                draft_tokens,
+                start_idx=i * self.speculative_num_draft_tokens,
+                max_count=self.speculative_num_draft_tokens,
+                advance=False,
+            )
+
         return FrozenKVMTPVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,

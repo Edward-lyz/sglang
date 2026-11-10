@@ -29,7 +29,7 @@ import contextlib
 import inspect
 import logging
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
 
 import torch
 import tqdm
@@ -77,6 +77,9 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    FullCudaGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -123,6 +126,41 @@ def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -
     from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 
     return ragged_verify_compact_enabled()
+
+
+def _normalize_split_graph_list(
+    split_graph_list: Optional[Sequence[Union[int, str]]],
+    num_layers: int,
+) -> Optional[list[tuple[int, int]]]:
+    if not split_graph_list:
+        return None
+
+    boundaries = []
+    for raw_boundary in split_graph_list:
+        if isinstance(raw_boundary, str):
+            boundary_items = raw_boundary.strip("[]").replace(",", " ").split()
+            boundaries.extend(int(item) for item in boundary_items)
+        else:
+            boundaries.append(int(raw_boundary))
+
+    if not boundaries:
+        return None
+    if boundaries[0] != 0:
+        boundaries.insert(0, 0)
+    if boundaries[-1] != num_layers:
+        raise ValueError(
+            "split graph boundaries must end with the model layer count "
+            f"({num_layers}), got {boundaries}."
+        )
+
+    split_pairs = list(zip(boundaries, boundaries[1:]))
+    if any(start >= end for start, end in split_pairs):
+        raise ValueError(
+            f"split graph boundaries must be strictly increasing, got {boundaries}."
+        )
+    if len(split_pairs) <= 1:
+        return None
+    return split_pairs
 
 
 def build_replay_fb_view(
@@ -223,6 +261,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
+        self.split_graph_list = _normalize_split_graph_list(
+            model_runner.server_args.split_graph_list,
+            model_runner.model_config.num_hidden_layers,
+        )
+        if self.split_graph_list is not None:
+            if self.enable_two_batch_overlap:
+                raise ValueError("split cuda graph does not support TBO yet.")
+            if self.pp_size > 1:
+                raise ValueError(
+                    "split cuda graph does not support pipeline parallel yet."
+                )
+            if get_parallel().tp_rank == 0:
+                logger.info("Capture split cuda graph layers %s", self.split_graph_list)
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         if self.use_ngram_embedding:
             hf_config = model_runner.model_config.hf_config
@@ -385,6 +436,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
         )
         self.buffers.share_buffers()
+        self.split_graph_tensors = self._create_split_graph_tensors()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface, replacing
@@ -408,6 +460,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
+        if self.split_graph_list is not None and not isinstance(
+            self.backend, FullCudaGraphBackend
+        ):
+            raise ValueError(
+                "split cuda graph requires the full decode CUDA graph backend."
+            )
 
         # --- capture --------------------------------------------------
         try:
@@ -446,11 +504,59 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, size, stream_idx=None, variant_label=None):
+    def _create_split_graph_tensors(self):
+        if self.split_graph_list is None:
+            return None
+
+        inner_model = getattr(self.model_runner.model, "model", None)
+        if inner_model is None or not hasattr(inner_model, "layers_to_capture"):
+            raise ValueError(
+                "split cuda graph currently supports DeepSeek/GLM-DSA style "
+                "decoder models only."
+            )
+
+        with torch.device(self.device):
+            tensors = {
+                "hidden_states": torch.zeros(
+                    (self.max_num_token, self.model_runner.model_config.hidden_size),
+                    dtype=self.model_runner.model_config.dtype,
+                ),
+                "residual": torch.zeros(
+                    (self.max_num_token, self.model_runner.model_config.hidden_size),
+                    dtype=self.model_runner.model_config.dtype,
+                ),
+                "aux_hidden_states": [
+                    torch.zeros(
+                        (
+                            self.max_num_token,
+                            self.model_runner.model_config.hidden_size,
+                        ),
+                        dtype=self.model_runner.model_config.dtype,
+                    )
+                    for _ in inner_model.layers_to_capture
+                ],
+            }
+            if getattr(inner_model, "use_dsa", False):
+                from sglang.srt.configs.model_config import get_dsa_index_topk
+
+                tensors["topk_indices"] = torch.zeros(
+                    (self.max_num_token, get_dsa_index_topk(inner_model.config)),
+                    dtype=torch.int32,
+                )
+        return tensors
+
+    def _make_graph_key(
+        self,
+        size,
+        stream_idx=None,
+        variant_label=None,
+        split_graph_id=None,
+    ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
+            split_graph_id=split_graph_id,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -560,6 +666,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
+            split_graph_id=0 if self.split_graph_list is not None else None,
         )
 
         is_bs_supported = (
@@ -877,6 +984,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
+        # EAGLE's specialized runner intentionally skips DecodeCudaGraphRunner
+        # __init__, so it does not have split-graph state.
+        split_graph_list = getattr(self, "split_graph_list", None)
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,
             self.model_runner.gpu_id,
@@ -912,7 +1022,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     num_tokens=bs * self.captured_req_width,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                    if split_graph_list is None:
+                        self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                    else:
+                        for split_graph_id in range(len(split_graph_list)):
+                            self.capture_one_shape(
+                                bs,
+                                forward,
+                                stream_idx,
+                                variant_label,
+                                split_graph_id,
+                            )
 
     def capture_one_shape(
         self,
@@ -920,6 +1040,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        split_graph_id: Optional[int] = None,
     ):
         num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -943,14 +1064,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            if split_graph_id in (None, 0):
+                attn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=True
+                )
 
             def run_once():
                 # Graph-recordable metadata-prep hook. The unified memory pool
                 # records ZERO translate nodes here: all its read/write translates
                 # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
                 # the captured graph reads already-physical locs. Base no-op for triton.
-                attn_backend.init_forward_metadata_in_graph(forward_batch)
+                if split_graph_id in (None, 0):
+                    attn_backend.init_forward_metadata_in_graph(forward_batch)
 
                 # No invalidate_loc_cache() here: the unified pool translates its
                 # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
@@ -981,6 +1106,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     and not hasattr(self.model_runner.model, "forward_embed")
                 ):
                     kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
+                if self.split_graph_list is not None:
+                    kwargs["split_graph_id"] = split_graph_id
+                    kwargs["split_graph_list"] = self.split_graph_list
+                    kwargs["split_graph_tensors"] = self.split_graph_tensors
 
                 out = forward(
                     forward_batch.input_ids,
@@ -988,8 +1117,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch,
                     **kwargs,
                 )
-                for capture_hook in self.model_runner.capture_tail_hooks:
-                    capture_hook(self, out, forward_batch, num_tokens)
+                if self.split_graph_list is None or split_graph_id == len(
+                    self.split_graph_list
+                ) - 1:
+                    for capture_hook in self.model_runner.capture_tail_hooks:
+                        capture_hook(self, out, forward_batch, num_tokens)
                 return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -1007,6 +1139,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self._capture_graph_size(bs=bs, num_tokens=num_tokens),
                     stream_idx,
                     variant_label,
+                    split_graph_id,
                 )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
@@ -1077,7 +1210,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label
+                graph_size_key,
+                stream_idx,
+                variant_label,
+                0 if self.split_graph_list is not None else None,
             )
             return
 
@@ -1179,7 +1315,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label
+            graph_size_key,
+            stream_idx,
+            variant_label,
+            0 if self.split_graph_list is not None else None,
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
@@ -1230,7 +1369,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if self.split_graph_list is None:
+                output = self.backend.replay(self._replay_graph_key, forward_batch)
+            else:
+                output = None
+                for split_graph_id in range(len(self.split_graph_list)):
+                    split_graph_key = self._make_graph_key(
+                        self._replay_graph_key.size,
+                        self._replay_graph_key.stream_idx,
+                        self._replay_graph_key.variant_label,
+                        split_graph_id,
+                    )
+                    output = self.backend.replay(split_graph_key, forward_batch)
             if read_done_post_replay:
                 read_done = self.device_module.Event()
                 read_done.record()

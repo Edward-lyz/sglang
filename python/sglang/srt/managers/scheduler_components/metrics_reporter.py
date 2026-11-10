@@ -53,6 +53,34 @@ def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     return sum(req.seqlen for req in batch.reqs)
 
 
+def _compute_dp_balance_values(
+    token_counts: Optional[List[int]], capacity_per_dp: Optional[int]
+) -> Tuple[float, float, float, int, int]:
+    """Return balance, idle ratio, utilization, worker count, and token count."""
+    if not token_counts:
+        return 0.0, 1.0, 0.0, 0, 0
+
+    total_dp = len(token_counts)
+    total_tokens = sum(token_counts)
+    idle_batch_ratio = token_counts.count(0) / total_dp
+    utilization = (
+        total_tokens / total_dp / capacity_per_dp
+        if capacity_per_dp is not None and capacity_per_dp > 0
+        else 0.0
+    )
+    if total_dp == 1:
+        dp_balance = 1.0
+    elif total_tokens == 0:
+        dp_balance = 0.0
+    else:
+        weighted_distance = sum(
+            (2 * i - total_dp - 1) * value
+            for i, value in enumerate(sorted(token_counts), start=1)
+        )
+        dp_balance = 1.0 - weighted_distance / (total_dp * total_tokens)
+    return dp_balance, idle_batch_ratio, utilization, total_dp, total_tokens
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -159,9 +187,18 @@ class SchedulerMetricsReporter:
                 self._mfu_log_read_bytes = 0.0
                 self._mfu_log_write_bytes = 0.0
 
+            self.stats.num_max_batchs = self.scheduler.max_running_requests
+
         self.fwd_occupancy = float("nan")
 
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
+
+        # Iteration timing follows the source branch: the scheduler loop owns
+        # iteration start, while result processing owns forward finish.
+        self.iter_start_time = 0
+        self.iter_forward_start_time = 0
+        self.iter_forward_finish_time = 0
+        self.iter_finish_time = 0
 
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
@@ -527,6 +564,68 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
+    def log_prefill_dp_balance_stats(
+        self, batch: Optional[ScheduleBatch]
+    ) -> str:
+        """Compute DP load-balance metrics for the prefill stage."""
+        if (
+            batch is None
+            or self.dp_rank != 0
+            or batch.dp_global_num_tokens_for_metric is None
+        ):
+            return ""
+
+        token_counts = batch.dp_global_num_tokens_for_metric
+        (
+            dp_balance,
+            idle_batch_ratio,
+            prefill_chunk_util,
+            total_dp,
+            total_tokens,
+        ) = _compute_dp_balance_values(
+            token_counts, self.scheduler.chunked_prefill_size
+        )
+        if self.current_scheduler_metrics_enabled:
+            self.stats.dp_balance = dp_balance
+            self.stats.idle_batch_ratio = idle_batch_ratio
+            self.stats.prefill_chunk_util = prefill_chunk_util
+            self.stats.all_gather_latency_us = batch.all_gather_latency * 1e6
+
+        return (
+            f"prefill DP tokens: {token_counts}, #DP: {total_dp}, "
+            f"#DP-token: {total_tokens}, balance: {dp_balance:.2f}, "
+            f"idle: {idle_batch_ratio:.2f}, chunk util: {prefill_chunk_util:.2f}, "
+        )
+
+    def log_decode_dp_balance_stats(self, batch: Optional[ScheduleBatch]) -> str:
+        """Compute DP load-balance metrics for the decode stage."""
+        if (
+            batch is None
+            or self.dp_rank != 0
+            or batch.dp_global_num_tokens_for_metric is None
+        ):
+            return ""
+
+        token_counts = batch.dp_global_num_tokens_for_metric
+        (
+            dp_balance,
+            idle_batch_ratio,
+            decode_bs_util,
+            total_dp,
+            total_tokens,
+        ) = _compute_dp_balance_values(token_counts, self.scheduler.max_running_requests)
+        if self.current_scheduler_metrics_enabled:
+            self.stats.dp_balance = dp_balance
+            self.stats.idle_batch_ratio = idle_batch_ratio
+            self.stats.decode_bs_util = decode_bs_util
+            self.stats.all_gather_latency_us = batch.all_gather_latency * 1e6
+
+        return (
+            f"decode DP tokens: {token_counts}, #DP: {total_dp}, "
+            f"#DP-token: {total_tokens}, balance: {dp_balance:.2f}, "
+            f"idle: {idle_batch_ratio:.2f}, batch util: {decode_bs_util:.2f}, "
+        )
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
@@ -586,6 +685,7 @@ class SchedulerMetricsReporter:
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
             )
 
+        msg += self.log_prefill_dp_balance_stats(batch)
         msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
@@ -637,7 +737,6 @@ class SchedulerMetricsReporter:
             cache_hit_rate = (
                 effective_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
-
             # Basics
             if (
                 self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL
@@ -682,6 +781,13 @@ class SchedulerMetricsReporter:
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
                 )
+                self.stats.prealloc_token_usage = (
+                    self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated
+                    * 100
+                    // self.scheduler.max_total_num_tokens
+                    if self.scheduler.max_total_num_tokens
+                    else 0
+                )
 
             # Utilization / LoRA / HiCache
             self._calculate_utilization()
@@ -691,6 +797,23 @@ class SchedulerMetricsReporter:
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
+
+    def _log_decode_run_batch_stats(self, _: ScheduleBatch) -> str:
+        """Log runtime stats of one scheduler iteration."""
+        self.iter_finish_time = time.perf_counter()
+        generation_time = self.iter_finish_time - self.iter_start_time
+        run_batch_time = self.iter_forward_finish_time - self.iter_forward_start_time
+        iter_token_process_time = generation_time - run_batch_time
+
+        if self.enable_metrics:
+            self.stats.generation_time = generation_time
+            self.stats.run_batch_time = run_batch_time
+            self.stats.iter_token_process_time = iter_token_process_time
+
+        return (
+            f", generation_time: {generation_time * 1000:.2f} (ms), "
+            f"run_batch_time: {run_batch_time * 1000:.2f} (ms)"
+        )
 
     def report_decode_stats(
         self,
@@ -755,6 +878,7 @@ class SchedulerMetricsReporter:
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg += self.log_decode_dp_balance_stats(batch)
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
@@ -855,6 +979,8 @@ class SchedulerMetricsReporter:
             self._mfu_log_read_bytes = 0.0
             self._mfu_log_write_bytes = 0.0
 
+        run_batch_msg = self._log_decode_run_batch_stats(batch)
+        msg += run_batch_msg
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
@@ -906,6 +1032,13 @@ class SchedulerMetricsReporter:
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+                )
+                self.stats.prealloc_token_usage = (
+                    self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated
+                    * 100
+                    // self.scheduler.max_total_num_tokens
+                    if self.scheduler.max_total_num_tokens
+                    else 0
                 )
 
             # Streaming session metrics
@@ -1101,6 +1234,10 @@ class SchedulerMetricsReporter:
             self.fwd_occupancy = float("nan")
             self.stats.fwd_occupancy = float("nan")
 
+    def reset_device_timer_window(self):
+        """Public scheduler hook for resetting the device timer window."""
+        self._reset_device_timer_window()
+
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""
         # Preserve the transition so the rate limit cannot leave a finite idle gauge.
@@ -1156,5 +1293,12 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+            )
+            self.stats.prealloc_token_usage = (
+                self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated
+                * 100
+                // self.scheduler.max_total_num_tokens
+                if self.scheduler.max_total_num_tokens
+                else 0
             )
         self.metrics_collector.log_stats(self.stats)

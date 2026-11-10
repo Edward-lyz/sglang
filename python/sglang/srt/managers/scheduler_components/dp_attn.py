@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -199,14 +200,16 @@ def _update_gather_batch(
     skip_all_gather=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
-    if not require_mlp_tp_gather:
+    if not require_mlp_tp_gather or skip_all_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
+        batch.dp_global_num_tokens_for_metric = [mlp_sync_info.num_tokens]
     else:
         batch.global_num_tokens = mlp_sync_info.global_num_tokens
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+        batch.dp_global_num_tokens_for_metric = mlp_sync_info.global_num_tokens
     if not skip_all_gather:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -313,6 +316,7 @@ def prepare_mlp_sync_batch_raw(
         group = tp_group.cpu_group
         device = "cpu"
 
+    gather_start = time.perf_counter()
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
     if use_world_group:
         dp_size = _resolve_elastic_world_dp_size(
@@ -347,6 +351,7 @@ def prepare_mlp_sync_batch_raw(
                 mlp_sync_info.tp0_info[:, 4:6],
             )
         )
+    all_gather_latency = time.perf_counter() - gather_start
 
     # Decide whether to emit idle batch
     if skip_all_gather:
@@ -367,6 +372,10 @@ def prepare_mlp_sync_batch_raw(
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
+        batch_to_gather.all_gather_latency = all_gather_latency
+
+    if local_batch is not None:
+        local_batch.all_gather_latency = all_gather_latency
 
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
     # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.

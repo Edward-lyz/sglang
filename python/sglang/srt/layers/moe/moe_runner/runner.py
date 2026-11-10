@@ -60,7 +60,7 @@ class MoeRunner:
             self.runner_core = AscendRunnerCore(config)
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
-        elif runner_backend.is_deep_gemm():
+        elif runner_backend.is_deep_gemm() or runner_backend.is_deepgemm_mxfp4():
             self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_humming():
             from sglang.srt.layers.moe.moe_runner.humming import HummingRunnerCore

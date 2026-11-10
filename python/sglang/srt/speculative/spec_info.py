@@ -127,6 +127,10 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+    def supports_spec_v2(self) -> bool:
+        """Whether this algorithm uses the overlap/spec-v2 scheduler path."""
+        return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
+
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify

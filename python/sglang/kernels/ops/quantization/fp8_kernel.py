@@ -530,6 +530,8 @@ def _run_per_token_group_quant_8bit_kernel(
     scale_ue8m0: bool,
     fuse_silu_and_mul: bool,
     masked_m: Optional[torch.Tensor],
+    column_major_scales: bool = False,
+    enable_v2: bool = False,
 ) -> None:
     """Quantize into caller-owned ``x_q`` / ``x_s``.
 
@@ -606,6 +608,7 @@ def sglang_per_token_group_quant_fp8(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    enable_v2: bool = False,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -647,6 +650,8 @@ def sglang_per_token_group_quant_fp8(
             scale_ue8m0=scale_ue8m0,
             fuse_silu_and_mul=fuse_silu_and_mul,
             masked_m=masked_m,
+            column_major_scales=column_major_scales,
+            enable_v2=enable_v2,
         )
 
     return x_q, x_s
@@ -754,6 +759,77 @@ def sglang_per_token_group_quant_fp8_ue8m0(
     return x_q, x_s
 
 
+def sglang_rmsnorm_per_token_group_quant_fp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    group_size: int = 128,
+    eps: float = 1e-5,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-token-group quantized RMSNorm."""
+    from sglang.kernels.jit.rmsnorm_quant import rmsnorm_per_token_quant
+
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` must be divisible by `group_size`"
+    assert x.dtype == torch.bfloat16, "fused rmsnorm quant only supports bf16 input"
+    assert weight.dtype == torch.bfloat16, "fused rmsnorm quant only supports bf16 weight"
+    if residual is not None:
+        assert residual.shape == x.shape, "residual and input must have the same shape"
+        assert (
+            residual.dtype == torch.bfloat16
+        ), "fused rmsnorm quant only supports bf16 residual"
+
+    x_norm = torch.empty_like(x)
+    x_q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
+    x_s = create_per_token_group_quant_fp8_output_scale(
+        x_shape=x_q.shape,
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+    )
+
+    if x.shape[0] > 0:
+        if residual is None:
+            rmsnorm_per_token_quant(
+                x,
+                weight,
+                x_norm,
+                x_q,
+                x_s,
+                group_size,
+                scale_ue8m0,
+                eps,
+                fp8_min,
+                fp8_max,
+            )
+        else:
+            from sglang.kernels.jit.rmsnorm_quant import (
+                fused_add_rmsnorm_per_token_quant,
+            )
+
+            fused_add_rmsnorm_per_token_quant(
+                x,
+                residual,
+                weight,
+                x_norm,
+                x_q,
+                x_s,
+                group_size,
+                scale_ue8m0,
+                eps,
+                fp8_min,
+                fp8_max,
+            )
+
+    return x_norm, x_q, x_s
+
+
 # TODO maybe unify int8 and fp8 code later
 def sglang_per_token_group_quant_8bit(
     x: torch.Tensor,
@@ -765,6 +841,7 @@ def sglang_per_token_group_quant_8bit(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    enable_v2: bool = False,
 ):
     from sglang.kernels.ops.quantization.int8_kernel import (
         sglang_per_token_group_quant_int8,
@@ -791,6 +868,7 @@ def sglang_per_token_group_quant_8bit(
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
+        enable_v2=enable_v2,
     )
 
 

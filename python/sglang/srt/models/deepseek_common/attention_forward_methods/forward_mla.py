@@ -454,6 +454,36 @@ class DeepseekMLAForwardMixin:
                             self.kv_a_layernorm.weight,
                             self.kv_a_layernorm.variance_epsilon,
                         )
+                    elif (
+                        self.use_fused_qkv_norm_quant
+                        and q.is_cuda
+                        and q.dtype == torch.bfloat16
+                        and k_nope.dtype == torch.bfloat16
+                        and self.q_a_layernorm.weight.dtype == torch.bfloat16
+                        and self.kv_a_layernorm.weight.dtype == torch.bfloat16
+                        and q.stride(-1) == 1
+                        and k_nope.stride(-1) == 1
+                        and q.shape[-1] % 128 == 0
+                        and k_nope.shape[-1] % 16 == 0
+                    ):
+                        from sglang.kernels.jit.qkv_norm_quant import (
+                            fused_qkv_norm_quant,
+                        )
+
+                        q_norm, q_fp8, q_scale, k_nope = fused_qkv_norm_quant(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            k_nope,
+                            self.kv_a_layernorm.weight,
+                            self.kv_a_layernorm.variance_epsilon,
+                            group_size=128,
+                            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                            write_q_norm=self.use_dsa,
+                        )
+                        if self.use_dsa:
+                            q_lora = q_norm
+                        q = (q_fp8, q_scale)
                     else:
                         q = self.q_a_layernorm(q)
                         k_nope = self.kv_a_layernorm(k_nope)

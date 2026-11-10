@@ -766,11 +766,7 @@ class Envs:
     )
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
-    # Fused DSA indexer drops the Hadamard rotation the source branch always
-    # applied to indexer Q/K before fp8 quantization -> noisy indexer logits
-    # -> occasional wrong top-k block selection -> long-context accuracy
-    # regression. Default OFF; set =0 to re-enable the fused path for tuning.
-    SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(True)
+    SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

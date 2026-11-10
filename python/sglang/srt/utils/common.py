@@ -2170,7 +2170,7 @@ def configure_logger(server_args, prefix: str = ""):
         logging.config.dictConfig(custom_config)
         return
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
-    format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
+    format = f"%(levelname)s [%(asctime)s{maybe_ms}{prefix}] %(message)s"
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
@@ -3032,13 +3032,14 @@ class UvicornAccessLogFilter(logging.Filter):
 def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
+    maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
     LOGGING_CONFIG["formatters"]["default"][
         "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    ] = f"%(levelname)s [%(asctime)s{maybe_ms} Server] %(message)s"
     LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
     LOGGING_CONFIG["formatters"]["access"][
         "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    ] = f'%(levelname)s [%(asctime)s{maybe_ms} Server] %(client_addr)s - "%(request_line)s" %(status_code)s'
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
     _configure_uvicorn_access_log_filter(LOGGING_CONFIG, server_args)
@@ -3105,6 +3106,16 @@ def _configure_uvicorn_access_log_filter(
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):
+    """Launch a lightweight health check server for non-master nodes.
+
+    Non-master nodes (node_rank >= 1) do not run the full http_server, so this
+    dummy server only exposes liveness/readiness probe endpoints.
+
+    Args:
+        host: The host address to bind the server.
+        port: The port number to bind the server.
+        enable_metrics: Whether to enable the prometheus metrics middleware.
+    """
     import asyncio
 
     import uvicorn
@@ -3129,6 +3140,28 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         """Check the health of the http server."""
         return Response(status_code=200)
 
+    @app.get("/health_forward")
+    async def health_forward():
+        """Non-master node readiness: forward the check to the master node.
+
+        Non-master nodes have no tokenizer/scheduler forward chain, so they
+        cannot perform a real forward health check themselves. Instead they
+        proxy the master node's /health_forward and mirror its result.
+        """
+        import os
+        import urllib.request
+
+        master = os.environ.get("MASTER_IP", host)
+        try:
+            resp = urllib.request.urlopen(
+                f"http://{master}:{port}/health_forward", timeout=10
+            )
+            if resp.status != 200:
+                return Response(status_code=503)
+        except Exception:
+            return Response(status_code=503)
+        return Response(status_code=200)
+
     # Add prometheus middleware
     if enable_metrics:
         add_prometheus_middleware(app)
@@ -3141,7 +3174,7 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
         loop="auto",
         log_config=None,
-        log_level="warning",
+        log_level="info",
     )
     server = uvicorn.Server(config=config)
 

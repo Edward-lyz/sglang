@@ -734,16 +734,22 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # to return int32-packed UE8M0 scales that don't feed the flashinfer
         # cutedsl kernel.
-        fp8_deepgemm_scale_opts = (
-            dict(
+        use_mxfp8_for_sf = self.quant_config.get("use_mxfp8_for_sf", False)
+        if use_mxfp8_for_sf:
+            fp8_deepgemm_scale_opts = dict(
+                round_scale=False,
+                use_ue8m0=False,
+                use_mxfp8_for_sf=True,
+            )
+        elif self.use_fp8:
+            fp8_deepgemm_scale_opts = dict(
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
-            if self.use_fp8
-            else dict()
-        )
+        else:
+            fp8_deepgemm_scale_opts = {}
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()

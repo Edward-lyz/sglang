@@ -301,6 +301,7 @@ class _GenerationStreamAccumulator:
     spec_correct_drafts_histogram: list = field(default_factory=list)
     spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
+    trace_infos: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -445,6 +446,7 @@ class _GenerationStreamAccumulator:
         self.video_tokens.append(video_t)
 
         self.retraction_counts.append(req.retraction_count)
+        self.trace_infos.append(req.trace_info)
 
         self.time_stats.append(req.time_stats)
 
@@ -680,4 +682,5 @@ class _GenerationStreamAccumulator:
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
             dp_ranks=dp_ranks,
+            trace_infos=self.trace_infos,
         )

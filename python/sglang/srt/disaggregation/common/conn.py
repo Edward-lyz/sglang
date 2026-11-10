@@ -198,10 +198,25 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
+        zmq_port = None
+        if server_args.disaggregation_zmq_ports is not None:
+            port_index = self.kv_args.gpu_id
+            ports = server_args.disaggregation_zmq_ports
+            if port_index >= len(ports):
+                raise ValueError(
+                    f"gpu_id {port_index} exceeds the number of specified ports "
+                    f"({len(ports)})."
+                )
+            zmq_port = ports[port_index]
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            self._zmq_ctx, zmq.PULL, host=self.local_ip
+            self._zmq_ctx, zmq.PULL, host=self.local_ip, port=zmq_port
         )
-        logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
+        logger.debug(
+            "kv manager bind to %s:%s (%s port)",
+            self.local_ip,
+            self.rank_port,
+            "fixed" if zmq_port is not None else "random",
+        )
 
         self.request_status: Dict[int, KVPoll] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
@@ -1256,6 +1271,12 @@ class CommonKVReceiver(BaseKVReceiver):
     _socket_locks = {}
     _global_lock = threading.Lock()
 
+    @classmethod
+    def configure_max_sockets(cls, max_sockets: int) -> None:
+        """Set the shared receiver context socket cap before creating sockets."""
+        cls._ctx.set(zmq.MAX_SOCKETS, max_sockets)
+        logger.info("%s ZMQ MAX_SOCKETS set to %s", cls.__name__, max_sockets)
+
     def __init__(
         self,
         mgr: CommonKVManager,
@@ -1270,7 +1291,10 @@ class CommonKVReceiver(BaseKVReceiver):
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
+        with self.kv_mgr.connection_lock:
+            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(
+                self.bootstrap_room
+            )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
     def init(self, prefill_dp_rank: int):
@@ -1494,6 +1518,12 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        with self.kv_mgr.connection_lock:
+            rooms = self.kv_mgr.addr_to_rooms_tracker.get(self.bootstrap_addr)
+            if rooms is not None:
+                rooms.discard(self.bootstrap_room)
+                if not rooms:
+                    self.kv_mgr.addr_to_rooms_tracker.pop(self.bootstrap_addr, None)
 
     def abort(self):
         self.kv_mgr.record_failure(

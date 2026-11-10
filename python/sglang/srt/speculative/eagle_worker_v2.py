@@ -690,6 +690,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+        if self.index_share_for_mtp_iteration:
+            forward_batch.reuse_mtp_topk_indices = False
+            forward_batch.topk_indices = None
 
         if self.index_share_for_mtp_iteration:
             spec_info.dsa_topk_indices = None

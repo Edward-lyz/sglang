@@ -29,7 +29,7 @@ Operator groups (all populated): `activation`, `attention`, `communication`,
 `kvcache`, `layernorm`, `lplb`, `mamba`, `memory`, `moe`, `quantization`,
 `sampling`, `speculative`.
 
-As of the RFC #29630 finale (#32072) the legacy `sglang.jit_kernel` package has
+As of the RFC #29630 finale (#32072) the legacy `sglang.kernels.jit` package has
 been **removed**: its shared build/runtime infra moved to `sglang.kernels.jit`
 and each JIT-backed operator into its group as
 `sglang.kernels.ops.<group>._jit_<op>`. Tests and benchmarks live under

@@ -87,6 +87,9 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        page_table_1_override: Optional[torch.Tensor] = None,
+        real_page_table_override: Optional[torch.Tensor] = None,
+        topk_v2_plan_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
@@ -102,6 +105,11 @@ class DSATopKBackend(Enum):
         # exactly this case (see dsa_drop_wide_page_table), so once the shape
         # matches we commit to v2 and never silently fall back to the legacy
         # page_size=1 path from here.
+        paged_real_table = (
+            real_page_table_override
+            if real_page_table_override is not None
+            else attn_metadata.real_page_table
+        )
         if (
             self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
@@ -110,14 +118,26 @@ class DSATopKBackend(Enum):
             and 0 < topk <= 2048
             and lengths.shape[0]
             == logits.shape[0]
-            == attn_metadata.real_page_table.shape[0]
+            == paged_real_table.shape[0]
         ):
-            return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
+            return _topk_transform_v2_paged(
+                logits,
+                lengths,
+                topk,
+                attn_metadata,
+                page_table=real_page_table_override,
+                plan=topk_v2_plan_override,
+            )
 
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
         # which is always present here: the fold only drops it for the decode case
         # dispatched to v2 above.
-        assert attn_metadata.page_table_1 is not None
+        page_table_1 = (
+            page_table_1_override
+            if page_table_1_override is not None
+            else attn_metadata.page_table_1
+        )
+        assert page_table_1 is not None
 
         if self.is_sgl_kernel():
             from sgl_kernel import (
@@ -127,9 +147,9 @@ class DSATopKBackend(Enum):
 
             if topk_transform_method == TopkTransformMethod.PAGED:
                 page_table_size_1 = (
-                    attn_metadata.page_table_1[batch_idx_list]
+                    page_table_1[batch_idx_list]
                     if batch_idx_list is not None
-                    else attn_metadata.page_table_1
+                    else page_table_1
                 )
                 return fast_topk_transform_fused(
                     score=logits,
@@ -188,7 +208,7 @@ class DSATopKBackend(Enum):
                 )
                 return flashinfer.top_k_page_table_transform(
                     logits.contiguous(),
-                    attn_metadata.page_table_1.contiguous(),
+                    page_table_1.contiguous(),
                     lengths.contiguous(),
                     topk,
                     row_to_batch=row_to_batch,
@@ -263,6 +283,8 @@ def _topk_transform_v2_paged(
     lengths: torch.Tensor,
     topk: int,
     attn_metadata,
+    page_table: Optional[torch.Tensor] = None,
+    plan: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused top-k + page-table transform via the DeepSeek-V4 v2 JIT kernel.
 
@@ -307,7 +329,7 @@ def _topk_transform_v2_paged(
     ), f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
-    page_table = attn_metadata.real_page_table
+    page_table = page_table if page_table is not None else attn_metadata.real_page_table
     assert page_table.dtype == torch.int32
     lengths_i32 = lengths.to(torch.int32)
 
@@ -315,7 +337,7 @@ def _topk_transform_v2_paged(
     # refreshed in-place under CUDA graph) and reused across layers. A missing or
     # mismatched plan means the caller skipped that preprocessing -- fail loudly
     # rather than silently recompute it per layer.
-    plan = attn_metadata.topk_v2_plan
+    plan = plan if plan is not None else attn_metadata.topk_v2_plan
     assert (
         plan is not None and plan.shape[0] == num_rows + 1
     ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"

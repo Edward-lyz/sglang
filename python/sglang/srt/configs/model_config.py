@@ -390,6 +390,13 @@ class ModelConfig:
             n_group = getattr(self.hf_config, "n_group", None)
             if n_group is not None:
                 self.hf_config.topk_group = n_group
+        elif envs.SGLANG_GLM51_MXFP4_MODE.get():
+            # GLM-5.1 advertises an FP8 checkpoint while its routed experts use
+            # the same MXFP4 layout consumed by the DeepSeek-V4 expert stack.
+            self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
+            n_group = getattr(self.hf_config, "n_group", None)
+            if self.is_fp4_experts and n_group is not None:
+                self.hf_config.topk_group = n_group
 
         # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None

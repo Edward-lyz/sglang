@@ -7,6 +7,7 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
+import math
 import torch
 from huggingface_hub import snapshot_download
 
@@ -522,10 +523,12 @@ def generate_token_bitmask(
     for i, req in enumerate(reqs):
         if req.grammar is not None:
             if allocate_token_bitmask is None:
-                allocate_token_bitmask = req.grammar.allocate_vocab_mask(
-                    vocab_size=vocab_size,
-                    batch_size=draft_tokens_cpu.numel(),
+                allocate_token_bitmask = torch.full(
+                    (draft_tokens_cpu.numel(), math.ceil(vocab_size / 32)),
+                    -1,
+                    dtype=torch.int32,
                     device="cpu",
+                    pin_memory=True
                 )
             grammar = req.grammar
             s = time.perf_counter()

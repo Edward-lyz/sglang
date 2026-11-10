@@ -80,6 +80,13 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
     custom_params: Optional[Dict[str, CustomParamValue]] = None
+    # Limits tokens generated inside a <think>...</think> segment.  When the
+    # budget is exhausted, the scheduler injects the configured transition
+    # prompt and think-end token sequence.
+    thinking_budget: Optional[int] = None
+    # Request-provided transition prompt ids; the scheduler appends think-end
+    # ids before injecting them into the generated sequence.
+    thinking_prompt_token_ids: Optional[List[int]] = None
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -207,6 +214,18 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         if sum(x is not None for x in grammars) > 1:
             raise ValueError(
                 "Only one of json_schema, regex, ebnf, or structural_tag can be set."
+            )
+
+        # A negative budget is the historical disabled sentinel and does not
+        # need a transition prompt. Non-negative budgets do, because the
+        # scheduler must have tokens to inject when the limit is reached.
+        if (
+            self.thinking_budget is not None
+            and self.thinking_budget >= 0
+            and not self.thinking_prompt_token_ids
+        ):
+            raise ValueError(
+                "thinking_prompt_token_ids cannot be empty when thinking_budget is specified."
             )
 
     def normalize(self, tokenizer):

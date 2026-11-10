@@ -385,6 +385,19 @@ def build_eagle_verify_input(
         fill_prefix_mask=fill_mask,
     )
 
+    # Keep the draft path aligned with the verify path when a request has
+    # exhausted its thinking budget.  The tree builder returns the flattened
+    # per-request token window expected by the verify kernels.  The verify step
+    # advances the request's injection cursor; the draft step only mirrors the
+    # pending transition tokens so the speculative tree uses the same sequence.
+    for i, req in enumerate(batch.reqs):
+        req.inject_thinking_prompt_tokens(
+            draft_tokens,
+            start_idx=i * num_draft_tokens,
+            max_count=num_draft_tokens,
+            advance=False,
+        )
+
     return EagleVerifyInput(
         draft_token=draft_tokens,
         custom_mask=tree_mask,

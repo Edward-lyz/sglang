@@ -592,6 +592,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
 
+    # zmq transport (api server -> scheduler), get by time.perf_counter()
+    dispatch_to_scheduler_time: float = 0.0
+    arrive_scheduler_time: float = 0.0
+
     # prefill node, get by time.perf_counter()
     prefill_bootstrap_queue_entry_time: float = 0.0
     prefill_transfer_queue_entry_time: float = 0.0
@@ -1026,6 +1030,30 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         stage = RequestStage.DECODE_FAKE_OUTPUT
         self.observe_per_stage_req_latency(stage, ts - self.last_forward_entry_time)
         self.trace_slice(stage, self.last_forward_entry_time, ts)
+
+    def get_request_first_token_forward_time(self) -> float:
+        """Return source-compatible first-token forward latency."""
+        if self.disagg_mode == DisaggregationMode.NULL:
+            return self.completion_time - self.wait_queue_entry_time
+        if self.disagg_mode == DisaggregationMode.PREFILL:
+            return self.completion_time - self.prefill_bootstrap_queue_entry_time
+        return 0.0
+
+    def get_request_waiting_time(self) -> float:
+        """Return source-compatible waiting time before the first forward."""
+        if self.disagg_mode == DisaggregationMode.NULL:
+            return self.forward_entry_time - self.wait_queue_entry_time
+        if self.disagg_mode == DisaggregationMode.PREFILL:
+            return self.forward_entry_time - self.prefill_bootstrap_queue_entry_time
+        if self.disagg_mode == DisaggregationMode.DECODE:
+            return self.forward_entry_time - self.decode_transfer_queue_entry_time
+        return 0.0
+
+    def get_request_zmq_time(self) -> float:
+        """Return source-compatible API-server-to-scheduler ZMQ latency."""
+        if self.dispatch_to_scheduler_time <= 0.0 or self.arrive_scheduler_time <= 0.0:
+            return 0.0
+        return max(0.0, self.arrive_scheduler_time - self.dispatch_to_scheduler_time)
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time

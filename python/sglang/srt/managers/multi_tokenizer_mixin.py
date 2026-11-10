@@ -171,6 +171,7 @@ def _handle_output_by_index(output, i):
                 output, "spec_cap_lens_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
+            detokenize_completed_time=output.detokenize_completed_time,
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
             decode_ids=_extract_field_by_index(output, "decode_ids", i),
@@ -297,6 +298,7 @@ def _handle_output_by_index(output, i):
                 output, "spec_cap_lens_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
+            detokenize_completed_time=output.detokenize_completed_time,
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
             per_token_strs=_extract_field_by_index(output, "per_token_strs", i),

@@ -15,6 +15,43 @@ logger = logging.getLogger(__name__)
 
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
+    if server_args.disaggregation_zmq_ports is not None:
+        raw_ports = server_args.disaggregation_zmq_ports
+        if isinstance(raw_ports, str):
+            ports = []
+            for token in raw_ports.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                if "-" in token:
+                    start, end = token.split("-", 1)
+                    start, end = int(start), int(end)
+                    if start <= 0 or end < start:
+                        raise ValueError(
+                            "--disaggregation-zmq-ports contains an invalid range: "
+                            f"{token!r}"
+                        )
+                    ports.extend(range(start, end + 1))
+                else:
+                    port = int(token)
+                    if port <= 0:
+                        raise ValueError(
+                            "--disaggregation-zmq-ports values must be positive."
+                        )
+                    ports.append(port)
+            server_args.disaggregation_zmq_ports = ports
+        if not server_args.disaggregation_zmq_ports:
+            raise ValueError("--disaggregation-zmq-ports resulted in an empty port list.")
+        if server_args.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(
+                "--disaggregation-zmq-ports requires --disaggregation-mode prefill or decode."
+            )
+        if len(set(server_args.disaggregation_zmq_ports)) != len(
+            server_args.disaggregation_zmq_ports
+        ):
+            raise ValueError("Duplicate ports in --disaggregation-zmq-ports.")
+    if server_args.disaggregation_zmq_max_sockets <= 0:
+        raise ValueError("--disaggregation-zmq-max-sockets must be positive.")
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.

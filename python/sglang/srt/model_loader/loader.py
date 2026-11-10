@@ -857,7 +857,7 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
-        for _, module in model.named_modules():
+        for name, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 # When quant methods need to process weights after loading
@@ -865,6 +865,8 @@ class DefaultModelLoader(BaseModelLoader):
                 # to be on the global target device. This scope is for the
                 # case where cpu offloading is used, where we will move the
                 # parameters onto device for processing and back off after.
+                if envs.SGLANG_DEL_MLA_DEAD_WEIGHT.get() and "kv_b_proj" in name:
+                    continue
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
 

@@ -181,6 +181,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: TranscriptionRequest,
         raw_request: Request,
+        tokenizer_rev_request_time=None,
     ) -> Union[
         TranscriptionResponse,
         TranscriptionVerboseResponse,
@@ -238,6 +239,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: TranscriptionRequest,
         raw_request: Request,
+        tokenizer_rev_request_time=None,
     ) -> StreamingResponse:
         """Handle streaming transcription request."""
         if self._adapter.supports_chunked_streaming:

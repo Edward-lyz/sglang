@@ -27,7 +27,6 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -64,6 +63,7 @@ class SchedulerRequestReceiver:
     model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
+    send_tokenize_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
 
@@ -106,9 +106,8 @@ class SchedulerRequestReceiver:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
 
-                # Rust ringbuffer backend: drain the in-process ring fed by the
-                # embedded Rust TokenizerManager instead of a zmq socket. Same
-                # non-blocking, msgpack-decoded contract as the zmq path below.
+                # Rust frontend requests arrive through an in-process ring and
+                # use the same decoded request objects as the ZMQ path.
                 if envs.SGLANG_RUST_SERVER.get():
                     recv_reqs.extend(
                         self.recv_from_tokenizer.drain(self.max_recv_per_poll)
@@ -151,7 +150,7 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
-        if get_parallel().enable_dp_attention:
+        if self.server_args.enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
@@ -180,7 +179,7 @@ class SchedulerRequestReceiver:
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
             _local_ctrl = (
-                get_parallel().enable_dp_attention_local_control_broadcast
+                self.server_args.enable_dp_attention_local_control_broadcast
                 or self.server_args.is_ep_scale_joiner
             )
             if _local_ctrl:
@@ -232,20 +231,22 @@ class SchedulerRequestReceiver:
         # Process MM requests under EPD-disaggregation mode
         if (
             self.ps.pp_rank == 0
-            and get_disagg().language_only
-            and get_disagg().encoder_transfer_backend
+            and self.server_args.language_only
+            and self.server_args.encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:
-                if error_code is None:
-                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
-                elif isinstance(error_code, HTTPStatus):
-                    status_code = error_code
+                status_code = (
+                    HTTPStatus.BAD_REQUEST
+                    if error_code == 400
+                    else HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                if getattr(req, "tokenize_only", False):
+                    self.send_tokenize_output(req, error_msg, status_code)
                 else:
-                    status_code = HTTPStatus(int(error_code))
-                prepare_abort(req, error_msg, status_code=status_code)
-                self.stream_output([req], req.return_logprob)
+                    prepare_abort(req, error_msg, status_code=status_code)
+                    self.stream_output([req], req.return_logprob)
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:
@@ -258,7 +259,7 @@ class SchedulerRequestReceiver:
                 # peer ranks may still be unpickling ShmPointerMMData
                 # (-> shm_open).  Synchronize the same CPU groups that carried
                 # SHM-backed work requests before materialize() unlinks them.
-                if get_parallel().enable_dp_attention:
+                if self.server_args.enable_dp_attention:
                     if self.ps.attn_tp_size > 1:
                         barrier(group=self.attn_tp_cpu_group)
                     if self.ps.attn_cp_size > 1:

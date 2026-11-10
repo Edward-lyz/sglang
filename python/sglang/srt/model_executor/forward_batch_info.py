@@ -702,6 +702,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if skip_attn_backend_init:
             self.mark_forward_metadata_ready()
 
+    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
+    topk_indices: Optional[torch.Tensor] = None
+    reuse_mtp_topk_indices: Optional[bool] = False
+
     @classmethod
     def init_new(
         cls,

@@ -41,6 +41,7 @@ class OpenAIServingScore(OpenAIServingBase):
         adapted_request: ScoringRequest,
         request: ScoringRequest,
         raw_request: Request,
+        tokenizer_rev_request_time=None,
     ) -> Union[ScoringResponse, ErrorResponse]:
         """Handle the scoring request"""
         try:

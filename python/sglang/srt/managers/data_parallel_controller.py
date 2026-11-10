@@ -47,9 +47,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
-from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.runtime_context import get_exec, publish
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
@@ -233,7 +231,7 @@ class DataParallelController:
                 sock_send(worker, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        if get_exec().moe.elastic_ep_backend is not None:
+        if self.server_args.elastic_ep_backend is not None:
             if len(ranks.status) != self.max_dp_size:
                 logger.warning(
                     "[Elastic EP][DPC] active rank status len=%d != max_dp_size=%d; "
@@ -316,7 +314,12 @@ class DataParallelController:
         self.dp_budget.update_budget(self.load_snapshot_reader.read_all())
 
     def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
-        if refresh_load_budget and self.refresh_load_budget_on_dispatch:
+        is_tokenize_only = getattr(req, "tokenize_only", False)
+        if (
+            not is_tokenize_only
+            and refresh_load_budget
+            and self.refresh_load_budget_on_dispatch
+        ):
             self.refresh_load_budget()
 
         time_stats = DPControllerReqTimeStats.new_from_obj(
@@ -325,7 +328,13 @@ class DataParallelController:
 
         time_stats.set_dp_dispatch_time()
         req.time_stats = wrap_as_pickle(time_stats)
-        self.dispatching(req)
+        if is_tokenize_only:
+            # Tokenize-only requests do not consume generation load. Keep
+            # routed-rank handling, but use the same active-worker round robin
+            # as control traffic.
+            self.round_robin_scheduler(req)
+        else:
+            self.dispatching(req)
         req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
 
@@ -486,7 +495,7 @@ class DataParallelController:
             logger.debug("Worker port broadcast completed")
             return worker_ports
         finally:
-            if get_exec().moe.elastic_ep_backend is None:
+            if self.server_args.elastic_ep_backend is None:
                 rep_socket.close()
             else:
                 threading.Thread(
@@ -732,9 +741,6 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
-        self.startup_time = aggregate_scheduler_startup_times(
-            info.get("startup_time") for info in scheduler_info
-        )
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
@@ -820,9 +826,7 @@ def run_data_parallel_controller_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
-    # This process reads the config namespaces before spawning schedulers.
-    publish(server_args, role="dp_controller")
-    configure_logger(server_args)
+    configure_logger(server_args, " DPController")
     if server_args.enable_trace:
         process_tracing_init(
             server_args.otlp_traces_endpoint,
@@ -848,7 +852,6 @@ def run_data_parallel_controller_process(
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
-                "startup_time": controller.startup_time,
                 SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )

@@ -1277,22 +1277,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
-        # Append continuation_token_ids after input_ids is resolved (whether
-        # from obj.input_ids directly or from tokenization of text). This
-        # handles the multimodal-model case where serving_chat sends text
-        # instead of pre-built input_ids.
-        if getattr(obj, "continuation_token_ids", None) and input_ids is not None:
-            orig_len = len(input_ids)
-            input_ids = input_ids + obj.continuation_token_ids
-            logger.info(
-                "FC continuation in tokenizer_manager (rid=%s): appended %d tokens "
-                "(input_ids %d -> %d)",
-                obj.rid,
-                len(obj.continuation_token_ids),
-                orig_len,
-                len(input_ids),
-            )
-
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
@@ -1573,7 +1557,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_routed_experts=obj.return_routed_experts,
                 routed_experts_start_len=obj.routed_experts_start_len,
                 return_indexer_topk=obj.return_indexer_topk,
-                continuation_token_ids=getattr(obj, "continuation_token_ids", None),
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
@@ -1586,31 +1569,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 mm_data_mooncake=obj.mm_data_mooncake,
                 encoder_urls=obj.encoder_urls,
                 trace_config=obj.trace_config,
-                # AttentionStore parameters.
-                as_kv_cache_params=obj.as_kv_cache_params,
-                as_max_hit_host_ip=obj.as_max_hit_host_ip,
-                as_max_hit_token_len=obj.as_max_hit_token_len,
             )
-
-            # Generate the AS token/block hashes from the finalized prompt IDs.
-            # The scheduler and AsRadixCache consume the SDK Tokens object, not
-            # the raw request field.
-            if self.server_args.enable_asradix_cache:
-                try:
-                    from attentionstore_sdk.sdk import Tokens
-                except ImportError:
-                    logger.warning(
-                        "attentionstore_sdk not available, skipping AS hash generation"
-                    )
-                else:
-                    try:
-                        tokenized_obj.as_block_hashs = Tokens(
-                            input_ids, self.server_args.page_size
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "failed to generate AS hashes, skipping AS matching: %s", e
-                        )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
             positional_embed_overrides = obj.positional_embed_overrides
@@ -2178,11 +2137,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         elif self.server_args.tokenizer_worker_num == 1:
             return
         else:
-            # rid is not tracked in any state map (e.g. the request already
-            # completed and was removed from rid_to_state). Match the source
-            # branch: skip dispatch + metric so post-completion cleanup aborts
-            # from create_abort_task do not inflate num_aborted_requests_total.
-            return
+            target_rids = (rid,)
 
         for target_rid in target_rids:
             self._dispatch_to_scheduler(AbortReq(rid=target_rid, abort_all=abort_all))
@@ -2571,13 +2526,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "output_ids": output_token_ids,
                             "meta_info": meta_info,
                         }
-                        # Carry the per-token split (speculative multi-token
-                        # steps) to the SSE layer, which emits one chunk per
-                        # token so downstream streaming counters see
-                        # token-aligned granularity.
-                        per_tok = getattr(recv_obj, "per_token_strs", None)
-                        if per_tok and per_tok[i] and len(per_tok[i]) > 1:
-                            out_dict["per_token_strs"] = per_tok[i]
                     elif state.finished:
                         out_dict = {
                             "text": state.get_text(),

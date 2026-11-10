@@ -190,16 +190,6 @@ def build_paged_mqa_schedule_metadata(
             context_lens, block_kv, num_sms
         )
 
-    # A (B, next_n) tensor uses DeepGEMM's native single-launch path, where
-    # the kernel walks next_n internally. Chunking would flatten it to one row
-    # per token and silently switch the kernel to kNextN=1, which can deadlock
-    # in fetch_next_task. Keep the native layout intact; per-token (N, 1)
-    # layouts still use chunking for the long-context memory bound.
-    if context_lens.dim() == 2 and context_lens.size(1) > 1:
-        return deep_gemm.get_paged_mqa_logits_metadata(
-            context_lens, block_kv, num_sms
-        )
-
     max_rows = max(
         1,
         max_chunk_mb
@@ -212,12 +202,6 @@ def build_paged_mqa_schedule_metadata(
         return deep_gemm.get_paged_mqa_logits_metadata(
             context_lens, block_kv, num_sms
         )
-
-    # Native layouts must return above instead of being flattened into the
-    # generic chunk schedule, which would change the kernel's next_n shape.
-    assert not (
-        context_lens.dim() == 2 and context_lens.size(1) > 1
-    ), f"native paged-MQA layout {tuple(context_lens.shape)} must not be chunked"
 
     flat_context_lens = context_lens.reshape(-1, 1)
     schedules = []
@@ -1109,12 +1093,6 @@ class Indexer(MultiPlatformOp):
 
         if isinstance(schedule_metadata, PagedMQAScheduleMetadata):
             assert schedule_metadata.num_rows == q_offset
-            # A chunked schedule and the native single-launch path are
-            # mutually exclusive. Catch an inconsistent schedule on host.
-            assert not use_dg_native, (
-                "chunked schedule reached the native paged-MQA launch "
-                f"(B={B}, next_n={next_n})"
-            )
             seqlens_flat = seqlens_32.reshape(-1)[:q_offset]
             page_table_1 = metadata.get_page_table_1()
             topk_result = torch.full(

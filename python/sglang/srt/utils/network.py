@@ -203,6 +203,7 @@ def get_zmq_socket_on_host(
     context: zmq.Context,
     socket_type: zmq.SocketType,
     host: Optional[str] = None,
+    port: Optional[Union[int, Tuple[int, int]]] = None,
 ) -> Tuple[int, zmq.Socket]:
     """Create and configure a ZeroMQ socket.
 
@@ -215,7 +216,8 @@ def get_zmq_socket_on_host(
             cross-machine reachability must pass an explicit host.
 
     Returns:
-        Tuple of (port, socket) where port is the randomly assigned TCP port.
+        Tuple of (port, socket). A fixed integer port is bound directly; a
+        ``(min_port, max_port)`` tuple requests a random port in that range.
     """
     socket = context.socket(socket_type)
     config_socket(socket, socket_type)
@@ -226,8 +228,16 @@ def get_zmq_socket_on_host(
         bind_host = f"tcp://[{host}]"
     else:
         bind_host = f"tcp://{host}"
-    port = socket.bind_to_random_port(bind_host)
-    return port, socket
+    if isinstance(port, int):
+        socket.bind(f"{bind_host}:{port}")
+        return port, socket
+    if isinstance(port, tuple):
+        bound_port = socket.bind_to_random_port(
+            bind_host, min_port=port[0], max_port=port[1]
+        )
+    else:
+        bound_port = socket.bind_to_random_port(bind_host)
+    return bound_port, socket
 
 
 def config_socket(socket, socket_type: zmq.SocketType):

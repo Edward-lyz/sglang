@@ -4339,6 +4339,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        index_topk_pattern: Optional[list[str]] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -4364,6 +4365,23 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
+        self.indexer_layer_mapping: Optional[dict[int, int]] = None
+        self.indexer_layer_num = self.layer_num
+        if envs.SGLANG_INDEXER_CACHE_OPT.get() and index_topk_pattern is not None:
+            # Configs in the wild use either ``S``/``F`` or the descriptive
+            # ``shared`` spelling. Both denote a layer that reuses the prior
+            # top-k result and therefore has no own indexer buffer.
+            local_pattern = index_topk_pattern[
+                self.start_layer : self.start_layer + self.layer_num
+            ]
+            if len(local_pattern) == self.layer_num:
+                self.indexer_layer_mapping = {}
+                for local_layer, pattern in enumerate(local_pattern):
+                    if str(pattern).lower() not in ("s", "shared"):
+                        self.indexer_layer_mapping[local_layer] = len(
+                            self.indexer_layer_mapping
+                        )
+                self.indexer_layer_num = len(self.indexer_layer_mapping)
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
@@ -4407,8 +4425,19 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=self.device,
                 )
-                for _ in range(self.layer_num)
+                for _ in range(self.indexer_layer_num)
             ]
+
+    def _get_index_buf_by_layer(self, local_layer_id: int) -> torch.Tensor:
+        if self.indexer_layer_mapping is not None:
+            try:
+                local_layer_id = self.indexer_layer_mapping[local_layer_id]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Layer {local_layer_id + self.start_layer} reuses an indexer "
+                    "buffer but no previous indexer layer is available."
+                ) from exc
+        return self.index_k_with_scale_buffer[local_layer_id]
 
     def _clear_buffers(self):
         super()._clear_buffers()
@@ -4429,7 +4458,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return self._get_index_buf_by_layer(layer_id - self.start_layer)
 
     def get_index_k_continuous(
         self,
@@ -4439,7 +4468,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     ):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf_by_layer(layer_id - self.start_layer)
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -4452,7 +4481,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     ):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf_by_layer(layer_id - self.start_layer)
         return index_buf_accessor.GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -4467,18 +4496,18 @@ class DSATokenToKVPool(MLATokenToKVPool):
     ):
         """
         Fused method to get both index K and scale data in a single call using Triton.
-        More efficient than calling get_index_k_continuous and get_index_k_scale_continuous separately.
+        Batched across requests in one launch.
 
         :param layer_id: Layer index
-        :param seq_len: Sequence length
-        :param page_indices: Page indices tensor
-        :return: tuple of (k_fp8, k_scale) where
-                 k_fp8: (seq_len, index_head_dim), uint8
-                 k_scale: (seq_len, 4), uint8
+        :param seq_len_tensor: per-request sequence length tensor on device
+        :param page_indices: 2D page indices tensor (num_seqs, max_pages)
+        :param seq_len_sum: sum of seq_len_tensor (host int)
+        :param max_seq_len: max of seq_len_tensor (host int)
+        :return: (k_fp8, k_scale)
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf_by_layer(layer_id - self.start_layer)
         return index_buf_accessor.GetKAndS.execute(
             self,
             buf,
@@ -4495,7 +4524,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_index_buf_by_layer(layer_id - self.start_layer)
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )

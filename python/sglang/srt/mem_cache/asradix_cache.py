@@ -102,7 +102,6 @@ class _AsWriteTask:
     write_params: Any
     submit_time: float
     num_pages: int
-    trace_recorder: Optional[Any] = None
 
 
 class AsRadixCache(RadixCache):
@@ -834,32 +833,7 @@ class AsRadixCache(RadixCache):
         )
 
         # Include the boundary token reserved for EAGLE bigram key construction.
-        # Req.fill_ids was renamed upstream; use the complete untruncated
-        # sequence so AS-loaded prefixes build the same key as normal matches.
-        full_input_ids = getattr(req, "full_untruncated_fill_ids", None)
-        if full_input_ids is None:
-            full_input_ids = getattr(req, "fill_ids", None)
-        if full_input_ids is None:
-            get_fill_ids = getattr(req, "get_fill_ids", None)
-            full_input_ids = get_fill_ids() if get_fill_ids is not None else None
-        required_input_len = total_prefix_len + int(self.is_eagle)
-        if full_input_ids is None or len(full_input_ids) < required_input_len:
-            logger.warning(
-                "AS load skipped for req:%s: request input sequence is unavailable "
-                "or shorter than the loaded prefix (required=%d, available=%d)",
-                req.rid,
-                required_input_len,
-                len(full_input_ids) if full_input_ids is not None else 0,
-            )
-            deferred_page_ids.append(loaded_page_ids)
-            self._queue_as_load_completion(load_result, None, deferred_page_ids)
-            return (
-                torch.empty(
-                    (0,), dtype=loaded_indices.dtype, device=loaded_indices.device
-                ),
-                last_host_node,
-            )
-        token_ids = full_input_ids[:required_input_len]
+        token_ids = req.fill_ids[: total_prefix_len + int(self.is_eagle)]
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
@@ -932,13 +906,6 @@ class AsRadixCache(RadixCache):
             return False
         return True
 
-    def _get_as_trace(self, req):
-        if req is None:
-            return None
-        from sglang.srt.mem_cache.as_trace import get_recorder
-
-        return get_recorder(req, self)
-
     def _as_match(self, req, local_result: MatchResult, key) -> Optional[MatchResult]:
         """Query AS for additional prefix hits beyond local radix tree match.
 
@@ -953,25 +920,12 @@ class AsRadixCache(RadixCache):
         remote_addrs = req.as_max_hit_host_ip
         remote_len = req.as_max_hit_token_len
 
-        as_match_count = 0
-        match_error = None
-        remote_match = bool(remote_len and len(remote_len) == 1 and remote_len[0] > 0)
-
         # If remote hit info indicates a specific hit length, use it directly
-        if remote_match:
-            as_match_count = max((remote_len[0] - local_hit_len) // self.page_size, 0)
-            as_hit_tokens = as_match_count * self.page_size
+        if remote_len and len(remote_len) == 1 and remote_len[0] > 0:
+            as_hit_tokens = (
+                (remote_len[0] - local_hit_len) // self.page_size
+            ) * self.page_size
             if as_hit_tokens <= 0:
-                recorder = self._get_as_trace(req)
-                if recorder is not None:
-                    recorder.record(
-                        "AS_MATCH",
-                        raw_match_blocks=as_match_count,
-                        final_match_blocks=0,
-                        start_block=start_block,
-                        hash_ids=recorder.hash_ids(as_block_hashs),
-                        status="miss",
-                    )
                 return None
         else:
             # Each TP rank queries AS independently
@@ -984,7 +938,6 @@ class AsRadixCache(RadixCache):
                 )
             except Exception as e:
                 logger.warning(f"AS match failed: {e}")
-                match_error = str(e)
                 as_match_count = 0
 
             # TP sync: all_reduce(MIN) so all ranks agree on the same match count
@@ -998,17 +951,6 @@ class AsRadixCache(RadixCache):
                 as_match_count = int(match_tensor.item())
 
             if as_match_count < AS_MIN_MATCH_BLOCKS:
-                recorder = self._get_as_trace(req)
-                if recorder is not None:
-                    recorder.record(
-                        "AS_MATCH",
-                        raw_match_blocks=as_match_count,
-                        final_match_blocks=0,
-                        start_block=start_block,
-                        hash_ids=recorder.hash_ids(as_block_hashs),
-                        status="error" if match_error else "miss",
-                        error=match_error,
-                    )
                 return None
 
             as_hit_tokens = as_match_count * self.page_size
@@ -1017,65 +959,17 @@ class AsRadixCache(RadixCache):
         if self.is_eagle:
             as_hit_tokens -= self.page_size
             if as_hit_tokens <= 0:
-                recorder = self._get_as_trace(req)
-                if recorder is not None:
-                    recorder.record(
-                        "AS_MATCH",
-                        raw_match_blocks=as_match_count,
-                        final_match_blocks=0,
-                        start_block=start_block,
-                        hash_ids=recorder.hash_ids(as_block_hashs),
-                        status="miss",
-                    )
                 return None
 
         # Cap AS hit so that at least 1 token remains for extend forward pass.
-        # ``Req.fill_ids`` was renamed and split upstream: the complete current
-        # sequence is now ``full_untruncated_fill_ids`` while ``fill_len`` and
-        # ``get_fill_ids()`` can describe only the current extend range. Use the
-        # complete sequence here because this cap mirrors the old
-        # ``len(req.fill_ids)`` behavior. Keep the legacy fallback for mixed
-        # deployments, and skip the AS hit rather than crash if neither API is
-        # available.
-        full_input_ids = getattr(req, "full_untruncated_fill_ids", None)
-        if full_input_ids is None:
-            full_input_ids = getattr(req, "fill_ids", None)
-        if full_input_ids is None:
-            logger.warning(
-                "AS match skipped for req:%s: request has no full input "
-                "token sequence",
-                req.rid,
-            )
-            return None
-
-        full_input_len = len(full_input_ids)
+        # Without this, local_hit + AS_hit could cover all fill_ids, making
+        # extend_input_len=0 and causing an empty-tensor crash in model forward.
         max_as_tokens = (
-            (full_input_len - local_hit_len - 1) // self.page_size * self.page_size
+            (len(req.fill_ids) - local_hit_len - 1) // self.page_size * self.page_size
         )
         if max_as_tokens <= 0:
-            recorder = self._get_as_trace(req)
-            if recorder is not None:
-                recorder.record(
-                    "AS_MATCH",
-                    raw_match_blocks=as_match_count,
-                    final_match_blocks=0,
-                    start_block=start_block,
-                    hash_ids=recorder.hash_ids(as_block_hashs),
-                    status="miss",
-                )
             return None
         as_hit_tokens = min(as_hit_tokens, max_as_tokens)
-
-        recorder = self._get_as_trace(req)
-        if recorder is not None:
-            recorder.record(
-                "AS_MATCH",
-                raw_match_blocks=as_match_count,
-                final_match_blocks=as_hit_tokens // self.page_size,
-                start_block=start_block,
-                hash_ids=recorder.hash_ids(as_block_hashs),
-                status="hit",
-            )
 
         # Store load info on the last_device_node for init_load_back to use
         last_node = local_result.last_device_node
@@ -1084,7 +978,6 @@ class AsRadixCache(RadixCache):
             "start_block": start_block,
             "as_hit_tokens": as_hit_tokens,
             "as_block_hashs": as_block_hashs,
-            "req": req,
             "remote_addrs": remote_addrs,
             "remote_len": remote_len,
         }
@@ -2005,19 +1898,6 @@ class AsRadixCache(RadixCache):
         page_ids_cpu = torch.tensor(
             _materialize_data_id_list(), dtype=torch.int64, device="cpu"
         ).contiguous()
-        req = load_info.get("req")
-        recorder = self._get_as_trace(req)
-        if recorder is not None:
-            page_ids = page_ids_cpu.tolist()
-            recorder.record(
-                "AS_READ",
-                hash_ids=recorder.hash_ids(as_block_hashs),
-                data_id_list=page_ids,
-                actual_blocks=len(page_ids),
-                start_transfer_block_index=start_block,
-                md5_after_read=recorder.collect_page_md5(page_ids),
-                status="ok",
-            )
         return _AsLoadResult(
             indices=alloc_indices,
             page_ids_cpu=page_ids_cpu,
@@ -2069,11 +1949,6 @@ class AsRadixCache(RadixCache):
         """
         try:
             t0 = time.perf_counter()
-            md5_before_write = (
-                task.trace_recorder.collect_page_md5(task.data_id_list, write=True)
-                if task.trace_recorder is not None
-                else None
-            )
             w_res = self.ascli.write(
                 layer_ids=task.layer_ids,
                 tokens=task.as_block_hashs,
@@ -2092,27 +1967,9 @@ class AsRadixCache(RadixCache):
                 f"pages num={task.num_pages}, result={w_res}, "
                 f"cost={(t1 - t0) * 1000:.2f}ms"
             )
-            if task.trace_recorder is not None:
-                task.trace_recorder.record(
-                    "AS_WRITE",
-                    hash_ids=task.trace_recorder.hash_ids(task.as_block_hashs),
-                    data_id_list=task.data_id_list,
-                    start_transfer_block_index=0,
-                    md5_before_write=md5_before_write,
-                    status="ok",
-                )
             return w_res
         except Exception as e:
             logger.warning(f"AS write failed: {e}")
-            if task.trace_recorder is not None:
-                task.trace_recorder.record(
-                    "AS_WRITE",
-                    hash_ids=task.trace_recorder.hash_ids(task.as_block_hashs),
-                    data_id_list=task.data_id_list,
-                    start_transfer_block_index=0,
-                    status="error",
-                    error=str(e),
-                )
             return 0
 
     def _write_kv_on_finish(self, req, snapshot: Optional[torch.Tensor] = None):
@@ -2194,7 +2051,6 @@ class AsRadixCache(RadixCache):
                 write_params=write_params,
                 submit_time=time.perf_counter(),
                 num_pages=num_pages,
-                trace_recorder=self._get_as_trace(req),
             )
 
             # Lock the node before submitting write task

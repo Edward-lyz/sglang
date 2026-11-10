@@ -110,6 +110,10 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     def get_seqlens_expanded(self) -> torch.Tensor:
         return self.attn_metadata.dsa_seqlens_expanded
 
+    def get_cu_seqlens_k(self) -> torch.Tensor:
+        """Return cumulative key sequence lengths for the DSA indexer."""
+        return self.attn_metadata.cu_seqlens_k
+
     def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.attn_metadata.indexer_k_start_end
 
@@ -134,10 +138,17 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         ke_offset: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
+        cu_seqlens_q_override: Optional[torch.Tensor] = None,
+        page_table_1_override: Optional[torch.Tensor] = None,
+        real_page_table_override: Optional[torch.Tensor] = None,
+        topk_v2_plan_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if topk_indices_offset_override is not None:
             cu_topk_indices_offset = topk_indices_offset_override
             cu_seqlens_q_topk = None
+        elif cu_seqlens_q_override is not None:
+            cu_seqlens_q_topk = cu_seqlens_q_override
+            cu_topk_indices_offset = cu_seqlens_q_override[:-1]
         elif cu_seqlens_q is not None:
             cu_seqlens_q = cu_seqlens_q.to(torch.int32)
             cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
@@ -165,4 +176,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             row_starts=ks,
             batch_idx_list=batch_idx_list,
             force_unfused_topk=self.force_unfused_topk,
+            page_table_1_override=page_table_1_override,
+            real_page_table_override=real_page_table_override,
+            topk_v2_plan_override=topk_v2_plan_override,
         )

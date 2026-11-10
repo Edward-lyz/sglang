@@ -23,16 +23,33 @@ Usage:
 
 import contextvars
 import functools
+import hashlib
+import inspect
+import linecache
 import logging
+import os
 import pkgutil
 import sys
+import tempfile
+import textwrap
 import types
+import __future__ as _future_mod
 from collections import defaultdict
 from collections.abc import Callable
 from enum import Enum
 from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
+
+
+# Bitmask of all `__future__` compiler flags. Used by statement hooks to
+# inherit features like `from __future__ import annotations` (PEP 563) when
+# recompiling a patched function body, so that annotations referencing
+# names only available under TYPE_CHECKING (e.g. `Scheduler`) remain
+# strings instead of being eagerly evaluated.
+_ALL_FUTURE_FLAGS = 0
+for _name in _future_mod.all_feature_names:
+    _ALL_FUTURE_FLAGS |= getattr(_future_mod, _name).compiler_flag
 
 
 class HookSource(NamedTuple):
@@ -63,7 +80,16 @@ class HookType(Enum):
     BEFORE = "before"  # Execute before original; can modify args
     AFTER = "after"  # Execute after original; can modify return value
     AROUND = "around"  # Wrap original; full control over execution
-    REPLACE = "replace"  # Replace the original function or class entirely
+    REPLACE = "replace"  # Replace the original function, class, or statement
+
+
+class ReplaceHook(NamedTuple):
+    """Describes a REPLACE hook target — either whole-function or statement-level."""
+
+    hook: Callable | None  # The replacement callable (None for statement replace)
+    anchor: str | None  # If set, statement-level replace
+    code: str | None  # Replacement source code (for statement replace)
+    occurrence: int  # Which occurrence of anchor to replace (0-based)
 
 
 class HookRegistry:
@@ -75,18 +101,21 @@ class HookRegistry:
     engine starts serving requests.
     """
 
-    _hooks: dict[str, list[tuple[HookType, Callable, HookSource | None]]] = defaultdict(
-        list
-    )
+    _hooks: dict[
+        str, list[tuple[HookType, Callable | ReplaceHook, HookSource | None]]
+    ] = defaultdict(list)
     _patched: set[str] = set()
 
     @classmethod
     def register(
         cls,
         target: str,
-        hook: Callable,
+        hook: Callable | None = None,
         hook_type: HookType = HookType.AFTER,
         *,
+        anchor: str | None = None,
+        code: str | None = None,
+        occurrence: int = 0,
         source: HookSource | None = None,
     ):
         """
@@ -97,17 +126,22 @@ class HookRegistry:
                     e.g. "sglang.srt.managers.scheduler.Scheduler.schedule"
                     or   "sglang.srt.managers.scheduler.Scheduler" (class)
             hook: The hook callable (function or class). Signature depends on hook_type:
-                - BEFORE:  fn(*args, **kwargs) -> (args, kwargs) or None
-                - AFTER:   fn(result, *args, **kwargs) -> new_result or None
-                - AROUND:  fn(original_fn, *args, **kwargs) -> result
-                - REPLACE: fn(*args, **kwargs) -> result   (function replacement)
-                           MyClass                         (class replacement)
+                - BEFORE:    fn(*args, **kwargs) -> (args, kwargs) or None
+                - AFTER:     fn(result, *args, **kwargs) -> new_result or None
+                - AROUND:    fn(original_fn, *args, **kwargs) -> result
+                - REPLACE:   fn(*args, **kwargs) -> result   (function replacement)
+                             MyClass                         (class replacement)
+                For statement-level REPLACE (anchor is set), hook can be None.
             hook_type: Type of hook (default: AFTER).
+            anchor: For statement-level REPLACE — the source text to locate.
+            code: For statement-level REPLACE — the replacement source code.
+            occurrence: Zero-based match index when anchor appears multiple times.
             source: Optional source info. If None, auto-read from context var
                 set by ``load_plugins()``.
 
         Raises:
             TypeError: If a class is passed with a hook_type other than REPLACE.
+            ValueError: If anchor is set but code is empty.
         """
         if isinstance(hook, type) and hook_type != HookType.REPLACE:
             raise TypeError(
@@ -116,10 +150,35 @@ class HookRegistry:
                 f"Use a function for BEFORE/AFTER/AROUND hooks."
             )
         resolved_source = source or _current_plugin_source.get()
-        # Warn on duplicate REPLACE for the same target
+
+        # Statement-level REPLACE (anchor-based)
+        if anchor is not None:
+            if hook_type != HookType.REPLACE:
+                raise ValueError(
+                    f"anchor parameter requires HookType.REPLACE, got {hook_type.name}"
+                )
+            if occurrence < 0:
+                raise ValueError("Statement hook occurrence must be non-negative")
+            if not code or not code.strip():
+                raise ValueError("Statement hook replacement code cannot be empty")
+            replace_hook = ReplaceHook(
+                hook=None, anchor=anchor, code=code, occurrence=occurrence
+            )
+            cls._hooks[target].append((HookType.REPLACE, replace_hook, resolved_source))
+            logger.debug(
+                "Registered statement REPLACE on %s anchor occurrence %d [%s]",
+                target,
+                occurrence,
+                _format_source(resolved_source),
+            )
+            return
+
+        # Warn on duplicate whole-function REPLACE for the same target
         if hook_type == HookType.REPLACE:
             existing_replace = [
-                (h, src) for ht, h, src in cls._hooks[target] if ht == HookType.REPLACE
+                (h, src)
+                for ht, h, src in cls._hooks[target]
+                if ht == HookType.REPLACE and not isinstance(h, ReplaceHook)
             ]
             if existing_replace:
                 prev, prev_src = existing_replace[-1]
@@ -266,18 +325,30 @@ class HookRegistry:
             )
 
         # Build the wrapper chain.
-        # Sort: REPLACE hooks first (stable sort preserves registration order
-        # within the same type). This ensures AROUND/BEFORE/AFTER always wrap
-        # the replaced function, regardless of registration order.
-        sorted_hooks = sorted(
-            hooks, key=lambda h: (0 if h[0] == HookType.REPLACE else 1)
-        )
+        # Sort: REPLACE hooks first (whole-function, then statement-level), then wrappers
+        # (stable sort preserves registration order within the same type).
+        # This ensures wrappers observe the source-injected implementation.
+        def _hook_sort_key(h):
+            ht, hook_obj, _ = h
+            if ht == HookType.REPLACE:
+                if isinstance(hook_obj, ReplaceHook) and hook_obj.anchor:
+                    return 1  # statement-level REPLACE after whole-function REPLACE
+                return 0  # whole-function/class REPLACE first
+            return 2  # BEFORE/AFTER/AROUND last
+
+        sorted_hooks = sorted(hooks, key=_hook_sort_key)
         wrapped = original
         for hook_type, hook, _src in sorted_hooks:
-            if isinstance(hook, type) and hook_type == HookType.REPLACE:
-                # Class replacement: direct substitution to preserve type identity.
-                # This keeps isinstance(), issubclass(), and inheritance working.
-                wrapped = hook
+            if hook_type == HookType.REPLACE:
+                if isinstance(hook, ReplaceHook) and hook.anchor:
+                    # Statement-level REPLACE
+                    wrapped = _wrap_statement(wrapped, hook)
+                elif isinstance(hook, type):
+                    # Class replacement
+                    wrapped = hook
+                else:
+                    # Whole-function REPLACE
+                    wrapped = _wrap_fn(wrapped, hook, hook_type)
             else:
                 wrapped = _wrap_fn(wrapped, hook, hook_type)
 
@@ -317,6 +388,191 @@ class HookRegistry:
         """Reset all hooks and patches. Primarily for testing."""
         cls._hooks.clear()
         cls._patched.clear()
+
+
+def _get_function_body_source(fn: Callable) -> str:
+    """Return a decorated function's body source for statement injection."""
+    source = textwrap.dedent(inspect.getsource(fn))
+    lines = source.splitlines()
+    def_index = next(
+        (index for index, line in enumerate(lines) if line.lstrip().startswith("def ")),
+        None,
+    )
+    if def_index is None:
+        raise ValueError(f"Cannot find function body for statement hook {fn!r}")
+    body = "\n".join(lines[def_index + 1 :])
+    return textwrap.dedent(body).strip("\n")
+
+
+# Flow-control placeholders that allow writing continue/break/return in
+# decorator-style statement hooks without triggering SyntaxError at compile time.
+_FLOW_PLACEHOLDERS = {
+    "__CONTINUE__": "continue",
+    "__BREAK__": "break",
+}
+
+
+def _replace_flow_placeholders(code: str) -> str:
+    """Replace flow-control placeholders with real statements."""
+    for placeholder, replacement in _FLOW_PLACEHOLDERS.items():
+        code = code.replace(placeholder, replacement)
+    return code
+
+
+def _indent_source(code: str, indent: str) -> list[str]:
+    """Indent each line of code with the given prefix, return as list of lines."""
+    dedented = textwrap.dedent(code).strip("\n")
+    return [indent + line if line.strip() else line for line in dedented.splitlines()]
+
+
+# Statement-hook recompiled sources are materialized here so that runtime
+# exceptions carry a real filename + correct line numbers (and tracebacks can
+# render the *actual executed* source instead of the upstream file's mismatched
+# lines).
+_HOOK_SOURCE_DIR = os.path.join(tempfile.gettempdir(), "sglang_statement_hooks")
+
+
+def _materialize_hook_source(qualname: str, source: str) -> str:
+    """Write the combined (anchor + injected) source to a temp file and register it
+    with ``linecache``, returning the filename to use as the code object's
+    ``co_filename``.
+
+    Why: statement hooks recompile a patched function body via ``compile()``. If we
+    keep the upstream file as ``co_filename`` (the old behavior), a runtime error
+    inside the injected code points at the wrong lines of the real file and the
+    traceback shows misleading source. Compiling against a real on-disk file makes
+    tracebacks/pdb/py-spy show the exact executed code at the right line.
+
+    Falls back to a synthetic ``<statement-hook:...>`` name if the file cannot be
+    written (e.g. read-only fs); linecache registration still enables source
+    rendering in that case.
+    """
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in qualname) or "hook"
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:8]
+    filename = os.path.join(_HOOK_SOURCE_DIR, f"{safe}.{digest}.py")
+    try:
+        os.makedirs(_HOOK_SOURCE_DIR, exist_ok=True)
+        if not os.path.exists(filename):
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(source)
+    except OSError:
+        filename = f"<statement-hook:{safe}>"
+    # Register with linecache so traceback/inspect can render the source even if the
+    # file is missing or outside sys.path. (size, mtime=None, lines, fullname)
+    linecache.cache[filename] = (
+        len(source),
+        None,
+        source.splitlines(keepends=True),
+        filename,
+    )
+    return filename
+
+
+def _wrap_statement(original_fn: Callable, hook: ReplaceHook) -> Callable:
+    """Wrap source code around a stable statement anchor."""
+    # If original_fn was itself produced by a prior STATEMENT hook on the same
+    # target, reuse its stashed (already-patched) source and the upstream
+    # real_fn it was compiled against. This lets multiple STATEMENT hooks
+    # compose, instead of inspect.unwrap() walking back to the upstream
+    # source and clobbering earlier hook modifications.
+    prior_source = getattr(original_fn, "__statement_hook_source__", None)
+    prior_real_fn = getattr(original_fn, "__statement_hook_real_fn__", None)
+    if prior_source is not None and prior_real_fn is not None:
+        real_fn = prior_real_fn
+        source = prior_source
+    else:
+        # Unwrap decorators (e.g. @torch.no_grad()) so we operate on the real
+        # user-defined function: its __globals__, __code__.co_flags (for future
+        # flags such as `from __future__ import annotations`), and source file.
+        real_fn = inspect.unwrap(original_fn)
+        try:
+            source = inspect.getsource(real_fn)
+        except (OSError, TypeError) as exc:
+            raise ValueError(
+                f"Cannot inspect source for statement hook target {original_fn!r}"
+            ) from exc
+
+    lines = textwrap.dedent(source).splitlines()
+    anchor = textwrap.dedent(hook.anchor).strip()
+    if not anchor:
+        raise ValueError("Statement hook anchor cannot be empty")
+
+    anchor_lines = textwrap.dedent(hook.anchor).strip("\n").splitlines()
+    anchor_lines = [line.rstrip() for line in anchor_lines]
+    matches = _find_statement_anchor_matches(lines, anchor_lines)
+    if hook.occurrence >= len(matches):
+        raise ValueError(
+            f"Statement hook anchor occurrence {hook.occurrence} is out of range "
+            f"in {real_fn.__qualname__}; found {len(matches)} matches: {anchor!r}"
+        )
+
+    match_index = matches[hook.occurrence]
+    anchor_line = lines[match_index]
+    anchor_indent = anchor_line[: len(anchor_line) - len(anchor_line.lstrip())]
+    replacement_lines = _indent_source(
+        _replace_flow_placeholders(hook.code), anchor_indent
+    )
+    patched_lines = (
+        lines[:match_index]
+        + replacement_lines
+        + lines[match_index + len(anchor_lines) :]
+    )
+    patched_source = "\n".join(patched_lines) + "\n"
+
+    global_ns = real_fn.__globals__
+    local_ns: dict[str, object] = {}
+    # Inherit future flags (e.g. PEP 563 `annotations`) from the real function
+    # so type annotations remain strings rather than being eagerly evaluated.
+    future_flags = real_fn.__code__.co_flags & _ALL_FUTURE_FLAGS
+    # Materialize the patched source to a real file so runtime errors from the
+    # injected code produce a precise, readable traceback (filename + line + source)
+    # instead of pointing at mismatched lines in the upstream file.
+    hook_filename = _materialize_hook_source(real_fn.__qualname__, patched_source)
+    exec(
+        compile(
+            patched_source,
+            hook_filename,
+            "exec",
+            flags=future_flags,
+            dont_inherit=True,
+        ),
+        global_ns,
+        local_ns,
+    )
+    replacement = local_ns.get(real_fn.__name__)
+    if not callable(replacement):
+        raise ValueError(
+            f"Statement hook did not recreate callable {real_fn.__qualname__}"
+        )
+
+    functools.update_wrapper(replacement, original_fn)
+    replacement.__wrapped__ = original_fn
+    # Stash the patched source and the underlying real_fn so a subsequent
+    # STATEMENT hook on the same target can compose against this version
+    # instead of inspect.unwrap()-ing back to the upstream original.
+    replacement.__statement_hook_source__ = patched_source
+    replacement.__statement_hook_real_fn__ = real_fn
+    return replacement
+
+
+def _find_statement_anchor_matches(lines: list[str], anchor_lines: list[str]) -> list[int]:
+    """Find zero-based line indices whose dedented block matches anchor_lines."""
+    matches: list[int] = []
+    if not anchor_lines:
+        return matches
+    anchor_len = len(anchor_lines)
+    for index in range(0, len(lines) - anchor_len + 1):
+        block = lines[index : index + anchor_len]
+        block_indent = block[0][: len(block[0]) - len(block[0].lstrip())]
+        normalized_block = [
+            line[len(block_indent) :].rstrip()
+            if line.startswith(block_indent)
+            else line.rstrip()
+            for line in block
+        ]
+        if normalized_block == anchor_lines:
+            matches.append(index)
+    return matches
 
 
 def _propagate_patch(original: object, wrapped: object, source_module: object) -> int:
@@ -399,8 +655,11 @@ def _wrap_fn(original_fn: Callable, hook: Callable, hook_type: HookType) -> Call
 def plugin_hook(
     target: str,
     type: HookType = HookType.AFTER,
+    *,
+    anchor: str | None = None,
+    occurrence: int = 0,
 ) -> Callable:
-    """Decorator that registers a function or class as a hook on *target*.
+    """Decorator that registers a function/class hook, or statement replacement.
 
     Usage::
 
@@ -413,6 +672,14 @@ def plugin_hook(
             print(f"Elapsed: {time.perf_counter() - start:.3f}s")
             return result
 
+        # Statement-level REPLACE (anchor-based)
+        @plugin_hook("sglang.srt.managers.scheduler.Scheduler.schedule",
+                      anchor="result = self.forward_batch(...)")
+        def wrap_forward():
+            print("before forward")
+            result = self.forward_batch(...)
+            print("after forward")
+
         # Class replacement (REPLACE)
         @plugin_hook("sglang.srt.managers.scheduler.Scheduler",
                       type=HookType.REPLACE)
@@ -424,7 +691,16 @@ def plugin_hook(
     """
 
     def decorator(hook: Callable) -> Callable:
-        HookRegistry.register(target, hook, type)
+        if anchor is None:
+            HookRegistry.register(target, hook, type)
+        else:
+            HookRegistry.register(
+                target,
+                hook_type=HookType.REPLACE,
+                anchor=anchor,
+                code=_get_function_body_source(hook),
+                occurrence=occurrence,
+            )
         return hook
 
     return decorator

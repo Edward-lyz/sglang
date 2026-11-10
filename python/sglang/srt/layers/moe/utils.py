@@ -95,6 +95,7 @@ class MoeRunnerBackend(Enum):
 
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
+    DEEP_GEMM_MXFP4 = "deep_gemm_mxfp4"
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
     ASCEND = "ascend"
@@ -119,6 +120,10 @@ class MoeRunnerBackend(Enum):
 
     def is_deep_gemm(self):
         return self == MoeRunnerBackend.DEEP_GEMM
+
+    def is_deepgemm_mxfp4(self):
+        """Return whether the DeepGEMM MXFP4 backend is selected."""
+        return self == MoeRunnerBackend.DEEP_GEMM_MXFP4
 
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON

@@ -1079,7 +1079,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_deep_gemm():
+        if (
+            moe_runner_backend.is_deep_gemm()
+            or moe_runner_backend.is_deepgemm_mxfp4()
+        ):
             return True
         if moe_runner_backend.is_auto():
             return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (

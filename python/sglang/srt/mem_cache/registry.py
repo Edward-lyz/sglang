@@ -94,6 +94,19 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         return SWAChunkCache(params)
 
+    if server_args.enable_asradix_cache and (
+        envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get()
+        or envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
+        or use_mlx()
+        or ctx.is_hybrid_swa
+        or ctx.is_hybrid_ssm
+    ):
+        raise ValueError(
+            "AttentionStore cache is not compatible with the C++/unified radix "
+            "tree or hybrid SWA/SSM cache. Disable those modes before enabling "
+            "--enable-asradix-cache."
+        )
+
     if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
         # lazy import to avoid JIT overhead
         from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
@@ -113,6 +126,11 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
     if ctx.is_hybrid_ssm:
         return _create_unified_radix_cache(ctx, server_args, params)
+
+    if server_args.enable_asradix_cache:
+        from sglang.srt.mem_cache.asradix_cache import AsRadixCache
+
+        return AsRadixCache(params=params, server_args=server_args, tp_rank=ctx.tp_rank)
 
     if ctx.enable_hierarchical_cache:
         if ctx.is_hybrid_ssm or ctx.is_hybrid_swa or ctx.is_dsa:

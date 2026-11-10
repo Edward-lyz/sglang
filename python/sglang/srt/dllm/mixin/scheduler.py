@@ -103,6 +103,7 @@ class SchedulerDllmMixin:
                     req.update_finish_state(new_accepted_len=new_tokens)
 
                     if req.finished():
+                        self.batch_result_processor._fire_pending_trace(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     continue
@@ -144,6 +145,7 @@ class SchedulerDllmMixin:
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
 
                 if req.finished():
+                    self.batch_result_processor._fire_pending_trace(req)
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
 

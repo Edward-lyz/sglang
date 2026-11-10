@@ -45,7 +45,37 @@ if ENABLE_JIT_DEEPGEMM:
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
 
+def grouped_gemm_nt_f8f4bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
+    disable_ue8m0_cast: bool = False,
+    workspace: Optional[torch.Tensor] = None,
+):
+    """
+    grouped_gemm_nt_f8f4bf16_masked function performs grouped GEMM operation with mixed precision
+    using fp8 and fp4bf16 data types with masking support.
+    """
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+    return deep_gemm.m_grouped_fp8fp4_gemm_nt_masked(
+        lhs,
+        rhs,
+        out,
+        masked_m,
+        expected_m,
+        disable_ue8m0_cast=disable_ue8m0_cast,
+        workspace=workspace,
+    )
+
+
 # TODO maybe rename these functions
+
+
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -57,6 +87,10 @@ def grouped_gemm_nt_f8f8bf16_masked(
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
 ):
+    """
+    grouped_gemm_nt_f8f8bf16_masked function performs grouped GEMM operation with fp8 data types
+    and bf16 accumulation with masking support.
+    """
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
@@ -139,6 +173,10 @@ def grouped_gemm_nt_f8f8bf16_contig(
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
 ):
+    """
+    grouped_gemm_nt_f8f8bf16_contig function performs grouped GEMM operation with contiguous
+    memory layout using fp8 data types and bf16 accumulation.
+    """
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
@@ -172,6 +210,10 @@ def grouped_gemm_nt_bf16_contig(
         deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
 
 
+"""
+gemm_nt_f8f8bf16 function performs standard GEMM operation using fp8 data types
+and bf16 accumulation.
+"""
 def gemm_nt_f8f8bf16(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],

@@ -336,6 +336,116 @@ class TestCrossTargetConflict(_HookTestCase):
 
 
 # ===========================================================================
+# TestStatementReplace
+# ===========================================================================
+
+
+class TestStatementReplace(_HookTestCase):
+    """Statement-level REPLACE hooks anchored to stable lines."""
+
+    def test_statement_replace_after_anchor(self):
+        def orig(x):
+            y = x * 2
+            return y
+
+        mod, name = _make_module(orig=orig)
+        HookRegistry.register(
+            f"{name}.orig",
+            hook_type=HookType.REPLACE,
+            anchor="y = x * 2",
+            code="y = x * 2\ny += 3",
+        )
+        HookRegistry.apply_hooks()
+        self.assertEqual(mod.orig(4), 11)
+
+    def test_statement_replace_before_anchor(self):
+        def orig(x):
+            return x
+
+        mod, name = _make_module(orig=orig)
+        HookRegistry.register(
+            f"{name}.orig",
+            hook_type=HookType.REPLACE,
+            anchor="return x",
+            code="x += 5\nreturn x",
+        )
+        HookRegistry.apply_hooks()
+        self.assertEqual(mod.orig(4), 9)
+
+    def test_statement_replace_decorator_uses_function_body(self):
+        def orig(x):
+            y = x
+            return y
+
+        mod, name = _make_module(orig=orig)
+
+        @plugin_hook(f"{name}.orig", anchor="y = x")
+        def wrap_y_assignment():
+            y = x  # pylint: disable=undefined-variable
+            y *= 10
+
+        HookRegistry.apply_hooks()
+        self.assertEqual(mod.orig(4), 40)
+
+    def test_statement_replace_occurrence_selects_duplicate_anchor(self):
+        def orig(x):
+            x += 1
+            x += 1
+            return x
+
+        mod, name = _make_module(orig=orig)
+        HookRegistry.register(
+            f"{name}.orig",
+            hook_type=HookType.REPLACE,
+            anchor="x += 1",
+            code="x += 1\nx += 10",
+            occurrence=1,
+        )
+
+        HookRegistry.apply_hooks()
+        self.assertEqual(mod.orig(1), 13)
+
+    def test_statement_replace_wraps_anchor_with_if_else(self):
+        def orig(x, enabled):
+            x += 1
+            return x
+
+        mod, name = _make_module(orig=orig)
+        HookRegistry.register(
+            f"{name}.orig",
+            hook_type=HookType.REPLACE,
+            anchor="x += 1",
+            code="if enabled:\n    x += 1\nelse:\n    x += 10",
+        )
+
+
+
+        HookRegistry.apply_hooks()
+        self.assertEqual(mod.orig(1, True), 2)
+        self.assertEqual(mod.orig(1, False), 11)
+
+    def test_statement_replace_occurrence_out_of_range(self):
+        def orig(x):
+            x += 1
+            return x
+
+        mod, name = _make_module(orig=orig)
+        HookRegistry.register(
+            f"{name}.orig",
+            hook_type=HookType.REPLACE,
+            anchor="x += 1",
+            code="x += 1\nx += 10",
+            occurrence=1,
+        )
+
+        with self.assertLogs("sglang.srt.plugins.hook_registry", level="ERROR") as cm:
+            HookRegistry.apply_hooks()
+
+        self.assertTrue(any("out of range" in msg for msg in cm.output))
+        self.assertEqual(mod.orig(1), 2)
+
+
+# ===========================================================================
 # TestPatchPropagation
 # ===========================================================================
 

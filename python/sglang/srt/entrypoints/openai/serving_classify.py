@@ -131,6 +131,7 @@ class OpenAIServingClassify(OpenAIServingBase):
         adapted_request: EmbeddingReqInput,
         request: ClassifyRequest,
         raw_request: Request,
+        tokenizer_rev_request_time=None,
     ) -> Union[ClassifyResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming classification request."""
         # Generate request ID

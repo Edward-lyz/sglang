@@ -126,10 +126,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
-    def __init__(self):
+    def __init__(self, moe_quant_method: Optional[str] = None):
         super().__init__()
         # mapping is updated by models as they initialize
         self.packed_modules_mapping: Dict[str, List[str]] = dict()
+        self.moe_quant_method = moe_quant_method
 
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping = mapping

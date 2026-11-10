@@ -31,6 +31,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -62,6 +63,9 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     materialize_bpreshuffle_fp8_scale_tuple,
+)
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    sglang_rmsnorm_per_token_group_quant_fp8,
 )
 from sglang.srt.layers.utils.cp_utils import (
     is_mla_prefill_cp_enabled,
@@ -157,6 +161,27 @@ def _fused_rmsnorm_fp8_per_token_quant(
         return (out_fp8, scale.unsqueeze(1))
 
 
+def _can_use_jit_rmsnorm_quant(
+    hidden_states: torch.Tensor,
+    layernorm: torch.nn.Module,
+    residual: Optional[torch.Tensor] = None,
+) -> bool:
+    return (
+        deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and layernorm.weight.dtype == torch.bfloat16
+        and hidden_states.shape[-1] % 128 == 0
+        and (
+            residual is None
+            or (
+                residual.shape == hidden_states.shape
+                and residual.dtype == torch.bfloat16
+            )
+        )
+    )
+
+
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
 # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
@@ -224,8 +249,10 @@ class AttentionInputs:
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         qkv_latent_func: Callable,
+        qkv_hidden_states=None,
     ):
         self.hidden_states_local = hidden_states
+        self.qkv_hidden_states_local = qkv_hidden_states
         self.forward_batch = forward_batch
         self.qkv_latent_func = qkv_latent_func
         self.hidden_states_ = None
@@ -241,9 +268,12 @@ class AttentionInputs:
         if self.qkv_latent_ is not None:
             return self.qkv_latent_
         assert self.qkv_latent_func is not None
-        self.qkv_latent_ = self.qkv_latent_func(
-            self.hidden_states_local, self.forward_batch
+        qkv_hidden_states = (
+            self.qkv_hidden_states_local
+            if self.qkv_hidden_states_local is not None
+            else self.hidden_states_local
         )
+        self.qkv_latent_ = self.qkv_latent_func(qkv_hidden_states, self.forward_batch)
         if get_attn_tp_context().input_scattered:
             self.qkv_latent_ = self.tp_all_gather_hidden_states(
                 self.qkv_latent_, self.forward_batch
@@ -567,6 +597,12 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        qkv_hidden_states = None
+        qkv_owner = getattr(self.qkv_latent_func, "__self__", None)
+        use_qkv_rmsnorm_quant_fusion = (
+            envs.SGLANG_OPT_USE_RMSNORM_QUANT_FUSED.get()
+            and getattr(qkv_owner, "use_rmsnorm_quant_fused_input", False)
+        )
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -666,6 +702,22 @@ class LayerCommunicator:
                             self.input_layernorm.variance_epsilon,
                         )
 
+                    elif use_qkv_rmsnorm_quant_fusion and _can_use_jit_rmsnorm_quant(
+                        hidden_states, self.input_layernorm
+                    ):
+                        hidden_states, hidden_states_fp8, hidden_states_scale = (
+                            sglang_rmsnorm_per_token_group_quant_fp8(
+                                hidden_states,
+                                self.input_layernorm.weight,
+                                group_size=128,
+                                eps=self.input_layernorm.variance_epsilon,
+                                column_major_scales=True,
+                                scale_tma_aligned=True,
+                                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                            )
+                        )
+                        qkv_hidden_states = (hidden_states_fp8, hidden_states_scale)
+
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
@@ -718,6 +770,23 @@ class LayerCommunicator:
                             self.input_layernorm.variance_epsilon,
                             residual=residual,
                         )
+
+                    elif use_qkv_rmsnorm_quant_fusion and _can_use_jit_rmsnorm_quant(
+                        hidden_states, self.input_layernorm, residual
+                    ):
+                        hidden_states, hidden_states_fp8, hidden_states_scale = (
+                            sglang_rmsnorm_per_token_group_quant_fp8(
+                                hidden_states,
+                                self.input_layernorm.weight,
+                                residual=residual,
+                                group_size=128,
+                                eps=self.input_layernorm.variance_epsilon,
+                                column_major_scales=True,
+                                scale_tma_aligned=True,
+                                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                            )
+                        )
+                        qkv_hidden_states = (hidden_states_fp8, hidden_states_scale)
                     else:
                         hidden_states, residual = self.input_layernorm(
                             hidden_states,
@@ -732,7 +801,10 @@ class LayerCommunicator:
         )
         if self.qkv_latent_func is not None:
             attn_inputs = AttentionInputs(
-                hidden_states, forward_batch, self.qkv_latent_func
+                hidden_states,
+                forward_batch,
+                self.qkv_latent_func,
+                qkv_hidden_states=qkv_hidden_states,
             )
             get_attn_tp_context().set_attn_inputs(attn_inputs)
         return hidden_states, residual
@@ -762,17 +834,32 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        enable_shared_expert_rmsnorm_quant: bool = False,
     ):
         if cache is not None:
             self._context.cache = cache
 
-        return self._communicate_with_all_reduce_and_layer_norm_fn(
+        self._context.enable_shared_expert_rmsnorm_quant = (
+            enable_shared_expert_rmsnorm_quant
+        )
+        self._context.shared_expert_quant_input = None
+        hidden_states, residual = self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
         )
+        if (
+            self._context.shared_expert_quant_input is not None
+            and self._context.shared_expert_quant_input[0].shape == hidden_states.shape
+        ):
+            hidden_states._sglang_shared_expert_quant_input = (
+                self._context.shared_expert_quant_input
+            )
+        self._context.enable_shared_expert_rmsnorm_quant = False
+        self._context.shared_expert_quant_input = None
+        return hidden_states, residual
 
     def postprocess_layer(
         self,
@@ -866,6 +953,8 @@ class CommunicateContext:
     cache = None
     tp_rank: int
     force_layernorm_before_dp_gather: bool = False
+    enable_shared_expert_rmsnorm_quant: bool = False
+    shared_expert_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -967,6 +1056,38 @@ class CommunicateSimpleFn:
         return hidden_states
 
 
+def _rmsnorm_with_optional_shared_expert_quant(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    layernorm: torch.nn.Module,
+    context: "CommunicateContext",
+):
+    if (
+        context.enable_shared_expert_rmsnorm_quant
+        and envs.SGLANG_OPT_USE_RMSNORM_QUANT_FUSED.get()
+        and hidden_states.shape[0] != 0
+        and _can_use_jit_rmsnorm_quant(hidden_states, layernorm, residual)
+    ):
+        hidden_states, hidden_states_fp8, hidden_states_scale = (
+            sglang_rmsnorm_per_token_group_quant_fp8(
+                hidden_states,
+                layernorm.weight,
+                residual=residual,
+                group_size=128,
+                eps=layernorm.variance_epsilon,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+        )
+        context.shared_expert_quant_input = (hidden_states_fp8, hidden_states_scale)
+        return hidden_states, residual
+
+    if residual is None:
+        return layernorm(hidden_states), residual
+    return layernorm(hidden_states, residual)
+
+
 class CommunicateWithAllReduceAndLayerNormFn:
     """Besides communication, needs to
     1. All reduce in tp_attn_group on hidden_states
@@ -1061,7 +1182,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+            hidden_states, residual = _rmsnorm_with_optional_shared_expert_quant(
+                hidden_states, residual, layernorm, context
+            )
         return hidden_states, residual
 
     @staticmethod
@@ -1080,7 +1203,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
         """
         hidden_states = get_parallel().attn_tp_group.all_reduce(hidden_states)
         if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+            hidden_states, residual = _rmsnorm_with_optional_shared_expert_quant(
+                hidden_states, residual, layernorm, context
+            )
         return hidden_states, residual
 
     @staticmethod
@@ -1120,7 +1245,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
-                    hidden_states, residual = layernorm(hidden_states, residual)
+                    hidden_states, residual = _rmsnorm_with_optional_shared_expert_quant(
+                        hidden_states, residual, layernorm, context
+                    )
             elif context.attn_tp_rank == 0:
                 hidden_states += residual
 
@@ -1136,12 +1263,20 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)
                 if hidden_states.shape[0] != 0:
-                    hidden_states = layernorm(hidden_states)
+                    hidden_states, _ = _rmsnorm_with_optional_shared_expert_quant(
+                        hidden_states, None, layernorm, context
+                    )
         else:
             handled = False
             if (
+                not (
+                    context.enable_shared_expert_rmsnorm_quant
+                    and envs.SGLANG_OPT_USE_RMSNORM_QUANT_FUSED.get()
+                )
+                and (
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                )
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual, use_attn_tp_group=True
@@ -1163,7 +1298,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
-                hidden_states, residual = layernorm(hidden_states, residual)
+                hidden_states, residual = _rmsnorm_with_optional_shared_expert_quant(
+                    hidden_states, residual, layernorm, context
+                )
         return hidden_states, residual
 
     @staticmethod
@@ -1184,7 +1321,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+            hidden_states, residual = _rmsnorm_with_optional_shared_expert_quant(
+                hidden_states, residual, layernorm, context
+            )
         return hidden_states, residual
 
     @staticmethod
@@ -1200,7 +1339,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
         scattered_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
         scattered_states += residual
         residual = tensor_model_parallel_all_reduce(hidden_states)
-        hidden_states = layernorm(residual)
+        hidden_states, _ = _rmsnorm_with_optional_shared_expert_quant(
+            residual, None, layernorm, context
+        )
         return hidden_states, residual
 
     @staticmethod

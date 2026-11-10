@@ -101,9 +101,20 @@ def _get_mega_moe_symm_buffer(
 
 
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
+    keep_new_sf_only = envs.SGLANG_OPT_MEGA_MOE_KEEP_NEW_SF_ONLY.get()
     if not get_moe_a2a_backend().is_megamoe():
+        if keep_new_sf_only:
+            raise RuntimeError(
+                "SGLANG_OPT_MEGA_MOE_KEEP_NEW_SF_ONLY requires the MegaMoE "
+                "A2A backend; refusing to run a fallback that needs the original scales"
+            )
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
+        if keep_new_sf_only:
+            raise RuntimeError(
+                "MegaMoE-only scales were requested, but transformed MegaMoE "
+                "weights were not built"
+            )
         return False
     if _device_sm == 90:
         if not is_sm90_fp8_mega_moe_available(moe.experts):
@@ -117,6 +128,12 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    if keep_new_sf_only and max_tokens_per_rank > cap:
+        raise RuntimeError(
+            "SGLANG_OPT_MEGA_MOE_KEEP_NEW_SF_ONLY cannot fall back to the "
+            "normal DeepEP path because its scale buffers were released: "
+            f"{max_tokens_per_rank=} exceeds {cap=}"
+        )
     return max_tokens_per_rank <= cap
 
 
@@ -144,13 +161,33 @@ def forward_mega_moe(
         shared_output = moe._forward_shared_experts(hidden_states)
         mega_stream_ctx = nullcontext()
 
+    use_fused_tail = (
+        envs.SGLANG_OPT_MEGA_MOE_FUSED_TAIL.get()
+        and (shared_output is None or shared_output.is_contiguous())
+    )
+
     with mega_stream_ctx:
         y = _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            num_tokens,
+            defer_tail_scaling=use_fused_tail,
         )
 
     if sbo_overlap_flag:
         current_stream.wait_stream(moe.alt_stream)
+
+    if use_fused_tail:
+        from sglang.kernels.jit.glm5_moe import mega_moe_tail
+
+        routed_scaling_factor = (
+            1.0
+            if moe.experts.should_fuse_routed_scaling_factor_in_topk
+            else moe.routed_scaling_factor
+        )
+        return mega_moe_tail(y, shared_output, routed_scaling_factor)
 
     if shared_output is not None:
         y.add_(shared_output)
@@ -163,6 +200,7 @@ def _run_mega_routed(
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
+    defer_tail_scaling: bool = False,
 ) -> torch.Tensor:
     import deep_gemm
 
@@ -186,6 +224,8 @@ def _run_mega_routed(
             ),
             **topk_kwargs,
         )
+        if hasattr(topk_output, "to_standard"):
+            topk_output = topk_output.to_standard(layer_id=moe.layer_id)
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:
@@ -281,7 +321,7 @@ def _run_mega_routed(
     )
     y = y[:num_tokens]
 
-    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+    if not moe.experts.should_fuse_routed_scaling_factor_in_topk and not defer_tail_scaling:
         y.mul_(moe.routed_scaling_factor)
     return y
 
@@ -374,7 +414,28 @@ def build_mega_moe_experts_weights(experts) -> None:
 
         experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
         experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
+
+        if envs.SGLANG_OPT_MEGA_MOE_KEEP_NEW_SF_ONLY.get():
+            if not get_moe_a2a_backend().is_megamoe():
+                raise RuntimeError(
+                    "SGLANG_OPT_MEGA_MOE_KEEP_NEW_SF_ONLY requires the MegaMoE "
+                    "A2A backend"
+                )
+            for scale_param in (
+                experts.w13_weight_scale_inv,
+                experts.w2_weight_scale_inv,
+            ):
+                scale_param.data = torch.empty(
+                    0,
+                    dtype=scale_param.data.dtype,
+                    device=scale_param.data.device,
+                )
     else:
+        if envs.SGLANG_OPT_MEGA_MOE_KEEP_NEW_SF_ONLY.get():
+            raise RuntimeError(
+                "SGLANG_OPT_MEGA_MOE_KEEP_NEW_SF_ONLY requires "
+                "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1"
+            )
         l1_pair, l2_pair = transform_weights_for_mega_moe((w13, w13_sf), (w2, w2_sf))
 
         experts.mega_l1_weights = l1_pair

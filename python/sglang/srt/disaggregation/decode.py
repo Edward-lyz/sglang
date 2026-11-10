@@ -132,7 +132,6 @@ class DecodeReqToTokenPool:
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
-
         self.size = size
         # +1 padding row at index 0; see ReqToTokenPool for rationale.
         self._alloc_size = size + pre_alloc_size + 1
@@ -288,6 +287,15 @@ class DecodeRequest:
     @property
     def priority(self) -> Optional[int]:
         return self.req.priority
+
+
+@dataclass
+class QuarantinedDecodeRequest:
+    """An aborted request whose KV and metadata may still receive late writes."""
+
+    decode_req: DecodeRequest
+    quarantined_at: float
+    deadline: float
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -495,6 +503,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
+        configure_max_sockets = getattr(receiver_class, "configure_max_sockets", None)
+        if configure_max_sockets is not None:
+            configure_max_sockets(
+                self.scheduler.server_args.disaggregation_zmq_max_sockets
+            )
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
         if self.enable_staging and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool
@@ -626,6 +640,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         held = self.held_rebootstrap_reqs
         self.held_rebootstrap_reqs = []
         for req in held:
+            if req.finished() or getattr(req, "to_finish", None) is not None:
+                continue
             self.add(req, is_rebootstrap=True)
 
     @staticmethod
@@ -678,8 +694,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.add(req, is_retracted=is_retracted)
 
     def release_memory_occupation(self):
-        self.queue.clear()
-        self.retracted_queue.clear()
+        if self.queue or self.retracted_queue or self.pending_reqs:
+            raise RuntimeError(
+                "cannot release decode preallocation memory with live requests: "
+                f"queue={len(self.queue)} retracted={len(self.retracted_queue)} "
+                f"pending={len(self.pending_reqs)} "
+                f"held_rebootstrap={len(self.held_rebootstrap_reqs)}"
+            )
+        if self.held_rebootstrap_reqs:
+            raise RuntimeError(
+                "cannot release decode preallocation memory with held rebootstrap requests"
+            )
+        self._ensure_retry_count.clear()
+        self._ensure_last_attempt_time.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -1782,6 +1809,83 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self.quarantine: List[QuarantinedDecodeRequest] = []
+
+    def _release_quarantined(self, entry: QuarantinedDecodeRequest) -> None:
+        decode_req = entry.decode_req
+        if self.enable_staging and self.staging_handler is not None:
+            if not self.staging_handler.finish_aborted_room(decode_req):
+                raise RuntimeError(
+                    f"attempted to release staging room {decode_req.req.bootstrap_room} "
+                    "before local CUDA writes were drained"
+                )
+        release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+        idx = decode_req.metadata_buffer_index
+        self.metadata_buffers.bootstrap_room[idx] = 0
+        self.req_to_metadata_buffer_idx_allocator.free(idx)
+        discard = getattr(decode_req.kv_receiver, "discard_abort_ack_state", None)
+        if discard is not None:
+            discard()
+        if self.enable_staging and self.staging_handler.is_staging_room(
+            decode_req.req.bootstrap_room
+        ):
+            self.staging_handler.unregister_decode_req(decode_req.req.bootstrap_room)
+            kv_mgr = getattr(decode_req.kv_receiver, "kv_mgr", None)
+            if kv_mgr is not None and hasattr(kv_mgr, "_chunk_writer_counts"):
+                kv_mgr._chunk_writer_counts.pop(decode_req.req.bootstrap_room, None)
+        decode_req.kv_receiver.clear()
+        decode_req.kv_receiver = None
+
+    def _staging_writes_drained(self, decode_req: DecodeRequest) -> bool:
+        if not self.enable_staging or not self.staging_handler.is_staging_room(
+            decode_req.req.bootstrap_room
+        ):
+            return True
+        self.staging_handler.advance_scatter(decode_req)
+        return not self.staging_handler.has_pending_cuda_writes(decode_req)
+
+    def drain_quarantine(self) -> None:
+        """Release quarantined requests whose transfer state is safe to clean up."""
+        if not self.quarantine:
+            return
+        now = time.perf_counter()
+        pending = []
+        for entry in self.quarantine:
+            decode_req = entry.decode_req
+            ack_safe = getattr(decode_req.kv_receiver, "is_kv_safe_to_release", None)
+            ack_safe = ack_safe is None or ack_safe()
+            if ack_safe and self._staging_writes_drained(decode_req):
+                self._release_quarantined(entry)
+            elif now >= entry.deadline:
+                logger.warning(
+                    "Quarantine deadline reached for rid=%s room=%s after %.1fs; "
+                    "retaining KV until ABORT_ACK and local staging drain are proven",
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                    now - entry.quarantined_at,
+                )
+                entry.deadline = now + max(
+                    5.0, entry.deadline - entry.quarantined_at
+                )
+                pending.append(entry)
+            else:
+                pending.append(entry)
+        self.quarantine = pending
+
+    def quarantine_request(self, decode_req: DecodeRequest) -> None:
+        """Quarantine a decode request until its KV transfer is fully drained."""
+        now = time.perf_counter()
+        kv_mgr = getattr(decode_req.kv_receiver, "kv_mgr", None)
+        timeout = float(getattr(kv_mgr, "abort_quarantine_timeout", 60.0))
+        if self.enable_staging and self.staging_handler is not None:
+            self.staging_handler.mark_room_aborted(decode_req.req.bootstrap_room)
+        self.quarantine.append(
+            QuarantinedDecodeRequest(decode_req, now, now + timeout)
+        )
+
+    def num_quarantined(self) -> int:
+        """Return the number of requests currently held in quarantine."""
+        return len(self.quarantine)
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -1978,6 +2082,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         kv_manager._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+        self.drain_quarantine()
         if not self.queue:
             return []
 
@@ -1997,6 +2102,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         transferred_reqs = []
         indices_to_remove = set()
+        quarantined_indices = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -2011,7 +2117,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
+                begin_quiescence = getattr(
+                    decode_req.kv_receiver, "begin_abort_quiescence", None
+                )
+                if begin_quiescence is not None:
+                    begin_quiescence()
                 if poll == KVPoll.Failed:
+                    refresh_registration = getattr(
+                        decode_req.kv_receiver, "refresh_registration", None
+                    )
+                    if refresh_registration is not None:
+                        try:
+                            refresh_registration()
+                        except Exception:
+                            logger.exception(
+                                "Mooncake registration refresh failed after decode "
+                                "transfer failure: rank=%s rid=%s bootstrap_room=%s",
+                                self.tp_rank,
+                                decode_req.req.rid,
+                                decode_req.req.bootstrap_room,
+                            )
                     try:
                         decode_req.kv_receiver.failure_exception()
                     except Exception as e:
@@ -2026,7 +2151,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 prepare_abort(
                     decode_req.req,
                     error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status_code=HTTPStatus.REQUEST_TIMEOUT,
                 )
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req],
@@ -2034,10 +2159,29 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-                decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
+                safe_to_release = getattr(
+                    decode_req.kv_receiver, "is_kv_safe_to_release", None
+                )
+                has_staging_room = (
+                    self.enable_staging
+                    and self.staging_handler is not None
+                    and self.staging_handler.is_staging_room(
+                        decode_req.req.bootstrap_room
+                    )
+                )
+                if (
+                    safe_to_release is not None
+                    and not safe_to_release()
+                    or has_staging_room
+                ):
+                    self.quarantine_request(decode_req)
+                    quarantined_indices.add(i)
+                else:
+                    release_kv_cache(
+                        decode_req.req, self.tree_cache, is_insert=False
+                    )
+                    decode_req.kv_receiver.clear()
+                    decode_req.kv_receiver = None
                 indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -2066,6 +2210,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 else:
                     transferred_reqs.append(decode_req.req)
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        self.scheduler.metrics_collector.observe_kvcache_transfer_time(
+                            time.perf_counter()
+                            - decode_req.req.time_stats.decode_transfer_queue_entry_time
+                        )
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -2076,6 +2225,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
+            if i in quarantined_indices:
+                continue
             if self.enable_staging and self.staging_handler.is_staging_room(
                 self.queue[i].req.bootstrap_room
             ):
@@ -2097,7 +2248,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
-        self.queue.clear()
+        active_staging = (
+            self.staging_handler is not None
+            and self.staging_handler.has_active_rooms()
+        )
+        if self.queue or self.quarantine or active_staging:
+            raise RuntimeError(
+                "cannot release decode transfer memory with live transfers: "
+                f"queue={len(self.queue)} quarantine={len(self.quarantine)} "
+                f"staging_rooms={active_staging}"
+            )
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""
@@ -2173,6 +2333,22 @@ class SchedulerDisaggregationDecodeMixin:
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
+
+            # In decode disaggregation mode, the previous batch's accepted grammar
+            # tokens must be applied before generating the current batch's mask.
+            # Reuse the same overlapped grammar handoff as the centralized path.
+            if (
+                batch
+                and batch.is_spec_v2
+                and batch.spec_algorithm.is_eagle()
+                and batch.has_grammar
+                and batch.forward_mode.is_decode()
+                and len(self.result_queue) > 0
+            ):
+                last_batch, last_result = self.result_queue[-1]
+                if last_batch.has_grammar:
+                    batch.pending_accept_info = (last_batch, last_result)
+                    last_result.grammar_accept_processed = True
 
             # Launch the current batch
             if batch:

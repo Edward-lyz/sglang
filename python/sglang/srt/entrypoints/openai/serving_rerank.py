@@ -283,6 +283,7 @@ class OpenAIServingRerank(OpenAIServingBase):
         adapted_request: Union[EmbeddingReqInput, V1RerankReqInput],
         request: V1RerankReqInput,
         raw_request: Request,
+        tokenizer_rev_request_time=None,
     ) -> Union[List[RerankResponse], ErrorResponse, ORJSONResponse]:
         """Handle the rerank request"""
         chat_template = getattr(self.tokenizer_manager.tokenizer, "chat_template", None)

@@ -1122,7 +1122,31 @@ class PrefillAdder:
             # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
+
+        logger.info(
+            f"before lock, for req {req.rid} current rem_total_tokens: "
+            f"{self.rem_total_tokens}, "
+            f"local rem total: "
+            f"{self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}, "
+            f"avaliable: {self.token_to_kv_pool_allocator.available_size()}, "
+            f"evictable: {self.tree_cache.evictable_size()}, "
+            f"extend_input_len: {req.extend_input_len}, "
+            f"prefix len {prefix_len}, "
+            f"host_hit_length {req.host_hit_length}"
+        )
+
         with self._lock_node(req.last_node):
+            logger.info(
+                f"after lock, for req {req.rid} current rem_total_tokens: "
+                f"{self.rem_total_tokens}, "
+                f"local rem total: "
+                f"{self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}, "
+                f"avaliable: {self.token_to_kv_pool_allocator.available_size()}, "
+                f"evictable: {self.tree_cache.evictable_size()}, "
+                f"extend_input_len: {req.extend_input_len}, "
+                f"prefix len {prefix_len}, "
+                f"host_hit_length {req.host_hit_length}"
+            )
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
@@ -1164,6 +1188,7 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                logger.info(f"req:{req.rid} : {len(new_indices)} tokens be loaded from host")
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len

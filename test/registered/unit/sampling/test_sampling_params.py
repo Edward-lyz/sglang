@@ -458,6 +458,28 @@ class TestSamplingParamsMsgspecStruct(CustomTestCase):
         self.assertEqual(rebuilt.stop_token_ids, {1, 2})
         self.assertEqual(rebuilt.temperature, 0.5)
 
+    def test_msgpack_round_trip_preserves_thinking_budget_fields(self):
+        sp = SamplingParams(
+            thinking_budget=32,
+            thinking_prompt_token_ids=[101, 102],
+        )
+
+        encoder = msgspec.msgpack.Encoder()
+        decoder = msgspec.msgpack.Decoder(SamplingParams)
+        rebuilt = decoder.decode(encoder.encode(sp))
+
+        self.assertEqual(rebuilt.thinking_budget, 32)
+        self.assertEqual(rebuilt.thinking_prompt_token_ids, [101, 102])
+
+    def test_thinking_budget_requires_transition_prompt(self):
+        sp = SamplingParams(thinking_budget=32)
+        with self.assertRaisesRegex(ValueError, "thinking_prompt_token_ids"):
+            sp.verify(vocab_size=32000)
+
+    def test_negative_thinking_budget_is_disabled_without_prompt(self):
+        sp = SamplingParams(thinking_budget=-1)
+        sp.verify(vocab_size=32000)
+
 
 class TestRegexMaxLength(CustomTestCase):
 

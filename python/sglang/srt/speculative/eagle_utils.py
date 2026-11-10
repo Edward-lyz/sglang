@@ -870,6 +870,42 @@ def eagle_sample(
             spec_steps=verify_input.max_tree_depth - 1,
         )
 
+    # Once a request reaches its think budget, replace the accepted speculative
+    # path with the transition prompt before KV commit.  This keeps output ids,
+    # accepted lengths, and the next draft input consistent with one another.
+    for i, req in enumerate(batch.reqs):
+        accepted_path = accept_index[i][accept_index[i] >= 0]
+        if accepted_path.numel() == 0:
+            continue
+        # Result processing may later trim tokens at EOS/stop. Limit the
+        # eager overlap update to that same committed prefix so speculative
+        # suffixes cannot consume the request's budget before they are dropped.
+        stop_idx = req.find_stop_token_index(
+            predict[accepted_path].detach().cpu().tolist()
+        )
+        if stop_idx != -1:
+            accepted_path = accepted_path[: stop_idx + 1]
+        count = req.inject_thinking_prompt_tokens(
+            predict,
+            start_idx=accepted_path,
+            max_count=accepted_path.numel(),
+            advance=True,
+        )
+        if count <= 0:
+            accepted_path_for_state = accepted_path
+        else:
+            accepted_path_for_state = accepted_path[:count]
+            accept_index[i].fill_(-1)
+            accept_index[i, :count] = accepted_path_for_state
+            num_correct_drafts[i] = count - 1
+
+        # Update before returning from verify.  The overlap scheduler may
+        # launch the next draft before it processes this batch's result; doing
+        # this here prevents that draft from observing a stale budget.
+        req.update_thinking_state(
+            predict[accepted_path_for_state].detach().cpu().tolist()
+        )
+
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).

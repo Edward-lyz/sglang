@@ -4,12 +4,13 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.content_detection.config import DETECTION_CONFIG
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -71,18 +72,41 @@ class OpenAIServingBase(ABC):
         return explicit_lora_path
 
     async def handle_request(
-        self, request: OpenAIServingRequest, raw_request: Request
+        self,
+        request: OpenAIServingRequest,
+        raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
         """Handle the specific request type with common pattern
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
 
+        if hasattr(request, "rid") and request.rid:
+            logger.info(f"[trace] http server received request {request.rid}")
+
         try:
             # Validate request
             error_msg = self._validate_request(request)
             if error_msg:
                 return self.create_error_response(error_msg)
+
+            if not DETECTION_CONFIG.enable_trace:
+                if getattr(request, "trace_config", None) is not None:
+                    logger.info(
+                        "CD_ENABLE_TRACE is disabled; trace config for req %s "
+                        "will not take effect",
+                        getattr(request, "rid", None),
+                    )
+                    request.trace_config["enable_trace"] = False
+
+            # Content detection owns tracing when enabled; ordinary request-level
+            # tracing is disabled for those requests and is triggered on detection.
+            if DETECTION_CONFIG.enable_detection and DETECTION_CONFIG.enable_trace:
+                if hasattr(request, "trace_config"):
+                    if request.trace_config is None:
+                        request.trace_config = {}
+                    request.trace_config["enable_trace"] = False
 
             # Log the raw OpenAI request payload before conversion to tokenized form.
             request_logger = self.tokenizer_manager.request_logger
@@ -94,6 +118,8 @@ class OpenAIServingBase(ABC):
                 request, raw_request
             )
 
+            self._process_trace_config(request, adapted_request)
+
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
@@ -101,11 +127,17 @@ class OpenAIServingBase(ABC):
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
                 return await self._handle_streaming_request(
-                    adapted_request, processed_request, raw_request
+                    adapted_request,
+                    processed_request,
+                    raw_request,
+                    tokenizer_rev_request_time,
                 )
             else:
                 return await self._handle_non_streaming_request(
-                    adapted_request, processed_request, raw_request
+                    adapted_request,
+                    processed_request,
+                    raw_request,
+                    tokenizer_rev_request_time,
                 )
         except HTTPException as e:
             return self.create_error_response(
@@ -175,6 +207,7 @@ class OpenAIServingBase(ABC):
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> Union[StreamingResponse, ErrorResponse, ORJSONResponse]:
         """Handle streaming request
 
@@ -191,6 +224,7 @@ class OpenAIServingBase(ABC):
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> Union[Any, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming request
 
@@ -223,6 +257,45 @@ class OpenAIServingBase(ABC):
             code=status_code,
         )
         return ORJSONResponse(content=error.model_dump(), status_code=status_code)
+
+    @staticmethod
+    def _serialize_trace_value(value: Any) -> Any:
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json")
+        if isinstance(value, list):
+            return [OpenAIServingBase._serialize_trace_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: OpenAIServingBase._serialize_trace_value(item)
+                for key, item in value.items()
+            }
+        return value
+
+    def _process_trace_config(self, request, adapted_request) -> None:
+        cfg = getattr(request, "trace_config", None)
+        if not cfg:
+            return
+        cfg = dict(cfg)
+        if "dump_dir" not in cfg and DETECTION_CONFIG.trace_dump_dir:
+            cfg["dump_dir"] = DETECTION_CONFIG.trace_dump_dir
+        trace_type = cfg.get("trace_type")
+        if trace_type in ("prompt", "all"):
+            if hasattr(request, "messages"):
+                cfg["payload"] = {
+                    "messages": self._serialize_trace_value(request.messages)
+                }
+            elif hasattr(request, "prompt"):
+                cfg["payload"] = {
+                    "prompt": self._serialize_trace_value(request.prompt)
+                }
+        if trace_type in ("logprobs", "all"):
+            adapted_request.return_logprob = True
+            if cfg.get("top_logprobs") is not None:
+                adapted_request.top_logprobs_num = cfg["top_logprobs"]
+        adapted_request.trace_config = cfg
+
+    def _build_trace_info(self, request, meta_info: Optional[Dict[str, Any]] = None):
+        return (meta_info or {}).get("trace_info")
 
     def create_streaming_error_response(
         self,

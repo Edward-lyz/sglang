@@ -30,8 +30,11 @@ class ShapeKey:
     variant_label: optional execution variant (for example, "lora",
         "nolora", or "chunked_prefix"), or None for runners that don't
         record per-variant graphs.
+    split_graph_id: subgraph index for layer-split decode graphs, or None
+        for a complete model graph.
     """
 
     size: int
     stream_idx: Optional[int] = None
     variant_label: Optional[str] = None
+    split_graph_id: Optional[int] = None

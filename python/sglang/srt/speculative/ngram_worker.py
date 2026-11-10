@@ -310,7 +310,20 @@ class NGRAMWorker(BaseSpecWorker):
 
         req_drafts, mask = self._prepare_draft_tokens(batch)
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
-        draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
+
+        # ``eagle_sample`` is shared with NGRAM.  If a request has exhausted
+        # its thinking budget, rewrite the CPU draft window before the target
+        # verify so the KV writes match the transition tokens that verify will
+        # later accept and return to the client.
+        draft_tokens_cpu = torch.from_numpy(req_drafts)
+        for i, req in enumerate(batch.reqs):
+            req.inject_thinking_prompt_tokens(
+                draft_tokens_cpu,
+                start_idx=i * self.draft_token_num,
+                max_count=self.draft_token_num,
+                advance=False,
+            )
+        draft_tokens.copy_(draft_tokens_cpu, non_blocking=True)
 
         # Staged for the grammar bitmask, derived after the verify launch below.
         self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None

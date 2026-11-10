@@ -250,6 +250,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         adapted_request: EmbeddingReqInput,
         request: EmbeddingRequest,
         raw_request: Request,
+        tokenizer_rev_request_time=None,
     ) -> Union[EmbeddingResponse, ErrorResponse, ORJSONResponse]:
         """Handle the embedding request"""
         try:

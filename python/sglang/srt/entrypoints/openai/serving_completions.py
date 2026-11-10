@@ -28,6 +28,7 @@ from sglang.srt.entrypoints.openai.utils import (
     should_include_usage,
     to_openai_style_logprobs,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
@@ -185,6 +186,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
             "sampling_seed": request.seed,
+            "thinking_budget": request.thinking_budget,
+            "thinking_prompt_token_ids": request.thinking_prompt_token_ids,
         }
 
         # Handle response_format constraints
@@ -212,10 +215,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> Union[StreamingResponse, ErrorResponse]:
         """Handle streaming completion request"""
         generator = self._generate_completion_stream(
-            adapted_request, request, raw_request
+            adapted_request, request, raw_request, tokenizer_rev_request_time
         )
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
@@ -240,6 +244,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming completion response"""
         created = int(time.time())
@@ -266,7 +271,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             )
 
             async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
+                adapted_request, raw_request, tokenizer_rev_request_time
             ):
                 index = content.get("index", 0)
 
@@ -382,6 +387,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
                     text=delta,
+                    tokens=content.get("generated_token_num", 1),
                     logprobs=logprobs,
                     finish_reason=finish_reason_type,
                     matched_stop=(
@@ -425,6 +431,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                                 CompletionResponseStreamChoice(
                                     index=index,
                                     text="",
+                                    tokens=0,
                                     hidden_states=response_hidden_states,
                                     finish_reason=None,
                                 )
@@ -477,6 +484,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     choices=[],
                     model=request.model,
                     usage=usage,
+                    trace_info=self._build_trace_info(request, content["meta_info"]),
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
@@ -494,11 +502,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming completion request"""
         try:
             generator = self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
+                adapted_request, raw_request, tokenizer_rev_request_time
             )
             ret = await generator.__anext__()
         except ValueError as e:
@@ -614,6 +623,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
             sglext=response_sglext,
+            trace_info=self._build_trace_info(request, ret[0]["meta_info"]),
         )
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:

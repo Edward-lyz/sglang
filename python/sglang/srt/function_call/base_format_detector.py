@@ -32,7 +32,12 @@ logger = logging.getLogger(__name__)
 class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        tools: Optional[List[Tool]] = None,
+        tool_choice: Union[Literal["required", "auto", "none"], ToolChoice] = "auto",
+        parallel_tool_calls: bool = True,
+    ):
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
         self._buffer = ""
@@ -55,6 +60,10 @@ class BaseFormatDetector(ABC):
         self.bot_token = ""
         self.eot_token = ""
         self.tool_call_separator = ", "
+        self.tools = list(tools or [])
+        self.tool_choice = tool_choice
+        self.parallel_tool_calls = parallel_tool_calls
+        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL
 
     def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
         """

@@ -334,7 +334,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
                 ctx = self.grammar_compiler.compile_json_schema(
-                    schema=key_string, any_whitespace=self.any_whitespace
+                    schema=key_string, max_whitespace_cnt=1
                 )
 
         except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError) as e:

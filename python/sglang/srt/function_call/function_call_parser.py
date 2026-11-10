@@ -175,6 +175,50 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
+    def replay_continuation(self, continuation_text: str) -> None:
+        """Replay prior output without re-emitting it to restore parser state."""
+        if not self.tools or not continuation_text:
+            return
+
+        # Preserve multi-character detector markers while feeding ordinary text
+        # incrementally, matching the parser's live streaming state machine.
+        marker_attrs = (
+            "bot_token",
+            "eot_token",
+            "tool_call_separator",
+            "invoke_end_token",
+            "tool_call_begin",
+            "tool_call_end",
+            "tool_call_start_token",
+            "tool_call_end_token",
+        )
+        markers = {
+            value
+            for attr in marker_attrs
+            if isinstance(
+                value := getattr(self.detector, attr, None), str
+            )
+            and len(value) > 1
+        }
+        if not markers:
+            for char in continuation_text:
+                self.parse_stream_chunk(char)
+            return
+
+        import re
+
+        pattern = "|".join(
+            re.escape(marker) for marker in sorted(markers, key=len, reverse=True)
+        )
+        for part in re.split(f"({pattern})", continuation_text):
+            if not part:
+                continue
+            if part in markers:
+                self.parse_stream_chunk(part)
+            else:
+                for char in part:
+                    self.parse_stream_chunk(char)
+
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
     ) -> StructuralTagResponseFormat:
