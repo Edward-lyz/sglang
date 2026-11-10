@@ -73,11 +73,7 @@ from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
-from sglang.srt.mem_cache.common import (
-    kv_to_page_indices,
-    page_align_floor,
-    release_kv_cache,
-)
+from sglang.srt.mem_cache.common import page_align_floor, release_kv_cache
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -102,6 +98,11 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+
+METADATA_PENDING = 0
+METADATA_READY = 1
+METADATA_SENT = 2
+METADATA_CANCELLED = 3
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -273,6 +274,14 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    metadata_state: int = METADATA_PENDING
+    metadata_ready_event: Optional[torch.cuda.Event] = None
+    metadata_page_indices: Any = None
+    metadata_state_indices: Any = None
+    metadata_draft_dst_kv_indices: Any = None
+    metadata_decode_prefix_len: int = 0
+    metadata_draft_window_start: Optional[int] = None
+    metadata_sources: Any = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -288,6 +297,57 @@ class DecodeRequest:
     @property
     def priority(self) -> Optional[int]:
         return self.req.priority
+
+
+def _stage_decode_metadata(value, *, asynchronous=True):
+    """Stage device metadata to pinned host memory without blocking the host."""
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cuda" or not asynchronous:
+            return value.detach().cpu().clone(), False
+        host_value = torch.empty_like(value, device="cpu", pin_memory=True)
+        host_value.copy_(value, non_blocking=True)
+        return host_value, True
+    if isinstance(value, list):
+        staged = []
+        has_async_copy = False
+        for item in value:
+            staged_item, item_has_async_copy = _stage_decode_metadata(
+                item, asynchronous=asynchronous
+            )
+            staged.append(staged_item)
+            has_async_copy |= item_has_async_copy
+        return staged, has_async_copy
+    return value, False
+
+
+def _materialize_decode_metadata(value):
+    if isinstance(value, torch.Tensor):
+        return value.numpy().astype(np.int32, copy=False)
+    if isinstance(value, list):
+        return [_materialize_decode_metadata(item) for item in value]
+    return value
+
+
+class _MetadataGatedReceiver:
+    """Apply local send readiness before the cross-rank MIN reduction."""
+
+    def __init__(self, decode_req, receiver):
+        self.decode_req = decode_req
+        self.receiver = receiver
+
+    def poll(self):
+        """Return the receiver poll status gated by local send readiness."""
+        if (
+            self.decode_req.metadata_state == METADATA_CANCELLED
+            or isinstance(self.decode_req.req.finished_reason, FINISH_ABORT)
+        ):
+            return KVPoll.Failed
+        poll = self.receiver.poll()
+        if poll == KVPoll.Failed:
+            return poll
+        if self.decode_req.metadata_state != METADATA_SENT:
+            return KVPoll.Transferring
+        return poll
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -1185,8 +1245,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         decode_req.req.req_pool_idx
                     ]
-                    .cpu()
-                    .numpy()
                 ]
 
             def _swa_payload():
@@ -1201,7 +1259,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                return (
+                    window_kv_indices_swa[::page_size] // page_size
+                ).to(dtype=torch.int32)
 
             def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1209,7 +1269,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(kv_indices_full, device_page_size)
+                return (
+                    kv_indices_full[::device_page_size] // device_page_size
+                ).to(dtype=torch.int32)
 
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
@@ -1263,9 +1325,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             # int32 for ZMQ serialization -- from_zmq reads np.int32.
-            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
-                np.int32
-            )
+            page_indices = (
+                kv_indices[::kv_transfer_page_size] // kv_transfer_page_size
+            ).to(dtype=torch.int32)
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1302,27 +1364,51 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
                 # Mooncake draft DCP uses compact token slots directly; do not
                 # collapse them into target/virtual page indices.
-                draft_dst_kv_indices = (
-                    draft_slot_map.map_slots(
-                        full_window_slots,
-                        req_pool_idx=decode_req.req.req_pool_idx,
-                        end_pos=origin_input_len,
-                    )
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.int32)
-                )
-            metadata_kwargs = {"decode_prefix_len": total_prefix_len}
-            if draft_dst_kv_indices is not None:
-                metadata_kwargs["draft_dst_kv_indices"] = draft_dst_kv_indices
-                metadata_kwargs["draft_window_start"] = window_start
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                **metadata_kwargs,
+                draft_dst_kv_indices = draft_slot_map.map_slots(
+                    full_window_slots,
+                    req_pool_idx=decode_req.req.req_pool_idx,
+                    end_pos=origin_input_len,
+                    # Decode admission path: skip the _assert_capacity readback
+                    # (torch.stack(...).cpu()) that would block the scheduler on
+                    # the previous forward. Overflow is latched on-device and
+                    # raised by the next checked (prefill) map_slots call, per the
+                    # draft_swa_pool contract and the sibling site in
+                    # dspark_worker_v2.map_slots(..., assert_capacity=False).
+                    assert_capacity=False,
+                ).detach().to(dtype=torch.int32)
+            # Preserve the existing PP/staging/rebootstrap protocol. These
+            # paths send synchronously before their external consensus/dispatch.
+            asynchronous = (
+                self.pp_size == 1
+                and not self.transfer_queue.enable_staging
+                and not self.scheduler.enable_decode_hicache
+                and not decode_req.is_rebootstrap
             )
+            staged_metadata, has_async_copy = _stage_decode_metadata(
+                [page_indices, state_indices, draft_dst_kv_indices],
+                asynchronous=asynchronous,
+            )
+            (
+                decode_req.metadata_page_indices,
+                decode_req.metadata_state_indices,
+                decode_req.metadata_draft_dst_kv_indices,
+            ) = staged_metadata
+            decode_req.metadata_decode_prefix_len = total_prefix_len
+            decode_req.metadata_draft_window_start = (
+                window_start if draft_dst_kv_indices is not None else None
+            )
+            if has_async_copy:
+                decode_req.metadata_sources = [
+                    page_indices, state_indices, draft_dst_kv_indices
+                ]
+                decode_req.metadata_ready_event = torch.cuda.Event()
+                decode_req.metadata_ready_event.record(
+                    torch.cuda.current_stream(self.req_to_token_pool.device)
+                )
+            else:
+                decode_req.metadata_state = METADATA_READY
+            if not asynchronous:
+                self.transfer_queue._send_metadata(decode_req)
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
@@ -1750,10 +1836,13 @@ def alloc_for_decode_prealloc(
         kv_loc = allocator.alloc(delta_len)
     else:
         device = allocator.device
+        # These singleton values are host-known scalars. Fill on the current
+        # device stream instead of copying a pageable CPU tensor to CUDA,
+        # which can synchronize the decode scheduler during admission.
         last_loc = (
             prefix_indices[-1:].to(dtype=torch.int64, device=device)
             if prefix_len > 0
-            else torch.tensor([-1], dtype=torch.int64, device=device)
+            else torch.full((1,), -1, dtype=torch.int64, device=device)
         )
         if uses_swa_tail:
             # Tail-only SWA allocation: only valid when prefix_len == 0.
@@ -1761,9 +1850,9 @@ def alloc_for_decode_prealloc(
             # alloc_extend which allocates SWA at full page count; the
             # SWA budget in that case may slightly under-estimate.
             kv_loc = allocator.alloc_extend_swa_tail(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens=torch.full((1,), 0, dtype=torch.int64, device=device),
                 prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens=torch.full((1,), fill_len, dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
                 extend_num_tokens=fill_len,
@@ -1772,11 +1861,11 @@ def alloc_for_decode_prealloc(
             req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
         else:
             kv_loc = allocator.alloc_extend(
-                prefix_lens=torch.tensor(
-                    [total_prefix_len], dtype=torch.int64, device=device
+                prefix_lens=torch.full(
+                    (1,), total_prefix_len, dtype=torch.int64, device=device
                 ),
                 prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens=torch.full((1,), fill_len, dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
                 extend_num_tokens=delta_len,
@@ -1808,6 +1897,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self._retired_metadata: List[DecodeRequest] = []
 
     def _release_draft_mapping(self, decode_req: DecodeRequest) -> None:
         """Release draft SWA pages when a transferred request is discarded."""
@@ -1823,7 +1913,77 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
 
+    def _send_metadata(self, decode_req: DecodeRequest) -> None:
+        assert decode_req.metadata_state == METADATA_READY
+        kwargs = {"decode_prefix_len": decode_req.metadata_decode_prefix_len}
+        if decode_req.metadata_draft_dst_kv_indices is not None:
+            kwargs["draft_dst_kv_indices"] = _materialize_decode_metadata(
+                decode_req.metadata_draft_dst_kv_indices
+            )
+            kwargs["draft_window_start"] = decode_req.metadata_draft_window_start
+        try:
+            decode_req.kv_receiver.send_metadata(
+                _materialize_decode_metadata(decode_req.metadata_page_indices),
+                decode_req.metadata_buffer_index,
+                _materialize_decode_metadata(decode_req.metadata_state_indices),
+                **kwargs,
+            )
+        except Exception:
+            # A backend may have partially sent the message before raising.
+            # Do not retry the send; use the normal cross-rank failure path.
+            logger.exception("Failed to send decode metadata for %s", decode_req.req.rid)
+            self._cancel_metadata(decode_req)
+            decode_req.kv_receiver.abort()
+            return
+        decode_req.metadata_state = METADATA_SENT
+        self._clear_metadata_buffers(decode_req)
+
+    @staticmethod
+    def _clear_metadata_buffers(decode_req: DecodeRequest) -> None:
+        decode_req.metadata_ready_event = None
+        decode_req.metadata_page_indices = None
+        decode_req.metadata_state_indices = None
+        decode_req.metadata_draft_dst_kv_indices = None
+        decode_req.metadata_sources = None
+
+    def _advance_metadata_state(self) -> None:
+        retired = []
+        for req in self._retired_metadata:
+            if req.metadata_ready_event.query():
+                self._clear_metadata_buffers(req)
+            else:
+                retired.append(req)
+        self._retired_metadata = retired
+        # Keep metadata send order identical to queue order. A later request
+        # must not overtake an earlier request whose D2H copy is still pending.
+        for decode_req in self.queue:
+            if decode_req.metadata_state in (METADATA_CANCELLED, METADATA_SENT):
+                continue
+            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                self._cancel_metadata(decode_req)
+                continue
+            if decode_req.metadata_state == METADATA_PENDING:
+                event = decode_req.metadata_ready_event
+                if event is None or not event.query():
+                    break
+                decode_req.metadata_state = METADATA_READY
+                decode_req.metadata_sources = None
+            if decode_req.metadata_state == METADATA_READY:
+                self._send_metadata(decode_req)
+
+    def _cancel_metadata(self, decode_req: DecodeRequest) -> None:
+        if decode_req.metadata_state == METADATA_CANCELLED:
+            return
+        decode_req.metadata_state = METADATA_CANCELLED
+        if decode_req.metadata_ready_event is not None:
+            self._retired_metadata.append(decode_req)
+            # Hold pinned destinations until DMA completes, even if the
+            # request is removed by another rank's failure this round.
+            return
+        self._clear_metadata_buffers(decode_req)
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+        assert decode_req.metadata_state == METADATA_SENT
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -1990,6 +2150,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if self.scheduler.enable_decode_hicache
             else [dr.kv_receiver for dr in self.queue]
         )
+        pollers = [
+            _MetadataGatedReceiver(dr, poller)
+            for dr, poller in zip(self.queue, pollers)
+        ]
         return poll_and_all_reduce(
             pollers,
             self.gloo_group,
@@ -2047,6 +2211,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not self._queue_lengths_aligned():
             return []
 
+        self._advance_metadata_state()
         if not self.queue:
             return []
 
@@ -2076,6 +2241,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 poll == KVPoll.Failed
                 or hicache_restore_status == HiCacheRestoreResult.FAILED
             ):
+                self._cancel_metadata(decode_req)
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -2186,12 +2352,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        # Explicit teardown is allowed to wait. Never free pools while DMA
+        # still holds a view into their storage.
+        for decode_req in self.queue + self._retired_metadata:
+            if decode_req.metadata_ready_event is not None:
+                decode_req.metadata_ready_event.synchronize()
+            decode_req.metadata_state = METADATA_CANCELLED
+            self._clear_metadata_buffers(decode_req)
+        self._retired_metadata.clear()
         for decode_req in self.queue:
             self._release_draft_mapping(decode_req)
-        for decode_req in self.pending_reqs:
-            self._release_draft_mapping(decode_req)
         self.queue.clear()
-        self.pending_reqs.clear()
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""
