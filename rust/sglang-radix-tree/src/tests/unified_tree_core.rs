@@ -1857,6 +1857,7 @@ fn swa_host_backed_node_advances_best_match_but_keeps_the_device_anchor() {
 
 fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
+            rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(value),
@@ -1875,6 +1876,97 @@ fn tracked_insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'
         track_adopted_ranges: true,
         ..insert_params(key, value)
     }
+}
+
+#[test]
+fn rotation_conflict_declines_before_split_or_duplicate_free() {
+    let mut tc = core();
+    let first = vec![1, 2, 3, 4];
+    let incoming = vec![1, 2, 9];
+    let mut params = insert_params(&first, &[10, 11, 12, 13]);
+    params.rotation_base = Some(0);
+    let result = tc.insert(&params);
+    let original = result.last_device_node_id.unwrap();
+    assert_eq!(tc.rotation_base_of(original).unwrap(), Some(0));
+    let before = tc.all_values_flatten();
+    let mut other = tracked_insert_params(&incoming, &[20, 21, 22]);
+    other.rotation_base = Some(1);
+    let step = tc.try_begin_insert(&other).unwrap();
+    assert!(step.actions.is_empty());
+    let declined = step.result.unwrap();
+    assert!(declined.rotation_tail_declined);
+    assert_eq!(declined.prefix_len, 2);
+    assert_eq!(declined.last_device_node_id, Some(original));
+    assert_eq!(declined.adopted_ranges, Some(HashMap::new()));
+    assert!(declined.cache_actions.is_empty());
+    assert!(!tc.has_ongoing_insert());
+    assert!(tc.all_values_flatten().equal(&before));
+    let index = tc.arena.resolve(original).unwrap();
+    assert_eq!(tc.arena.node(index).key.atom_len(), 4);
+}
+
+#[test]
+fn rotation_same_run_split_and_tail_preserve_owner() {
+    let mut tc = core();
+    let first = vec![1, 2, 3, 4];
+    let second = vec![1, 2, 9];
+    for (key, value) in [(&first, vec![10, 11, 12, 13]), (&second, vec![20, 21, 22])] {
+        let mut params = insert_params(key, &value);
+        params.rotation_base = Some(3);
+        let result = tc.insert(&params);
+        assert!(!result.rotation_tail_declined);
+        assert_eq!(tc.rotation_base_of(result.last_device_node_id.unwrap()).unwrap(), Some(3));
+    }
+    let prefix = vec![1, 2];
+    let matched = tc.match_prefix(&match_params(&prefix));
+    assert_eq!(tc.rotation_base_of(matched.last_device_node_id).unwrap(), Some(3));
+    let tick = tc.arena.get_and_bump_access_counter();
+    assert_eq!(tc.peek_insert_overlap_len(&second, Default::default()), 3);
+    assert_eq!(tc.arena.get_and_bump_access_counter(), tick + 1, "peek must not update LRU");
+}
+
+#[test]
+fn rotation_guard_includes_device_evicted_nodes() {
+    let mut tc = core();
+    let key = vec![1, 2];
+    let mut params = insert_params(&key, &[10, 11]);
+    params.rotation_base = Some(0);
+    let id = tc.insert(&params).last_device_node_id.unwrap();
+    let index = tc.arena.resolve(id).unwrap();
+    let _ = tc.arena.take_device_value(index, FULL);
+    tc.component_state_mut(FULL).evictable_size = 0;
+    tc.evictable_device_leaves.discard(index);
+    let mut incompatible = insert_params(&key, &[20, 21]);
+    incompatible.rotation_base = Some(1);
+    let result = tc.insert(&incompatible);
+    assert!(result.rotation_tail_declined);
+    assert!(tc.arena.try_device_value(index, FULL).is_none());
+    let mut compatible = insert_params(&key, &[30, 31]);
+    compatible.rotation_base = Some(0);
+    assert!(!tc.insert(&compatible).rotation_tail_declined);
+    assert_eq!(tc.rotation_base_of(id).unwrap(), Some(0));
+}
+
+#[test]
+fn rotation_page256_namespaces_and_readonly_overlap() {
+    let mut tc = UnifiedTreeCore::<Vec<i64>>::new(
+        CacheInitParams { page_size: 256, ..Default::default() }, vec![FULL]);
+    let key = vec![7; 768];
+    let values = vec![100i64; 768];
+    let mut first = insert_params(&key, &values);
+    first.rotation_base = Some(0);
+    let original = tc.insert(&first).last_device_node_id.unwrap();
+    let mut other = insert_params(&key, &values);
+    other.rotation_base = Some(2);
+    other.namespace = KeyNamespaceRef::new(Some("mm"), Some("tenant"));
+    let accepted = tc.insert(&other);
+    assert!(!accepted.rotation_tail_declined);
+    assert_ne!(accepted.last_device_node_id, Some(original));
+    assert_eq!(tc.rotation_base_of(accepted.last_device_node_id.unwrap()).unwrap(), Some(2));
+    let mut partial = key.clone();
+    partial[512] = 8;
+    assert_eq!(tc.peek_insert_overlap_len(&partial, Default::default()), 512);
+    assert_eq!(tc.peek_insert_overlap_len(&key, KeyNamespaceRef::new(Some("other"), None)), 0);
 }
 
 #[test]
@@ -3046,6 +3138,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
     );
     let key: Vec<(i64, i64)> = vec![(1, 2), (2, 3)];
     tc.insert(&InsertParams {
+            rotation_base: None,
         key: &key,
         namespace: Default::default(),
         value: Tensor::from_slice(&[10i64, 11]),
@@ -8428,6 +8521,7 @@ fn sequence_insert_params<'k>(
         Tensor::from_slice(&[*mamba_next])
     });
     InsertParams {
+            rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(&kv),

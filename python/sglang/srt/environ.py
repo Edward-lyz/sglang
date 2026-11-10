@@ -288,6 +288,9 @@ class Envs:
     SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
     IS_H200 = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
+    # Optional scheduler Python thread switch interval in seconds.
+    # Unset preserves the interpreter default; valid range is [0.00001, 0.05].
+    SGLANG_PYTHON_SWITCH_INTERVAL = EnvStr(None)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
@@ -2249,6 +2252,25 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
+
+    # Optional AttentionStore host scheduling and native transport features.
+    # Deferred allocation preserves the all-rank publication gates.
+    SGLANG_AS_DEFER_ALLOCATION_GATE = EnvBool(False)
+    SGLANG_HTTP_REUSE_PORT = EnvBool(False)
+    SGLANG_ADMISSION_DIAG_DIR = EnvStr("")
+    SGLANG_ENABLE_REQUEST_OOB_BROADCAST = EnvBool(False)
+    SGLANG_LOG_AS_CACHE_OPERATIONS = EnvBool(True)
+    SGLANG_AS_READ_DIFFUSE_BATCHED = EnvBool(False)
+    SGLANG_AS_READ_DIFFUSE_GROUP_COMMIT = EnvBool(False)
+    SGLANG_AS_LOAD_BACK_COALESCE_READY = EnvBool(False)
+    SGLANG_AS_LOAD_BACK_REFILL_PASSES = EnvInt(2)
+    SGLANG_AS_LOAD_BACK_COALESCE_WAIT_US = EnvInt(0)
+    SGLANG_AS_LOAD_BACK_READ_WORKERS = EnvInt(1)
+    SGLANG_AS_LOAD_BACK_MAX_PENDING = EnvInt(32)
+    SGLANG_AS_SPAG_REUSE_FINISHED_WRITE = EnvBool(False)
+    SGLANG_AS_SPAG_BATCH_WRITE_FENCE = EnvBool(False)
+    SGLANG_DSV4_BATCH_PREFILL_INDEXER = EnvBool(False)
+    SGLANG_FUSE_CP_CANDIDATE_MASK = EnvBool(False)
 
 
 envs = Envs()

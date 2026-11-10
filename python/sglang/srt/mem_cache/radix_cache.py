@@ -33,6 +33,18 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Optional stdlib accelerator. PyDLL keeps the GIL during the buffer comparison.
+# Platforms without an exported memcmp retain the slice-based implementation.
+try:
+    import ctypes as _ctypes
+
+    _radix_memcmp = _ctypes.PyDLL(None).memcmp
+    _radix_memcmp.argtypes = (_ctypes.c_void_p, _ctypes.c_void_p, _ctypes.c_size_t)
+    _radix_memcmp.restype = _ctypes.c_int
+except (ImportError, AttributeError, OSError):
+    _radix_memcmp = None
+
+
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -209,6 +221,49 @@ class RadixKey:
                 break
             lo = hi
             step *= 2
+
+            # Keep short matches on the original path. For long plain integer
+            # arrays, compare bounded byte spans without allocating token slices.
+            if (
+                step == 2048
+                and type(n) is int
+                and n >= 16383
+                and _radix_memcmp is not None
+                and type(t0) is array
+                and type(t1) is array
+                and t0.typecode == t1.typecode
+                and t0.typecode in "bBhHiIlLqQ"
+                and type(offset) is int
+            ):
+                # Export both buffers before taking addresses, preventing resize
+                # until every comparison completes (also on exceptional exits).
+                with memoryview(t0), memoryview(t1):
+                    if n <= len(t0) and offset + n <= len(t1):
+                        itemsize = t0.itemsize
+                        addr0 = t0.buffer_info()[0]
+                        addr1 = t1.buffer_info()[0] + offset * itemsize
+                        compare = _radix_memcmp
+                        while lo < n:
+                            hi = lo + 32768 if lo + 32768 < n else n
+                            if compare(
+                                addr0 + lo * itemsize,
+                                addr1 + lo * itemsize,
+                                (hi - lo) * itemsize,
+                            ):
+                                while hi - lo > 1:
+                                    mid = (lo + hi) // 2
+                                    if compare(
+                                        addr0 + lo * itemsize,
+                                        addr1 + lo * itemsize,
+                                        (mid - lo) * itemsize,
+                                    ) == 0:
+                                        lo = mid
+                                    else:
+                                        hi = mid
+                                matched_tokens = lo
+                                break
+                            lo = hi
+                        break
 
         if self.is_bigram:
             matched = max(0, min(matched_tokens - 1, len(self), len(other) - offset))

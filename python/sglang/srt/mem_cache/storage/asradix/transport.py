@@ -253,6 +253,44 @@ class _PassiveStore:
         return
 
 
+class _NativeDiagnosticFuture:
+    """Native readiness with scheduler-owned optional diagnostic finalization."""
+    def __init__(self, native, finish):
+        self.native, self.finish = native, finish
+        self._lock = threading.Lock()
+        self._finalized = False
+        self._value = None
+
+    def done(self):
+        """Check native readiness without running scheduler diagnostics.
+
+        Returns:
+            bool: Whether the native future has completed.
+        """
+        return self.native.done()
+
+    def result(self, timeout=None):
+        """Drain native work and finalize diagnostics once under the boundary
+        lock.
+
+        Args:
+            timeout: Optional boundary wait in seconds; None uses the native
+                wait limit.
+
+        Returns:
+            Any: The value returned by the diagnostic completion callback.
+
+        Raises:
+            Exception: Native waiting or diagnostic finalization failed.
+        """
+        with self._lock:
+            if not self._finalized:
+                self._value = self.finish(self.native.result(timeout))
+                self._finalized = True
+                self.finish = None
+            return self._value
+
+
 class _BufferPageIO:
     """Transport page requests over SDK-owned typed buffer bindings."""
 
@@ -299,6 +337,217 @@ class _BufferPageIO:
             for name, tensors in self._buffer_tensors.items():
                 if len(tensors) != len(self._buffer_pools[name]):
                     raise ValueError(f"{name} buffer tensor/pool counts differ")
+
+    def submit_write_slots_native(
+        self,
+        block_hash_ids,
+        prepared,
+        chunks,
+        producer_ready,
+        *,
+        attempts=1,
+        params=None,
+        timeout=1.0,
+    ):
+        """Submit one FIFO native match/write/confirm transaction."""
+        import os
+
+        if os.environ.get("ATTENTIONSTORE_NATIVE_WRITE") != "1":
+            return None
+        from attentionstore_sdk.sdk import (
+            BlockBatch,
+            WriteRequest,
+            SPAGHandler,
+        )
+        from attentionstore_sdk.native_write_bridge import (
+            submit_write_pipeline,
+        )
+
+        if (
+            self._pages_per_block != 1
+            or not block_hash_ids
+            or not isinstance(self._sdk._handler, SPAGHandler)
+        ):
+            return None
+        if prepared.slots.numel() != len(block_hash_ids) * prepared.page_size:
+            raise ValueError("native hash/slot counts differ")
+        self._sdk._handler._ensure_registered(self._sdk)
+        for start, end, swa_ids, step in chunks:
+            request = WriteRequest(
+                blocks=BlockBatch(
+                    hash_ids=block_hash_ids[start:end],
+                    data_ids=range(end - start),
+                    layer_ids=self._layer_ids,
+                    logical_start=start,
+                ),
+                buffers=self._bind_swa_ids(self._write_buffers, swa_ids),
+                timeout=timeout,
+                params=params or {},
+                swa_block_step=step,
+            )
+            self._sdk._handler._validate_spag_buffers(request, True)
+        # Optional snapshots are taken on the submitting scheduler, before the
+        # native transaction. Worker threads never enter Python diagnostics.
+        if cache_digest_enabled() or barrier_debug_enabled():
+            pages = prepared.materialize()
+            wait_for_producer_event(
+                producer_ready, timeout, debug_tag="native source"
+            )
+            for start, end, swa_ids, step in chunks:
+                hashes = block_hash_ids[start:end]
+                self._emit_native_source(
+                    "write-source",
+                    self._snapshot_digests(hashes, pages[start:end]),
+                )
+                self._emit_native_source(
+                    "write-source-swa",
+                    self._swa_digests(hashes, swa_ids, step, True),
+                )
+        future = submit_write_pipeline(
+            self._sdk,
+            self._write_buffers,
+            block_hash_ids,
+            self._layer_ids,
+            prepared.slots,
+            prepared.page_size,
+            prepared.ready_event,
+            producer_ready,
+            [
+                (start, end, list(ids), step or 0)
+                for start, end, ids, step in chunks
+            ],
+            attempts=attempts,
+            params=params,
+            timeout=timeout,
+        )
+        if not getattr(self, "_native_writer_exercised", False):
+            self._native_writer_exercised = True
+            logger.info(
+                "Native writer selected: ordered Match/metadata/write/confirm lane"
+            )
+        return future
+
+    @staticmethod
+    def _emit_native_source(action, snapshot):
+        """Use092's reference protocol; an empty family is not byte evidence."""
+        for family, position, layer, digests in snapshot or ():
+            for offset in range(0, len(digests), 32):
+                chunk = digests[offset:offset + 32]
+                cache_digest_logger.info(
+                    "AS-REF %s digest: family=%s layer_pos=%d layer_id=%s "
+                    "blocks=%d transferred=0 digests=%s",
+                    action,
+                    family,
+                    position,
+                    layer,
+                    len(chunk),
+                    chunk,
+                )
+
+    def submit_read_slots_native(
+        self, block_hash_ids, slots, page_size, mapping, allocation_ready,
+        *, cp_rank=0, cp_size=1, swa_block_step=None, timeout=5.0, remote_addrs=None,
+    ):
+        """Submit borrowed physical tensors; prepare pages and copy in C++."""
+        import os
+        if os.environ.get("ATTENTIONSTORE_NATIVE_METADATA") != "1":
+            return None
+        import torch
+        from attentionstore_sdk.sdk import BlockBatch, ReadRequest, SPAGHandler
+        if (self._pages_per_block != 1 or not block_hash_ids
+                or not isinstance(self._sdk._handler, SPAGHandler)):
+            return None
+        if (not isinstance(slots, torch.Tensor) or not slots.is_cuda
+                or slots.dtype != torch.int64 or slots.ndim != 1
+                or not slots.is_contiguous() or page_size <= 0):
+            return None
+        if slots.numel() != len(block_hash_ids) * page_size:
+            raise ValueError("native hash/physical slot counts differ")
+        with_swa = self._sdk._handler.config.swa_segment_name is not None
+        if with_swa != (mapping is not None):
+            return None
+        if mapping is not None and (
+                not isinstance(mapping, torch.Tensor) or mapping.device != slots.device
+                or mapping.dtype != torch.int64 or mapping.ndim != 1
+                or not mapping.is_contiguous()):
+            return None
+        # Typed layout validation uses placeholder physical ids. The worker
+        # validates actual page continuity and SWA mapping before any RPC/copy.
+        buffers = self._bind_swa_ids(self._buffers, (1,) if with_swa else ())
+        request = ReadRequest(
+            blocks=BlockBatch(hash_ids=block_hash_ids,
+                              data_ids=range(len(block_hash_ids)), layer_ids=self._layer_ids),
+            buffers=buffers, timeout=timeout, remote_addrs=remote_addrs or (),
+            swa_block_step=swa_block_step)
+        self._sdk._handler._ensure_registered(self._sdk)
+        step = self._sdk._handler._validate_spag_buffers(request, False)
+        from attentionstore_sdk.native_slots_bridge import submit_slots
+        native = submit_slots(
+            self._sdk, buffers, block_hash_ids, self._layer_ids, slots, page_size,
+            mapping, allocation_ready, cp_rank=cp_rank, cp_size=cp_size,
+            swa_step=step, timeout=timeout, remote_addrs=remote_addrs or ())
+        if not getattr(self, "_native_async_exercised", False):
+            self._native_async_exercised = True
+            logger.info("Native metadata load-back selected: device=%d cp_rank=%d cp_size=%d",
+                        slots.device.index, cp_rank, cp_size)
+
+        def finish(read):
+            result = native._completion
+            if result is None:
+                raise RuntimeError("native completion metadata unavailable")
+            pages = result["prepared_pages"]
+            indices = result["local_indices"]
+            hashes = [block_hash_ids[i] for i in indices]
+            local_pages = [pages[i] for i in indices]
+            swa_ids = (result["prepared_swa_page"],) if with_swa else ()
+            rp_hashes, rp_pages = self._read_prefix(hashes, local_pages, read)
+            self._emit_digests("read", self._snapshot_digests(rp_hashes, rp_pages), read)
+            if read >= len(hashes):
+                self._emit_digests(
+                    "read-swa", self._swa_digests(hashes, swa_ids, step, False), read)
+            self._debug_recheck_after_sync(
+                rp_hashes, rp_pages, "read hash=%s" % (rp_hashes[:1],))
+            return read
+        return _NativeDiagnosticFuture(native, finish)
+
+    def submit_read_native(
+        self, block_hash_ids, page_ids, timeout=1.0, remote_addrs=None,
+        logical_start=None, swa_ids=None, swa_block_step=None,
+    ):
+        """Submit native SPAG I/O; diagnostics run when the scheduler drains it."""
+        import os
+        if os.environ.get("ATTENTIONSTORE_NATIVE_CONTROL") != "1":
+            return None
+        from attentionstore_sdk.sdk import BlockBatch, ReadRequest, SPAGHandler
+        if (self._pages_per_block != 1 or not block_hash_ids
+                or not isinstance(self._sdk._handler, SPAGHandler)):
+            return None
+        from attentionstore_sdk.native_bridge import submit_spag
+        self._logical_blocks(block_hash_ids, page_ids)
+        request = ReadRequest(
+            blocks=BlockBatch(
+                hash_ids=block_hash_ids, data_ids=page_ids, layer_ids=self._layer_ids,
+                logical_start=0 if logical_start is None else logical_start),
+            buffers=self._bind_swa_ids(self._buffers, swa_ids), timeout=timeout,
+            remote_addrs=remote_addrs or (), swa_block_step=swa_block_step)
+        self._sdk._handler._ensure_registered(self._sdk)
+        step = self._sdk._handler._validate_spag_buffers(request, False)
+        future = submit_spag(self._sdk, request, "read", step)
+        if not getattr(self, "_native_async_exercised", False):
+            self._native_async_exercised = True
+            logger.info("Native control load-back completion selected")
+
+        def finish(read):
+            rp_hashes, rp_pages = self._read_prefix(block_hash_ids, page_ids, read)
+            self._emit_digests("read", self._snapshot_digests(rp_hashes, rp_pages), read)
+            if read >= len(block_hash_ids):
+                self._emit_digests(
+                    "read-swa",
+                    self._swa_digests(block_hash_ids, swa_ids, swa_block_step, False), read)
+            self._debug_recheck_after_sync(
+                rp_hashes, rp_pages, "read hash=%s" % (rp_hashes[:1],))
+            return read
+        return _NativeDiagnosticFuture(future, finish)
 
     @property
     def _pages_per_block(self) -> int:
@@ -362,6 +611,7 @@ class _BufferPageIO:
         self,
         block_hash_ids: Sequence[int],
         page_ids: Sequence[int],
+        force: bool = False,
     ) -> Optional[list]:
         """Hash the HBM pages a transfer touches, grouped per logical block.
 
@@ -369,7 +619,7 @@ class _BufferPageIO:
         a D2H copy per layer per page, and a corruption that spares both ends of
         the layer range is not a case worth paying for by default.
         """
-        if not cache_digest_enabled() or not block_hash_ids:
+        if not (cache_digest_enabled() or force) or not block_hash_ids:
             return None
         try:
             blocks = self._logical_blocks(block_hash_ids, page_ids)
@@ -460,17 +710,19 @@ class _BufferPageIO:
         if not snapshot:
             return
         for name, position, layer_id, digests in snapshot:
-            cache_digest_logger.info(
-                "AS %s digest: family=%s layer_pos=%d layer_id=%s "
-                "blocks=%d transferred=%s digests=%s",
-                action,
-                name,
-                position,
-                layer_id,
-                len(digests),
-                transferred,
-                digests,
-            )
+            for offset in range(0, max(1, len(digests)), 32):
+                chunk = digests[offset:offset + 32]
+                cache_digest_logger.info(
+                    "AS %s digest: family=%s layer_pos=%d layer_id=%s "
+                    "blocks=%d transferred=%s digests=%s",
+                    action,
+                    name,
+                    position,
+                    layer_id,
+                    len(chunk),
+                    transferred,
+                    chunk,
+                )
 
     def emit_content_digest(
         self, action: str, block_hash_ids: Sequence[int], page_ids: Sequence[int]
@@ -487,6 +739,29 @@ class _BufferPageIO:
         self._emit_digests(
             action, self._snapshot_digests(block_hash_ids, page_ids), len(block_hash_ids)
         )
+
+    @staticmethod
+    def _publish_digest(
+        callback: Optional[Callable[[dict], None]],
+        action: str,
+        snapshot: Optional[list],
+        transferred: int,
+    ) -> None:
+        """Publish the already-captured digest without re-reading HBM buffers."""
+        if callback is not None and snapshot:
+            try:
+                callback(
+                    {
+                        "kind": "page_buffers",
+                        "action": action,
+                        "transferred": int(transferred),
+                        "components": snapshot,
+                    }
+                )
+            except Exception as exc:
+                cache_digest_logger.warning(
+                    "AS %s digest callback failed: %s", action, exc
+                )
 
     def match(self, block_hash_ids: Sequence[int], timeout: float = 1.0) -> int:
         """Return the matched page prefix length."""
@@ -519,6 +794,7 @@ class _BufferPageIO:
         swa_ids: Optional[Sequence[int]] = None,
         swa_block_step: Optional[int] = None,
         logical_start: Optional[int] = None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Write page blocks through the typed SDK buffers."""
         from attentionstore_sdk.sdk import BlockBatch, WriteRequest
@@ -538,7 +814,9 @@ class _BufferPageIO:
             self._logical_blocks(block_hash_ids, page_ids)
             # Snapshot before the SDK call: the D2H gather happens inside write(),
             # so this is the source content actually handed to the Agent.
-            snapshot = self._snapshot_digests(block_hash_ids, page_ids)
+            snapshot = self._snapshot_digests(
+                block_hash_ids, page_ids, force=on_digest_snapshot is not None
+            )
             swa_snapshot = self._swa_digests(
                 block_hash_ids, swa_ids, swa_block_step, True
             )
@@ -557,14 +835,18 @@ class _BufferPageIO:
                     swa_block_step=swa_block_step,
                 )
             )
-            self._emit_digests("write", snapshot, written)
+            if cache_digest_enabled():
+                self._emit_digests("write", snapshot, written)
             self._emit_digests("write-swa", swa_snapshot, written)
+            self._publish_digest(on_digest_snapshot, "write", snapshot, written)
             self._debug_recheck_after_sync(
                 block_hash_ids, page_ids, "write hash=%s" % (block_hash_ids[:1],)
             )
             return written
         blocks = self._logical_blocks(block_hash_ids, page_ids)
-        snapshot = self._snapshot_digests(block_hash_ids, page_ids)
+        snapshot = self._snapshot_digests(
+            block_hash_ids, page_ids, force=on_digest_snapshot is not None
+        )
         written = self._sdk.write(
             WriteRequest(
                 blocks=BlockBatch(
@@ -580,7 +862,9 @@ class _BufferPageIO:
                 swa_block_step=swa_block_step,
             )
         )
-        self._emit_digests("write", snapshot, written)
+        if cache_digest_enabled():
+            self._emit_digests("write", snapshot, written)
+        self._publish_digest(on_digest_snapshot, "write", snapshot, written)
         self._debug_recheck_after_sync(
             block_hash_ids, page_ids, "write hash=%s" % (block_hash_ids[:1],)
         )
@@ -595,6 +879,7 @@ class _BufferPageIO:
         logical_start: Optional[int] = None,
         swa_ids: Optional[Sequence[int]] = None,
         swa_block_step: Optional[int] = None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Read page blocks through the typed SDK buffers."""
         from attentionstore_sdk.sdk import BlockBatch, ReadRequest
@@ -619,13 +904,13 @@ class _BufferPageIO:
                     swa_block_step=swa_block_step,
                 )
             )
-            self._emit_digests(
-                "read",
-                self._snapshot_digests(
-                    *self._read_prefix(block_hash_ids, page_ids, read)
-                ),
-                read,
+            snapshot = self._snapshot_digests(
+                *self._read_prefix(block_hash_ids, page_ids, read),
+                force=on_digest_snapshot is not None,
             )
+            if cache_digest_enabled():
+                self._emit_digests("read", snapshot, read)
+            self._publish_digest(on_digest_snapshot, "read", snapshot, read)
             if read >= len(block_hash_ids):
                 # The SWA window only lands on the final requested block, so a
                 # short read leaves it untouched and hashing it says nothing.
@@ -659,11 +944,13 @@ class _BufferPageIO:
                 swa_block_step=swa_block_step,
             )
         )
-        self._emit_digests(
-            "read",
-            self._snapshot_digests(*self._read_prefix(block_hash_ids, page_ids, read)),
-            read,
+        snapshot = self._snapshot_digests(
+            *self._read_prefix(block_hash_ids, page_ids, read),
+            force=on_digest_snapshot is not None,
         )
+        if cache_digest_enabled():
+            self._emit_digests("read", snapshot, read)
+        self._publish_digest(on_digest_snapshot, "read", snapshot, read)
         rp_hashes, rp_pages = self._read_prefix(block_hash_ids, page_ids, read)
         self._debug_recheck_after_sync(
             rp_hashes, rp_pages, "read hash=%s" % (rp_hashes[:1],)
@@ -722,8 +1009,8 @@ class _SpagDigestPageIO(_BufferPageIO):
         self._digest_segments = tuple(digest_segments)
         self._swa_digest = swa_digest
 
-    def _snapshot_digests(self, block_hash_ids, page_ids):
-        if not cache_digest_enabled() or not block_hash_ids:
+    def _snapshot_digests(self, block_hash_ids, page_ids, force: bool = False):
+        if not (cache_digest_enabled() or force) or not block_hash_ids:
             return None
         segments = self._digest_segments
         if not segments:
@@ -871,6 +1158,7 @@ class CheckpointedPageStore:
         checkpoint_slot: Mapping[str, int] | int,
         timeout: float = 1.0,
         remote_addrs=None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Read pages and their terminal checkpoint as one unit."""
         if not block_hash_ids:
@@ -880,6 +1168,7 @@ class CheckpointedPageStore:
             page_ids,
             timeout=timeout,
             remote_addrs=remote_addrs,
+            on_digest_snapshot=on_digest_snapshot,
         )
         if page_count != len(block_hash_ids):
             return page_count
@@ -888,6 +1177,7 @@ class CheckpointedPageStore:
             checkpoint_slot,
             timeout=timeout,
             remote_addrs=remote_addrs,
+            on_digest_snapshot=on_digest_snapshot,
         )
         return page_count if state_count == 1 else 0
 
@@ -899,6 +1189,7 @@ class CheckpointedPageStore:
         timeout: float = 1.0,
         params: Optional[dict] = None,
         producer_ready=None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Write pages and their terminal checkpoint as one unit."""
         if not block_hash_ids:
@@ -906,13 +1197,20 @@ class CheckpointedPageStore:
         wait_for_producer = getattr(self.checkpoint_store, "wait_for_producer", None)
         if wait_for_producer is not None:
             wait_for_producer(producer_ready, timeout=timeout)
-        self.page_store.write(block_hash_ids, page_ids, timeout=timeout, params=params)
+        self.page_store.write(
+            block_hash_ids,
+            page_ids,
+            timeout=timeout,
+            params=params,
+            on_digest_snapshot=on_digest_snapshot,
+        )
         checkpoint_result = self.checkpoint_store.write(
             int(block_hash_ids[-1]),
             checkpoint_slot,
             timeout=timeout,
             params=params,
             producer_ready=producer_ready,
+            on_digest_snapshot=on_digest_snapshot,
         )
         return len(block_hash_ids) if checkpoint_result == 1 else -1
 

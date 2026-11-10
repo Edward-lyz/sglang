@@ -37,6 +37,26 @@ class TargetHiddenKvInjector:
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
 
+    def prepare_prefill_swa_loc(self, cache_loc: torch.Tensor) -> Optional[torch.Tensor]:
+        """Snapshot physical SWA locations before target forward can reuse
+        mappings.
+
+        Args:
+            cache_loc: Physical full-cache locations to translate before target
+                forward.
+
+        Returns:
+            Optional[Tensor]: Int32 SWA locations, or None for unsupported
+                pools.
+        """
+        pool = self.draft_model_runner.token_to_kv_pool
+        if (
+            not hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
+            or is_unified_kv_triton()
+        ):
+            return None
+        return pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+
     def inject_target_hidden(
         self,
         *,
@@ -49,6 +69,7 @@ class TargetHiddenKvInjector:
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
         row_valid: Optional[torch.Tensor] = None,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         if target_hidden is None or target_hidden.numel() == 0:
             return
@@ -98,6 +119,7 @@ class TargetHiddenKvInjector:
                 state_slot=state_slot,
                 final_pos=final_pos,
                 row_valid=row_valid,
+                swa_loc=swa_loc,
             )
             return
 
@@ -130,6 +152,7 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
         row_valid: Optional[torch.Tensor] = None,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         if is_unified_kv_triton():
             swa_loc = self._unified_inject_loc(
@@ -141,28 +164,37 @@ class TargetHiddenKvInjector:
                 final_pos=final_pos,
             )
         else:
-            gate_lens = commit_lens if cache_loc_2d is not None else None
-            gate_len = cache_loc_2d.shape[1] if gate_lens is not None else None
-            swa_mapping = getattr(pool, "full_to_swa_index_mapping", None)
-            if envs.SGLANG_OPT_DSPARK_INJECT_LOC_FUSE.get() and can_commit_swa_loc(
-                swa_mapping, cache_loc, gate_lens, gate_len, row_valid
-            ):
-                # translate + commit gate + row_valid gate in one launch (identical ints)
-                swa_loc = commit_swa_loc(
-                    swa_mapping, cache_loc, gate_lens, gate_len, row_valid
-                )
-                row_valid = None
-            else:
-                swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+            if swa_loc is not None:
+                # Prefill borrowed a stable snapshot before the target forward;
+                # never translate it through a subsequently reused allocator map.
                 if commit_lens is not None and cache_loc_2d is not None:
-                    bs, verify_len = cache_loc_2d.shape
+                    verify_len = cache_loc_2d.shape[1]
                     col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
-                    committed_mask = (
-                        col < commit_lens.to(torch.long).view(-1, 1)
-                    ).reshape(-1)
-                    swa_loc = torch.where(
-                        committed_mask, swa_loc, torch.full_like(swa_loc, -1)
+                    committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
+                    swa_loc = torch.where(committed, swa_loc, torch.full_like(swa_loc, -1))
+            else:
+                gate_lens = commit_lens if cache_loc_2d is not None else None
+                gate_len = cache_loc_2d.shape[1] if gate_lens is not None else None
+                swa_mapping = getattr(pool, "full_to_swa_index_mapping", None)
+                if envs.SGLANG_OPT_DSPARK_INJECT_LOC_FUSE.get() and can_commit_swa_loc(
+                    swa_mapping, cache_loc, gate_lens, gate_len, row_valid
+                ):
+                    # translate + commit gate + row_valid gate in one launch (identical ints)
+                    swa_loc = commit_swa_loc(
+                        swa_mapping, cache_loc, gate_lens, gate_len, row_valid
                     )
+                    row_valid = None
+                else:
+                    swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+                    if commit_lens is not None and cache_loc_2d is not None:
+                        bs, verify_len = cache_loc_2d.shape
+                        col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
+                        committed_mask = (
+                            col < commit_lens.to(torch.long).view(-1, 1)
+                        ).reshape(-1)
+                        swa_loc = torch.where(
+                            committed_mask, swa_loc, torch.full_like(swa_loc, -1)
+                        )
         if row_valid is not None:
             # [MEM-P3] Rank-major all-gather padding rows: -1 means "do not commit",
             # the same contract the commit gate above uses.

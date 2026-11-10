@@ -17,8 +17,11 @@ import torch
 from sglang.srt.mem_cache.storage.asradix import checkpoint_coordinator as cc
 from sglang.srt.mem_cache.storage.asradix.checkpoint_coordinator import (
     SPACacheCoordinator,
+    SPAGCacheCoordinator,
     _SPAWriteTask,
 )
+from sglang.srt.mem_cache.storage.asradix.cache import AttentionStoreUnifiedRadixCache
+from sglang.test.test_utils import CustomTestCase
 
 PAGE = 256
 
@@ -209,6 +212,144 @@ class TestAfterLocalCommitFloor(unittest.TestCase):
         self.assertEqual(len(discarded), 1)
         self.assertEqual(dummies, ["r1"])
         self.assertEqual(len(cache.failures), 1)
+
+
+class TestSPAGFinishedWriteReuse(CustomTestCase):
+    def setUp(self):
+        self.coordinator = SPAGCacheCoordinator()
+        self.coordinator._reuse_finished_write = True
+        self.req = SimpleNamespace(
+            rid="reuse-request",
+            origin_input_ids=list(range(2 * PAGE)),
+            output_ids=[],
+            effective_kv_committed_len=lambda: 2 * PAGE,
+            kv=SimpleNamespace(req_pool_idx=0),
+            as_block_hashs=SimpleNamespace(hash_ids=[11, 22]),
+            as_kv_cache_params={},
+            as_spag_submitted_write=((11, 22), {}),
+        )
+        self.cache = object.__new__(AttentionStoreUnifiedRadixCache)
+        self.cache.tree_core = SimpleNamespace()
+        self.cache.pp_size = 1
+        self.cache.page_size = PAGE
+        self.cache.disable = False
+        self.cache.disable_finished_insert = False
+        self.cache._as_active_write_owner = None
+        self.cache._as_coordinator = self.coordinator
+        self.cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(2 * PAGE).reshape(1, -1)
+        )
+
+    def test_reuse_keeps_local_commit_and_avoids_second_retention(self):
+        with mock.patch.object(
+            cc.UnifiedRadixCache, "cache_finished_req"
+        ) as local_commit, mock.patch.object(
+            self.coordinator, "prepare_write"
+        ) as prepare_write, mock.patch.object(
+            self.coordinator, "enqueue_dummy"
+        ) as enqueue_dummy:
+            self.cache.cache_finished_req(self.req, is_insert=True)
+        local_commit.assert_called_once_with(self.req, True)
+        prepare_write.assert_not_called()
+        enqueue_dummy.assert_not_called()
+
+    def test_changed_prefix_namespace_or_pp_still_writes(self):
+        for hashes, params, pp_size in (
+            ([11, 23], {}, 1),
+            ([11, 22], {"namespace": "other"}, 1),
+            ([11, 22], {}, 2),
+        ):
+            with self.subTest(hashes=hashes, params=params, pp_size=pp_size):
+                self.req.as_block_hashs.hash_ids = hashes
+                self.req.as_kv_cache_params = params
+                self.cache.pp_size = pp_size
+                context = self.coordinator.capture_finished(self.cache, self.req, True)
+                self.assertTrue(context.is_insert)
+
+    def test_failed_write_allows_retry_without_clearing_newer_prefix(self):
+        task = _SPAWriteTask(
+            rid=self.req.rid,
+            page_endpoint=None,
+            checkpoint_store=None,
+            block_hash_ids=(11, 22),
+            page_ids=None,
+            checkpoint_snapshot=None,
+            params={},
+            request=self.req,
+        )
+        self.coordinator.finish(self.cache, task, -1)
+        self.assertIsNone(self.req.as_spag_submitted_write)
+        context = self.coordinator.capture_finished(self.cache, self.req, True)
+        self.assertTrue(context.is_insert)
+        self.req.as_spag_submitted_write = ((11, 22, 33), {})
+        self.coordinator.finish(self.cache, task, -1)
+        self.assertEqual(self.req.as_spag_submitted_write, ((11, 22, 33), {}))
+
+    def test_batch_fence_covers_producer_and_scheduler_staging(self):
+        self.coordinator._batch_write_fence = True
+        producer = object()
+        self.req.as_kv_ready_event = producer
+        task = SimpleNamespace(request=self.req, swa_slot_ids=(), producer_ready=None)
+        stream = mock.Mock()
+        staged_ready = object()
+        cache = SimpleNamespace(
+            device="cuda",
+            token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: object()),
+        )
+        with mock.patch.object(
+            SPACacheCoordinator, "_make_release_after_write"
+        ), mock.patch.object(
+            cc.torch.cuda, "current_stream", return_value=stream
+        ), mock.patch.object(
+            self.coordinator, "record_device_event", return_value=staged_ready
+        ) as record_event:
+            self.coordinator._make_release_after_write(cache, task, object())
+        stream.wait_event.assert_called_once_with(producer)
+        record_event.assert_called_once_with("cuda", stream)
+        self.assertIs(task.producer_ready, staged_ready)
+
+    def test_reused_write_retries_before_releasing_staging(self):
+        actions = []
+        task = SimpleNamespace(
+            requested_blocks=2,
+            release_after_write=lambda: actions.append("release"),
+        )
+        results = iter((-1, 2))
+
+        def write(cache, task):
+            actions.append("write")
+            return next(results)
+
+        with mock.patch.object(self.coordinator, "do_write", side_effect=write):
+            result = self.coordinator._run_write(self.cache, task)
+        self.assertEqual(result, 2)
+        self.assertEqual(actions, ["write", "write", "release"])
+
+    def test_writer_uses_captured_fence_without_waiting_on_later_forward(self):
+        captured_ready = object()
+        store = mock.Mock()
+        task = _SPAWriteTask(
+            rid=self.req.rid,
+            page_endpoint=SimpleNamespace(store=store),
+            checkpoint_store=None,
+            block_hash_ids=(11, 22),
+            page_ids=SimpleNamespace(materialize=lambda: (7, 8)),
+            checkpoint_snapshot=None,
+            params={},
+            request=self.req,
+            producer_ready=captured_ready,
+        )
+        cache = SimpleNamespace(_log_as_result=mock.Mock(), _log_as_failure=mock.Mock())
+        with mock.patch.object(
+            self.coordinator, "_match_pages", side_effect=(0, 2)
+        ), mock.patch.object(
+            self.coordinator, "_write_chunks", return_value=[(0, 2, (), None)]
+        ), mock.patch.object(self.coordinator, "record_device_event") as late_record:
+            result = self.coordinator.do_write(cache, task)
+        self.assertEqual(result, 2)
+        late_record.assert_not_called()
+        self.assertIs(store.write.call_args.kwargs["producer_ready"], captured_ready)
+        cache._log_as_failure.assert_not_called()
 
 
 if __name__ == "__main__":

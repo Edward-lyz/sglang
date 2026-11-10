@@ -63,8 +63,37 @@ def _rust_tree_core_factory(
     return RustUnifiedTreeCore(params)
 
 
+def _as_native_tree_core_factory(params, components):
+    """Use the native CP-aware Full/SWA core inside its validated contract.
+
+    Other components and optional Python-node APIs keep the original backend;
+    this opt-in backend must not remove session/C128/Mamba/PP/custom features.
+    """
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+    if (
+        params.enable_session_radix_cache
+        or params.component_registry_override
+        or params.eviction_policy_config
+        or params.eviction_policy != "lru"
+        or params.cache_ttl_seconds is not None
+        or params.pp_size != 1
+        or not params.tree_components
+        or ComponentType.FULL not in params.tree_components
+        or set(params.tree_components) - {ComponentType.FULL, ComponentType.SWA}
+    ):
+        return _python_tree_core_factory(params, components)
+    import logging
+    core = _rust_tree_core_factory(params, components)
+    logging.getLogger(__name__).info(
+        "Native tree selected: components=%s page_size=%d CP=%d",
+        params.tree_components, params.page_size, params.attn_cp_size,
+    )
+    return core
+
+
 register_tree_core_backend("python", _python_tree_core_factory)
 register_tree_core_backend("rust", _rust_tree_core_factory)
+register_tree_core_backend("as_native", _as_native_tree_core_factory)
 
 
 def create_tree_core(

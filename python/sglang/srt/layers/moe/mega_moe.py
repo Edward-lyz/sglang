@@ -878,7 +878,7 @@ def warmup_mega_moe_kernels(moes, max_tokens: int) -> dict:
     stats = {"layers": 0, "token_counts": 0, "gate_cfgs": 0, "block_ms": 0}
     if (
         _device_sm != 100
-        or _mega_moe_mma_type() != "fp8xfp4"
+        or _mega_moe_mma_type() not in ("fp8xfp4", "mxf4xmxf4")
         or not get_moe_a2a_backend().is_megamoe()
         or max_tokens <= 0
     ):
@@ -913,6 +913,10 @@ def warmup_mega_moe_kernels(moes, max_tokens: int) -> dict:
         seen.update((layer_key, moe_kernel))
 
         device = moe.gate.weight.device
+        # Bind the device ProcessGroup before DeepGEMM's bare group.barrier().
+        # fake-DP replicas restart global ranks at 0 while using offset GPUs;
+        # NCCL's first-barrier rank-based guess would otherwise target DP0.
+        torch.distributed.barrier(group=ep.device_group, device_ids=[device.index])
         gen = torch.Generator(device=device).manual_seed(0)
         hidden_states = torch.randn(
             (max_tokens, moe.config.hidden_size),

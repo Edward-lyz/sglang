@@ -23,7 +23,9 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.environ import envs
-from sglang.srt.utils.nvtx_utils import NVTX_OPERATIONS_ENABLED, profile_method
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_OPERATIONS_ENABLED, operations_nvtx_range, profile_method,
+)
 
 from .coordinator import AttentionStoreCoordinator
 from .plans import AttentionStoreCachePlan
@@ -43,6 +45,21 @@ class AttentionStoreIntegrationMixin:
 
     _as_coordinator: Optional[AttentionStoreCoordinator] = None
     _as_plan: Optional[AttentionStoreCachePlan] = None
+
+    def get_as_trace_recorder(self, req):
+        """Return the request-scoped AttentionStore trace recorder."""
+        if req is None:
+            return None
+        from sglang.srt.mem_cache.as_trace import get_recorder
+
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        return get_recorder(req, kv_cache)
+
+    def _trace_as_match_skip(self, req, reason: str, **fields) -> None:
+        """Record why an AS match produced no load, so the trace is not silent."""
+        recorder = self.get_as_trace_recorder(req)
+        if recorder is not None:
+            recorder.record("AS_MATCH", status="skipped", reason=reason, **fields)
 
     @property
     def attention_store_block_size(self) -> int:
@@ -135,6 +152,8 @@ class AttentionStoreIntegrationMixin:
         result: int,
         started: float,
     ) -> None:
+        if not envs.SGLANG_LOG_AS_CACHE_OPERATIONS.get():
+            return
         result_field = self._AS_RESULT_FIELDS[operation]
         logger.info(
             "AS %s: cache_plan=%s rid=%s requested_blocks=%s "
@@ -318,6 +337,9 @@ class AttentionStoreIntegrationMixin:
             )
             local_hit_len = len(local_result.device_indices)
         if local_hit_len == max_hit_len and not joint_pp_match:
+            self._trace_as_match_skip(
+                req, "local_full_hit", local_hit_tokens=local_hit_len
+            )
             return None
 
         start_block = local_hit_len // block_size
@@ -331,9 +353,13 @@ class AttentionStoreIntegrationMixin:
         # Apply the request's prefix limit before matching so a later checkpoint
         # cannot be matched and then relabeled as an earlier prefix by truncation.
         if not hashes:
+            self._trace_as_match_skip(
+                req, "no_hashes_to_match", local_hit_tokens=local_hit_len
+            )
             return zero_match_result(self, local_result) if joint_pp_match else None
 
         requested = len(hashes)
+        recorder = self.get_as_trace_recorder(req)
         started = time.perf_counter()
         match_error = None
         authoritative_pp_match = (
@@ -388,11 +414,30 @@ class AttentionStoreIntegrationMixin:
                 started=started,
             )
         if match_count <= 0:
+            if recorder is not None:
+                recorder.record(
+                    "AS_MATCH",
+                    raw_match_blocks=0,
+                    final_match_blocks=0,
+                    start_block=start_block,
+                    hash_ids=recorder.hash_ids(hashes),
+                    status="miss",
+                )
             return zero_match_result(self, local_result) if joint_pp_match else None
 
         terminal_block = match_count if joint_pp_match else start_block + match_count
         if terminal_block <= start_block:
             if terminal_block == start_block:
+                # AS matched, but only what the local device cache already holds.
+                if recorder is not None:
+                    recorder.record(
+                        "AS_MATCH",
+                        raw_match_blocks=match_count,
+                        final_match_blocks=0,
+                        start_block=start_block,
+                        hash_ids=recorder.hash_ids(hashes),
+                        status="local_covered",
+                    )
                 return local_result
             terminal_tokens = terminal_block * block_size
             capped_params = MatchPrefixParams(
@@ -412,6 +457,15 @@ class AttentionStoreIntegrationMixin:
             local_hit_len = len(local_result.device_indices)
             start_block = local_hit_len // block_size
             if terminal_block == start_block:
+                if recorder is not None:
+                    recorder.record(
+                        "AS_MATCH",
+                        raw_match_blocks=match_count,
+                        final_match_blocks=0,
+                        start_block=start_block,
+                        hash_ids=recorder.hash_ids(hashes),
+                        status="local_covered",
+                    )
                 return local_result
             if terminal_block < start_block:
                 raise RuntimeError(
@@ -438,11 +492,30 @@ class AttentionStoreIntegrationMixin:
         if restorable_block <= start_block:
             # Keep the local hit intact rather than capping it down to the AS
             # boundary: HBM already holds more than the store can hand back.
+            if recorder is not None:
+                recorder.record(
+                    "AS_MATCH",
+                    raw_match_blocks=match_count,
+                    final_match_blocks=0,
+                    start_block=start_block,
+                    restorable_blocks=restorable_block,
+                    hash_ids=recorder.hash_ids(hashes),
+                    status="local_covered",
+                )
             return zero_match_result(self, local_result) if joint_pp_match else None
         terminal_block = restorable_block
 
         read_hashes = req.as_block_hashs.hash_ids[start_block:terminal_block]
         read_count = terminal_block - start_block
+        if recorder is not None:
+            recorder.record(
+                "AS_MATCH",
+                raw_match_blocks=match_count,
+                final_match_blocks=read_count,
+                start_block=start_block,
+                hash_ids=recorder.hash_ids(read_hashes),
+                status="hit",
+            )
 
         anchor = local_result.last_device_node
         req._as_load_info = {
@@ -613,9 +686,55 @@ class AttentionStoreIntegrationMixin:
         """Whether any deferred load-back read is still in flight."""
         return bool(self.attention_store_coordinator._pending_load_backs)
 
+    def pending_ascache_load_back_requests(self):
+        """Requests whose allocated reads will be committed together."""
+        return tuple(
+            task.req for task in self.attention_store_coordinator._pending_load_backs
+        )
+
+    def attention_store_load_back_batch_is_full(self) -> bool:
+        """Bound deferred allocations while leaving requests queued for retry."""
+        limit = envs.SGLANG_AS_LOAD_BACK_MAX_PENDING.get()
+        return limit > 0 and len(
+            self.attention_store_coordinator._pending_load_backs
+        ) >= limit
+
     def drain_attention_store_writes(self) -> None:
         """Wait for all pending AttentionStore writes."""
         self.attention_store_coordinator.drain(self)
+
+    def ensure_attention_store_swa_staging_capacity(self, pool, required: int) -> None:
+        """Backpressure a batch before it can allocate incomplete SWA backups.
+
+        Capacity and the decision to drain must agree across attention ranks;
+        writer progress and staging free lists can differ momentarily.
+        """
+        if (
+            self.attention_store_plan.name != "SPAG"
+            or getattr(self, "pp_world_size", 1) > 1
+        ):
+            return
+        state = torch.tensor(
+            [pool.available_size(), -int(required), pool.num_pages],
+            dtype=torch.int64,
+        )
+        self._all_reduce_attn_groups(state, torch.distributed.ReduceOp.MIN)
+        available, negative_required, capacity = state.tolist()
+        required = -negative_required
+        if required > capacity:
+            raise RuntimeError(
+                f"AS SWA staging batch needs {required} slots, pool capacity {capacity}"
+            )
+        if available >= required:
+            return
+        with operations_nvtx_range("radix.as.swa_staging_backpressure"):
+            self.drain_attention_store_writes()
+        available = self._as_min(pool.available_size())
+        if available < required:
+            raise RuntimeError(
+                "AS SWA staging cannot reserve a complete batch after draining: "
+                f"need={required} available={available}"
+            )
 
     def reset(self) -> None:
         """Drain remote writes before resetting the local cache."""

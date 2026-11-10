@@ -32,6 +32,7 @@ def _diffuse_blocks() -> int:
 
 _CUDA = r"""
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
 // contiguous region copy (dst/src already offset), nbytes multiple of 16
 __global__ void _copy_region(char* dst, const char* src, long n4) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -39,7 +40,8 @@ __global__ void _copy_region(char* dst, const char* src, long n4) {
     for (; i < n4; i += stride) ((float4*)dst)[i] = ((const float4*)src)[i];
 }
 void copy_region(long long dst, long long src, long nbytes, int blocks) {
-    _copy_region<<<blocks, 256>>>((char*)dst, (const char*)src, nbytes / 16);
+    _copy_region<<<blocks, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        (char*)dst, (const char*)src, nbytes / 16);
 }
 // PHYSICALLY DISCRETE scatter: page k lives at the SAME scattered byte offset
 // idx[k]*page_bytes in BOTH src and dst windows (real paged-KV layout: identical
@@ -56,14 +58,39 @@ __global__ void _scatter_pages(char* dst, const char* src, const int* idx,
 }
 void scatter_pages(long long dst, long long src, long long idx,
                    int page_bytes, int npages, int blocks) {
-    _scatter_pages<<<blocks, 256>>>((char*)dst, (const char*)src,
-                                    (const int*)idx, page_bytes, npages);
+    _scatter_pages<<<blocks, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        (char*)dst, (const char*)src, (const int*)idx, page_bytes, npages);
+}
+// One descriptor is (local base, peer base, byte stride of one pool page).
+// All descriptors come from the pool's physical layout; there is no assumption
+// that compressed KV, index K and SWA regions have equal page strides.
+__global__ void _scatter_buffers(const long long* descriptors, int nbuffers,
+                                const int* idx, int npages) {
+    const long long ntasks = (long long)nbuffers * npages;
+    for (long long task = blockIdx.x; task < ntasks; task += gridDim.x) {
+        int buffer = task / npages;
+        int page = task % npages;
+        const long long* desc = descriptors + 3 * buffer;
+        long long page_bytes = desc[2];
+        long long offset = (long long)idx[page] * page_bytes;
+        const float4* src = (const float4*)(desc[1] + offset);
+        float4* dst = (float4*)(desc[0] + offset);
+        for (long long i = threadIdx.x; i < page_bytes / 16; i += blockDim.x)
+            dst[i] = src[i];
+    }
+}
+void scatter_buffers(long long descriptors, int nbuffers, long long idx,
+                     int npages, int blocks) {
+    _scatter_buffers<<<blocks, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        (const long long*)descriptors, nbuffers, (const int*)idx, npages);
 }
 """
 _CPP = (
     "void copy_region(long long dst, long long src, long nbytes, int blocks);\n"
     "void scatter_pages(long long dst, long long src, long long idx, "
-    "int page_bytes, int npages, int blocks);"
+    "int page_bytes, int npages, int blocks);\n"
+    "void scatter_buffers(long long descriptors, int nbuffers, long long idx, "
+    "int npages, int blocks);"
 )
 
 
@@ -93,7 +120,7 @@ def _kernel():
         name="asradix_kernel_diffuse",
         cpp_sources=_CPP,
         cuda_sources=_CUDA,
-        functions=["copy_region", "scatter_pages"],
+        functions=["copy_region", "scatter_pages", "scatter_buffers"],
         verbose=False,
     )
 # PLACEHOLDER_APPEND
@@ -175,5 +202,21 @@ def scatter_pages(
         return
     _kernel().scatter_pages(
         dst_ptr, src_ptr, idx_ptr, page_bytes, npages, _diffuse_blocks()
+    )
+
+
+def scatter_buffers(descriptors, page_indices) -> None:
+    """Copy scattered pages from every pool buffer on the current stream.
+
+    Descriptors are an int64 CUDA tensor [buffers, 3] containing destination,
+    source and page-byte stride. The caller validates alignment once when
+    constructing it and keeps it, the IPC mappings and the indices alive until
+    the stream completes. Empty work submits no kernel.
+    """
+    if descriptors.numel() == 0 or page_indices.numel() == 0:
+        return
+    _kernel().scatter_buffers(
+        descriptors.data_ptr(), descriptors.shape[0], page_indices.data_ptr(),
+        page_indices.numel(), _diffuse_blocks(),
     )
 

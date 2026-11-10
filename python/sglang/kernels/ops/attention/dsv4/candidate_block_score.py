@@ -80,3 +80,48 @@ def fused_select_candidate_block_ids(
     scores = candidate_block_scores_(logits, lengths, width, block_size)
     top = scores.topk(min(topk_blocks, scores.shape[-1]), dim=-1)
     return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
+
+
+@triton.jit
+def _publish_block_membership(
+    IDS, KEEP, ID_ROW: tl.constexpr, ID_COL: tl.constexpr,
+    COUNT: tl.constexpr, BLOCKS: tl.constexpr, TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    k = tl.arange(0, TILE)
+    block = tl.load(IDS + row * ID_ROW + k * ID_COL, k < COUNT, -1)
+    tl.store(KEEP + row * BLOCKS + block, True, (k < COUNT) & (block >= 0) & (block < BLOCKS))
+
+
+@triton.jit
+def _mask_candidate_scores_inplace(
+    SCORES, KEEP, ROW_STRIDE: tl.constexpr, WIDTH: tl.constexpr,
+    BLOCKS: tl.constexpr, GROUP: tl.constexpr, TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    live = col < WIDTH
+    keep = tl.load(KEEP + row * BLOCKS + col // GROUP, live, False)
+    # Kept NaNs and signed zeros are unchanged, just like masked_fill_.
+    tl.store(SCORES + row * ROW_STRIDE + col, -float("inf"), live & ~keep)
+
+
+def mask_candidate_logits_(logits, blocks, block_size):
+    """Apply exactly the block-id visibility mask, without a full-width bool mask."""
+    assert logits.dtype == torch.float32 and logits.stride(-1) == 1
+    assert blocks.ndim == 2 and blocks.shape[0] == logits.shape[0]
+    assert block_size > 0
+    rows, width = logits.shape
+    nblocks = triton.cdiv(width, block_size)
+    if not rows or not width:
+        return logits
+    keep = torch.zeros((rows, nblocks), dtype=torch.bool, device=logits.device)
+    if blocks.shape[1]:
+        _publish_block_membership[(rows,)](
+            blocks, keep, blocks.stride(0), blocks.stride(1),
+            blocks.shape[1], nblocks, triton.next_power_of_2(blocks.shape[1]),
+        )
+    _mask_candidate_scores_inplace[(rows, triton.cdiv(width, 1024))](
+        logits, keep, logits.stride(0), width, nblocks, block_size, 1024,
+    )
+    return logits

@@ -445,6 +445,36 @@ def _copy_or_replace(dst, src):
     return src
 
 
+def _finish_prefill_indexer_selection(
+    *, selected, k_slots, ks, page_indices, raw_indices
+) -> None:
+    num_tokens, topk = selected.shape
+    if selected.is_cuda and get_platform().is_sm100 and selected.dtype == torch.int32:
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            finish_flat_indexer_topk,
+        )
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "#41251 finish_flat_indexer_topk",
+            "fused prefill top-k sort/slot-map kernel enabled (rows=%d, topk=%d)",
+            num_tokens,
+            topk,
+        )
+        finish_flat_indexer_topk(selected, k_slots, ks, page_indices, raw_indices)
+        return
+    unselected = torch.iinfo(torch.int32).max
+    selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
+    chosen = selected != unselected
+    page_indices[:num_tokens, :topk] = torch.where(
+        chosen, k_slots[selected.clamp_max(k_slots.shape[0] - 1)], -1
+    ).to(torch.int32)
+    if raw_indices is not None:
+        raw_indices[:num_tokens, :topk] = torch.where(
+            chosen, selected - ks[:, None], -1
+        )
+
+
 @dataclass
 class DSV4AttnMetadata:
     """Per-forward DSv4 attention metadata shared by every layer of one stage."""
@@ -3719,6 +3749,49 @@ class DeepseekV4AttnBackend(
         if live_rows < num_tokens:
             ks = torch.nn.functional.pad(ks, (0, num_tokens - live_rows), value=0)
         topk = indexer.index_topk
+        if envs.SGLANG_DSV4_BATCH_PREFILL_INDEXER.get():
+            from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+                PrefillCandidateBlocks as DensePrefillCandidateBlocks,
+            )
+            from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import (
+                dense_prefill_topk,
+            )
+
+            consume = (
+                DensePrefillCandidateBlocks(
+                    request_blocks=published_prefill_blocks(
+                        self.forward_metadata.candidate_metadata
+                    ).request_blocks
+                )
+                if indexer.uses_candidates and not indexer.is_candidate_source
+                else None
+            )
+            selected, published = dense_prefill_topk(
+                q=(q_fp4, q_sf),
+                kv=(k_fp4, k_sf),
+                weights=weights,
+                starts=ks,
+                lengths=compress_lens,
+                request_lengths=list(zip(q_lens_cpu, lc_per_req)),
+                topk=topk,
+                candidate_topk_blocks=indexer.candidate_topk_blocks,
+                candidate_block_size=indexer.candidate_block_size,
+                publish_candidates=indexer.is_candidate_source,
+                candidates=consume,
+                score_budget_bytes=_TORCH_INDEXER_SCORE_BUDGET_BYTES,
+            )
+            if published is not None:
+                self.forward_metadata.candidate_metadata = PrefillCandidateBlocks(
+                    request_blocks=published.request_blocks
+                )
+            _finish_prefill_indexer_selection(
+                selected=selected,
+                k_slots=k_slots,
+                ks=ks,
+                page_indices=page_indices,
+                raw_indices=raw_indices,
+            )
+            return
         # -1 is the "nothing selected" value the tail below turns into a -1 page:
         # a request with no visible compressed position never enters the loop.
         selected = torch.full((num_tokens, topk), -1, dtype=torch.int32, device=device)

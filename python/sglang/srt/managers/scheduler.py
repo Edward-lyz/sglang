@@ -299,6 +299,11 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.observability.admission_diag import (
+    ADMISSION_DIAG,
+    admission_stage,
+    trace_admission,
+)
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -367,6 +372,8 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.nvtx_utils import (
     NVTX_OPERATIONS_ENABLED,
+    NVTX_SCHEDULER_ENABLED,
+    profile_range,
     operations_nvtx_range,
     profile_method,
 )
@@ -389,6 +396,27 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_DEFAULT_PYTHON_SWITCH_INTERVAL = sys.getswitchinterval()
+
+
+def _configure_python_switch_interval():
+    value = envs.SGLANG_PYTHON_SWITCH_INTERVAL.get()
+    if value is None:
+        return
+    error = (
+        "SGLANG_PYTHON_SWITCH_INTERVAL requires seconds in [0.00001, 0.05], "
+        f"got {value!r}."
+    )
+    try:
+        interval = float(value)
+    except ValueError:
+        raise ValueError(error) from None
+    if not 0.00001 <= interval <= 0.05:
+        raise ValueError(error)
+    sys.setswitchinterval(interval)
+    logger.info(
+        "Python switch interval configured at startup: %.9f", sys.getswitchinterval()
+    )
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -2198,7 +2226,7 @@ class Scheduler(
         # prefix that this forward has just filled. Using the untruncated array
         # here would count tokens of later chunks as committed and stage a window
         # whose KV has not been written yet.
-        committed_len = len(req.get_fill_ids())
+        committed_len = Req._get_fill_ids_len(req)
         first = req.as_swa_copy_count
         while req.as_swa_copy_count < len(req.as_swa_kv_slots):
             if policy.checkpoint_pos(req.as_swa_copy_count) > committed_len:
@@ -2295,10 +2323,13 @@ class Scheduler(
                 swa_page_idxs.append(swa_slot // kvcache.swa_page_size)
         if not slot_ids:
             return
-        # The triton copy launches on the scheduler thread's current stream (the
-        # schedule stream): it reads SWA pages this forward wrote, and the next
-        # run_batch's forward_stream.wait_stream(schedule_stream) orders the next
-        # forward behind it, so no extra fence is needed.
+        stage_stream = torch.cuda.current_stream(device)
+        producer_events = [req.as_kv_ready_event for req, _, _ in plans]
+        if any(event is None for event in producer_events):
+            stage_stream.wait_stream(self.forward_stream)
+        else:
+            for event in {id(event): event for event in producer_events}.values():
+                stage_stream.wait_event(event)
         pool.copy_swa_page_half_batch(
             slot_ids, swa_page_idxs, kvcache.swa_kv_pool, half=1
         )
@@ -2310,6 +2341,7 @@ class Scheduler(
                 slot_ids, swa_page_idxs, draft_pool.swa_kv_pool, half=1
             )
 
+    @admission_stage("retire")
     def retire_ascache_writes(self) -> None:
         """Retire completed AttentionStore async writes in submission order.
 
@@ -2486,6 +2518,7 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
+    @admission_stage("ingest")
     def ingest_requests(self) -> List:
         """Receive, broadcast and dispatch this iteration's external input.
 
@@ -4241,6 +4274,69 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _ascache_ready_refill_candidates(
+        self, adder, running_batch, refill_passes=0
+    ):
+        """Finish a deferred read group before launching an underfilled batch.
+
+        The caller makes one more pass through the ordinary admission loop,
+        so every existing request, token, SWA, LoRA and preemption gate still
+        applies. The opt-in bounded refill also scans queued requests not yet
+        submitted for load-back. Never choose collectives from local done().
+        """
+        max_passes = max(
+            1, min(8, envs.SGLANG_AS_LOAD_BACK_REFILL_PASSES.get())
+        )
+        rescan = max_passes > 1
+        if (
+            refill_passes >= max_passes
+            or not envs.SGLANG_AS_LOAD_BACK_COALESCE_READY.get()
+            or not envs.SGLANG_ENABLE_AS_LOAD_BACK_ASYNC.get()
+            or not self.enable_asradix_cache
+            or running_batch.batch_is_full
+            or (not adder.can_run_list and not rescan)
+            or adder.rem_chunk_tokens is None
+            or adder.rem_chunk_tokens <= 0
+            or adder.rem_input_tokens <= 0
+            or self.chunked_req is not None
+            or adder.new_chunked_req is not None
+            or adder.preempt_list
+            or getattr(self.req_to_token_pool, "mamba_allocator", None) is not None
+        ):
+            return ()
+        pending = self.tree_cache.pending_ascache_load_back_requests()
+        if not pending:
+            return ()
+        wanted = set(pending) - set(adder.can_run_list)
+        if ADMISSION_DIAG is not None:
+            ADMISSION_DIAG.phase(self, "refill_commit_before")
+        self.tree_cache.commit_ascache_load_backs()
+        wait_us = max(0, min(5000, envs.SGLANG_AS_LOAD_BACK_COALESCE_WAIT_US.get()))
+        if wait_us and self.tree_cache.pending_ascache_load_back_requests():
+            # Only the scheduler changes this queue; the first commit removes
+            # the same globally confirmed prefix on every CP rank. No local
+            # Future.done() or local clock chooses a collective here. Give the
+            # remaining reads a bounded opportunity to refill the ordinary
+            # admission loop before launching a small forward.
+            time.sleep(wait_us / 1_000_000)
+            self.tree_cache.commit_ascache_load_backs()
+        if ADMISSION_DIAG is not None:
+            ADMISSION_DIAG.phase(self, "refill_commit_after")
+        if rescan:
+            admitted = set(adder.can_run_list)
+            return [
+                req for req in self.waiting_queue
+                if req not in admitted and req._as_pending_load_back is None
+                and (req not in wanted or req.as_read_pending_lock)
+            ]
+        return [
+            req for req in self.waiting_queue
+            if req in wanted
+            and req._as_pending_load_back is None
+            and req.as_read_pending_lock
+        ]
+
+    @trace_admission
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4268,6 +4364,8 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if ADMISSION_DIAG is not None:
+                ADMISSION_DIAG.reason("no_queue_or_batch_full")
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -4282,6 +4380,8 @@ class Scheduler(
                 ),
             )
         ):
+            if ADMISSION_DIAG is not None:
+                ADMISSION_DIAG.reason("min_free_slots_delay")
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
@@ -4295,6 +4395,8 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            if ADMISSION_DIAG is not None:
+                ADMISSION_DIAG.reason("no_allocatable_req_slots")
             return None, running_batch
 
         # Get priority queue
@@ -4344,6 +4446,8 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
         )
+        if ADMISSION_DIAG is not None:
+            ADMISSION_DIAG.attach(adder)
 
         skip_waiting_admission = False
         if self.chunked_req is not None:
@@ -4360,6 +4464,11 @@ class Scheduler(
             skip_waiting_admission = (
                 post_chunk_budget_state == AddReqResult.OTHER or chunk_budget_exhausted
             )
+            if ADMISSION_DIAG is not None and ADMISSION_DIAG.active:
+                ADMISSION_DIAG.emit(
+                    "continuation", budget=ADMISSION_DIAG.budget(adder),
+                    skip_waiting=skip_waiting_admission,
+                )
             if (
                 skip_waiting_admission
                 and post_chunk_budget_state == AddReqResult.NO_TOKEN
@@ -4398,119 +4507,141 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(candidate_reqs))
-        # Get requests from the waiting queue to a new prefill batch
-        for req in candidate_reqs:
-            if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
-                continue
-            # Deferred AS load-back in flight: commit_load_backs publishes the
-            # prefix at a loop top; until then this request must neither
-            # re-prefill nor block admission of the requests behind it.
-            if req._as_pending_load_back is not None:
-                continue
+        refill_passes = 0
+        while True:
+            # Get requests from the waiting queue to a new prefill batch
+            for req in candidate_reqs:
+                if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                    if ADMISSION_DIAG is not None:
+                        ADMISSION_DIAG.skip("lora")
+                    continue
+                # Deferred AS load-back in flight: commit_load_backs publishes the
+                # prefix at a loop top; until then this request must neither
+                # re-prefill nor block admission of the requests behind it.
+                if req._as_pending_load_back is not None:
+                    if ADMISSION_DIAG is not None:
+                        ADMISSION_DIAG.skip("pending_load_back")
+                    continue
 
-            running_bs = len(running_batch.reqs)
-            candidate_beam_width = (
-                req.beam_group.beam_width if req.beam_group is not None else None
-            )
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
-                running_bs,
-                candidate_beam_width,
-                running_batch=running_batch,
-            ):
-                running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    running_batch.batch_is_full = True
-
-            if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+                running_bs = len(running_batch.reqs)
+                candidate_beam_width = (
+                    req.beam_group.beam_width if req.beam_group is not None else None
+                )
+                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                    running_bs,
+                    candidate_beam_width,
+                    running_batch=running_batch,
                 ):
+                    running_batch.batch_is_full = True
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    # In prefill mode, prealloc queue and transfer queue can also take memory,
+                    # so we need to check if the available size for the actual available size.
+                    if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                        running_batch.batch_is_full = True
+
+                if running_batch.batch_is_full:
+                    if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                        req
+                    ):
+                        if ADMISSION_DIAG is not None:
+                            ADMISSION_DIAG.reason("req_slots_limit", adder, req)
+                        break
+
+                if self.enable_hicache_storage:
+                    prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                    if not prefetch_done:
+                        # skip staging requests that are ongoing prefetch
+                        if ADMISSION_DIAG is not None:
+                            ADMISSION_DIAG.skip("storage_prefetch")
+                        continue
+                    # Pop the L3-loaded span. Unified cache exposes its absolute
+                    # start so cache-mode L2/L3 attribution survives L3-tail eviction.
+                    loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
+                        req.rid
+                    )
+                    if loaded_tokens > 0:
+                        req.storage_hit_length = loaded_tokens
+                        req.storage_hit_start = loaded_start
+                        # Cache-mode host memory is a resident L2 tier. Buffer mode
+                        # marks the staged span below once it is surfaced.
+                        req.host_hit_is_storage = False
+
+                req.init_next_round_input(self.tree_cache)
+                if (
+                    self.enable_hicache_storage
+                    and get_memory().hicache_host_memory_mode == "buffer_only"
+                ):
+                    # Buffer mode: surface a staged prefetch as the request's host
+                    # hit (consumed through init_load_back) plus its SWA window,
+                    # which consumption allocates and the request lock pins —
+                    # uncharged, the batch alloc can OOM. Planned against the same
+                    # live prefix admission uses, so only the splice-able span
+                    # tail is charged and unusable holds are freed. Set AFTER
+                    # init_next_round_input (which recomputes host_hit). Mamba
+                    # (fenced in init_hicache) will need the same charge via
+                    # mamba_host_hit_length.
+                    held_tokens, held_swa_tokens = self.tree_cache.plan_staged_splice(
+                        req.rid, len(req.prefix_indices)
+                    )
+                    if held_tokens > 0:
+                        req.host_hit_length = held_tokens
+                        req.swa_host_hit_length = held_swa_tokens
+                        req.storage_hit_length = held_tokens
+                        req.storage_hit_start = len(req.prefix_indices)
+                        req.host_hit_is_storage = True
+                    elif not (req.host_hit_is_storage and req.host_loaded_length > 0):
+                        req.storage_hit_length = 0
+                        req.storage_hit_start = None
+                        req.host_hit_is_storage = False
+                previous_count = len(adder.can_run_list)
+                if ADMISSION_DIAG is not None:
+                    ADMISSION_DIAG.candidate(req, adder)
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
+                )
+                if ADMISSION_DIAG is not None:
+                    ADMISSION_DIAG.candidate(req, adder, res, previous_count)
+
+                if self.enable_lora:
+                    running_loras.add(req.lora_id)
+
+                if res != AddReqResult.CONTINUE:
+                    if res == AddReqResult.NO_TOKEN:
+                        if (
+                            self.enable_hierarchical_cache
+                            or self.enable_unified_cache_external_linker
+                        ):
+                            # Set batch_is_full after making sure there are requests that can be served
+                            running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                                not running_batch.is_empty()
+                            )
+                        else:
+                            running_batch.batch_is_full = True
+                    # revert matched mamba idx to avoid memory leak, if req is not added.
+                    # Only free if the slot was freshly allocated in this batch (not
+                    # pre-existing from a session). Session-held slots have their own
+                    # lifecycle and freeing them here causes double-free.
+                    added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                    if not added:
+                        # init_next_round_input() may stage deferred Mamba COW/clear
+                        # metadata before add_one_req() rejects the request.
+                        req.kv.mamba_cow_src_index = None
+                        req.kv.mamba_needs_clear = False
+                        if req.kv.holds_mamba and not getattr(req, "session", None):
+                            self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                                req.kv.mamba_pool_idx.unsqueeze(-1)
+                            )
+                            req.kv.mamba_pool_idx = None
                     break
 
-            if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
-                    continue
-                # Pop the L3-loaded span. Unified cache exposes its absolute
-                # start so cache-mode L2/L3 attribution survives L3-tail eviction.
-                loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
-                    req.rid
-                )
-                if loaded_tokens > 0:
-                    req.storage_hit_length = loaded_tokens
-                    req.storage_hit_start = loaded_start
-                    # Cache-mode host memory is a resident L2 tier. Buffer mode
-                    # marks the staged span below once it is surfaced.
-                    req.host_hit_is_storage = False
-
-            req.init_next_round_input(self.tree_cache)
-            if (
-                self.enable_hicache_storage
-                and get_memory().hicache_host_memory_mode == "buffer_only"
-            ):
-                # Buffer mode: surface a staged prefetch as the request's host
-                # hit (consumed through init_load_back) plus its SWA window,
-                # which consumption allocates and the request lock pins —
-                # uncharged, the batch alloc can OOM. Planned against the same
-                # live prefix admission uses, so only the splice-able span
-                # tail is charged and unusable holds are freed. Set AFTER
-                # init_next_round_input (which recomputes host_hit). Mamba
-                # (fenced in init_hicache) will need the same charge via
-                # mamba_host_hit_length.
-                held_tokens, held_swa_tokens = self.tree_cache.plan_staged_splice(
-                    req.rid, len(req.prefix_indices)
-                )
-                if held_tokens > 0:
-                    req.host_hit_length = held_tokens
-                    req.swa_host_hit_length = held_swa_tokens
-                    req.storage_hit_length = held_tokens
-                    req.storage_hit_start = len(req.prefix_indices)
-                    req.host_hit_is_storage = True
-                elif not (req.host_hit_is_storage and req.host_loaded_length > 0):
-                    req.storage_hit_length = 0
-                    req.storage_hit_start = None
-                    req.host_hit_is_storage = False
-            res = adder.add_one_req(
-                req,
-                has_chunked_req=(self.chunked_req is not None),
-                truncation_align_size=self.truncation_align_size,
+            candidate_reqs = self._ascache_ready_refill_candidates(
+                adder, running_batch, refill_passes
             )
-
-            if self.enable_lora:
-                running_loras.add(req.lora_id)
-
-            if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    if (
-                        self.enable_hierarchical_cache
-                        or self.enable_unified_cache_external_linker
-                    ):
-                        # Set batch_is_full after making sure there are requests that can be served
-                        running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
-                            not running_batch.is_empty()
-                        )
-                    else:
-                        running_batch.batch_is_full = True
-                # revert matched mamba idx to avoid memory leak, if req is not added.
-                # Only free if the slot was freshly allocated in this batch (not
-                # pre-existing from a session). Session-held slots have their own
-                # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
-                if not added:
-                    # init_next_round_input() may stage deferred Mamba COW/clear
-                    # metadata before add_one_req() rejects the request.
-                    req.kv.mamba_cow_src_index = None
-                    req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
-                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.kv.mamba_pool_idx.unsqueeze(-1)
-                        )
-                        req.kv.mamba_pool_idx = None
+            if not candidate_reqs:
                 break
+            refill_passes += 1
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
@@ -4567,6 +4698,8 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        if ADMISSION_DIAG is not None:
+            ADMISSION_DIAG.phase(self, "prepare_extend_after", new_batch)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -4819,6 +4952,20 @@ class Scheduler(
         # equal-token batches can be matched across captures (e.g. a 0%-hit and
         # an 80%-hit run both have full prefill chunks of the same size).
         _rb_label = f"sched.run_batch.nt{batch.extend_num_tokens or 0}"
+        if batch.admission_attempt_id is not None:
+            _rb_label += f" aid={batch.admission_attempt_id}"
+        if (NVTX_OPERATIONS_ENABLED or NVTX_SCHEDULER_ENABLED) and batch.prefill_stats is not None:
+            prefill_stats = batch.prefill_stats
+            _rb_label += (
+                f" it={self.forward_ct}"
+                f" new={prefill_stats.log_input_tokens}"
+                f" hit={prefill_stats.log_hit_tokens}"
+                f" device_hit={prefill_stats.log_device_hit_tokens}"
+                f" host_hit={prefill_stats.log_host_hit_tokens}"
+                f" storage_hit={prefill_stats.log_storage_hit_tokens}"
+                f" replay={prefill_stats.log_replay_tokens}"
+                f" reqs={len(batch.reqs)}"
+            )
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
@@ -4887,7 +5034,10 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        with operations_nvtx_range(_rb_label):
+                        with profile_range(
+                            _rb_label,
+                            nvtx_enabled=NVTX_OPERATIONS_ENABLED or NVTX_SCHEDULER_ENABLED,
+                        ):
                             batch_result = self.model_worker.forward_batch_generation(
                                 batch, **fwd_kwargs
                             )
@@ -4960,7 +5110,10 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    with operations_nvtx_range(_rb_label):
+                    with profile_range(
+                        _rb_label,
+                        nvtx_enabled=NVTX_OPERATIONS_ENABLED or NVTX_SCHEDULER_ENABLED,
+                    ):
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, pp_proxy_tensors=pp_proxy_tensors
                         )
@@ -4989,7 +5142,10 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                with operations_nvtx_range(_rb_label):
+                with profile_range(
+                    _rb_label,
+                    nvtx_enabled=NVTX_OPERATIONS_ENABLED or NVTX_SCHEDULER_ENABLED,
+                ):
                     batch_result = self.model_worker.forward_batch_generation(
                         batch, **kwargs
                     )
@@ -5673,6 +5829,13 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "as_cache_digest",
+                "as_barrier_debug",
+                "python_switch_interval",
+                "as_load_back_coalesce_wait_us",
+                "scheduler_max_recv_per_poll",
+                "prefill_war_read_done",
+                "dsv4_batch_prefill_indexer",
             ]
         )
 
@@ -5714,6 +5877,54 @@ class Scheduler(
                     )
                     if_success = False
                     break
+            elif k in (
+                "as_cache_digest",
+                "as_barrier_debug",
+                "prefill_war_read_done",
+                "dsv4_batch_prefill_indexer",
+            ):
+                if v is not None and not isinstance(v, bool):
+                    logging.warning(f"{k} requires a boolean or null, got {v}.")
+                    if_success = False
+                    break
+                if (
+                    k in ("prefill_war_read_done", "dsv4_batch_prefill_indexer")
+                    and v is None
+                ):
+                    logging.warning(f"{k} requires an explicit boolean.")
+                    if_success = False
+                    break
+            elif k == "scheduler_max_recv_per_poll":
+                if (
+                    isinstance(v, bool)
+                    or not isinstance(v, int)
+                    or (v != -1 and not 1 <= v <= 256)
+                ):
+                    logging.warning(
+                        "scheduler_max_recv_per_poll requires -1 or an integer "
+                        "in [1, 256], got %s.", v,
+                    )
+                    if_success = False
+                    break
+            elif k == "as_load_back_coalesce_wait_us":
+                if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 5000:
+                    logging.warning(
+                        "as_load_back_coalesce_wait_us requires an integer in [0, 5000], got %s.", v
+                    )
+                    if_success = False
+                    break
+            elif k == "python_switch_interval":
+                if v is not None and (
+                    isinstance(v, bool)
+                    or not isinstance(v, (int, float))
+                    or not 0.00001 <= v <= 0.05
+                ):
+                    logging.warning(
+                        "python_switch_interval requires seconds in [0.00001, 0.05] "
+                        "or null, got %s.", v,
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -5731,6 +5942,44 @@ class Scheduler(
             # DSpark control keys are worker commands, not server args; route
             # them to the draft worker and keep them out of the override.
             remaining = dict(server_args_dict)
+            if "scheduler_max_recv_per_poll" in remaining:
+                limit = remaining.pop("scheduler_max_recv_per_poll")
+                self.request_receiver = dataclasses.replace(
+                    self.request_receiver, max_recv_per_poll=limit
+                )
+                self.max_recv_per_poll = limit
+                logger.info("Scheduler receive limit updated: %d", limit)
+            for command, field in (
+                ("prefill_war_read_done", envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE),
+                ("dsv4_batch_prefill_indexer", envs.SGLANG_DSV4_BATCH_PREFILL_INDEXER),
+            ):
+                if command in remaining:
+                    field.set(remaining.pop(command))
+                    logger.info(
+                        "Runtime experiment %s updated: %s", command, field.get()
+                    )
+            if "as_load_back_coalesce_wait_us" in remaining:
+                wait_us = remaining.pop("as_load_back_coalesce_wait_us")
+                envs.SGLANG_AS_LOAD_BACK_COALESCE_WAIT_US.set(wait_us)
+                logger.info("AS load-back coalesce wait updated: %d", wait_us)
+            if "python_switch_interval" in remaining:
+                interval = remaining.pop("python_switch_interval")
+                sys.setswitchinterval(
+                    _DEFAULT_PYTHON_SWITCH_INTERVAL if interval is None else interval
+                )
+                logger.info(
+                    "Python switch interval updated: %.9f", sys.getswitchinterval()
+                )
+            if "as_cache_digest" in remaining or "as_barrier_debug" in remaining:
+                from sglang.srt.mem_cache.storage.asradix.transport import (
+                    set_barrier_debug_enabled,
+                    set_cache_digest_enabled,
+                )
+
+                if "as_cache_digest" in remaining:
+                    set_cache_digest_enabled(remaining.pop("as_cache_digest"))
+                if "as_barrier_debug" in remaining:
+                    set_barrier_debug_enabled(remaining.pop("as_barrier_debug"))
             frac = remaining.pop("dspark_force_budget_frac", None)
             if "dspark_force_budget_frac" in server_args_dict:
                 self.draft_worker.set_dspark_forced_budget_frac(
@@ -6367,6 +6616,7 @@ def configure_scheduler_process(
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+    _configure_python_switch_interval()
 
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():

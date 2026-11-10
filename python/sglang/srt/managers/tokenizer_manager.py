@@ -1688,7 +1688,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         AS_BLOCK_SIZE,
                     )
 
-                    tokenized_obj.as_block_hashs = Tokens(input_ids, AS_BLOCK_SIZE)
+                    tokenized_obj.as_block_hashs = Tokens(input_ids_arr, AS_BLOCK_SIZE)
                 except ImportError:
                     logger.warning(
                         "[AS] attentionstore_sdk unavailable; skip as_block_hashs"

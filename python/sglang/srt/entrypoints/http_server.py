@@ -3038,7 +3038,14 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
             else:
-                uvicorn.run(
+                run_http = uvicorn.run
+                if envs.SGLANG_HTTP_REUSE_PORT.get():
+                    from sglang.srt.entrypoints.http_server_reuseport import (
+                        run_uvicorn_reuseport,
+                    )
+
+                    run_http = run_uvicorn_reuseport
+                run_http(
                     "sglang.srt.entrypoints.http_server:app",
                     host=get_serving().host,
                     port=get_serving().port,

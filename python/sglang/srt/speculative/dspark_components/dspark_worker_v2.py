@@ -542,6 +542,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
+        prefill_swa_loc = (
+            self._kv_injector.prepare_prefill_swa_loc(batch.out_cache_loc)
+            if envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+            else None
+        )
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
@@ -616,6 +621,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if token_indices is not None:
             cache_loc = cache_loc[token_indices]
             positions = positions[token_indices]
+            if prefill_swa_loc is not None:
+                prefill_swa_loc = prefill_swa_loc[token_indices]
             if state_slot is not None:
                 state_slot = state_slot[token_indices]
                 final_pos = final_pos[token_indices]
@@ -634,6 +641,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             safe_index = torch.where(row_valid, row_index, row_index.new_zeros(()))
             cache_loc = cache_loc[safe_index]
             positions = positions[safe_index]
+            if prefill_swa_loc is not None:
+                prefill_swa_loc = prefill_swa_loc[safe_index]
             if state_slot is not None:
                 state_slot = state_slot[safe_index]
                 final_pos = final_pos[safe_index]
@@ -671,6 +680,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos=final_pos,
             target_hidden_is_projected=target_hidden_is_projected,
             row_valid=row_valid,
+            swa_loc=prefill_swa_loc,
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None

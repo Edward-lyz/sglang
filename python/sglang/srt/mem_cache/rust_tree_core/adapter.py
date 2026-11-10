@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from array import array
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -230,6 +231,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
             mamba_exist=step.result.mamba_exist,
             swa_branch_inserted=step.result.swa_branch_inserted,
             host_insert_dropped=step.result.host_insert_dropped,
+            rotation_tail_declined=step.result.rotation_tail_declined,
             adopted_ranges=(
                 {
                     ComponentType(component_type): list(ranges)
@@ -296,10 +298,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     """A TreeCore backed by the Rust extension binding."""
 
     _bindings = bindings
+    supports_rotation_base = True
 
     def __init__(self, params: CacheInitParams):
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        self._native_exercised = 0
 
         # TODO(Jialin): Port session-reference-aware TreeCore support from #29173.
         if params.enable_session_radix_cache:
@@ -410,6 +414,31 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     @property
     def root_node(self) -> UnifiedTreeNode:
         raise NotImplementedError("root_node: not yet ported to the Rust tree core")
+
+    def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
+        """Read the rotation base retained by a native tree node.
+
+        Args:
+            node_id: Identifier of the native tree node to inspect.
+
+        Returns:
+            Optional[int]: The node rotation base, if present.
+        """
+        return self._binding.rotation_base_of(node_id)
+
+    def peek_insert_overlap_len(self, key: RadixKey) -> int:
+        """Inspect the existing prefix overlap without mutating the native
+        tree.
+
+        Args:
+            key: Radix key whose existing overlap is queried without mutation.
+
+        Returns:
+            int: Length of the prefix already represented by the tree.
+        """
+        return self._binding.peek_insert_overlap_len(
+            _radix_key_buffer(key), key.extra_key, key.cache_salt
+        )
 
     def inc_lock_ref(
         self,
@@ -560,6 +589,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_salt=key.cache_salt,
             )
         )
+        if len(key) and not self._native_exercised & 1:
+            self._native_exercised |= 1
+            logging.getLogger(__name__).info(
+                "Native tree match exercised: tokens=%d", len(key)
+            )
         return _match_result_from_binding(result)
 
     @property
@@ -595,8 +629,15 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 chunked=params.chunked,
                 priority=0 if params.priority is None else params.priority,
                 track_adopted_ranges=params.track_adopted_ranges,
+                rotation_base=params.rotation_base,
             )
         )
+        if len(key) and not self._native_exercised & 2:
+            self._native_exercised |= 2
+            logging.getLogger(__name__).info(
+                "Native tree insert exercised: tokens=%d rotation=%s",
+                len(key), params.rotation_base,
+            )
         return _insert_step_from_binding(step)
 
     def resume_insert(self) -> InsertStepResult:

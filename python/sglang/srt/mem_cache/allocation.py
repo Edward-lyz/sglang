@@ -354,6 +354,16 @@ def _alloc_chunk_tail_slots_for_batch(batch: ScheduleBatch) -> None:
         return
     policy = kvcache.swa_policy
     new_lens = batch.seq_lens_cpu.tolist()
+    reserve = getattr(
+        batch.tree_cache, "ensure_attention_store_swa_staging_capacity", None
+    )
+    if reserve is not None:
+        required = sum(
+            max(0, policy.num_checkpoints(new_len)
+                - policy.num_checkpoints(new_len - extend_len))
+            for new_len, extend_len in zip(new_lens, batch.extend_lens)
+        )
+        reserve(pool, required)
     for i, (req, new_len) in enumerate(zip(batch.reqs, new_lens)):
         extend_len = batch.extend_lens[i]
         prev_checkpoints = policy.num_checkpoints(new_len - extend_len)

@@ -158,6 +158,8 @@ pub struct Node<K: ChildKeyType> {
     pub(crate) idx: NodeIdx_,
     /// The namespace this node belongs to.
     pub namespace: KeyNamespace,
+    /// Owner of logical page zero for the entire cached rotation run.
+    pub rotation_base: Option<i64>,
     /// Child edges keyed by (namespace, the child's page key); the namespace
     /// component mirrors the child's namespace at every level.
     pub children: ChildMap<K>,
@@ -392,6 +394,7 @@ impl<K: ChildKeyType> Node<K> {
         Node {
             parent: None,
             namespace: KeyNamespace::default(),
+            rotation_base: None,
             children: ChildMap::with_hasher(RandomState::new()),
             key: K::default(),
             values: Default::default(),
@@ -415,6 +418,7 @@ impl<K: ChildKeyType> Node<K> {
         Node {
             parent: None,
             namespace: KeyNamespace::default(),
+            rotation_base: None,
             children: ChildMap::with_hasher(RandomState::new()),
             key,
             values: Default::default(),

@@ -2509,6 +2509,22 @@ def broadcast_pyobj(
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
+            if (
+                force_cpu_device
+                and envs.SGLANG_ENABLE_REQUEST_OOB_BROADCAST.get()
+            ):
+                from sglang.srt.mem_cache.cpp_utils.request_oob import maybe_encode_requests
+
+                oob = maybe_encode_requests(data)
+                if oob is not None:
+                    # Negative length selects the explicit OOB packet format.
+                    # Collective count and order stay size then payload.
+                    tensor_size = torch.tensor(
+                        [-oob.numel()], dtype=torch.long, device="cpu"
+                    )
+                    dist.broadcast(tensor_size, src=src, group=dist_group)
+                    dist.broadcast(oob, src=src, group=dist_group)
+                    return data
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
 
@@ -2527,6 +2543,15 @@ def broadcast_pyobj(
 
         if size == 0:
             return []
+
+        if size < 0:
+            if not force_cpu_device:
+                raise ValueError("request OOB broadcast requires CPU transport")
+            from sglang.srt.mem_cache.cpp_utils.request_oob import decode_requests
+
+            tensor_data = torch.empty(-size, dtype=torch.uint8, device="cpu")
+            dist.broadcast(tensor_data, src=src, group=dist_group)
+            return decode_requests(tensor_data)
 
         tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.broadcast(tensor_data, src=src, group=dist_group)

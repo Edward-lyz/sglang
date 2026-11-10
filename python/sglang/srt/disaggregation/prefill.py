@@ -827,6 +827,22 @@ class SchedulerDisaggregationPrefillMixin:
         untouched)."""
         if getattr(self, "_fwd_thread", None) is not None:
             return
+        if (
+            torch.device(self.device).type == "cuda"
+            and self.token_to_kv_pool_allocator.page_size > 1
+        ):
+            from sglang.srt.mem_cache.allocator.paged import warmup_alloc_extend_kernel
+
+            warmup_alloc_extend_kernel(
+                self.device,
+                self.token_to_kv_pool_allocator.page_size,
+                self.max_running_requests,
+            )
+            logger.info(
+                "Prefill allocator kernels warmed: page_size=%d max_batch_size=%d",
+                self.token_to_kv_pool_allocator.page_size,
+                self.max_running_requests,
+            )
         import queue as _queue
         import threading as _threading
 
@@ -849,6 +865,7 @@ class SchedulerDisaggregationPrefillMixin:
         forward's shared reads, so it captures them before any slot reuse.
         """
         self.device_module.set_device(self.ps.gpu_id)
+        batch_write_fence = envs.SGLANG_AS_SPAG_BATCH_WRITE_FENCE.get()
         while True:
             item = self._fwd_in_q.get()
             if item is None:  # shutdown sentinel
@@ -865,6 +882,9 @@ class SchedulerDisaggregationPrefillMixin:
                         early_send_prefix=early_send_prefix,
                         extend_input_len_per_req=extend_input_len_per_req,
                     )
+                if batch_write_fence:
+                    batch.as_kv_ready_event = self.device_module.Event()
+                    batch.as_kv_ready_event.record(stream=self.forward_stream)
                 self._apply_war_barrier()
                 # Snapshot on the worker, after the forward's in-place SB edits
                 # and while only this thread owns the batch (the scheduler has
@@ -891,6 +911,9 @@ class SchedulerDisaggregationPrefillMixin:
         result, batch_copy, exc = self._fwd_out_q.get()
         if exc is not None:
             raise exc
+        if batch_copy.as_kv_ready_event is not None:
+            for req in batch_copy.reqs:
+                req.as_kv_ready_event = batch_copy.as_kv_ready_event
         return result, batch_copy
 
     def _run_batch_on_fwd_thread(self: Scheduler, batch):

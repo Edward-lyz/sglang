@@ -56,11 +56,13 @@ import dataclasses
 import logging
 import re
 import sys
+import weakref
 from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
+from types import MethodType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -150,12 +152,11 @@ from sglang.srt.utils.nvtx_utils import (
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
-    from typing import Any, Dict
-
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
+    from sglang.srt.managers.io_struct import TraceReq
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -358,6 +359,18 @@ class MultimodalInputFormat(Enum):
 # Msgpack-native containers and Ext-decoded tensor/transport leaves. Tuple
 # containers intentionally decode as lists, matching msgpack's native model.
 MultimodalDataValue: TypeAlias = object
+
+
+class _EventDone:
+    """``done()`` over a CUDA event, for the EPD deferred pool release."""
+
+    def __init__(self, event):
+        """Wrap a recorded ``torch.cuda.Event``."""
+        self.event = event
+
+    def done(self) -> bool:
+        """Whether the GPU work before the event has completed."""
+        return self.event.query()
 
 
 class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=True):
@@ -698,6 +711,8 @@ class MultimodalInputs:
     # EPD: pinned-pool addresses backing zero-copy precomputed-embedding views
     # on the rank that pulled them. See release_pool_buffers().
     pool_buffer_addrs: Optional[List[int]] = None
+    # GC backstop that returns the regions if release_pool_buffers never runs.
+    pool_release_finalizer: Optional[Any] = None
 
     def release_pool_buffers(self):
         """Return pinned-pool pages once prefill has consumed the embeddings.
@@ -710,19 +725,35 @@ class MultimodalInputs:
         if not addrs:
             return
         self.pool_buffer_addrs = None
+        if self.pool_release_finalizer is not None:
+            # Released explicitly below; the backstop must not free it again.
+            self.pool_release_finalizer.detach()
+            self.pool_release_finalizer = None
+        pending = []
         for item in self.mm_items:
             item.precomputed_embeddings = None
+            event = getattr(item, "h2d_done_event", None)
+            if event is not None:
+                item.h2d_done_event = None
+                if not event.query():
+                    pending.append(_EventDone(event))
 
         from sglang.srt.disaggregation.encoder.factory_transport import (
             EmbeddingLandingPool,
+        )
+        from sglang.srt.disaggregation.encoder.receiver import (
+            _defer_pool_release,
+            drain_deferred_pool_releases,
         )
 
         pool = EmbeddingLandingPool.get_instance_if_exists()
         if pool is None:
             return
+        drain_deferred_pool_releases()
         for address in addrs:
             try:
-                pool.release(address)
+                # An async H2D copy of these rows may still be queued.
+                _defer_pool_release(pending, pool, address)
             except Exception as error:
                 logger.warning(
                     "release_pool_buffers: failed to free addr=%s: %s", address, error
@@ -818,7 +849,32 @@ class MultimodalInputs:
             if val is not None:
                 setattr(mm_inputs, arg, val)
 
+        mm_inputs.take_pool_buffers_from(obj)
         return mm_inputs
+
+    def take_pool_buffers_from(self, obj) -> None:
+        """Move ownership of EPD landing-pool regions from ``obj`` to self.
+
+        The pulled rows in ``mm_items`` are views into the pinned landing pool.
+        The receiver bound the region to the processor output, whose GC
+        finalizer would return it to the pool as soon as that object is
+        dropped here -- while these items still read it, so the next pull
+        could overwrite this request's image rows with another request's.
+        """
+        addrs = getattr(obj, "pool_buffer_addrs", None)
+        if not addrs:
+            return
+        self.pool_buffer_addrs = addrs
+        obj.pool_buffer_addrs = None
+        finalizer = getattr(obj, "pool_release_finalizer", None)
+        obj.pool_release_finalizer = None
+        if finalizer is not None:
+            detached = finalizer.detach()
+            if detached is not None:
+                _, func, args, kwargs = detached
+                self.pool_release_finalizer = weakref.finalize(
+                    self, func, *args, **(kwargs or {})
+                )
 
     def contains_image_inputs(self) -> bool:
         return any(item.is_image() for item in self.mm_items)
@@ -1023,6 +1079,7 @@ class Req(ReqDllmMixin):
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
         skip_radix_cache_insert: bool = False,
+        trace_config=None,
     ):
         # Input and output info
         self.rid = rid
@@ -1085,6 +1142,8 @@ class Req(ReqDllmMixin):
         # AS write task and freed asynchronously on retirement; slots at or after it
         # are freed synchronously in release_kv_cache.
         self.as_written_count: int = 0
+        self.as_spag_submitted_write = None
+        self.as_kv_ready_event = None
         # Fail-fast flag: set True only when a genuine chunk_tail_swa_pool alloc has
         # failed (pool full). Distinct from the -1 AS-hit prefix placeholders, which
         # are NOT alloc failures. Once set, later extends skip alloc.
@@ -1207,6 +1266,10 @@ class Req(ReqDllmMixin):
         # admission; less than host_hit_length when the load-back was declined
         # or the staged splice dropped (that shortfall is re-prefilled).
         self.host_loaded_length = 0
+        # A deferred AS read publishes before the next admission re-matches the
+        # tree. Keep its actual restored interval separate from host_hit_length,
+        # which describes IO still needed and becomes zero after publication.
+        self._as_materialized_host_span: Optional[Tuple[int, int]] = None
         # Buffer-mode host memory is transport staging, not an L2 cache tier.
         self.host_hit_is_storage = False
         # Storage prefetch retry state while queued
@@ -1228,6 +1291,30 @@ class Req(ReqDllmMixin):
         # would make it stale); the only allocation-time reader is the
         # ChunkCache fallback, which has no tree nodes and no rebind.
         self.kv_rotation_base: Optional[int] = None
+        # for trace
+        self.trace_config: Optional[Dict[str, Any]] = trace_config
+        self.to_trace_req: Optional[TraceReq] = self.build_trace_req()
+        self.trace_info: Optional[Dict[str, Any]] = None
+        # Online AS trace: hold the finish output until AS writes retire.
+        # defer_finish_output is set by TraceManager; finish_output_deferred
+        # marks that output_streamer skipped the finish output and owes a resend.
+        self.defer_finish_output: bool = False
+        self.finish_output_deferred: bool = False
+        # AS trace: pure in-memory event collector owned by the request.
+        # unique_trace_id lives on to_trace_req so normal trace and AS trace
+        # share the same id; JSON writing and rank info are owned by TraceManager.
+        self.as_trace_context: Optional[Any] = None
+        if (
+            trace_config
+            and trace_config.get("enable_trace")
+            and trace_config.get("trace_type") in ("as_cache", "all")
+            and self.to_trace_req is not None
+        ):
+            from sglang.srt.mem_cache.as_trace import ASTraceContext
+
+            self.as_trace_context = ASTraceContext(
+                self, self.to_trace_req.unique_trace_id
+            )
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1420,6 +1507,30 @@ class Req(ReqDllmMixin):
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
 
+    def build_trace_req(self):
+        """Build TraceReq from trace_config at init time.
+
+        Parses trace_config to create a TraceReq. Returns None if tracing is
+        not enabled or trace_type is missing.
+        """
+        from sglang.srt.content_detection.config import DETECTION_CONFIG
+        from sglang.srt.managers.io_struct import TraceReq, TraceTrigger, TraceType
+        from sglang.srt.mem_cache.as_trace import build_unique_trace_id
+
+        cfg = self.trace_config or {}
+        if not cfg.get("enable_trace") or not cfg.get("trace_type"):
+            return None
+        return TraceReq(
+            rid=self.rid,
+            trace_type=cfg.get("trace_type", TraceType.METADATA),
+            dump_dir=cfg.get("dump_dir") or DETECTION_CONFIG.trace_dump_dir,
+            trigger=cfg.get("trigger", TraceTrigger.ON_FINISH),
+            payload=cfg.get("payload"),
+            return_logprob=cfg.get("return_logprob", False),
+            return_online=cfg.get("online", True),
+            unique_trace_id=build_unique_trace_id(self),
+        )
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1458,7 +1569,17 @@ class Req(ReqDllmMixin):
         """Host-hit tokens that actually reached the device: the metrics tier
         split must not credit host/storage for a declined or dropped
         load-back, whose span was re-prefilled and counted as input."""
-        return min(self.host_hit_length, self.host_loaded_length)
+        prefix_len = len(self.prefix_indices)
+        synchronous = min(prefix_len, self.host_hit_length, self.host_loaded_length)
+        span = getattr(self, "_as_materialized_host_span", None)
+        if span is None:
+            return synchronous
+        # Credit only restored bytes still covered by the admitted prefix.
+        # A shortened/evicted prefix must never retain the planned host hit.
+        start = max(0, min(prefix_len, span[0]))
+        end = max(start, min(prefix_len, span[1]))
+        overlap = max(0, end - max(start, prefix_len - synchronous))
+        return synchronous + end - start - overlap
 
     def fulfilled_storage_hit_len(self, prefix_len: int) -> int:
         """L3-fetched tokens covered by the admitted cached prefix."""
@@ -1513,6 +1634,30 @@ class Req(ReqDllmMixin):
 
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.extend_range.end]
+
+    _GET_FILL_IDS_FOR_LENGTH = get_fill_ids
+
+    def _get_fill_ids_len(self) -> int:
+        """Length of the public fill snapshot, without exporting a token view."""
+        get_fill_ids = self.get_fill_ids
+        if (
+            type(self) is Req
+            and type(get_fill_ids) is MethodType
+            and get_fill_ids.__self__ is self
+            and get_fill_ids.__func__ is Req._GET_FILL_IDS_FOR_LENGTH
+        ):
+            token_ids = self.full_untruncated_fill_ids
+            extend_range = self.extend_range
+            if (
+                type(token_ids) is array
+                and token_ids.typecode == "q"
+                and type(extend_range) is Range
+                and type(extend_range.end) is int
+            ):
+                # Normalize exactly as token_ids[:end], including negative and
+                # arbitrarily large ends. The step is one and the start is zero.
+                return slice(None, extend_range.end).indices(len(token_ids))[1]
+        return len(get_fill_ids())
 
     def _refresh_fill_ids(self) -> None:
         """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
@@ -1927,6 +2072,7 @@ class Req(ReqDllmMixin):
         self.ever_read_as = False
         self.as_read_pending_lock = False
         self.lock_receipt = DecLockRefParams()
+        self._as_materialized_host_span = None
         self.swa_prefix_lock_released = False
         self.swa_branching_seqlen = None
         self.extend_range = None
@@ -2286,6 +2432,34 @@ def _compute_chunked_req_next_prompt_token(
     return None
 
 
+_REQ_GET_FILL_IDS = Req.get_fill_ids
+
+
+def _get_extend_input_ids(req: Req) -> array:
+    """Copy only this extend's suffix; keep the public fill snapshot unchanged."""
+    get_fill_ids = req.get_fill_ids
+    if (
+        type(req) is Req
+        and type(get_fill_ids) is MethodType
+        and get_fill_ids.__self__ is req
+        and get_fill_ids.__func__ is _REQ_GET_FILL_IDS
+        and type(req.extend_range) is Range
+        and type(req.prefix_indices) is torch.Tensor
+    ):
+        token_ids = req.full_untruncated_fill_ids
+        end = req.extend_range.end
+        if (
+            type(token_ids) is array
+            and token_ids.typecode == "q"
+            and type(end) is int
+        ):
+            # len(prefix_indices) is nonnegative, so this is equivalent to
+            # token_ids[:end][len(prefix_indices):], including clipped ends.
+            # Retain an owned array across allocator/encoder callbacks below.
+            return token_ids[len(req.prefix_indices) : end]
+    return get_fill_ids()[len(req.prefix_indices) :]
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2345,6 +2519,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
+    admission_attempt_id: Optional[int] = None
+    as_kv_ready_event: Optional[object] = None
     launch_ts: Optional[float] = None
     after_idle_gap: bool = False
 
@@ -2677,7 +2853,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
+        input_ids = [_get_extend_input_ids(r) for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [r.extend_range.end for r in reqs]
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
@@ -3767,6 +3943,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
+            admission_attempt_id=self.admission_attempt_id,
+            as_kv_ready_event=self.as_kv_ready_event,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,

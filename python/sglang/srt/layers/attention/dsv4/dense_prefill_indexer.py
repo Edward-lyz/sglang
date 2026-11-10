@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Iterator, List, Optional
 
 import torch
+from sglang.srt.environ import envs
 
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
@@ -38,6 +39,7 @@ def dense_prefill_topk(
     candidate_block_size: int,
     publish_candidates: bool,
     candidates: PrefillCandidateBlocks | None,
+    score_budget_bytes: int | None = None,
 ) -> tuple[torch.Tensor, PrefillCandidateBlocks | None]:
     """Top-k per query row from dense scores, tiled under the score budget;
     optionally publishes or consumes per-request candidate blocks."""
@@ -66,7 +68,9 @@ def dense_prefill_topk(
     width = ceil_align(max((n for _, n in request_lengths), default=0), 4)
     if row == 0 or width == 0:
         return selected, published
-    rows_per_chunk = _rows_per_chunk(row, width, heads=q[0].shape[1])
+    rows_per_chunk = _rows_per_chunk(
+        row, width, heads=q[0].shape[1], budget_bytes=score_budget_bytes
+    )
     for offset in range(0, row, rows_per_chunk):
         rows = slice(offset, min(offset + rows_per_chunk, row))
         _select_tile(
@@ -86,14 +90,16 @@ def dense_prefill_topk(
     return selected, published
 
 
-def _rows_per_chunk(rows: int, width: int, *, heads: int) -> int:
+def _rows_per_chunk(
+    rows: int, width: int, *, heads: int, budget_bytes: int | None = None
+) -> int:
     """Query rows per logits tile so one fp32 [rows, width] tile fits the
     budget; the row count stays a multiple of the kernel's row alignment."""
     row_alignment = 128 // heads
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
         row_bytes=mqa_logits_row_bytes(width),
-        budget_bytes=_SCORE_BUDGET_BYTES,
+        budget_bytes=_SCORE_BUDGET_BYTES if budget_bytes is None else budget_bytes,
     )
     if rows_per_chunk is None:
         return rows
@@ -254,11 +260,19 @@ def _select_tile(
             scores = logits[rows, :context_length]
             if publish is not None:
                 lens = lengths[rows, None]
+                blocks = publish.request_blocks[request][request_rows]
+                if envs.SGLANG_FUSE_CANDIDATE_BLOCK_SCORE.get():
+                    from sglang.kernels.ops.attention.dsv4.candidate_block_score import (
+                        fused_select_candidate_block_ids,
+                    )
+                    blocks.copy_(fused_select_candidate_block_ids(
+                        scores, lengths[rows], context_length, blocks.shape[1], block_size
+                    ))
+                    continue
                 scores.masked_fill_(
                     torch.arange(context_length, device=logits.device)[None, :] >= lens,
                     -torch.inf,
                 )
-                blocks = publish.request_blocks[request][request_rows]
                 blocks.copy_(
                     select_candidate_block_ids(
                         logits=scores,
@@ -268,6 +282,14 @@ def _select_tile(
                     )
                 )
             else:
+                if envs.SGLANG_FUSE_CP_CANDIDATE_MASK.get():
+                    from sglang.kernels.ops.attention.dsv4.candidate_block_score import (
+                        mask_candidate_logits_,
+                    )
+                    mask_candidate_logits_(
+                        scores, consume.request_blocks[request][request_rows], block_size
+                    )
+                    continue
                 scores.masked_fill_(
                     ~candidate_block_mask(
                         blocks=consume.request_blocks[request][request_rows],
