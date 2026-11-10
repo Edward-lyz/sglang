@@ -328,6 +328,11 @@ class DraftBlockProposer:
         # collective pads to whenever the batch fits it, so a graph replay (which
         # bakes it) and an eager/idle join always agree.
         self._dp_graph_rows = dp_graph_rows
+        # Last observed graph-vs-eager mode of the draft forward on each path;
+        # logged on change so busy/idle divergence is visible in the log rather
+        # than inferred.
+        self._idle_participation_mode: Optional[bool] = None
+        self._busy_forward_mode: Optional[bool] = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -419,6 +424,18 @@ class DraftBlockProposer:
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:
+        # A weight-sharded dense draft also needs idle participation: its
+        # per-layer flat AllGather runs on the node-local shard group, so every
+        # rank must enter the draft forward. It MUST take the same graph-vs-
+        # eager branch as busy ranks, so it goes through the bs=1 dummy-tier
+        # path below -- the generic bs=0 IDLE forward underneath cannot replay
+        # and would be the only eager AG producer while every busy rank replays.
+        draft_weight_sharded = bool(
+            getattr(self.draft_model, "_weight_shard_layers", None)
+        )
+        if draft_weight_sharded:
+            self._run_weight_shard_idle_participation(batch)
+            return
         if not self._dp_sync or batch.global_num_tokens is None:
             return
         device = self.draft_model_runner.device
@@ -487,6 +504,99 @@ class DraftBlockProposer:
             return int(graph_rows)
         return rows
 
+    def _run_weight_shard_idle_participation(self, batch: ScheduleBatch) -> None:
+        """Idle participation for a weight-sharded draft, shaped like a real
+        decode step so it takes the same graph-vs-eager branch as busy ranks.
+
+        Mirrors `TargetVerifyExecutor.run_idle_participation`, which sizes its
+        dummy verify batch to a captured tier for exactly this reason. A bs=0
+        IDLE batch cannot replay (`ForwardMode.IDLE.is_cuda_graph()` is False
+        and no bs=0 tier is captured), so it would be the only eager producer
+        of the shard-group AllGather while every busy rank replays a graph.
+        """
+        gamma = self.gamma
+        device = self.draft_model_runner.device
+        if not hasattr(self.draft_model, "forward_embed"):
+            # Without a draft-owned embedding we would need the target's embed
+            # module to build input_embeds, which this call site does not have.
+            raise RuntimeError(
+                "Weight-sharded draft idle participation requires a draft model "
+                "that owns its embedding (forward_embed)."
+            )
+        # bs=1 is the smallest captured draft decode tier; req/cache indices
+        # point at slot 0, the same dummy slot the target's idle verify uses.
+        bs = 1
+        num_tokens = bs * gamma
+        idle_forward_batch = self._build_draft_forward_batch(
+            batch=batch,
+            bs=bs,
+            device=device,
+            input_ids=torch.full(
+                (num_tokens,), int(self._mask_token_id), dtype=torch.long, device=device
+            ),
+            req_pool_indices=torch.zeros((bs,), dtype=torch.int64, device=device),
+            seq_lens=torch.ones((bs,), dtype=torch.int64, device=device),
+            out_cache_loc=torch.zeros((num_tokens,), dtype=torch.int64, device=device),
+            positions=torch.arange(1, num_tokens + 1, dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.full((bs,), 1 + gamma, dtype=torch.int64),
+            seq_lens_sum=bs * (1 + gamma),
+            input_embeds=None,
+        )
+        draft_out = self._forward_draft_model(idle_forward_batch)
+        self._log_idle_participation_mode(bool(draft_out.can_run_graph))
+
+    def _forward_draft_model(self, forward_batch: ForwardBatch):
+        """Run the draft forward, joining the prefetched AG 0.
+
+        AG 0 is launched by the worker on a dedicated stream late in the
+        previous step (`prefetch_weight_shard`, right before the ReplaySSM
+        commit fold), so here we only wait for it. Busy decode and idle
+        participation both go through this, which keeps the per-step AG
+        sequence identical on every rank of the shard group.
+        """
+        wait = getattr(self.draft_model, "wait_first_weight_shard", None)
+        if wait is not None:
+            wait()
+        with torch.inference_mode():
+            draft_out = self.draft_model_runner.forward(forward_batch)
+        return draft_out
+
+    def prefetch_weight_shard(self) -> None:
+        """Launch AG 0 for the next forward (called by the worker).
+
+        Kept on the proposer so the draft model stays the only owner of the
+        shard bookkeeping; the worker decides *when* in the step to call it.
+        """
+        prefetch = getattr(self.draft_model, "prefetch_first_weight_shard", None)
+        if prefetch is not None:
+            prefetch()
+
+    def _log_idle_participation_mode(self, can_run_graph: bool) -> None:
+        """Report the mode idle participation actually took, once per state.
+
+        The previous fix attempt inferred the mode instead of measuring it and
+        was wrong (the batch still replayed), so record the observed value.
+        """
+        if self._idle_participation_mode == can_run_graph:
+            return
+        self._idle_participation_mode = can_run_graph
+        logger.info(
+            "[K3WeightShard] draft idle participation can_run_graph=%s "
+            "(must match the busy ranks' draft forward)",
+            can_run_graph,
+        )
+
+    def _log_busy_forward_mode(self, can_run_graph: bool) -> None:
+        """Same for the busy path, so the two can be compared in one log."""
+        if self._busy_forward_mode == can_run_graph:
+            return
+        self._busy_forward_mode = can_run_graph
+        logger.info(
+            "[K3WeightShard] draft busy forward can_run_graph=%s "
+            "(must match idle participation)",
+            can_run_graph,
+        )
+
     def _run_forward(
         self,
         *,
@@ -526,22 +636,83 @@ class DraftBlockProposer:
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
-        draft_forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            batch_size=bs,
+        draft_forward_batch = self._build_draft_forward_batch(
+            batch=batch,
+            bs=bs,
+            device=device,
             input_ids=draft_block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=prefix_lens,
             out_cache_loc=draft_cache_loc,
-            seq_lens_sum=draft_seq_lens_sum,
-            seq_lens_cpu=draft_seq_lens_cpu,
             positions=draft_positions,
+            seq_lens_cpu=draft_seq_lens_cpu,
+            seq_lens_sum=draft_seq_lens_sum,
             input_embeds=draft_input_embeds,
+        )
+        graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+        if (
+            draft_sampler is not None
+            and graph_runner is not None
+            and graph_runner.can_run_graph(draft_forward_batch)
+        ):
+            draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+        draft_out = self._forward_draft_model(draft_forward_batch)
+        logits_output = draft_out.logits_output
+        raw_hidden = logits_output.hidden_states
+        if raw_hidden is None:
+            raise RuntimeError("DSpark draft model returned no hidden states.")
+        draft_hidden_3d = raw_hidden.view(bs, gamma, -1)
+        if getattr(self.draft_model, "_weight_shard_layers", None):
+            self._log_busy_forward_mode(bool(draft_out.can_run_graph))
+        return DraftForwardResult(
+            draft_block_ids=draft_block_ids,
+            raw_hidden=raw_hidden,
+            draft_hidden_3d=draft_hidden_3d,
+            can_run_graph=draft_out.can_run_graph,
+        )
+
+    def _build_draft_forward_batch(
+        self,
+        *,
+        batch: ScheduleBatch,
+        bs: int,
+        device: str,
+        input_ids: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        seq_lens_sum: int,
+        input_embeds: Optional[torch.Tensor],
+    ) -> ForwardBatch:
+        """Build the draft ForwardBatch shared by the busy and idle paths.
+
+        Busy decode and idle participation MUST produce structurally identical
+        batches: the draft's per-layer flat AllGather is launched from inside
+        `DFlashDraftModel.forward`, so if one rank replays a cuda graph while
+        another runs eager, the two disagree on both the AG submission order
+        and on the ownership of `FlatAGScheduler._shared_event` (a graph event
+        node vs. an eager record on the same cudaEvent). That mismatch stalls
+        the shard group. Routing both paths through this builder keeps replay
+        admission (`can_run_graph`) reading the same fields on both sides.
+        """
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_lens_sum,
+            seq_lens_cpu=seq_lens_cpu,
+            positions=positions,
+            input_embeds=input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-        self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
+        self._fill_dp_moe_sync_metadata(forward_batch, batch)
         self._publish_dp_embed_rows_capacity(batch)
         if not self._dp_moe_sync:
             # Dense (dp-local) draft: under --enable-dp-attention the draft's
@@ -554,33 +725,14 @@ class DraftBlockProposer:
             # num_token_non_padded mirrors ForwardBatch.init_new; the replay
             # hook localizes it per attn-TP rank when the gathered-buffer path
             # is active.
-            draft_forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+            forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
             if enable_num_token_non_padded():
-                num_tokens = int(draft_forward_batch.input_ids.numel())
-                draft_forward_batch.num_token_non_padded = torch.tensor(
+                num_tokens = int(forward_batch.input_ids.numel())
+                forward_batch.num_token_non_padded = torch.tensor(
                     num_tokens, dtype=torch.int32
                 ).to(device, non_blocking=True)
-                draft_forward_batch.num_token_non_padded_cpu = num_tokens
-        graph_runner = self.draft_model_runner.decode_cuda_graph_runner
-        if (
-            draft_sampler is not None
-            and graph_runner is not None
-            and graph_runner.can_run_graph(draft_forward_batch)
-        ):
-            draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
-        with torch.inference_mode():
-            draft_out = self.draft_model_runner.forward(draft_forward_batch)
-        logits_output = draft_out.logits_output
-        raw_hidden = logits_output.hidden_states
-        if raw_hidden is None:
-            raise RuntimeError("DSpark draft model returned no hidden states.")
-        draft_hidden_3d = raw_hidden.view(bs, gamma, -1)
-        return DraftForwardResult(
-            draft_block_ids=draft_block_ids,
-            raw_hidden=raw_hidden,
-            draft_hidden_3d=draft_hidden_3d,
-            can_run_graph=draft_out.can_run_graph,
-        )
+                forward_batch.num_token_non_padded_cpu = num_tokens
+        return forward_batch
 
     def _fill_dp_moe_sync_metadata(
         self, forward_batch: ForwardBatch, batch: ScheduleBatch

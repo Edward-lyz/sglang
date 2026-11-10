@@ -52,6 +52,11 @@ class WeightShardingConfig:
     enabled: bool = False
     # Layer 0 is dense and is never a K3 weight-sharding target.
     layer_idx_spec: str = "1-92"
+    # Master switch for sharding the DSPARK dense draft (MTP) layers, from
+    # SGLANG_ENABLE_K3_DRAFT_WEIGHT_SHARD. Applied only to modules flagged
+    # `_weight_shard_is_draft`; the draft has no layer-0 exclusion, so when
+    # enabled every draft layer is a target ("all").
+    draft_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "WeightShardingConfig":
@@ -61,6 +66,7 @@ class WeightShardingConfig:
         return cls(
             enabled=envs.SGLANG_ENABLE_K3_WEIGHT_SHARD.get(),
             layer_idx_spec=envs.SGLANG_K3_WEIGHT_SHARD_LAYERS.get(),
+            draft_enabled=envs.SGLANG_ENABLE_K3_DRAFT_WEIGHT_SHARD.get(),
         )
 
     def targets(self, num_layers: int) -> List[int]:
@@ -1259,6 +1265,12 @@ class FlatAGScheduler:
         self._waited_launch_id = 0
         self._launch_id = 0
         self._finalized = False
+        self._external_prefetch = False
+        # Optional dedicated stream for externally launched AGs. Without it the
+        # eager AG would queue behind the target's own flat AG on the shared
+        # side stream, which pushed it past the fold window it was meant to
+        # overlap (measured: AG started at fold end, ~25us overlap).
+        self._prefetch_stream = None
 
     def finalize(
         self,
@@ -1298,12 +1310,51 @@ class FlatAGScheduler:
 
     def wait_ready_once(self) -> None:
         """Wait for the all-gather to complete, at most once per launch."""
+        if self._external_prefetch:
+            # The host launches this layer's AG outside the cuda graph and
+            # waits for it before replay (wait_first_weight_shard), so neither
+            # the launch nor the wait may be captured: an in-graph wait on an
+            # eagerly recorded event is an illegal cross-capture dependency.
+            return
         if self._waited_launch_id == self._launch_id:
             return
         torch.cuda.current_stream().wait_event(self._shared_event)
         self._waited_launch_id = self._launch_id
 
-    def launch(self, gate_event: Optional[torch.cuda.Event] = None) -> None:
+    def set_external_prefetch(self, enabled: bool) -> None:
+        """Move this layer's AG off the forward path (host-driven).
+
+        Used for the first sharded layer (AG 0), whose overlap target is the
+        ReplaySSM commit fold outside any cuda graph; layers 1..N-1 stay
+        in-graph under the planner's depth-1 lookahead dispatch.
+        """
+        self._external_prefetch = bool(enabled)
+
+    def set_prefetch_stream(self, stream) -> None:
+        """Assign a dedicated stream for externally launched AGs.
+
+        The shared side stream also carries the target model's flat AGs, so an
+        eager AG submitted there is serialized behind them and its start time
+        becomes uncontrolled. A dedicated stream keeps the external AG's
+        position determined solely by its gate event.
+        """
+        self._prefetch_stream = stream
+
+    def external_launch(self, gate_event: Optional[torch.cuda.Event] = None) -> None:
+        """Launch this layer's AG from the host, outside any cuda graph."""
+        self.launch(gate_event=gate_event, _external=True)
+
+    def external_wait(self) -> None:
+        """Block the current stream on the externally launched AG."""
+        if self.dp_size == 1:
+            return
+        torch.cuda.current_stream().wait_event(self._shared_event)
+
+    def launch(
+        self,
+        gate_event: Optional[torch.cuda.Event] = None,
+        _external: bool = False,
+    ) -> None:
         """Launch the flat all-gather on the side stream.
 
         AG reads directly from the persistent per-layer ``flat_shard``
@@ -1312,22 +1363,39 @@ class FlatAGScheduler:
         """
         if not self._finalized:
             raise RuntimeError("FlatAGScheduler.launch called before finalize()")
+        if self._external_prefetch and not _external:
+            # In-forward dispatch is a no-op for host-prefetched layers; this
+            # keeps the captured graph free of this layer's AG.
+            return
         self._launch_id += 1
         if self.dp_size == 1:
             self._shared_event.record()
             return
+        stream = (
+            self._prefetch_stream
+            if (_external and self._prefetch_stream is not None)
+            else self.side_stream
+        )
         cur = torch.cuda.current_stream()
-        self.side_stream.wait_stream(cur)
-        if gate_event is not None:
-            self.side_stream.wait_event(gate_event)
+        if _external and gate_event is not None:
+            # Eager path with an explicit gate: wait only on the gate event, so
+            # the AG lands exactly at the device-time point the caller chose
+            # instead of behind the whole compute-stream backlog.
+            stream.wait_event(gate_event)
+        else:
+            # In-graph dispatch keeps the fork edge: it joins the side stream
+            # into the capture and cannot be dropped there.
+            stream.wait_stream(cur)
+            if gate_event is not None:
+                stream.wait_event(gate_event)
         flat_buf = self._pool.borrow_flat(self._seq_idx)
-        with torch.cuda.stream(self.side_stream):
+        with torch.cuda.stream(stream):
             dist.all_gather_into_tensor(
                 output_tensor=flat_buf,
                 input_tensor=self._flat_shard,
                 group=self.dp_group,
             )
-            self._shared_event.record(self.side_stream)
+            self._shared_event.record(stream)
 
 
 class WeightShardForwardPlanner:
@@ -1518,7 +1586,7 @@ def _install_row_shard_loader(
         )
 
     # ModelWeightParameter exposes ``weight_loader`` as a read-only property
-    # backed by ``_weight_loader``.  Replace the backing callback directly so
+    # backed by ``_weight_loader``. Replace the backing callback directly so
     # the loader remains compatible with both vLLM-style parameters and plain
     # Parameters used by older model implementations.
     if hasattr(param, "_weight_loader"):
@@ -1550,7 +1618,16 @@ def _setup_shard_weight(
     if not cfg.enabled:
         return None
     layer_id = _layer_id(layer)
-    ids = _parse_layer_spec(cfg.layer_idx_spec)
+    is_draft = getattr(layer, "_weight_shard_is_draft", False)
+    if is_draft:
+        # Draft (MTP) layers are gated by their own master switch; no dense
+        # layer-0 exclusion, so every draft layer is a target when enabled.
+        if not cfg.draft_enabled:
+            return None
+        spec = "all"
+    else:
+        spec = cfg.layer_idx_spec
+    ids = _parse_layer_spec(spec)
     if ids is not None and layer_id not in set(ids):
         return None
 

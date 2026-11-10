@@ -882,6 +882,10 @@ class Envs:
     # Layer selection: comma-separated ids or inclusive ranges. K3 weight
     # sharding applies to transformer layers 1-92; layer 0 is never sharded.
     SGLANG_K3_WEIGHT_SHARD_LAYERS = EnvStr("1-92")
+    # Master switch for sharding the DSPARK dense draft (MTP) layers the same
+    # way as the target model. The draft has no dense layer-0 exclusion, so
+    # when enabled every draft layer is sharded (equivalent to "all").
+    SGLANG_ENABLE_K3_DRAFT_WEIGHT_SHARD = EnvBool(False)
     # Fuse the K3 KDA short_conv q/k/v width-4 depthwise causal conv1d + SiLU,
     # plus the in-place conv-state update, into one CUDA launch, replacing the
     # three serial Triton causal_conv1d_fn calls in KDAAttnBackend.forward_extend.

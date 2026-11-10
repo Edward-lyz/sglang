@@ -295,6 +295,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.draft_model.prune_to_ctx_kv_injection()
             self._init_pp_context_feature_indices()
 
+    @property
+    def _draft_weight_sharded(self) -> bool:
+        # Runtime weight sharding adds a node-local AllGather to the dense
+        # draft's forward. Idle DP ranks must still run that forward (empty
+        # batch) so all shard-group members enter the AG; probe live because
+        # prune_to_ctx_kv_injection() drops the shard bookkeeping.
+        return bool(getattr(self.draft_model, "_weight_shard_layers", None))
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -705,7 +713,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
             if self.server_args.enable_dp_attention:
-                if self._draft_is_moe or self._dp_vocab_sync:
+                if (
+                    self._draft_is_moe
+                    or self._dp_vocab_sync
+                    or self._draft_weight_sharded
+                ):
                     # Same TP context as the busy path's propose, so the draft
                     # side of an idle rank issues its collectives on the same
                     # groups.
@@ -714,6 +726,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )
+                # Mirror the busy path: exactly one AG submission per step on
+                # every rank (the proposer's prefetch is idempotent).
+                if self._draft_weight_sharded:
+                    self._proposer.prefetch_weight_shard()
             return self._decode_idle_result(on_publish=on_publish)
 
         batch.seq_lens.record_stream(
@@ -853,6 +869,15 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+        # Fire AG 0 here, right where the accept-epilogue kernels
+        # (finalize_accept_lens / build_out_tokens / index ops) are about to be
+        # enqueued: the gate resolves at the epilogue start on the device, so
+        # the AG covers [accept epilogue + ReplaySSM commit fold]. The proposer's
+        # prefetch is idempotent per step, and the idle path mirrors this with
+        # exactly one submission per step (NCCL pairs the shard-group AGs by
+        # sequence number).
+        if self._draft_weight_sharded:
+            self._proposer.prefetch_weight_shard()
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,

@@ -12,6 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sharding import WeightShardForwardPlanner
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
@@ -711,6 +712,9 @@ class DSparkDraftMixin:
         Cached; None (per-layer fallback) when a QKV weight cannot be sliced
         (quantized) or layers disagree on norm epsilon / bias presence.
         """
+        # NOTE: safe under runtime weight sharding because `qkv_proj` is never
+        # a shard target (see DFlashDecoderLayer.weight_shard_targets), so the
+        # weight read here is always the full, stable tensor.
         cached = getattr(self, "_stacked_ctx_kv_cache", False)
         if cached is not False:
             return cached
@@ -885,6 +889,28 @@ class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
         for layer in self.layers:
             layer.mlp = None
             layer.self_attn.o_proj = None
+        if self._weight_shard_layers:
+            # Only the pruned modules were shard targets (qkv stays replicated
+            # for the KV-injection path), and the pruned draft never runs a
+            # forward, so drop the shard bookkeeping to release the per-layer
+            # shards and the staging pool.
+            for layer in self.layers:
+                for _role, sharded_attr, _path in getattr(
+                    layer, "_weight_shard_targets", []
+                ):
+                    if hasattr(layer, sharded_attr):
+                        delattr(layer, sharded_attr)
+                for attr in ("_weight_shard_sched", "_weight_shard_targets"):
+                    if hasattr(layer, attr):
+                        delattr(layer, attr)
+            self._weight_shard_layers = []
+            self._weight_shard_planner = WeightShardForwardPlanner([])
+            self._weight_shard_pool = None
+            # Drop the host-side AG-0 prefetch too; its scheduler was just
+            # deleted along with the layer bookkeeping.
+            self._external_weight_shard_scheds = []
+            self._weight_shard_prefetched = False
+            self._weight_shard_gate = None
         torch.cuda.empty_cache()
 
 
