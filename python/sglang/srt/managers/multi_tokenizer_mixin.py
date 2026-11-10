@@ -37,7 +37,6 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import TransferBackend
-from sglang.srt.environ import envs
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -297,7 +296,9 @@ def _handle_output_by_index(output, i):
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),
-            generated_token_nums=_extract_field_by_index(output, "generated_token_nums", i),
+            generated_token_nums=_extract_field_by_index(
+                output, "generated_token_nums", i
+            ),
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
@@ -647,9 +648,6 @@ class TokenizerWorker(TokenizerManager):
         torch.set_num_threads(1)
         # Configure the logger
         configure_logger(server_args, prefix=f" TokenizerWorker{os.getpid()}")
-        # prevent init prefill bootstrapserver again
-        disaggregation_mode = server_args.disaggregation_mode
-        server_args.disaggregation_mode = "null"
         super().__init__(
             server_args,
             port_args,
