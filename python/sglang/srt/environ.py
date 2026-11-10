@@ -420,6 +420,9 @@ class Envs:
     # DSPARK target-verify: build the dense KDA cu_seqlens / MLA q_indptr
     # arange once per forward and share it across layers. Same values.
     SGLANG_K3_VERIFY_METADATA_HOIST = EnvBool(False)
+    # Dense MLP: fuse the SiTU activation with the down-proj DeepGEMM block-FP8
+    # input quant (situ_and_mul_quant).
+    SGLANG_K3_MLP_SITU_QUANT = EnvBool(False)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)

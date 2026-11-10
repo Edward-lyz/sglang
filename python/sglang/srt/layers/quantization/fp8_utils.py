@@ -822,7 +822,24 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
+    if input_scale is not None:
+        # Pre-quantized (fp8, UE8M0 column-major TMA-aligned scale) input from
+        # a producer that fused the quant this function would otherwise run
+        # (e.g. K3 situ_and_mul_quant); only the DeepGEMM path takes it.
+        assert input.dtype == torch.float8_e4m3fn
+        assert weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+        output_shape = [*input.shape[:-1], weight.shape[0]]
+        output = w8a8_block_fp8_matmul_deepgemm(
+            input.view(-1, input.shape[-1]),
+            weight,
+            input_scale,
+            weight_scale,
+            block_size,
+            output_dtype=torch.bfloat16,
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*output_shape)
 
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16

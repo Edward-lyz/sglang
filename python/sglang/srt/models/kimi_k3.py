@@ -304,6 +304,10 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
 # ---------------------------------------------------------------------------
 
 
+# One-shot log guard: proves the fused SiTU+quant MLP path is live.
+_ACT_QUANT_LOGGED = False
+
+
 class KimiK3MLP(nn.Module):
     def __init__(
         self,
@@ -383,6 +387,56 @@ class KimiK3MLP(nn.Module):
         self._dp_attention = is_dp_attention_enabled()
         self._tp_group = tp_group if reduce_results else None
 
+    def _act_quant_static_fusable(self) -> bool:
+        """Whether down_proj is a DeepGEMM block-FP8 linear whose input quant
+        (group 128, UE8M0, column-major) situ_and_mul_quant reproduces."""
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+        from sglang.srt.layers.quantization.fp8_utils import (
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
+        )
+        from sglang.srt.utils import use_intel_amx_backend
+
+        method = self.down_proj.quant_method
+        weight = getattr(self.down_proj, "weight", None)
+        return (
+            envs.SGLANG_K3_MLP_SITU_QUANT.get()
+            and isinstance(self.act_fn, SituAndMul)
+            and isinstance(method, Fp8LinearMethod)
+            and method.block_quant
+            and not method.use_marlin
+            and not method.use_mxfp8
+            and method.w8a8_block_fp8_linear
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+            and list(method.weight_block_size) == [128, 128]
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and weight is not None
+            and weight.dtype == torch.float8_e4m3fn
+            and weight.shape[0] % 64 == 0
+            and weight.shape[1] % 128 == 0
+            and not use_intel_amx_backend(self.down_proj)
+        )
+
+    def _act_quant_fusable(self, gate_up: torch.Tensor) -> bool:
+        fusable = getattr(self, "_act_quant_static", None)
+        if fusable is None:
+            fusable = self._act_quant_static_fusable()
+            self._act_quant_static = fusable
+            global _ACT_QUANT_LOGGED
+            if fusable and not _ACT_QUANT_LOGGED:
+                _ACT_QUANT_LOGGED = True
+                logger.info(
+                    "K3 MLP SiTU+quant fusion active (down_proj K=%d)",
+                    self.down_proj.weight.shape[1],
+                )
+        if not fusable:
+            return False
+        from sglang.kernels.ops.kimi_k3.activation import (
+            situ_and_mul_quant_supported,
+        )
+
+        return situ_and_mul_quant_supported(gate_up)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -418,7 +472,16 @@ class KimiK3MLP(nn.Module):
             gate_up = torch.cat((gate, up), dim=-1)
         else:
             gate_up, _ = self.gate_up_proj(hidden_states)
-        hidden_states = self.act_fn(gate_up)
+        if self._act_quant_fusable(gate_up):
+            from sglang.kernels.ops.kimi_k3.activation import situ_and_mul_quant
+
+            # The down projection takes the (fp8, scale) pair as-is, so the
+            # activation and its input quant run as one kernel.
+            hidden_states = situ_and_mul_quant(
+                gate_up, self.act_fn.beta, self.act_fn.linear_beta
+            )
+        else:
+            hidden_states = self.act_fn(gate_up)
         hidden_states, _ = self.down_proj(hidden_states)
         if self._tp_group is not None:
             hidden_states = self._tp_group.all_reduce(hidden_states)
