@@ -1,3 +1,5 @@
+"""Scheduler-side grammar handling: per-request init, TP-synced grammar queue, timeouts."""
+
 from __future__ import annotations
 
 import logging
@@ -28,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 
 class GrammarManager:
+    """Owns the grammar backend and the queue of requests whose grammar is still compiling."""
+
     def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
         self.server_args = scheduler.server_args

@@ -1,3 +1,5 @@
+"""Unit tests for ReasonerGrammarBackend (reasoning-aware grammar wrapper)."""
+
 import os
 import unittest
 from types import SimpleNamespace
@@ -141,6 +143,8 @@ class TestReasonerGrammarObject(unittest.TestCase):
 
 
 class TestReasonerGrammarBackend(unittest.TestCase):
+    """ReasonerGrammarBackend wrapping a dummy inner backend."""
+
     def setUp(self):
         self._prev_budget = os.environ.get("SGLANG_MAX_THINK_TOKENS")
 
@@ -302,6 +306,22 @@ class TestReasonerGrammarBackend(unittest.TestCase):
                 self._make_tokenizer(),
                 enable_strict_thinking=True,
             )
+
+    def test_inherits_inner_cache_policy_and_resets_inner(self):
+        """The wrapper copies the inner cache policy and reset() also resets the inner backend."""
+        backend = _DummyGrammarBackend(support_token_filter=True)
+        backend._cache_compiled_grammars = False
+        backend.reset = MagicMock()
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            self._make_tokenizer(),
+            enable_strict_thinking=False,
+        )
+
+        self.assertFalse(reasoner._cache_compiled_grammars)
+        reasoner.reset()
+        backend.reset.assert_called_once()
 
 
 class TestReasonerGrammarObjectRollback(unittest.TestCase):

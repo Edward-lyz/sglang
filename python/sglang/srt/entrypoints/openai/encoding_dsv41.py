@@ -67,10 +67,17 @@ REASONING_EFFORT_TEMPLATE = (
     "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
 )
 
+# Budgets follow the checkpoint's own encoder, encoding/encoding.py, which the
+# model card documents: "low" -> 50, "high" -> 75, "max" -> 100, default high.
+# The port used to carry low=25/high=50/xhigh=75, so a request that asked for
+# the documented "high" rendered 50 instead of 75 and no longer matched the
+# token ids the checkpoint encoder produces. "xhigh" has no checkpoint tier:
+# it is the Anthropic output_config.effort level above high, so it renders the
+# maximum budget.
 REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
-    "low": 25,
-    "high": 50,
-    "xhigh": 75,
+    "low": 50,
+    "high": 75,
+    "xhigh": 100,
     "max": 100,
 }
 DEFAULT_REASONING_EFFORT = "high"
@@ -140,9 +147,15 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
     P_dsml_strs = []
 
     raw_arguments = tool_call["arguments"]
-    arguments = (
-        json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
-    )
+    if isinstance(raw_arguments, str):
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            # The tool parser passes a JSON invoke body through unvalidated, so
+            # history can carry malformed JSON; re-render it as that body verbatim.
+            return raw_arguments
+    else:
+        arguments = raw_arguments
     if not isinstance(arguments, dict):
         raise ValueError(
             "Assistant tool call function.arguments must be a JSON object."

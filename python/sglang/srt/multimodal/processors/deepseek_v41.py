@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from functools import partial
+from typing import List, Optional
 
 import torch
 
@@ -19,14 +20,24 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     load_image_rust,
     prepare_image_gpu,
 )
+from sglang.srt.multimodal.task_id import media_task_hash
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.runtime_context import get_mm
+from sglang.srt.runtime_context import get_mm, get_serving
 from sglang.srt.rust_extensions import load_rust_extension
 
 logger = logging.getLogger(__name__)
+
+
+def media_url_of(media) -> Optional[str]:
+    """Where a data item's media came from: an ImageData url, a dict url, or a url."""
+    if isinstance(media, dict):
+        media = media.get("url")
+    else:
+        media = getattr(media, "url", media)
+    return media if isinstance(media, str) else None
 
 
 class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
@@ -74,7 +85,13 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
         return payload
 
     async def process_mm_data_async(
-        self, image_data, input_text, request_obj, *args, **kwargs
+        self,
+        image_data,
+        input_text,
+        request_obj,
+        image_urls: Optional[List[str]] = None,
+        *args,
+        **kwargs,
     ):
         base = await self.load_mm_data(
             input_text, image_data=image_data, multimodal_tokens=self.mm_tokens
@@ -87,12 +104,14 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
         if ids.count(self.image_token_id) != len(base.images):
             raise ValueError("Image placeholders and images must match")
         images = iter(base.images)
+        urls = iter(image_urls or [])
         tokens, items = [], []
         for token in ids:
             if token != self.image_token_id:
                 tokens.append(token)
                 continue
             image = next(images)
+            url = media_url_of(next(urls, None))
             plan = None
             if self.image_backend == "gpu":
                 patches, plan, lh, lw = await asyncio.to_thread(
@@ -112,14 +131,23 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
             count = len(image_token_types(lh, lw))
             start = len(tokens)
             tokens.extend([self.image_token_id] * count)
-            items.append(
-                MultimodalDataItem(
-                    modality=Modality.IMAGE,
-                    feature=patches,
-                    offsets=[(start, start + count - 1)],
-                    model_specific_data=metadata,
-                )
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=patches,
+                offsets=[(start, start + count - 1)],
+                model_specific_data=metadata,
             )
+            # The pad value follows the media url, so a rank that never holds
+            # the encoded tensor derives the same one. Media without a url
+            # keeps the feature hash; a shared empty url would collide.
+            if url is not None:
+                item.set_hash(
+                    media_task_hash(
+                        model_id=get_serving().served_model_name or "",
+                        media_url=url,
+                    )
+                )
+            items.append(item)
         return MultimodalProcessorOutput(
             input_ids=tokens,
             mm_items=self._prepare_mm_items_for_transport(items),

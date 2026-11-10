@@ -126,6 +126,12 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
+from sglang.srt.observability.request_trace import (
+    log_input_ids,
+    trace,
+    traced_rid,
+    traced_rids,
+)
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
     assert_published,
@@ -1128,6 +1134,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
+                        image_urls=obj.image_data,
                         audio_data=obj.audio_data,
                         input_text=mm_processor_input,
                         request_obj=obj,
@@ -1143,6 +1150,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # to encoder (e.g., only one image), process locally like non-language_only mode
                 mm_inputs = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,
+                    image_urls=obj.image_data,
                     audio_data=obj.audio_data,
                     input_text=mm_processor_input,
                     request_obj=obj,
@@ -1196,6 +1204,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         item.set_pad_value()
         else:
             mm_inputs = None
+
+        log_input_ids(logger, obj.rid, "tokenized", input_ids)
 
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
@@ -1806,6 +1816,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
+            if rid := traced_rid(tokenized_obj.rid):
+                trace(logger, "tokenizer sent request %s to the scheduler", rid)
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
@@ -2464,6 +2476,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
     ):
+        if traced := traced_rids(recv_obj.rids):
+            trace(logger, "tokenizer received %s from the detokenizer", traced)
         recv_obj.time_stats = unwrap_from_pickle(recv_obj.time_stats)
         if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
             customized_info = unwrap_from_pickle(recv_obj.customized_info)
@@ -2720,6 +2734,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 state.time_stats.set_finished_time(span_attrs=span_attrs)
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
+                if traced := traced_rid(rid):
+                    trace(
+                        logger,
+                        "request %s finished in %.3fs",
+                        traced,
+                        meta_info["e2e_latency"],
+                    )
 
                 if get_spec().speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)

@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.request_trace import trace, traced_rids
 from sglang.srt.runtime_context import (
     get_device,
     get_model,
@@ -441,6 +442,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         ]
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        if rids := traced_rids(recv_obj.rids):
+            trace(logger, "detokenizer received %s from the scheduler", rids)
         # Beam decoding is additive: a batch may mix beam leaders with normal
         # requests, so every item still goes through the standard decode.
         if is_beam_search_batch(recv_obj):

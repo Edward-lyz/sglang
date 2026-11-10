@@ -43,7 +43,9 @@ def validate_deepseek_v4_mega_moe_token_budget(
     if cfg.enable_prefill_cp:
         token_partition_size = cfg.attn_cp_size
         token_partition_name = "attn_cp_size"
-        token_alignment = 1
+        # Interleave CP pads every local shard to a multiple of CP size
+        # (pad_logical_token_to_physical), including an uneven final chunk.
+        token_alignment = cfg.attn_cp_size
         local_chunked_prefill_size = (
             cfg.chunked_prefill_size + token_partition_size - 1
         ) // token_partition_size
@@ -225,9 +227,18 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         "validate_deepseek_v4_cp",
         attn_cp_size=cfg.tp_size // cfg.dp_size,
     )
-    assert cfg.dp_size == 1, (
-        "For round-robin split mode, dp attention is not supported."
+    assert cfg.tp_size % cfg.dp_size == 0 and cfg.tp_size // cfg.dp_size >= 1, (
+        f"CP requires tp_size ({cfg.tp_size}) to be divisible by dp_size "
+        f"({cfg.dp_size})."
     )
+    if cfg.dp_size > 1:
+        logger.warning(
+            "DeepSeekV4 CP with dp_size=%d (attn_cp_size=%d): combining the "
+            "round-robin CP token split with DP attention is experimental; "
+            "each DP group runs its own CP token partition.",
+            cfg.dp_size,
+            cfg.tp_size // cfg.dp_size,
+        )
     assert cfg.tp_size <= 8, (
         "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
     )
@@ -317,18 +328,27 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        is_fake_decode_benchmark = (
+            cfg.disaggregation_mode == "decode"
+            and cfg.disaggregation_transfer_backend == "fake"
+        )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend != "mooncake"
-            or cfg.dp_size != 1
-            or cfg.enable_dp_attention
-            or cfg.attn_cp_size != 1
+            or (
+                cfg.disaggregation_transfer_backend != "mooncake"
+                and not is_fake_decode_benchmark
+            )
+            # [experimental] allow CP on the prefill side with DSpark: the
+            # prefill-CP shard produces KV that the dp decode pulls; decode
+            # itself must still stay CP=1. Runtime compatibility unverified.
+            or (cfg.attn_cp_size != 1 and not cfg.enable_prefill_cp)
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake "
+                "(or fake for decode-only synthetic benchmarking), "
+                "DP=1 and CP=1 (prefill CP allowed experimentally). Both "
+                "servers must enable DSpark with the same block size and TP size."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -359,9 +379,19 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, not a per-local-token tensor,
-            # so the tail slice does not apply to it.
-            ("DP attention", cfg.enable_dp_attention),
+            # The late-layer tail slice needs per-request LOCAL tokens. With
+            # dp_size==1 (incl. dp1 + prefill-CP) that holds. With REAL dp_size>1
+            # the DP-wide input_ids_global gather breaks the tail slice (batch_size
+            # mismatch). But under "fake DP" (DWDP / local-control-broadcast, which
+            # sets SGLANG_SCHEDULER_SKIP_ALL_GATHER) each DP worker is independent
+            # and does NOT do the DP-wide gather, so the per-request tail slice
+            # still holds -> allow swa there. Reject only real DP fan-out.
+            (
+                "real DP attention with dp_size>1",
+                cfg.enable_dp_attention
+                and cfg.dp_size > 1
+                and not cfg.enable_dp_attention_local_control_broadcast,
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:

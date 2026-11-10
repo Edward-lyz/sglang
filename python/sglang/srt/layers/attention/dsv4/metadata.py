@@ -1,3 +1,5 @@
+"""Forward metadata dataclasses of the DeepSeek-V4 attention backend (core attention, indexer, compressor)."""
+
 from __future__ import annotations
 
 import logging

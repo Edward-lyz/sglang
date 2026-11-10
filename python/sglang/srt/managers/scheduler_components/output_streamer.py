@@ -29,9 +29,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
+    FINISH_ABORT,
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.observability.request_trace import trace, traced_rid
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -415,6 +417,31 @@ class _GenerationStreamAccumulator:
         # Only the leader is ever streamed, and only at group finish.
         return req.is_beam_leader and req.finished()
 
+    def _trace_finalized(self, req: Req, rid: str) -> None:
+        """Trace a request leaving this role. An abort is traced everywhere; a
+        normal finish only where it is the user-visible one, since the prefill
+        role hands the request over after the first token."""
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            trace(
+                logger,
+                "request %s aborted: reason=%r status_code=%s "
+                "input_len=%d output_len=%d",
+                rid,
+                req.finished_reason.message,
+                req.finished_reason.status_code,
+                len(req.origin_input_ids),
+                len(req.output_ids),
+            )
+        elif self.disaggregation_mode != DisaggregationMode.PREFILL:
+            trace(
+                logger,
+                "request %s finished: %s input_len=%d output_len=%d",
+                rid,
+                req.finished_reason.to_json() if req.finished_reason else None,
+                len(req.origin_input_ids),
+                len(req.output_ids),
+            )
+
     def accept(self, *, req: Req) -> None:
         if req.beam_group is not None and not self._beam_admits(req=req):
             return
@@ -423,6 +450,8 @@ class _GenerationStreamAccumulator:
             req.finished_output = True
             if req.finished_len is None:
                 req.finished_len = len(req.output_ids)
+            if rid := traced_rid(req.rid):
+                self._trace_finalized(req, rid)
             should_output = True
         else:
             if req.stream:

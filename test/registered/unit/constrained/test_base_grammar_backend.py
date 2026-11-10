@@ -183,6 +183,22 @@ class TestBaseGrammarBackend(unittest.TestCase):
         result = self.backend._init_value_dispatch(("json", "schema"), False)
         self.assertIsNone(result)
 
+    def test_compiled_grammar_cache_disabled_keeps_only_failures(self):
+        """With engine caching off, successes recompile but failures stay cached."""
+        self.backend._cache_compiled_grammars = False
+        ok_key, bad_key = ("json", "ok"), ("json", "bad")
+        self.backend.set_cache(ok_key, MagicMock(spec=BaseGrammarObject))
+        self.backend.set_cache(bad_key, InvalidGrammarObject("timed out"))
+
+        result, hit = self.backend.get_cached_or_future_value(ok_key, False)
+        self.assertFalse(hit)
+        self.assertIsInstance(result, Future)
+        result.result(timeout=5)
+
+        result, hit = self.backend.get_cached_or_future_value(bad_key, False)
+        self.assertTrue(hit)
+        self.assertEqual(result.error_message, "timed out")
+
     def test_cache_miss_duplicate_key_submits_separate_futures(self):
         """Two cache misses for the same key each get their own Future.
 
@@ -430,6 +446,62 @@ class TestCreateGrammarBackend(unittest.TestCase):
         create_grammar_backend(args, "tok", 32000, None)
         _, kwargs = mock_xgrammar_cls.call_args
         self.assertIsNone(kwargs["model_eos_token_ids"])
+
+    @patch("sglang.srt.constrained.xgrammar_backend.GrammarCompiler")
+    @patch("sglang.srt.constrained.xgrammar_backend.TokenizerInfo")
+    def test_xgrammar_with_reasoner_caches_only_failures(self, *_):
+        """Production path (DSV4.1 + reasoning parser): the reasoner wrapper must
+        inherit xgrammar's no-engine-cache policy, or its own dict leaks instead."""
+        from sglang.srt.constrained.reasoner_grammar_backend import (
+            ReasonerGrammarBackend,
+        )
+
+        args = self._make_server_args("xgrammar", reasoning_parser="deepseek-r1")
+        tokenizer = MagicMock(spec=["encode"])
+        tokenizer.encode.return_value = [42]
+
+        backend = create_grammar_backend(args, tokenizer, 32000, think_end_ids=[42])
+        self.addCleanup(backend.grammar_backend.executor.shutdown, wait=True)
+        self.addCleanup(backend.executor.shutdown, wait=True)
+
+        self.assertIsInstance(backend, ReasonerGrammarBackend)
+        backend.set_cache(("json", "ok"), MagicMock(spec=BaseGrammarObject))
+        backend.set_cache(("json", "bad"), InvalidGrammarObject("timed out"))
+        self.assertEqual(list(backend.cache), [("json", "bad")])
+
+
+class TestXGrammarCompilerCachePolicy(unittest.TestCase):
+    """xgrammar owns the compiled-grammar cache (bounded); the engine dict is off."""
+
+    def _build(self):
+        from sglang.srt.constrained import xgrammar_backend
+
+        with patch.object(xgrammar_backend, "TokenizerInfo"), patch.object(
+            xgrammar_backend, "GrammarCompiler"
+        ) as compiler_cls:
+            backend = xgrammar_backend.XGrammarGrammarBackend(
+                MagicMock(spec=[]), vocab_size=32000
+            )
+        self.addCleanup(backend.executor.shutdown, wait=True)
+        return backend, compiler_cls.call_args.kwargs["cache_limit_bytes"]
+
+    def test_default_limit_is_200gb(self):
+        _, limit = self._build()
+        self.assertEqual(limit, 200 * 1024**3)
+
+    def test_limit_env_override_and_unbounded(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_XGRAMMAR_CACHE_LIMIT_GB.override(0.5):
+            self.assertEqual(self._build()[1], 512 * 1024**2)
+        with envs.SGLANG_XGRAMMAR_CACHE_LIMIT_GB.override(-1):
+            self.assertEqual(self._build()[1], -1)
+
+    def test_engine_cache_disabled(self):
+        """xgrammar keeps compiled grammars in its own compiler cache, not the engine dict."""
+        backend, _ = self._build()
+        backend.set_cache(("json", "s"), MagicMock(spec=BaseGrammarObject))
+        self.assertEqual(backend.cache, {})
 
 
 class TestLlguidanceStructuralTagTriggerPairing(unittest.TestCase):

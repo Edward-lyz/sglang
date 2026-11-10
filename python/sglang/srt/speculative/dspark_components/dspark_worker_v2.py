@@ -688,7 +688,13 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
-            if get_parallel().enable_dp_attention:
+            # Under SGLANG_SCHEDULER_SKIP_ALL_GATHER (fake-DP) DP workers are
+            # independent (no cross-DP collective), so idle DP-lockstep
+            # participation is unnecessary and must be skipped.
+            if (
+                get_parallel().enable_dp_attention
+                and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+            ):
                 if self._draft_is_moe:
                     self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(

@@ -99,6 +99,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.observability.request_trace import trace, traced_rid, traced_rids
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
     SCHEDULER_STAGE_PROCESS_QUEUE,
@@ -1578,6 +1579,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        for rid in traced_rids(entry.req.rid for entry in preallocated_reqs):
+            trace(logger, "request %s finished decode bootstrap", rid)
+        for rid in traced_rids(entry.req.rid for entry in failed_reqs):
+            trace(logger, "request %s was aborted during decode bootstrap", rid)
+
         return preallocated_reqs, failed_reqs
 
     @property
@@ -2418,6 +2424,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                     if self.scheduler.metrics_reporter.enable_metrics:
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                    if rid := traced_rid(decode_req.req.rid):
+                        trace(logger, "request %s failed its kv cache transfer", rid)
                 else:
                     transferred_reqs.append(decode_req.req)
             elif poll in [
@@ -2449,6 +2457,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+
+        for rid in traced_rids(req.rid for req in transferred_reqs):
+            trace(logger, "request %s received its kv cache", rid)
 
         return transferred_reqs
 

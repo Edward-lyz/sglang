@@ -4,16 +4,19 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, Tuple, Union
 
 import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.content_detection.config import DETECTION_CONFIG
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
+from sglang.srt.observability.request_trace import trace, traced_rid
 from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
 
@@ -76,6 +79,8 @@ class OpenAIServingBase(ABC):
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
+        if rid := traced_rid(getattr(request, "rid", None)):
+            trace(logger, "api server received request %s", rid)
 
         try:
             # Validate request
@@ -96,6 +101,8 @@ class OpenAIServingBase(ABC):
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
+
+            self._process_trace_config(request, adapted_request)
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
@@ -226,6 +233,25 @@ class OpenAIServingBase(ABC):
         )
         return json.dumps({"error": error.model_dump()})
 
+    @staticmethod
+    def raise_abort_before_stream(finish_reason: dict) -> NoReturn:
+        """Re-raise a scheduler abort that arrived before any SSE chunk was sent.
+
+        A StreamingResponse commits HTTP 200 the moment it is returned, so an
+        abort can only be reported in-band once streaming has started. Before
+        that -- while the caller is still inside the kick-start ``__anext__()``
+        of ``_handle_streaming_request`` -- raising instead lets
+        ``handle_request`` emit the real HTTP status code, matching the
+        non-streaming path. The exception mapping mirrors
+        ``TokenizerManager._handle_abort_finish_reason`` so both modes produce
+        identical response bodies.
+        """
+        message = finish_reason.get("message", "Generation aborted.")
+        code = finish_reason["status_code"]
+        if code == HTTPStatus.BAD_REQUEST:
+            raise ValueError(message)
+        raise HTTPException(status_code=int(code), detail=message)
+
     def extract_custom_labels(self, raw_request):
         if (
             not self.allowed_custom_labels
@@ -288,3 +314,68 @@ class OpenAIServingBase(ABC):
                 )
 
         return body_routed_dp_rank
+
+    @staticmethod
+    def _serialize_trace_value(value: Any) -> Any:
+        """JSON-ready copy of a request field for the trace payload."""
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json")
+        if isinstance(value, list):
+            return [OpenAIServingBase._serialize_trace_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: OpenAIServingBase._serialize_trace_value(item)
+                for key, item in value.items()
+            }
+        return value
+
+    def _build_trace_info(
+        self,
+        request: OpenAIServingRequest,
+        meta_info: Optional[Dict[str, Any]] = None,
+    ) -> Optional[dict]:
+        """Trace payload the scheduler attached to this request, if any.
+
+        The scheduler-side dump tool that fills meta_info["trace_info"] is not
+        part of this delivery, so this returns None until it lands; the response
+        field exists so the gateway contract does not change when it does.
+        """
+        if not DETECTION_CONFIG.enable_trace or not request.trace_config:
+            return None
+        if not meta_info or "trace_info" not in meta_info:
+            return None
+        return dict(meta_info["trace_info"])
+
+    def _process_trace_config(self, request, adapted_request) -> None:
+        """Resolve trace settings onto the internal request.
+
+        A trace_config only survives when tracing is enabled, and asking for a
+        logprobs trace has to turn logprobs on, otherwise the trace would be
+        assembled from data the scheduler was never told to produce.
+        """
+        trace_config = getattr(request, "trace_config", None)
+        if not trace_config:
+            return
+        if not DETECTION_CONFIG.enable_trace:
+            logger.info(
+                "CD_ENABLE_TRACE is not set, so the trace config of req %s is ignored",
+                getattr(request, "rid", None),
+            )
+            trace_config["enable_trace"] = False
+
+        trace_type = trace_config.get("trace_type")
+        if trace_type in ("prompt", "all"):
+            if hasattr(request, "messages"):
+                trace_config["payload"] = {
+                    "messages": self._serialize_trace_value(request.messages)
+                }
+            elif hasattr(request, "prompt"):
+                trace_config["payload"] = {
+                    "prompt": self._serialize_trace_value(request.prompt)
+                }
+        if trace_type in ("logprobs", "all"):
+            adapted_request.return_logprob = True
+            if "top_logprobs" in trace_config:
+                adapted_request.top_logprobs_num = trace_config.get("top_logprobs")
+
+        adapted_request.trace_config = trace_config

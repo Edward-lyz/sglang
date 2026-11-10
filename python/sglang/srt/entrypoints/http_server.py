@@ -21,7 +21,9 @@ import asyncio
 import dataclasses
 import logging
 import os
+import re
 import ssl
+import subprocess
 import tempfile
 import threading
 import time
@@ -659,7 +661,30 @@ async def validate_json_request(raw_request: Request):
 ##### Native API endpoints #####
 
 
+def stopped_by_external() -> bool:
+    """Read the drain flag that the PaaS preStop hook writes.
+
+    The platform polls /ready and pulls the instance out of rotation as soon as
+    the answer stops being 200, so the flag has to be visible before the
+    process goes away.
+    """
+    signal_path = os.environ.get("AIAK_STOP_SIGNAL_DIR", "/run/sglang/stop")
+    if not signal_path:
+        return False
+
+    try:
+        with open(signal_path) as flag_file:
+            return flag_file.read().strip().lower() == "stop"
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        logger.info(f"Cannot read the stop signal file {signal_path}: {error}")
+        return False
+
+
+@app.get("/ready")
 @app.get("/health")
+@app.get("/health_forward")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """
@@ -668,6 +693,11 @@ async def health_generate(request: Request) -> Response:
     If the server is running something, this request will be ignored, so it creates zero overhead.
     If the server is not running anything, this request will be run, so we know whether the server is healthy.
     """
+    # /ready is the endpoint the internal gateway polls. 507 during drain keeps
+    # new traffic away while the in-flight requests finish.
+    if request.url.path.rstrip("/") == "/ready" and stopped_by_external():
+        logger.info("Server is shutting down, reporting not ready")
+        return Response(content="Server is shutting down", status_code=507)
 
     if _global_state.tokenizer_manager.gracefully_exit:
         logger.info("Health check request received during shutdown. Returning 503.")
@@ -738,6 +768,41 @@ async def health_generate(request: Request) -> Response:
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
+
+
+@app.get("/get_instance_info")
+async def get_instance_info():
+    """Instance topology and live load, polled by the internal inspection tool."""
+    tokenizer_manager = _global_state.tokenizer_manager
+    server_args = tokenizer_manager.server_args
+
+    current_input_tokens = 0
+    for state in tokenizer_manager.rid_to_state.values():
+        input_ids = getattr(getattr(state, "obj", None), "input_ids", None)
+        if isinstance(input_ids, list):
+            current_input_tokens += len(input_ids)
+
+    max_running_requests = None
+    if server_args.max_running_requests:
+        max_running_requests = server_args.max_running_requests * server_args.dp_size
+
+    # Each node owns a contiguous slice of the DP ranks, so a non-master node
+    # must report its own slice instead of the whole range.
+    dp_per_node = server_args.dp_size // server_args.nnodes
+    first_dp_rank = server_args.node_rank * dp_per_node
+
+    return {
+        "kv_role": server_args.disaggregation_mode,
+        "dp_ranks": list(range(first_dp_rank, first_dp_rank + dp_per_node)),
+        "dp_size": server_args.dp_size,
+        "tp_size": server_args.tp_size,
+        "nnodes": server_args.nnodes,
+        "chunked_prefill_enabled": server_args.chunked_prefill_size != -1,
+        "chunked_prefill_size": server_args.chunked_prefill_size,
+        "active_request_count": len(tokenizer_manager.rid_to_state),
+        "max_running_requests": max_running_requests,
+        "current_input_tokens": current_input_tokens,
+    }
 
 
 @app.get("/get_model_info")
@@ -913,12 +978,34 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
+        generator = _global_state.tokenizer_manager.generate_request(obj, request)
+
+        # Kick-start the generator before the StreamingResponse is returned:
+        # afterwards HTTP 200 is committed and failures can only be reported
+        # in-band. Pre-generation failures (validation errors, scheduler
+        # aborts) must surface as a real HTTP status, same as the non-stream
+        # branch below.
+        first_out = None
+        try:
+            first_out = await generator.__anext__()
+            _raise_stream_abort(first_out)
+        except StopAsyncIteration:
+            pass
+        except ValueError as e:
+            # A client disconnect also surfaces here. It's a client-side
+            # cancellation, not a server error or bad input -- log it and
+            # return an empty stream instead of a 400.
+            if request is not None and await request.is_disconnected():
+                logger.info(f"[http_server] Client disconnected: {e}")
+            else:
+                logger.error(f"[http_server] Error: {e}")
+                return _create_error_response(e)
 
         async def stream_results() -> AsyncIterator[bytes]:
+            if first_out is not None:
+                yield b"data: " + dumps_json(first_out) + b"\n\n"
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+                async for out in generator:
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
@@ -995,6 +1082,189 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     return Response(
         content=content,
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+#   # Clear device and memory caches:
+#   curl -X POST http://127.0.0.1:30000/clear_all_cache
+#   # Wait up to 5 seconds for the scheduler to become idle (the default):
+#   curl -X POST 'http://127.0.0.1:30000/clear_all_cache?timeout=5'
+#   # Clear only the memory cache on every node of this instance:
+#   curl -X POST 'http://127.0.0.1:30000/clear_all_cache?memory_only=true'
+#
+# The memory-cache service port defaults to 8080 and can be overridden via
+# AIAK_HOST_CACHE_PORT. In a federated deployment, FED_MEMBER_FILE points to a
+# file containing all member IPs; single-node deployments fall back to
+# ``hostname -i``.
+@app.api_route("/clear_all_cache", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def clear_all_cache(
+    memory_only: bool = Query(
+        False, description="Only clear the memory cache; keep the device KV cache."
+    ),
+    timeout: float = Query(
+        5.0,
+        ge=0.0,
+        description="Seconds to wait for an idle scheduler before flushing device cache.",
+    ),
+):
+    """Clear caches, optionally clearing only memory caches on all nodes."""
+    lines = []
+    all_ok = True
+
+    logger.info("[/clear_all_cache] received request, memory_only=%s", memory_only)
+
+    # Optionally wait for an idle scheduler before flushing device cache.
+    # Memory-only mode retains device cache for independent control of the tiers.
+    if memory_only:
+        lines.append("[device] skipped (memory_only=true)")
+    else:
+        logger.info("[/clear_all_cache] clearing device cache ...")
+        try:
+            device_ret = await _global_state.tokenizer_manager.flush_cache(
+                timeout_s=timeout
+            )
+            device_ok = bool(device_ret.success)
+        except Exception as e:
+            device_ok = False
+            lines.append(f"[device] exception: {e}")
+            logger.exception("[/clear_all_cache] device cache clear raised")
+        if device_ok:
+            lines.append("[device] cache flushed")
+        else:
+            lines.append("[device] flush failed; see backend logs")
+            all_ok = False
+
+    # Memory cache: federated instances expose all DP member IPs through the
+    # file referenced by FED_MEMBER_FILE. Clear those nodes concurrently;
+    # ``hostname -i`` is only a fallback for deployments without federation.
+    logger.info("[/clear_all_cache] clearing memory cache on all nodes ...")
+    host_port = os.environ.get("AIAK_HOST_CACHE_PORT", "8080")
+    fed_member_file = os.environ.get("FED_MEMBER_FILE")
+    try:
+        if fed_member_file:
+
+            def _read_member_file() -> str:
+                """Read the federated member list from its mounted file."""
+                with open(fed_member_file, encoding="utf-8") as member_file:
+                    return member_file.read()
+
+            raw_members = await asyncio.to_thread(_read_member_file)
+            # The current format is comma-separated, e.g.
+            # ``10.95.253.147,10.95.251.218``. Also accept whitespace/newlines
+            # so a harmless formatting change in the mounted file still works.
+            host_ips = re.findall(r"[^,\s]+", raw_members)
+            discovery_source = f"FED_MEMBER_FILE={fed_member_file}"
+        else:
+            raw = await asyncio.to_thread(
+                subprocess.check_output, ["hostname", "-i"], timeout=5
+            )
+            host_ips = raw.decode().strip().split()
+            discovery_source = "hostname -i"
+
+        host_ips = list(dict.fromkeys(host_ips))
+        if not host_ips:
+            raise RuntimeError(f"{discovery_source} returned no node IP")
+        logger.info(
+            "[/clear_all_cache] discovered memory-cache nodes from %s: %s",
+            discovery_source,
+            host_ips,
+        )
+        lines.append(f"[memory] nodes ({discovery_source}): {host_ips}")
+    except Exception as e:
+        host_ips = []
+        lines.append(f"[memory] failed to discover instance nodes: {e}")
+        logger.exception("[/clear_all_cache] failed to discover instance nodes")
+        all_ok = False
+
+    # AIBrix /debug/GetIndexSize returns plain text lines like:
+    #   "ns: <namespace> idx size <N>"
+    size_line = re.compile(r"ns:\s*(\S+)\s+idx\s+size\s+(\d+)")
+
+    def _parse_index_size(text: str) -> dict:
+        """Parse namespace sizes returned by the memory-cache service."""
+        return {m.group(1): int(m.group(2)) for m in size_line.finditer(text or "")}
+
+    async def _clear_memory_cache(host_ip: str) -> tuple[list[str], bool]:
+        """Clear one node; blocking requests calls run outside the event loop."""
+        base = f"http://{host_ip}:{host_port}"
+        node_lines = []
+        node_ok = True
+        logger.info("[/clear_all_cache] memory cache service base=%s", base)
+
+        try:
+            resp = await asyncio.to_thread(
+                requests.get, f"{base}/debug/GetIndexSize/", timeout=10
+            )
+            resp.raise_for_status()
+            sizes_before = _parse_index_size(resp.text)
+        except Exception as e:
+            node_lines.append(f"[memory:{host_ip}] GetIndexSize before failed: {e}")
+            logger.exception("[/clear_all_cache] GetIndexSize before failed: %s", base)
+            return node_lines, False
+
+        namespaces = list(sizes_before)
+        node_lines.append(f"[memory:{host_ip}] before: {sizes_before}")
+        for namespace in namespaces:
+            try:
+                resp = await asyncio.to_thread(
+                    requests.get,
+                    f"{base}/op/evictBlocks",
+                    params={
+                        "namespace": namespace,
+                        "clearCacheWithExpireAt": "true",
+                    },
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    node_lines.append(
+                        f"[memory:{host_ip}] evicted namespace={namespace}"
+                    )
+                else:
+                    node_lines.append(
+                        f"[memory:{host_ip}] evictBlocks namespace={namespace} "
+                        f"status={resp.status_code} body={resp.text[:200]}"
+                    )
+                    node_ok = False
+            except Exception as e:
+                node_lines.append(
+                    f"[memory:{host_ip}] evictBlocks namespace={namespace} error: {e}"
+                )
+                node_ok = False
+
+        # Read back the sizes so a successful HTTP call cannot mask a failed
+        # eviction. Keep the values in the response for operational diagnosis.
+        try:
+            resp = await asyncio.to_thread(
+                requests.get, f"{base}/debug/GetIndexSize/", timeout=10
+            )
+            resp.raise_for_status()
+            sizes_after = _parse_index_size(resp.text)
+            node_lines.append(f"[memory:{host_ip}] after: {sizes_after}")
+            if any(sizes_after.get(ns, 0) > 0 for ns in namespaces):
+                node_lines.append(
+                    f"[memory:{host_ip}] cache is not empty after eviction"
+                )
+                node_ok = False
+        except Exception as e:
+            node_lines.append(f"[memory:{host_ip}] GetIndexSize after failed: {e}")
+            node_ok = False
+
+        return node_lines, node_ok
+
+    if host_ips:
+        node_results = await asyncio.gather(
+            *(_clear_memory_cache(host_ip) for host_ip in host_ips)
+        )
+        for node_lines, node_ok in node_results:
+            lines.extend(node_lines)
+            all_ok = all_ok and node_ok
+
+    logger.info("[/clear_all_cache] done, overall_success=%s", all_ok)
+    return Response(
+        content="\n".join(lines) + "\n",
+        status_code=200 if all_ok else HTTPStatus.MULTI_STATUS,
     )
 
 
@@ -2091,6 +2361,27 @@ def _create_error_response(e):
         {"error": {"message": str(e)}},
         status_code=getattr(e, "status_code", HTTPStatus.BAD_REQUEST),
     )
+
+
+def _raise_stream_abort(out: dict) -> None:
+    """Raise if `out` is a scheduler abort carrying an explicit HTTP status code.
+
+    TokenizerManager._handle_abort_finish_reason only raises for non-stream
+    requests; streaming aborts are yielded as ordinary outputs. Callers that
+    have not committed HTTP 200 yet use this to get the same exception -- and
+    therefore the same HTTP status -- as the non-stream path.
+    """
+    finish_reason = out["meta_info"].get("finish_reason")
+    if not isinstance(finish_reason, dict) or finish_reason.get("type") != "abort":
+        return
+    status_code = finish_reason.get("status_code")
+    if not isinstance(status_code, HTTPStatus):
+        return
+
+    message = finish_reason.get("message", "Generation aborted.")
+    if status_code == HTTPStatus.BAD_REQUEST:
+        raise ValueError(message)
+    raise HTTPException(status_code=int(status_code), detail=message)
 
 
 # FIXME: In theory we should configure ADMIN_FORCE for some entrypoints, but doing so
