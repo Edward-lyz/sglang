@@ -3837,12 +3837,20 @@ class DeepseekV4AttnBackend(
                 width,
             )
             if masks is not None:
-                # the block selection is per request (its width is the request's own)
+                # the block selection is per request (its width is the request's own);
+                # requests of one width share a launch, the rows stay independent
+                spans = []
                 for b, lc in enumerate(lc_per_req):
                     lo = max(req_bounds[b], rows.start)
                     hi = min(req_bounds[b + 1], rows.stop)
                     if lo >= hi:
                         continue
+                    if spans and spans[-1][3] == lc and spans[-1][2] == lo:
+                        spans[-1][1].append((b, lo, hi))
+                        spans[-1][2] = hi
+                    else:
+                        spans.append([lo, [(b, lo, hi)], hi, lc])
+                for lo, members, hi, lc in spans:
                     sub = slice(lo - rows.start, hi - rows.start)
                     scores = logits[sub, :lc]
                     sub_lens = lens[sub]
@@ -3851,28 +3859,26 @@ class DeepseekV4AttnBackend(
                             fused_select_candidate_block_ids,
                         )
 
-                        masks[b].append(
-                            fused_select_candidate_block_ids(
-                                scores,
-                                sub_lens,
-                                lc,
-                                indexer.candidate_topk_blocks,
-                                block_size,
-                            )
+                        picked = fused_select_candidate_block_ids(
+                            scores,
+                            sub_lens,
+                            lc,
+                            indexer.candidate_topk_blocks,
+                            block_size,
                         )
                     else:
                         scores.masked_fill_(
                             torch.arange(lc, device=device) >= sub_lens[:, None],
                             -torch.inf,
                         )
-                        masks[b].append(
-                            select_candidate_block_ids(
-                                scores,
-                                sub_lens[:, None],
-                                topk_blocks=indexer.candidate_topk_blocks,
-                                block_size=block_size,
-                            )
+                        picked = select_candidate_block_ids(
+                            scores,
+                            sub_lens[:, None],
+                            topk_blocks=indexer.candidate_topk_blocks,
+                            block_size=block_size,
                         )
+                    for b, m_lo, m_hi in members:
+                        masks[b].append(picked[m_lo - lo : m_hi - lo])
             elif consume_blocks is not None:
                 # columns past a row's request are never read by the top-k
                 logits.masked_fill_(
