@@ -246,6 +246,11 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
+    # With pipeline parallelism every rank reads the whole checkpoint and then
+    # drops the layers it does not own in load_weights(). Enabling this pushes
+    # that layer-range filter down into the loader: shards holding no owned
+    # layer are never opened, and owned shards only materialize owned tensors.
+    SGLANG_ENABLE_PP_WEIGHT_FILTER = EnvBool(False)
 
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.
