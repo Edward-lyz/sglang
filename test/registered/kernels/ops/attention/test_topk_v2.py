@@ -295,5 +295,149 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
 
 
+def _tight_cluster(batch: int, seq: int, device: str) -> torch.Tensor:
+    """Scores that all land in ONE fp16 coarse bin (both the 12-bit register/
+    streaming bins and the 10-bit cluster bins), in shuffled order.
+
+    [1, 1 + 2^-7) sits inside a single fp16 bin of width 2^-6, so every element
+    is a threshold-bin candidate. Positions are shuffled per row so the order
+    in which threads claim tie-buffer slots does not follow the score order.
+    """
+    span = 2.0**-7
+    base = 1.0 + torch.arange(seq, dtype=torch.float64, device=device) * (span / seq)
+    rows = [base[torch.randperm(seq, device=device)] for _ in range(batch)]
+    return torch.stack(rows).to(torch.float32)
+
+
+def _assert_topk_values_exact(scores_cpu, our_raw, seq_lens, k):
+    """Selected scores must equal torch.topk's as a multiset (index swaps among
+    equal scores are fine; any lower-scoring pick is not)."""
+    for i in range(scores_cpu.shape[0]):
+        L = int(seq_lens[i])
+        n = min(k, L)
+        assert len(our_raw[i]) == n, f"b={i} L={L} k={k}: {len(our_raw[i])} != {n}"
+        ref = torch.topk(scores_cpu[i, :L], n).values.sort().values
+        ours = scores_cpu[i, our_raw[i]].sort().values
+        # Picks strictly below the k-th largest score are genuine misses; equal
+        # scores at the cutoff are interchangeable.
+        below_cutoff = int((ours < ref[0]).sum())
+        assert torch.equal(ours, ref), (
+            f"b={i} L={L} k={k}: {below_cutoff}/{n} picks below the top-k "
+            f"cutoff (lowest picked {ours[0].item():.9f} vs "
+            f"cutoff {ref[0].item():.9f})"
+        )
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize(
+    "batch,seq",
+    [
+        (4, 4096),  # Register2
+        (4, 16384),  # Register4
+        (4, 65536),  # Streaming
+        (2, 131072),  # Cluster, fused small-batch kernel
+        (40, 131072),  # Cluster, persistent pool + main kernel
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_threshold_bin_overflow(batch: int, seq: int, k: int) -> None:
+    """More threshold-bin candidates than the kMaxNumTie (2048) tie buffer.
+
+    Mirrors the overflow case sgl-project/sglang#37625 fixed for the legacy and
+    v1 selectors: when the coarse threshold bin holds more candidates than the
+    tie buffer, the extras must not be dropped before full scores are compared.
+    """
+    torch.manual_seed(batch * 1009 + seq + k)
+    device = "cuda"
+    scores = _tight_cluster(batch, seq, device)
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, _ = _make_page_table(batch, num_pages, "perm", device)
+
+    our_raw = _run_raw(scores, seq_lens, page_table, k)
+    _assert_topk_values_exact(scores.cpu(), our_raw, seq_lens.cpu(), k)
+
+
+def _overflow_scores(pattern: str, batch: int, seq: int, device: str) -> torch.Tensor:
+    if pattern == "constant":
+        # One fp32 key holds every candidate: the exact search cannot narrow
+        # below kMaxNumTie, so any `remain` of them must be emitted.
+        return torch.full((batch, seq), 0.5, dtype=torch.float32, device=device)
+    if pattern == "around_zero":
+        # The coarse bin around 0 spans ~2^31 fp32 keys (both signs, every
+        # small exponent): several 12-bit levels, plus the +0/-0 bound case.
+        vals = (torch.rand(batch, seq, device=device) - 0.5) * 1e-6
+        vals[:, ::7] = 0.0
+        vals[:, 3::7] = -0.0
+        return vals
+    # "few_distinct": each value repeated many times -- ties straddle the cutoff.
+    levels = 1.0 + torch.arange(64, dtype=torch.float32, device=device) * 2.0**-14
+    return levels[torch.randint(0, 64, (batch, seq), device=device)]
+
+
+@pytest.mark.parametrize("pattern", ["constant", "around_zero", "few_distinct"])
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("batch,seq", [(4, 16384), (4, 65536), (2, 131072), (40, 131072)])
+@torch.inference_mode()
+def test_topk_v2_threshold_bin_overflow_patterns(batch: int, seq: int, k: int, pattern: str) -> None:
+    """Overflow corner cases: a single key, multi-level narrowing around 0 and
+    heavy exact ties at the cutoff, on the register, streaming and both
+    cluster dispatch shapes."""
+    torch.manual_seed(batch * 7919 + seq + k)
+    device = "cuda"
+    scores = _overflow_scores(pattern, batch, seq, device)
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, _ = _make_page_table(batch, num_pages, "perm", device)
+
+    our_raw = _run_raw(scores, seq_lens, page_table, k)
+    for i in range(batch):
+        assert len(set(our_raw[i])) == len(our_raw[i]), f"b={i}: duplicate indices"
+    _assert_topk_values_exact(scores.cpu(), our_raw, seq_lens.cpu(), k)
+
+
+def _midpoint_mismatch_row(seq: int, hist_bits: int):
+    """A row whose fp32 tie set overflows while the fp16 histogram's does not.
+
+    The collect pass classifies by fp32 bin boundaries, which are midpoints
+    between adjacent fp16 values. For negative scores the lower boundary of a
+    bin rounds (ties-to-even) DOWN into the bin below, so 3000 copies of it are
+    fp32 "ties" yet sit outside the histogram's threshold bin.
+    """
+    shift = 16 - hist_bits
+    # Negative fp16 near -1: ordered key = ~bits; pick a bin-start key.
+    bits = torch.tensor([-1.0], dtype=torch.float16).view(torch.int16).item() & 0xFFFF
+    key = ((~bits) & 0xFFFF) >> shift << shift
+    to_f = lambda k: torch.tensor([(~k) & 0xFFFF], dtype=torch.int32).to(torch.int16).view(torch.float16).float().item()
+    lower, start = to_f(key - 1), to_f(key)
+    mid = (lower + start) / 2
+    mid32 = torch.tensor([mid], dtype=torch.float32)
+    assert mid32.half().float().item() == lower, "midpoint must round into the lower bin"
+    interior = [to_f(key + j) for j in range(1, (1 << shift) - 1)]
+    row = torch.full((seq,), -1000.0)
+    above = 10.0 + torch.arange(400, dtype=torch.float32) * 1e-3
+    row[:400] = above
+    row[400:600] = torch.tensor(interior, dtype=torch.float32).repeat(200 // len(interior) + 1)[:200]
+    row[600:3600] = mid32.item()
+    return row[torch.randperm(seq)]
+
+
+@pytest.mark.parametrize("batch,seq", [(4, 16384), (4, 32768), (2, 131072), (40, 131072)])
+@torch.inference_mode()
+def test_topk_v2_boundary_midpoint_mismatch(batch: int, seq: int) -> None:
+    """The fp32 collect overflows the tie buffer although the histogram's
+    threshold bin does not (covers the cluster path's rank-0 fallback)."""
+    torch.manual_seed(batch + seq)
+    k = 512
+    hist_bits = 10 if seq > 65536 else 12
+    scores = torch.stack([_midpoint_mismatch_row(seq, hist_bits) for _ in range(batch)]).cuda()
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, _ = _make_page_table(batch, num_pages, "perm", "cuda")
+
+    our_raw = _run_raw(scores, seq_lens, page_table, k)
+    _assert_topk_values_exact(scores.cpu(), our_raw, seq_lens.cpu(), k)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
