@@ -130,7 +130,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = kvc.layer_info.num_effective_layers
 
-        self._cell_size = self._compute_cell_size(kvc, num_layers)
+        self._cell_size = (
+            envs.SGLANG_K3_MLA_CELL_SIZE.get()
+            if envs.SGLANG_K3_MLA_CELL_SIZE.get()
+            else self._compute_cell_size(kvc, num_layers)
+        )
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None

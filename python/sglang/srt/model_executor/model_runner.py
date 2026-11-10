@@ -926,6 +926,9 @@ class ModelRunner:
             m.q_b_proj_qrep_weight = dcp_group.all_gather(
                 qp.weight.data.contiguous(), dim=0
             )
+            if envs.SGLANG_K3_DEL_MLA_KVB_DCP.get():
+                del m.w_kc
+                del qp.weight
             n_prepared += 1
         logger.info(
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
