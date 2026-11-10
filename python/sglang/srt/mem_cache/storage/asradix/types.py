@@ -9,6 +9,9 @@ from typing import Any, Mapping, Optional, Sequence
 import torch
 
 
+AS_BLOCK_SIZE = 256
+
+
 class AttentionStoreEndpointRole(str, Enum):
     """Identify whether an endpoint stores pages or checkpoints."""
 
@@ -76,6 +79,7 @@ class AttentionStoreInitContext:
     pod_name: str
     model_version: str
     page_size: int
+    block_size: int
     tp_rank: int
     tp_size: int
     pp_rank: int

@@ -29,6 +29,7 @@ from .types import (
     AttentionStoreBinding,
     AttentionStoreInitContext,
     AttentionStoreWriteOwner,
+    AS_BLOCK_SIZE,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,13 @@ class AttentionStoreIntegrationMixin:
 
     _as_coordinator: Optional[AttentionStoreCoordinator] = None
     _as_plan: Optional[AttentionStoreCachePlan] = None
+
+    @property
+    def attention_store_block_size(self) -> int:
+        """Return the token granularity used by the active AS cache plan."""
+        if self._as_plan is not None and self._as_plan.name in ("KDA", "MLA"):
+            return AS_BLOCK_SIZE
+        return self.page_size
 
     _AS_RESULT_FIELDS = {
         "write": "written_blocks",
@@ -256,18 +264,34 @@ class AttentionStoreIntegrationMixin:
         ):
             return None
 
-        local_hit_len = len(local_result.device_indices)
-        max_hit_len = len(params.key) // self.page_size * self.page_size
+        block_size = self.attention_store_block_size
+        max_hit_len = len(params.key) // block_size * block_size
         joint_pp_match = self.pp_world_size > 1
+        local_hit_len = len(local_result.device_indices)
+        aligned_local_hit_len = local_hit_len // block_size * block_size
+        if local_hit_len != aligned_local_hit_len:
+            local_result = super().match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(
+                        params.key.token_ids,
+                        params.key.extra_key,
+                        is_bigram=params.key.is_bigram,
+                        limit=aligned_local_hit_len,
+                    ),
+                    cow_mamba=params.cow_mamba,
+                    req=req,
+                )
+            )
+            local_hit_len = len(local_result.device_indices)
         if local_hit_len == max_hit_len and not joint_pp_match:
             return None
 
-        start_block = local_hit_len // self.page_size
+        start_block = local_hit_len // block_size
         # Every PP stage must submit the same absolute prefix to its local Agent.
         # Submitting only the suffix after a stage-local HBM hit would preserve
         # the very PP-stage divergence this path is meant to eliminate.
         match_start_block = 0 if joint_pp_match else start_block
-        max_end_block = max_hit_len // self.page_size
+        max_end_block = max_hit_len // block_size
         hashes = req.as_block_hashs.hash_ids[match_start_block:max_end_block]
         # A checkpoint match is valid only for the hash at its returned endpoint.
         # Apply the request's prefix limit before matching so a later checkpoint
@@ -336,7 +360,7 @@ class AttentionStoreIntegrationMixin:
         if terminal_block <= start_block:
             if terminal_block == start_block:
                 return local_result
-            terminal_tokens = terminal_block * self.page_size
+            terminal_tokens = terminal_block * block_size
             capped_params = MatchPrefixParams(
                 key=RadixKey(
                     params.key.token_ids,
@@ -352,7 +376,7 @@ class AttentionStoreIntegrationMixin:
             # Continue through the normal AS load path for the remaining gap.
             local_result = super().match_prefix(capped_params)
             local_hit_len = len(local_result.device_indices)
-            start_block = local_hit_len // self.page_size
+            start_block = local_hit_len // block_size
             if terminal_block == start_block:
                 return local_result
             if terminal_block < start_block:
@@ -378,7 +402,7 @@ class AttentionStoreIntegrationMixin:
             last_device_node=anchor,
             last_host_node=anchor,
             best_match_node=anchor,
-            host_hit_length=read_count * self.page_size,
+            host_hit_length=read_count * block_size,
         )
 
     def configure_attention_store(self, plan: AttentionStoreCachePlan) -> None:

@@ -556,8 +556,8 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 node.component_data[ComponentType.MAMBA] if node is not None else None
             )
             if (
-                cache_len < cache.page_size
-                or cache_len % cache.page_size != 0
+                cache_len < cache.attention_store_block_size
+                or cache_len % cache.attention_store_block_size != 0
                 or node is None
                 or mamba_data.value is None
                 or len(snapshot) < cache_len
@@ -565,11 +565,12 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 self.enqueue_dummy(cache, req.rid)
                 return
 
-            page_count = cache_len // cache.page_size
+            block_size = cache.attention_store_block_size
+            page_count = cache_len // block_size
             hashes = _request_block_hash_ids(
                 req,
                 token_ids,
-                cache.page_size,
+                block_size,
                 page_count,
             )
             endpoint_hash = hashes[-1]
@@ -624,7 +625,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             cache._log_as_failure(
                 "write",
                 rid=req.rid,
-                requested=cache_len // cache.page_size,
+                requested=cache_len // cache.attention_store_block_size,
                 error=exc,
             )
             self.enqueue_dummy(cache, req.rid)
@@ -709,7 +710,8 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
         block_count = int(load_info["block_count"])
         rid = load_info.get("rid", "-")
         started = time.perf_counter()
-        token_count = block_count * cache.page_size
+        block_size = cache.attention_store_block_size
+        token_count = block_count * block_size
         value_transaction = cache.component_value_transaction()
         try:
             full_allocation = value_transaction.allocate(
@@ -829,7 +831,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
         value_transaction,
         checkpoint_allocation,
     ) -> Tuple[torch.Tensor, Any]:
-        local_hit_len = load_info["start_block"] * cache.page_size
+        local_hit_len = load_info["start_block"] * cache.attention_store_block_size
         total_prefix_len = local_hit_len + len(loaded_indices)
         if len(req.prefix_indices) != local_hit_len:
             logger.error(

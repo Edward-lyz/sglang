@@ -1083,6 +1083,7 @@ class Scheduler(
                 attention_store_node_pp_range,
             )
             from sglang.srt.mem_cache.storage.asradix.types import (
+                AS_BLOCK_SIZE,
                 AttentionStoreEndpointRole,
                 AttentionStoreInitContext,
             )
@@ -1135,7 +1136,7 @@ class Scheduler(
                     describe_kda_local_endpoint_bytes(
                         kv_cache,
                         self.req_to_token_pool,
-                        self.page_size,
+                        AS_BLOCK_SIZE,
                         page_active=bool(page_layer_ids),
                         state_active=bool(state_layer_ids),
                     )
@@ -1417,6 +1418,7 @@ class Scheduler(
                     pod_name=pod_name,
                     model_version="v1",
                     page_size=self.page_size,
+                    block_size=AS_BLOCK_SIZE,
                     tp_rank=self.ps.attn_tp_rank,
                     tp_size=self.ps.attn_tp_size,
                     pp_rank=pp_rank,

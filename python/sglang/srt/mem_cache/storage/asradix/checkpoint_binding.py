@@ -532,7 +532,7 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
                     layer_num=ctx.state_layer_num,
                     shard_id=ctx.state_shard_id,
                     shard_num=ctx.state_shard_num,
-                    block_token_size=ctx.page_size,
+                    block_token_size=ctx.block_size,
                     temporal_bytes=checkpoint_binding.temporal_bytes,
                     conv_bytes=checkpoint_binding.conv_bytes,
                 ),

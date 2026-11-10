@@ -88,9 +88,28 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             or cache.ascli is None
         ):
             return None
-        max_hit_length = len(params.key) // cache.page_size * cache.page_size
-        if local_result.device_indices.numel() == max_hit_length:
-            return None
+        block_size = cache.attention_store_block_size
+        max_hit_length = len(params.key) // block_size * block_size
+        local_hit_length = local_result.device_indices.numel()
+        aligned_local_hit_length = min(
+            local_hit_length // block_size * block_size, max_hit_length
+        )
+        if local_hit_length != aligned_local_hit_length:
+            local_result = UnifiedRadixCache.match_prefix(
+                cache,
+                MatchPrefixParams(
+                    key=RadixKey(
+                        params.key.token_ids,
+                        params.key.extra_key,
+                        is_bigram=params.key.is_bigram,
+                        limit=aligned_local_hit_length,
+                    ),
+                    cow_mamba=params.cow_mamba,
+                    req=req,
+                ),
+            )
+        if aligned_local_hit_length == max_hit_length:
+            return local_result if local_hit_length != aligned_local_hit_length else None
         return self._match_remote(cache, req, local_result)
 
     def init_load_back(
@@ -121,8 +140,9 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
         req,
         local_result: MatchResult,
     ) -> Optional[MatchResult]:
-        local_hit_len = len(local_result.device_indices)
-        start_block = local_hit_len // cache.page_size
+        block_size = cache.attention_store_block_size
+        local_hit_len = len(local_result.device_indices) // block_size * block_size
+        start_block = local_hit_len // block_size
         # Router hints describe one namespace/host. Multi-node PP requests use
         # an Agent-coordinated quote before this coordinator is entered.
         remote_addrs = req.as_max_hit_host_ip if cache.pp_size <= 1 else []
@@ -130,8 +150,8 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
 
         if remote_len and len(remote_len) == 1 and remote_len[0] > 0:
             as_hit_tokens = (
-                (remote_len[0] - local_hit_len) // cache.page_size
-            ) * cache.page_size
+                (remote_len[0] - local_hit_len) // block_size
+            ) * block_size
             if as_hit_tokens <= 0:
                 return None
         else:
@@ -148,7 +168,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             match_count = cache._as_min(match_count)
             max_blocks = max(
                 (len(req.full_untruncated_fill_ids) - local_hit_len - 1)
-                // cache.page_size,
+                // block_size,
                 0,
             )
             match_count = min(match_count, max_blocks)
@@ -172,12 +192,12 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
                 )
             if match_count == 0:
                 return None
-            as_hit_tokens = match_count * cache.page_size
+            as_hit_tokens = match_count * block_size
 
         max_as_tokens = (
             (len(req.full_untruncated_fill_ids) - local_hit_len - 1)
-            // cache.page_size
-            * cache.page_size
+            // block_size
+            * block_size
         )
         if max_as_tokens <= 0:
             return None
@@ -207,7 +227,8 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
         host_hit_length: int,
     ) -> Optional[torch.Tensor]:
         rid = load_info.get("rid", "-")
-        requested = host_hit_length // cache.page_size
+        block_size = cache.attention_store_block_size
+        requested = host_hit_length // block_size
         started = time.perf_counter()
         as_hit_tokens = load_info["as_hit_tokens"]
         available = cache.token_to_kv_pool_allocator.available_size()
@@ -300,7 +321,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             cache.token_to_kv_pool_allocator.free(alloc_indices)
             return None
 
-        loaded_tokens = read_count * cache.page_size
+        loaded_tokens = read_count * block_size
         loaded_indices = alloc_indices[:loaded_tokens]
         if loaded_tokens < len(alloc_indices):
             cache.token_to_kv_pool_allocator.free(alloc_indices[loaded_tokens:])
@@ -314,7 +335,8 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
         load_info,
         loaded_indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, Any]:
-        local_hit_len = load_info["start_block"] * cache.page_size
+        block_size = cache.attention_store_block_size
+        local_hit_len = load_info["start_block"] * block_size
         total_prefix_len = local_hit_len + len(loaded_indices)
         if len(req.prefix_indices) != local_hit_len:
             logger.error(
@@ -329,7 +351,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             return loaded_indices[:0], anchor
         token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
         bigram_len = max(0, len(token_ids) - 1) if cache.is_eagle else len(token_ids)
-        final_key_len = bigram_len // cache.page_size * cache.page_size
+        final_key_len = bigram_len // block_size * block_size
         if final_key_len == 0:
             cache.token_to_kv_pool_allocator.free(loaded_indices)
             return loaded_indices[:0], anchor
@@ -436,16 +458,17 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
         task = None
         num_pages = 0
         try:
-            num_pages = len(token_ids) // cache.page_size
+            block_size = cache.attention_store_block_size
+            num_pages = len(token_ids) // block_size
             if num_pages <= 0:
                 if cache.as_world_size > 1:
                     self.enqueue_dummy(req.rid)
                 return
-            aligned_tokens = num_pages * cache.page_size
+            aligned_tokens = num_pages * block_size
             hashes = _request_block_hash_ids(
                 req,
                 token_ids,
-                cache.page_size,
+                block_size,
                 num_pages,
             )
             kv_indices = snapshot[:aligned_tokens]

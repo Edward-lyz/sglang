@@ -1605,9 +1605,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 else:
                     try:
-                        tokenized_obj.as_block_hashs = Tokens(
-                            input_ids, self.server_args.page_size
+                        from sglang.srt.mem_cache.storage.asradix.types import (
+                            AS_BLOCK_SIZE,
                         )
+
+                        tokenized_obj.as_block_hashs = Tokens(input_ids, AS_BLOCK_SIZE)
                     except Exception as e:
                         logger.warning(
                             "failed to generate as_block_hashs, skipping AS matching: %s",

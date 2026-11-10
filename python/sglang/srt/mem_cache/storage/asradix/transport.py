@@ -134,11 +134,67 @@ class _BufferPageIO:
         layer_ids: Sequence[int],
         *,
         buffer_owners: Sequence[Any] = (),
+        buffer_tensors: Optional[Mapping[str, Sequence[Any]]] = None,
+        buffer_pools: Optional[Mapping[str, Sequence[Any]]] = None,
+        local_page_size: Optional[int] = None,
+        block_size: Optional[int] = None,
     ):
         self._sdk = sdk
         self._buffers = buffers
         self._layer_ids = tuple(map(int, layer_ids))
         self._buffer_owners = tuple(buffer_owners)
+        self._buffer_tensors = {
+            name: tuple(tensors) for name, tensors in (buffer_tensors or {}).items()
+        }
+        self._buffer_pools = {
+            name: tuple(pools) for name, pools in (buffer_pools or {}).items()
+        }
+        self._local_page_size = local_page_size
+        self._block_size = block_size
+        if (local_page_size is None) != (block_size is None):
+            raise ValueError("local_page_size and block_size must be set together")
+        if block_size is not None:
+            if local_page_size <= 0 or block_size % local_page_size:
+                raise ValueError(
+                    f"block_size={block_size} must be divisible by "
+                    f"local_page_size={local_page_size}"
+                )
+            if set(self._buffer_tensors) != set(self._buffer_pools):
+                raise ValueError("buffer tensor/pool families must match")
+            for name, tensors in self._buffer_tensors.items():
+                if len(tensors) != len(self._buffer_pools[name]):
+                    raise ValueError(f"{name} buffer tensor/pool counts differ")
+
+    @property
+    def _pages_per_block(self) -> int:
+        return (
+            1
+            if self._block_size is None
+            else self._block_size // self._local_page_size
+        )
+
+    def _logical_blocks(self, block_hash_ids, page_ids):
+        """Group the physical pages backing each logical AttentionStore block."""
+        page_ids = tuple(map(int, page_ids))
+        pages_per_block = self._pages_per_block
+        if pages_per_block == 1:
+            if len(block_hash_ids) != len(page_ids):
+                raise ValueError("hash and page counts differ")
+            return tuple(
+                (int(hash_id), (page_id,))
+                for hash_id, page_id in zip(block_hash_ids, page_ids)
+            )
+        expected = len(block_hash_ids) * pages_per_block
+        if len(page_ids) != expected:
+            raise ValueError(
+                f"{len(block_hash_ids)} blocks of size {self._block_size} require "
+                f"{expected} local pages, got {len(page_ids)}"
+            )
+        result = []
+        for index, hash_id in enumerate(block_hash_ids):
+            pages = page_ids[index * pages_per_block : (index + 1) * pages_per_block]
+            result.append((int(hash_id), pages))
+        return tuple(result)
 
     def match(self, block_hash_ids: Sequence[int], timeout: float = 1.0) -> int:
         """Return the matched page prefix length."""
@@ -156,11 +212,27 @@ class _BufferPageIO:
         """Write page blocks through the typed SDK buffers."""
         from attentionstore_sdk.sdk import BlockBatch, WriteRequest
 
+        if self._pages_per_block == 1:
+            self._logical_blocks(block_hash_ids, page_ids)
+            return self._sdk.write(
+                WriteRequest(
+                    blocks=BlockBatch(
+                        hash_ids=block_hash_ids,
+                        data_ids=page_ids,
+                        layer_ids=self._layer_ids,
+                    ),
+                    buffers=self._buffers,
+                    timeout=timeout,
+                    params=params or {},
+                    h2h_copy=False,
+                )
+            )
+        blocks = self._logical_blocks(block_hash_ids, page_ids)
         return self._sdk.write(
             WriteRequest(
                 blocks=BlockBatch(
-                    hash_ids=block_hash_ids,
-                    data_ids=page_ids,
+                    hash_ids=tuple(block[0] for block in blocks),
+                    page_ids=tuple(block[1] for block in blocks),
                     layer_ids=self._layer_ids,
                 ),
                 buffers=self._buffers,
@@ -181,14 +253,33 @@ class _BufferPageIO:
         """Read page blocks through the typed SDK buffers."""
         from attentionstore_sdk.sdk import BlockBatch, ReadRequest
 
+        if self._pages_per_block == 1:
+            self._logical_blocks(block_hash_ids, page_ids)
+            block_kwargs = (
+                {"logical_start": logical_start} if logical_start is not None else {}
+            )
+            return self._sdk.read(
+                ReadRequest(
+                    blocks=BlockBatch(
+                        hash_ids=block_hash_ids,
+                        data_ids=page_ids,
+                        layer_ids=self._layer_ids,
+                        **block_kwargs,
+                    ),
+                    buffers=self._buffers,
+                    timeout=timeout,
+                    remote_addrs=remote_addrs or (),
+                )
+            )
+        blocks = self._logical_blocks(block_hash_ids, page_ids)
         block_kwargs = (
             {"logical_start": logical_start} if logical_start is not None else {}
         )
         return self._sdk.read(
             ReadRequest(
                 blocks=BlockBatch(
-                    hash_ids=block_hash_ids,
-                    data_ids=page_ids,
+                    hash_ids=tuple(block[0] for block in blocks),
+                    page_ids=tuple(block[1] for block in blocks),
                     layer_ids=self._layer_ids,
                     **block_kwargs,
                 ),

@@ -42,11 +42,16 @@ def _uniform_page_bytes(
     for buffer, pool in zip(buffers, pools):
         row_bytes = int(buffer[0].nbytes)
         pool_size = getattr(pool, "size", None)
-        sizes.add(
-            row_bytes * page_size
-            if pool_size is not None and buffer.shape[0] >= int(pool_size)
-            else row_bytes
-        )
+        if pool_size is not None and buffer.shape[0] >= int(pool_size):
+            sizes.add(row_bytes * page_size)
+            continue
+        local_page_size = int(getattr(pool, "page_size", page_size))
+        if page_size % local_page_size:
+            raise ValueError(
+                f"{name} block size {page_size} is not divisible by "
+                f"local page size {local_page_size}"
+            )
+        sizes.add(row_bytes * (page_size // local_page_size))
     if len(sizes) != 1:
         raise ValueError(f"{name} buffers have non-uniform block sizes: {sizes}")
     return sizes.pop()
@@ -114,15 +119,18 @@ def _create_mha_page_endpoint(
         "MHA V",
     )
     buffer_pools = [pool] * ctx.page_layer_num
-    k_bytes = _uniform_page_bytes(key_buffers, buffer_pools, ctx.page_size, "MHA K")
-    v_bytes = _uniform_page_bytes(value_buffers, buffer_pools, ctx.page_size, "MHA V")
+    block_size = (
+        ctx.block_size if registration_endpoint_name == "kda-page" else ctx.page_size
+    )
+    k_bytes = _uniform_page_bytes(key_buffers, buffer_pools, block_size, "MHA K")
+    v_bytes = _uniform_page_bytes(value_buffers, buffer_pools, block_size, "MHA V")
     bindings = BufferBindings(
         k=[buffer.data_ptr() for buffer in key_buffers],
         v=[buffer.data_ptr() for buffer in value_buffers],
     )
     layout_id = _page_layout_id(
         "MHA",
-        ctx.page_size,
+        block_size,
         {"k": key_buffers, "v": value_buffers},
         range(ctx.page_layer_num),
     )
@@ -138,7 +146,7 @@ def _create_mha_page_endpoint(
             layer_num=ctx.page_layer_num,
             shard_id=ctx.page_shard_id,
             shard_num=ctx.page_shard_num,
-            block_token_size=ctx.page_size,
+            block_token_size=block_size,
             k_bytes=k_bytes,
             v_bytes=v_bytes,
         ),
@@ -148,7 +156,15 @@ def _create_mha_page_endpoint(
         name="mha",
         registration_name=registration_endpoint_name,
         role=AttentionStoreEndpointRole.PAGE,
-        store=_BufferPageIO(sdk, bindings, range(ctx.page_layer_num)),
+        store=_BufferPageIO(
+            sdk,
+            bindings,
+            range(ctx.page_layer_num),
+            buffer_tensors={"k": key_buffers, "v": value_buffers},
+            buffer_pools={"k": buffer_pools, "v": buffer_pools},
+            local_page_size=ctx.page_size,
+            block_size=block_size,
+        ),
         namespace=namespace,
         layout_id=layout_id,
         bytes_per_block=(k_bytes + v_bytes) * ctx.page_layer_num,
@@ -179,13 +195,14 @@ def _create_mla_page_endpoint(
         ctx.page_layer_num,
         "MLA latent KV",
     )
+    buffer_pools = [pool] * ctx.page_layer_num
     kv_bytes = _uniform_page_bytes(
-        kv_buffers, [pool] * ctx.page_layer_num, ctx.page_size, "MLA latent KV"
+        kv_buffers, buffer_pools, ctx.block_size, "MLA latent KV"
     )
     bindings = BufferBindings(k=[buffer.data_ptr() for buffer in kv_buffers])
     layout_id = _page_layout_id(
         "MLA",
-        ctx.page_size,
+        ctx.block_size,
         {"kv_latent": kv_buffers},
         range(ctx.page_layer_num),
     )
@@ -202,7 +219,7 @@ def _create_mla_page_endpoint(
             layer_num=ctx.page_layer_num,
             shard_id=ctx.page_shard_id // ctx.tp_size,
             shard_num=ctx.page_shard_num // ctx.tp_size,
-            block_token_size=ctx.page_size,
+            block_token_size=ctx.block_size,
             kv_bytes=kv_bytes,
         ),
         enable_as_kv_rw=True,
@@ -211,7 +228,15 @@ def _create_mla_page_endpoint(
         name="mla",
         registration_name=registration_endpoint_name,
         role=AttentionStoreEndpointRole.PAGE,
-        store=_BufferPageIO(sdk, bindings, range(ctx.page_layer_num)),
+        store=_BufferPageIO(
+            sdk,
+            bindings,
+            range(ctx.page_layer_num),
+            buffer_tensors={"k": kv_buffers},
+            buffer_pools={"k": buffer_pools},
+            local_page_size=ctx.page_size,
+            block_size=ctx.block_size,
+        ),
         namespace=namespace,
         layout_id=layout_id,
         bytes_per_block=kv_bytes * ctx.page_layer_num,
@@ -319,7 +344,7 @@ def create_mla_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
     buffer_pools = pad_layer_buffers(
         buffer_pools, ctx.page_layer_num, "MLA buffer pools"
     )
-    kv_bytes = _uniform_page_bytes(kv_buffers, buffer_pools, ctx.page_size, "MLA KV")
+    kv_bytes = _uniform_page_bytes(kv_buffers, buffer_pools, ctx.block_size, "MLA KV")
     namespace = _standard_namespace(ctx, "mla", ctx.page_shard_num)
     sdk = AttentionStoreSDK(
         _sdk_pod_config(ctx, namespace),
@@ -327,19 +352,32 @@ def create_mla_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
             layer_num=ctx.page_layer_num,
             shard_id=ctx.page_shard_id,
             shard_num=ctx.page_shard_num,
-            block_token_size=ctx.page_size,
+            block_token_size=ctx.block_size,
             kv_bytes=kv_bytes,
         ),
         enable_as_kv_rw=True,
     )
     buffers = BufferBindings(k=[buffer.data_ptr() for buffer in kv_buffers])
-    page_store = _BufferPageIO(sdk, buffers, range(ctx.page_layer_num))
+    page_store = _BufferPageIO(
+        sdk,
+        buffers,
+        range(ctx.page_layer_num),
+        buffer_tensors={"k": kv_buffers},
+        buffer_pools={"k": buffer_pools},
+        local_page_size=ctx.page_size,
+        block_size=ctx.block_size,
+    )
     endpoint = AttentionStoreEndpointBinding(
         name="mla",
         role=AttentionStoreEndpointRole.PAGE,
         store=page_store,
         namespace=namespace,
-        layout_id="mla",
+        layout_id=_page_layout_id(
+            "MLA",
+            ctx.block_size,
+            {"kv_latent": kv_buffers},
+            range(ctx.page_layer_num),
+        ),
         bytes_per_block=kv_bytes * ctx.page_layer_num,
         payload_fields=("kv_latent",),
     )
