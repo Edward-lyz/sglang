@@ -101,7 +101,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
-from sglang.srt.managers.utils import is_health_check_generate_req
+from sglang.srt.managers.utils import is_health_check_rid
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -629,6 +629,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
                 bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
             )
+            # Last time a real (non-health-check) request updated latency
+            # metrics; the idle heartbeat loop uses it to detect a traffic stop.
+            self._last_real_request_ts = time.monotonic()
 
             start_cpu_monitor_thread("tokenizer")
 
@@ -993,7 +996,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         Kimi-K3 additionally frames each image span with its original
         resolution, so when ``encoder_addr.original_image_sizes`` is present the
         placeholder is expanded through the same helper the prefill node uses,
-        keeping both nodes' origin_input_ids identical.
+        keeping both nodes' origin_input_ids identical. That helper skips already
+        framed video placeholders, so sizes are needed only for the images.
         """
         if not task_results:
             return None
@@ -1017,11 +1021,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         image_sizes = original_image_sizes_from_task_results(task_results)
         if image_sizes is not None:
             from sglang.srt.multimodal.processors.kimi_k3 import (
-                _expand_k3_image_prompt_token_ids,
+                _expand_k3_media_prompt_token_ids,
             )
 
             expanded_ids = (
-                _expand_k3_image_prompt_token_ids(
+                _expand_k3_media_prompt_token_ids(
                     input_ids,
                     media_token_id,
                     token_counts,
@@ -2335,6 +2339,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
 
+        if self.enable_metrics:
+            self.asyncio_tasks.add(
+                loop.create_task(
+                    print_exception_wrapper(self._idle_metric_heartbeat_loop)
+                )
+            )
+
+    async def _idle_metric_heartbeat_loop(self):
+        """Emit idle histogram heartbeats on a timer.
+
+        Decode-latency panels are plotted as rate(_sum)/rate(_count); after
+        traffic stops both rates hit 0 and the panel goes 0/0 = NaN (breaks
+        off). The tokenizer is request-driven and -- unlike the scheduler whose
+        idle batch drives it -- never wakes on its own while idle, so a timer
+        must drive the heartbeat. Throttle and env gating live in the
+        collector's emit method; this only fires once decode has been quiet
+        past the staleness window.
+        """
+        while True:
+            await asyncio.sleep(30.0)
+            try:
+                if time.monotonic() - self._last_real_request_ts >= 30.0:
+                    self.metrics_collector.emit_idle_histogram_heartbeat()
+            except Exception:
+                pass
+
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
@@ -2959,6 +2989,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return labels
 
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
+        # Mark real traffic so the idle heartbeat loop knows decode is active
+        # (health-check rids are filtered out before reaching here).
+        self._last_real_request_ts = time.monotonic()
         completion_tokens = (
             recv_obj.completion_tokens[i]
             if getattr(recv_obj, "completion_tokens", None)
@@ -3269,7 +3302,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.info(
                 f"[trace] tokenizer received aborted {recv_obj.rid} from detokenizer"
             )
-        if is_health_check_generate_req(recv_obj):
+        if is_health_check_rid(recv_obj.rid):
             return
         # Two scheduler messages can race in handle_loop for the same rid: a
         # batch output that finishes it normally (deletes rid_to_state[rid])

@@ -236,6 +236,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     is_health_check_generate_req,
+    is_health_check_rid,
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
@@ -4125,7 +4126,7 @@ class Scheduler(
                 )
                 if resumed_chunked_req._pp_replay_local_abort:
                     reason = resumed_chunked_req._as_cache_read_abort_reason or (
-                        "PP replay resumed chunk exceeds local token budget, "
+                        "PP replay resumed chunk cannot be admitted locally, "
                         f"rid={resumed_chunked_req.rid}"
                     )
                     record = {
@@ -4250,11 +4251,15 @@ class Scheduler(
                     cache_read_aborted_reqs.add(req)
                     # Preserve the fixed PP candidate sequence after a local abort.
                     continue
+                # A non-CONTINUE result can follow a successful admit.
+                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if (
-                    authoritative_admissions is not None
+                    not added
+                    and authoritative_admissions is not None
                     and authoritative_admissions_by_rid is not None
                     and req.rid in authoritative_admissions_by_rid
                 ):
+                    # Aborting an admitted req would trip the replay invariant below.
                     pp_local_aborts.append(self._abort_failed_replay(req, res))
                     cache_read_aborted_reqs.add(req)
                     # Preserve the fixed PP candidate sequence after a local abort.
@@ -4271,7 +4276,6 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
@@ -4284,6 +4288,10 @@ class Scheduler(
                             req.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.mamba_pool_idx = None
+                if added and authoritative_admissions is not None:
+                    # Replay: keep visiting so every remaining planned req is either
+                    # admitted or aborted; `break` would trip the replay invariant.
+                    continue
                 break
 
         if mamba_allocator is not None:
@@ -4940,7 +4948,8 @@ class Scheduler(
         is_prefill = mode.is_extend_without_speculative()
         if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
             return
-        if all(is_health_check_generate_req(req) for req in batch.reqs):
+        # `batch.reqs` are `Req` objects, so match on the rid only.
+        if all(is_health_check_rid(req.rid) for req in batch.reqs):
             return
         if is_prefill:
             # Busy span = run_batch entry -> result processed.

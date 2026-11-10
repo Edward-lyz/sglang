@@ -219,14 +219,33 @@ class AttentionStoreIntegrationMixin:
             )
         )
 
+    def _note_authoritative_match_abort(
+        self, req, reason: str, detail: str = ""
+    ) -> None:
+        """Abort one request on PP0 match divergence instead of crashing.
+
+        `reason` goes to the client; keep internals in `detail` (log only).
+        """
+        if req is not None:
+            req._as_cache_read_abort_reason = reason
+        logger.error(
+            "%s%s rid=%s",
+            reason,
+            f" ({detail})" if detail else "",
+            req.rid if req is not None else None,
+        )
+
     def _validate_authoritative_match_decision(
         self, req, hashes, requested: int
     ) -> int:
         decision = getattr(req, "_as_pp_match_decision", None)
         if not isinstance(decision, dict):
-            raise RuntimeError(
-                f"missing PP0 AttentionStore match decision for rid={req.rid}"
+            # PP0 skipped the AS match while this rank did; a local fallback
+            # would leave the stages with different prefixes, so abort.
+            self._note_authoritative_match_abort(
+                req, "missing PP0 AttentionStore match decision"
             )
+            return 0
         expected_digest = self._pipeline_prefix_digest(hashes)
         expected_generation = self._pipeline_generation_key()
         if (
@@ -236,17 +255,24 @@ class AttentionStoreIntegrationMixin:
             or decision.get("hash_digest") != expected_digest
             or tuple(decision.get("generation", ())) != expected_generation
         ):
-            raise RuntimeError(
-                "invalid PP0 AttentionStore match decision: "
-                f"rid={req.rid} requested={requested} "
-                f"digest={expected_digest} generation={expected_generation} "
-                f"decision={decision}"
+            # Digest and generation are rank-local, so a stage mismatch is possible.
+            self._note_authoritative_match_abort(
+                req,
+                "invalid PP0 AttentionStore match decision",
+                detail=(
+                    f"requested={requested} digest={expected_digest} "
+                    f"generation={expected_generation} decision={decision}"
+                ),
             )
+            return 0
         matched = int(decision.get("matched", -1))
         if matched < 0 or matched > requested:
-            raise RuntimeError(
-                f"invalid PP0 AttentionStore match count rid={req.rid}: {matched}"
+            self._note_authoritative_match_abort(
+                req,
+                "invalid PP0 AttentionStore match count: "
+                f"matched={matched} requested={requested}",
             )
+            return 0
         return matched
 
     def _match_as_aligned_local_prefix(
@@ -278,10 +304,14 @@ class AttentionStoreIntegrationMixin:
                 ),
             )
             if len(local_result.device_indices) > aligned_len:
-                raise RuntimeError(
+                # Rematch overshot the AS-aligned cap; reuse nothing rather than
+                # overshoot the committed prefix.
+                self._note_authoritative_match_abort(
+                    params.req,
                     "local cache match exceeded the AttentionStore prefix limit: "
-                    f"limit={aligned_len} actual={len(local_result.device_indices)}"
+                    f"limit={aligned_len} actual={len(local_result.device_indices)}",
                 )
+                return zero_match_result(self, local_result)
         if local_hit_len == 0 and params.cow_mamba and params.req is not None:
             # An empty rematch does not run Mamba's postprocessor, so discard
             # any deferred COW recorded by the earlier, longer prefix match.
@@ -308,6 +338,9 @@ class AttentionStoreIntegrationMixin:
         max_hit_len = len(params.key) // block_size * block_size
         joint_pp_match = self.pp_world_size > 1
         local_result = self._match_as_aligned_local_prefix(params, local_result)
+        if req._as_cache_read_abort_reason:
+            # Rematch already gave up; skip the Agent RPC for a request being dropped.
+            return zero_match_result(self, local_result)
         local_hit_len = len(local_result.device_indices)
         if local_hit_len == max_hit_len and not joint_pp_match:
             return local_result
@@ -422,11 +455,14 @@ class AttentionStoreIntegrationMixin:
             if terminal_block == start_block:
                 return local_result
             if terminal_block < start_block:
-                raise RuntimeError(
+                # Still past PP0's terminal block after capping; reuse nothing.
+                self._note_authoritative_match_abort(
+                    req,
                     "local cache match exceeded the AttentionStore PP terminal "
                     f"after capping: terminal_block={terminal_block} "
-                    f"local_block={start_block}"
+                    f"local_block={start_block}",
                 )
+                return zero_match_result(self, local_result)
 
         read_hashes = req.as_block_hashs.hash_ids[start_block:terminal_block]
         read_count = terminal_block - start_block

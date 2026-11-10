@@ -1127,8 +1127,16 @@ class PrefillAdder:
         else:
             self._validate_planned_admission(req, planned_admission, "chunked")
             start, end = self._validate_authoritative_extend_range(
-                req, planned_admission.extend_range, prefix_len=prefix_len
+                req, planned_admission.extend_range, prefix_len=None
             )
+            if start != prefix_len:
+                # Local prefix != PP0 chunk start: abort this req, not the scheduler.
+                req._pp_replay_local_abort = True
+                req._as_cache_read_abort_reason = (
+                    "PP replay chunk start unreachable on this stage: "
+                    f"rid={req.rid} planned_start={start} local_prefix={prefix_len}"
+                )
+                return None
             new_len = end - start
             if new_len > _rem_tokens:
                 req._pp_replay_local_abort = True
