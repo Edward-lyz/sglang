@@ -380,3 +380,92 @@ def engram_packed_exchange(
         recv_rows, n_real, n_rows, fill=fill, out_bf16=out_bf16
     )
     return values, scales, sent
+
+
+@triton.jit(do_not_specialize=["num_pairs", "layer"])
+def _engram_peer_gather_packed_kernel(
+    bases_ptr,
+    starts_ptr,
+    ids_ptr,
+    out_ptr,
+    num_pairs,
+    layer,
+    LAYERS: tl.constexpr,
+    COLS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLK: tl.constexpr,
+    SHARDS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    """Gather packed engram rows from a table row-sharded across peer GPUs.
+
+    Like _engram_gather_packed_kernel, but the table is split into SHARDS row
+    ranges [starts[s], starts[s + 1]) that live at raw addresses bases[s] (this
+    GPU's shard or a peer GPU's, mapped over CUDA IPC). Shard s stores
+    [rows_s, DIM] fp8 bytes followed by [rows_s, DIM // BLK] e8m0 bytes.
+    """
+    pair = tl.program_id(0).to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
+    valid = pair < num_pairs
+    flat = (pair // COLS * LAYERS + layer) * COLS + pair % COLS
+    idx = tl.load(ids_ptr + flat, mask=valid, other=-1).to(tl.int64)
+    total = tl.load(starts_ptr + SHARDS)
+    owned = valid & (idx >= 0) & (idx < total)
+    shard = tl.zeros([BLOCK_R], dtype=tl.int64)
+    for s in tl.static_range(1, SHARDS):
+        shard += (idx >= tl.load(starts_ptr + s)).to(tl.int64)
+    start = tl.load(starts_ptr + shard, mask=owned, other=0)
+    end = tl.load(starts_ptr + shard + 1, mask=owned, other=0)
+    base = tl.load(bases_ptr + shard, mask=owned, other=0)
+    local = tl.where(owned, idx - start, 0)
+    w = base.to(tl.pointer_type(tl.uint8))
+    s_base = (base + (end - start) * DIM).to(tl.pointer_type(tl.uint8))
+    cols = tl.arange(0, DIM)
+    scale_cols = tl.arange(0, DIM // BLK)
+    vals = tl.load(
+        w[:, None] + local[:, None] * DIM + cols[None, :], mask=owned[:, None], other=0
+    )
+    exps = tl.load(
+        s_base[:, None] + local[:, None] * (DIM // BLK) + scale_cols[None, :],
+        mask=owned[:, None],
+        other=0,
+    )
+    dst = out_ptr + flat[:, None] * (DIM + DIM // BLK)
+    tl.store(dst + cols[None, :], vals, mask=valid[:, None])
+    tl.store(dst + DIM + scale_cols[None, :], exps, mask=valid[:, None])
+
+
+def engram_peer_gather_packed(
+    bases: torch.Tensor,
+    starts: torch.Tensor,
+    ids: torch.Tensor,
+    out: torch.Tensor,
+    layer: int,
+    dim: int,
+    block: int = 32,
+) -> torch.Tensor:
+    """engram_gather_packed over a row-sharded table: ``bases`` [S] int64 device
+    addresses of the shards, ``starts`` [S + 1] int64 global row boundaries.
+    ``ids`` [..., LAYERS, COLS], ``out`` [..., LAYERS, COLS, DIM + DIM // block]
+    uint8; only ``layer`` is written, out-of-range ids become zero bytes."""
+    layers, cols = ids.shape[-2:]
+    assert ids.is_contiguous() and out.is_contiguous() and out.dtype == torch.uint8
+    assert out.shape == (*ids.shape, dim + dim // block), (out.shape, ids.shape)
+    assert bases.dtype == torch.int64 and starts.dtype == torch.int64
+    num_pairs = ids.numel() // layers
+    if num_pairs:
+        block_r = 16
+        _engram_peer_gather_packed_kernel[(triton.cdiv(num_pairs, block_r),)](
+            bases,
+            starts,
+            ids,
+            out,
+            num_pairs,
+            layer,
+            LAYERS=layers,
+            COLS=cols,
+            DIM=dim,
+            BLK=block,
+            SHARDS=bases.numel(),
+            BLOCK_R=block_r,
+        )
+    return out
