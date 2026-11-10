@@ -54,6 +54,7 @@ def _jit_fused_tma_module(
             cuda_files=["kimi_k3/attn_res/fused_tma.cuh"],
             cuda_wrappers=[
                 ("run", f"AttnResFusedTmaKernel<{args}>::run"),
+                ("run_quant", f"AttnResFusedTmaKernel<{args}>::run_quant"),
                 ("run_pull_rs", f"AttnResFusedTmaKernel<{args}>::run_pull_rs"),
                 ("run_direct_ag", f"AttnResFusedTmaKernel<{args}>::run_direct_ag"),
             ],
@@ -179,6 +180,41 @@ def attn_res_fused_tma(
     _jit_fused_tma_module(*_tuning(nvb, prefix_sum.shape[0])).run(
         prefix_sum, bank, cw, ow, out, nvb, eps, write_prefix
     )
+
+
+def attn_res_fused_tma_quant(
+    prefix_sum: torch.Tensor,
+    bank: torch.Tensor,
+    cw: torch.Tensor,
+    ow: torch.Tensor,
+    out: torch.Tensor,
+    nvb: int,
+    eps: float,
+    *,
+    write_prefix: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """attn_res_fused_tma that also emits the DeepGEMM block-FP8 input quant
+    of ``out`` from the same epilogue: returns ``(q, scale)``, fp8_e4m3
+    ``[T, H]`` and the group-128 UE8M0 column-major TMA-aligned int32 scale,
+    bit-identical to ``sglang_per_token_group_quant_fp8(out, 128,
+    column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=True)``."""
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        create_per_token_group_quant_fp8_output_scale,
+    )
+
+    q = torch.empty_like(out, dtype=torch.float8_e4m3fn)
+    scale = create_per_token_group_quant_fp8_output_scale(
+        x_shape=out.shape,
+        device=out.device,
+        group_size=128,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
+    _jit_fused_tma_module(*_tuning(nvb, prefix_sum.shape[0])).run_quant(
+        prefix_sum, bank, cw, ow, out, q, scale, nvb, eps, write_prefix
+    )
+    return q, scale
 
 
 @register_custom_op(mutates_args=["bank", "out"])

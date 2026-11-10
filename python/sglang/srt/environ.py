@@ -957,6 +957,10 @@ class Envs:
     # side stream, overlapped with the latent down-proj GEMM. The ops are
     # unchanged, so routing is bit-identical to the serial front. Default off.
     SGLANG_K3_FRONT_OVERLAP = EnvBool(False)
+    # K3 attention-residual fast kernel also emits the DeepGEMM block-FP8 input
+    # quant of its normed output, which the following FP8 linears reuse instead
+    # of re-quantizing (bit-identical). Default off.
+    SGLANG_K3_ATTN_RES_FP8_OUT = EnvBool(False)
     # Keep only one shard-group rank's row slice of Kimi K3's replicated
     # weights, reconstructing each layer's full set with one lookahead
     # AllGather. Covers latent-MoE, TP1 shared-expert, and DP-attention

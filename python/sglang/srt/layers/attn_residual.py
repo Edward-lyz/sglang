@@ -16,6 +16,8 @@
 
 from typing import Optional
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -23,10 +25,32 @@ import triton.language as tl
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 
+logger = logging.getLogger(__name__)
+
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 
 _FAST_SUPPORTED = None
+_FP8_OUT_ENABLED = None
+
+
+def _fp8_out_enabled() -> bool:
+    """Emit the DeepGEMM input quant of the normed output from the fast
+    kernel epilogue; only worth it when DeepGEMM block-FP8 linears with UE8M0
+    scales are what consume it."""
+    global _FP8_OUT_ENABLED
+    if _FP8_OUT_ENABLED is None:
+        from sglang.srt.environ import envs
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        _FP8_OUT_ENABLED = bool(
+            envs.SGLANG_K3_ATTN_RES_FP8_OUT.get()
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        )
+        if _FP8_OUT_ENABLED:
+            logger.info("K3 attn-res FP8 output fusion active")
+    return _FP8_OUT_ENABLED
 
 
 def _use_fast(hidden_size: int) -> bool:
@@ -83,6 +107,23 @@ def _aggregate_fast(
 
     cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
     out = torch.empty_like(prefix_sum)
+    if _fp8_out_enabled():
+        from sglang.kernels.ops.kimi_k3.attn_res import attn_res_fused_tma_quant
+        from sglang.srt.layers.quantization.fp8_utils import set_prequantized_input
+
+        q, scale = attn_res_fused_tma_quant(
+            prefix_sum,
+            bank,
+            cw,
+            out_norm.weight,
+            out,
+            nvb,
+            score_norm.variance_epsilon,
+            write_prefix=write_bank_row,
+        )
+        # The consuming FP8 linears are handed `out` itself and pick the pair up.
+        set_prequantized_input(out, q, scale)
+        return out
     attn_res_fused_tma(
         prefix_sum,
         bank,

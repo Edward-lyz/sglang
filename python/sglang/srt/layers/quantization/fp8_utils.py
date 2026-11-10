@@ -814,6 +814,43 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
+# Pre-quantized activation slot. A producer whose epilogue already emitted
+# the exact DeepGEMM input quant of a bf16 tensor (group 128, UE8M0,
+# column-major TMA-aligned scale; e.g. the K3 attention-residual kernel)
+# registers it, and every DeepGEMM block-FP8 linear that is handed that
+# tensor (or a same-layout view of it, e.g. a reshape to 2D) reuses the pair
+# instead of re-quantizing it. The slot keeps the tensor alive, so a matching
+# pointer cannot belong to unrelated memory. One slot: the next registration
+# replaces it.
+_PREQUANTIZED_INPUT: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+
+
+def set_prequantized_input(
+    x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor
+) -> None:
+    """Register (q, scale) as the DeepGEMM input quant of x, reused by the
+    next DeepGEMM block-FP8 linear that is handed x."""
+    global _PREQUANTIZED_INPUT
+    _PREQUANTIZED_INPUT = (x, q, scale)
+
+
+def _lookup_prequantized_input(
+    x: torch.Tensor,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    slot = _PREQUANTIZED_INPUT
+    if slot is None:
+        return None
+    src = slot[0]
+    if src is x or (
+        x.data_ptr() == src.data_ptr()
+        and x.dtype == src.dtype
+        and x.shape == src.shape
+        and x.stride() == src.stride()
+    ):
+        return slot[1], slot[2]
+    return None
+
+
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -863,7 +900,14 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    if not _is_musa:
+    prequantized = (
+        _lookup_prequantized_input(input)
+        if block_size[1] == 128 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        else None
+    )
+    if prequantized is not None:
+        q_input, x_scale = prequantized
+    elif not _is_musa:
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d,
             block_size[1],
