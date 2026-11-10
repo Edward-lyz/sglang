@@ -5,8 +5,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
-
 
 def transform_index_page_table_prefill(**kwargs):
     return transform_index_page_table_prefill_fast(**kwargs)
@@ -72,11 +70,7 @@ def transform_index_page_table_prefill_kernel(
     topk_indices_ptr: torch.Tensor,
     cu_seqlens_q_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
-    # Runtime (not constexpr): page_table is a per-batch [bs, max_seqlen_k] gather, so
-    # stride(0) == max_seqlen_k changes almost every batch. As a constexpr it forced a
-    # fresh Triton JIT compile (~90 ms on the scheduler thread) per new width; as a
-    # runtime int it only specializes on ==1 / %16, i.e. a bounded set of variants.
-    page_table_stride_0,
+    page_table_stride_0: tl.constexpr,
     page_table_stride_1: tl.constexpr,
     topk_indices_stride_0: tl.constexpr,
     topk_indices_stride_1: tl.constexpr,
@@ -126,124 +120,6 @@ def transform_index_page_table_prefill_kernel(
         loaded_kv_indices,
         mask=mask,
     )
-
-
-@triton.jit(
-    do_not_specialize=[
-        "page_table_stride_0",
-        "page_table_stride_1",
-        "topk_indices_stride_0",
-        "topk_indices_stride_1",
-        "result_stride_0",
-        "result_stride_1",
-    ],
-    do_not_specialize_on_alignment=[
-        "page_table_ptr",
-        "topk_indices_ptr",
-        "cu_seqlens_q_ptr",
-        "result_ptr",
-    ],
-)
-def transform_index_page_table_prefill_threaded_kernel(
-    page_table_ptr: torch.Tensor,
-    topk_indices_ptr: torch.Tensor,
-    cu_seqlens_q_ptr: torch.Tensor,
-    result_ptr: torch.Tensor,
-    page_table_stride_0,
-    page_table_stride_1,
-    topk_indices_stride_0,
-    topk_indices_stride_1,
-    result_stride_0,
-    result_stride_1,
-    PAGE_TABLE_IS_EXPANDED: tl.constexpr,
-    TOPK: tl.constexpr,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_TOPK: tl.constexpr,
-):
-    """Translate topk indices to KV slots for P-side threaded prefill.
-
-    Strides are runtime arguments so request-length changes do not load a new
-    CUDA module while another thread runs collectives or events. D-side MTP
-    verify and draft extend keep using transform_index_page_table_prefill_kernel.
-    """
-    request_id = tl.program_id(0)
-    query_offsets = tl.program_id(1) * BLOCK_Q + tl.arange(0, BLOCK_Q)
-    topk_offsets = tl.program_id(2) * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
-
-    query_start = tl.load(cu_seqlens_q_ptr + request_id)
-    query_end = tl.load(cu_seqlens_q_ptr + request_id + 1)
-    # Grid axis 1 spans the batch-max extend len; fully-masked blocks store nothing.
-    if query_start + tl.program_id(1) * BLOCK_Q >= query_end:
-        return
-    token_indices = query_start + query_offsets
-    mask = (token_indices[:, None] < query_end) & (topk_offsets[None, :] < TOPK)
-
-    loaded_topk_indices = tl.load(
-        topk_indices_ptr
-        + token_indices[:, None] * topk_indices_stride_0
-        + topk_offsets[None, :] * topk_indices_stride_1,
-        mask=mask,
-        other=-1,
-    )
-    valid_topk_mask = mask & (loaded_topk_indices >= 0)
-
-    if PAGE_TABLE_IS_EXPANDED:
-        page_table_rows = token_indices
-    else:
-        page_table_rows = token_indices * 0 + request_id
-    loaded_kv_indices = tl.load(
-        page_table_ptr
-        + page_table_rows[:, None] * page_table_stride_0
-        + loaded_topk_indices * page_table_stride_1,
-        mask=valid_topk_mask,
-        other=-1,
-    )
-    tl.store(
-        result_ptr
-        + token_indices[:, None] * result_stride_0
-        + topk_offsets[None, :] * result_stride_1,
-        loaded_kv_indices,
-        mask=mask,
-    )
-
-
-_USE_THREADED_PREFILL_KERNEL = False
-
-
-def warmup_transform_index_page_table_prefill(device) -> None:
-    """Load all prefill tile/layout variants before concurrent AS and forward."""
-    global _USE_THREADED_PREFILL_KERNEL
-    # 中文：设为 0 时 P 侧线程化 prefill 也使用原始 kernel，与 D 保持一致。
-    if not envs.SGLANG_DSA_THREADED_TRANSFORM_KERNEL.get():
-        return
-    pointer = torch.empty(1, dtype=torch.int32, device=device)
-    # 中文：只编译并加载，不执行 kernel；指针不需要承载真实页表。
-    # stride 不再专门化，指针对齐也不产生新变体，故只需覆盖这六种组合。
-    for expanded in (False, True):
-        for block_q in (1, 2, 4):
-            kernel = transform_index_page_table_prefill_threaded_kernel.warmup(
-                pointer,
-                pointer,
-                pointer,
-                pointer,
-                17,
-                1,
-                2048,
-                1,
-                2048,
-                1,
-                PAGE_TABLE_IS_EXPANDED=expanded,
-                TOPK=2048,
-                BLOCK_Q=block_q,
-                BLOCK_TOPK=256,
-                num_warps=4,
-                grid=(1, 1, 8),
-            )
-            if hasattr(kernel, "result"):
-                kernel = kernel.result()
-            kernel._init_handles()
-    # 中文：只有 P 侧线程化 prefill 会调用本预加载，之后改用去特化 kernel。
-    _USE_THREADED_PREFILL_KERNEL = True
 
 
 def transform_index_page_table_decode_fast(
@@ -309,12 +185,7 @@ def transform_index_page_table_prefill_fast(
         triton.cdiv(max_extend_len, block_q),
         triton.cdiv(topk_indices.shape[1], block_topk),
     )
-    kernel = (
-        transform_index_page_table_prefill_threaded_kernel
-        if _USE_THREADED_PREFILL_KERNEL
-        else transform_index_page_table_prefill_kernel
-    )
-    kernel[grid](
+    transform_index_page_table_prefill_kernel[grid](
         page_table,
         topk_indices,
         cu_seqlens_q,

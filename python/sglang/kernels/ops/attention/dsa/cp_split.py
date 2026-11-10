@@ -12,9 +12,7 @@ def dsa_cp_round_robin_split_q_seqs_kernel(
     in_seqs_ptr,
     out_seqs_ptr,
     bs_idx_ptr,
-    # Runtime loop bound (number of sequences in the batch); a constexpr here compiled a
-    # new kernel per (batch size, cp_rank).
-    tokens,
+    tokens: tl.constexpr,
     cp_size: tl.constexpr,
     cp_rank: tl.constexpr,
 ):

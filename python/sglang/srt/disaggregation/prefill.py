@@ -59,6 +59,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import TraceTrigger
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -417,6 +418,19 @@ class PrefillBootstrapQueue:
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
+            elif poll == KVPoll.Transferring:
+                # KV transfer still in progress; keep waiting in the bootstrap queue.
+                continue
+            elif poll == KVPoll.Success:
+                # Room already reached terminal Success while the req is still
+                # un-finalized in the bootstrap queue. A queued req has not sent KV
+                # yet, so this is an anomalous/stale room state; the sender has
+                # cached this Success, so admitting would prematurely complete the
+                # request and risk serving with incomplete KV. Fail this request
+                # gracefully (retryable) instead of taking down the engine.
+                self.scheduler.handle_bootstrap_failure(req)
+                indices_to_remove.add(i)
+                failed_reqs.append(req)
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
@@ -653,14 +667,6 @@ class SchedulerDisaggregationPrefillMixin:
                 "Threaded AS prefill requires ordinary paged DSA cache ownership"
             )
         if self.enable_asradix_cache:
-            from sglang.kernels.ops.attention.dsa.transform_index import (
-                warmup_transform_index_page_table_prefill,
-            )
-
-            # 中文：先加载随 chunk/尾批形状切换的 DSA 页表 kernel，再开启 worker。
-            # 只做 .warmup() 不会加载 CUDA module，必须完成 _init_handles()。
-            warmup_transform_index_page_table_prefill(f"cuda:{self.gpu_id}")
-            logger.info("DSA prefill transform modules ready")
             # 在 worker 启动前准备独立 restore communicator 和互不复用的 CUDA stream，
             # 避免调度线程与 forward 线程无意共享流，导致恢复与前向重新串行。
             self.tree_cache.initialize_threaded_restore(
@@ -1245,6 +1251,14 @@ class SchedulerDisaggregationPrefillMixin:
         ]
         for req in stream_reqs:
             req.finished_reason = FINISH_LENGTH(length=0)
+            trace_req = req.to_trace_req
+            if (
+                trace_req is not None
+                and trace_req.trigger == TraceTrigger.ON_FINISH
+                and trace_req.return_online
+            ):
+                self._run_trace(trace_req, req)
+                req.to_trace_req = None
         if stream_reqs:
             self.output_streamer.stream_output(
                 stream_reqs,
@@ -1314,6 +1328,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                self.batch_result_processor._fire_pending_trace(req)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
@@ -1323,6 +1338,15 @@ class SchedulerDisaggregationPrefillMixin:
                     self.metrics_collector.observe_kvcache_transfer_time(
                         req.time_stats.prefill_kv_transfer_finish_time
                         - req.time_stats.prefill_transfer_queue_entry_time
+                    )
+                    # Align with source branch ds-dev-community-glm-0312-w4:
+                    # the P/D prefill also observes time_to_first_token (first
+                    # token latency from bootstrap queue entry to KV transfer
+                    # finish), which the migration dropped. Without it the
+                    # metric is never exposed on the prefill /metrics.
+                    self.metrics_collector.observe_time_to_first_token(
+                        req.time_stats.prefill_kv_transfer_finish_time
+                        - req.time_stats.prefill_bootstrap_queue_entry_time
                     )
             elif poll == KVPoll.Failed:
                 self.handle_inflight_transfer_failure(req)
@@ -1465,6 +1489,16 @@ class SchedulerDisaggregationPrefillMixin:
             # the request entered the waiting queue, so finalize should not fail.
             assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
             return True
+        elif poll == KVPoll.Transferring:
+            # KV transfer still in progress; keep waiting.
+            return False
+        elif poll == KVPoll.Success:
+            # A parked (already forwarded) req whose room is in terminal Success
+            # without an initialized sender — anomalous/stale, so transfer tracking
+            # is unreliable. Fail this request gracefully (retryable) instead of
+            # admitting and risking serving with incomplete KV.
+            self.handle_bootstrap_failure(req)
+            return False
         else:
             raise RuntimeError(
                 f"Unexpected poll state {poll} for req {req.rid} in handle_pending_bootstrap"
