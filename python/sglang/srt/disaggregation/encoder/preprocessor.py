@@ -57,7 +57,6 @@ from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backe
 
 logger = logging.getLogger(__name__)
 
-
 _mm_grid_attrs = {
     # Kimi K2.5/K3 HF processors use grid_thws (see base_processor.ATTR_NAME_TO_MODALITY).
     Modality.IMAGE: ("image_grid_thw", "image_grid_hws", "grid_thws"),
@@ -700,14 +699,26 @@ class EncoderPreprocessor:
             images = self._normalize_kimi_encoder_images(images)
         original_image_sizes = [_get_original_image_size(item) for item in images]
         if model_preprocessor:
-            processor_output = invoke_encoder_preprocessor(
-                model_preprocessor,
-                images,
-                Modality.IMAGE,
-                self.vision_config,
-                image_processor=self.image_processor,
-                use_gpu_preprocessing=self.use_image_processor_gpu,
+            # Off the event loop: for DeepSeek-V4.1 this is PIL resize/pad on
+            # the CPU, which otherwise stalls fetches and /epd/transfer pulls
+            # served by the same loop. PIL releases the GIL, so tasks overlap.
+            processor_output = await asyncio.get_running_loop().run_in_executor(
+                self.preproc_executor,
+                functools.partial(
+                    invoke_encoder_preprocessor,
+                    model_preprocessor,
+                    images,
+                    Modality.IMAGE,
+                    self.vision_config,
+                    image_processor=self.image_processor,
+                    use_gpu_preprocessing=self.use_image_processor_gpu,
+                ),
             )
+            if (
+                isinstance(processor_output, EncoderPreprocessOutput)
+                and self.model_type == "deepseek_v41"
+            ):
+                processor_output["original_image_sizes"] = original_image_sizes
             if (
                 isinstance(processor_output, EncoderPreprocessOutput)
                 and processor_output.materialize_local_items is not None
@@ -911,8 +922,27 @@ class EncoderPreprocessor:
                 and modality == Modality.IMAGE
             ):
                 return self._kimi_tokens_from_patch_grid(grid)
+            if self.model_type == "deepseek_v41" and modality == Modality.IMAGE:
+                return self._dsv41_tokens_from_patch_grid(grid)
             merge_size = getattr(self.image_processor, "merge_size", 2)
             return self.get_num_patches(grid, modality) // (merge_size**2)
+
+    def _dsv41_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
+        """V4.1 image span length: the aligner grid plus its row/span delimiters.
+
+        A V4.1 image does not cost ``patches // merge**2`` tokens -- each
+        aligner row is followed by an IMAGE_NEW_LINE and the span is wrapped in
+        IMAGE_START/IMAGE_END. get_image_feature() returns that whole span, so
+        the token count and the encoder's row count agree.
+        """
+        from sglang.srt.multimodal.deepseek_v41_image_processing import (
+            num_image_tokens,
+        )
+
+        values = torch.as_tensor(grid).flatten().tolist()
+        n_vit_h, n_vit_w = int(values[-2]), int(values[-1])
+        r = self.model_config.hf_config.vision_downsample_ratio
+        return num_image_tokens(-(-n_vit_h // r), -(-n_vit_w // r))
 
     # ------------------------------------------------------------------
     # Video Timestamp Computation

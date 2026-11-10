@@ -5,9 +5,11 @@ import hashlib
 import logging
 import os
 import pickle
+import threading
 import time
 import traceback
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -22,11 +24,17 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.encode_collector import (
+    EncoderMetricsCollector as FactoryEncoderMetricsCollector,
+    StageReadyMark,
+)
 from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
     _convert,
     _mm_grid_attrs,
+    embed_ready,
+    media_load_seconds,
 )
 from sglang.srt.disaggregation.encoder.receiver import (
     EmbeddingData,
@@ -81,6 +89,73 @@ logger = logging.getLogger(__name__)
 
 def is_health_check_request(rid: Optional[str]) -> bool:
     return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+
+
+def _flatten_encoder_embedding(embedding):
+    """Normalize a get_*_feature() result to one ``[tokens, hidden]`` tensor.
+
+    K3's ``get_image_feature`` returns a single tensor, but models like
+    DeepSeek-V4.1 return a per-image list of spans (with the image delimiter
+    embeddings baked in). Mirror the colocated path
+    (``mm_schedule._flatten_embedding_result``) so the encoder always holds one
+    contiguous embedding to cache / move to host / RDMA-transfer.
+    """
+    from sglang.srt.managers.mm_schedule import _flatten_embedding_result
+
+    return _flatten_embedding_result(embedding)
+
+
+def _cgroup_memory_limit_bytes() -> int:
+    """This container's memory limit (bytes), or 0 when unlimited/unknown."""
+    candidates = (
+        "/sys/fs/cgroup/memory.max",  # cgroup v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+    )
+    for path in candidates:
+        try:
+            with open(path) as handle:
+                value = handle.read().strip()
+        except OSError:
+            continue
+        if value in ("", "max"):
+            return 0
+        try:
+            limit = int(value)
+        except ValueError:
+            continue
+        # cgroup v1 reports a huge sentinel when unlimited.
+        if limit <= 0 or limit >= (1 << 60):
+            return 0
+        return limit
+    return 0
+
+
+def _split_rows(embedding: torch.Tensor, row_counts: Iterable[int]) -> List[torch.Tensor]:
+    """Consecutive row slices of ``embedding`` (short slices if it is too short)."""
+    parts, offset = [], 0
+    for count in row_counts:
+        parts.append(embedding[offset : offset + count])
+        offset += count
+    return parts
+
+
+def _request_segments(ctx, mm_items) -> Optional[List[Tuple[int, int, int]]]:
+    """``(item_start, item_end, num_tokens)`` of each request of ``ctx``.
+
+    Item ranges index ``mm_items``. A fused batch built from a legacy aggregate
+    item cannot be split per request, so it has no segments (None).
+    """
+    token_counts = ctx.preprocess_result.token_counts
+    if len(ctx.items_per_req) == 1:
+        return [(0, len(mm_items), sum(token_counts))]
+    if len(mm_items) != ctx.num_items:
+        return None
+    segments, start = [], 0
+    for count in ctx.items_per_req:
+        segments.append((start, start + count, sum(token_counts[start : start + count])))
+        start += count
+    return segments
+
 
 
 rid_lock = asyncio.Lock()
@@ -517,20 +592,224 @@ def _normalize_aux_value(val):
     return val
 
 
+# Models whose factory TaskResult carries each image's pre-resize [w, h] (K3's
+# EncoderAddr.original_image_sizes).
+_MODELS_REPORTING_ORIGINAL_IMAGE_SIZES = frozenset({"kimi_k3", "deepseek_v41"})
+
+
 def _build_mm_aux_data(mm_inputs, model_type=None):
     # Video aux metadata, scoped to model_type's video-meta attrs.
     aux = {
         attr: _normalize_aux_value(mm_inputs.get(attr))
         for attr in video_meta_attrs_for(model_type)
     }
-    if model_type == "kimi_k3":
+    if model_type in _MODELS_REPORTING_ORIGINAL_IMAGE_SIZES:
         aux["original_image_sizes"] = _normalize_aux_value(
             mm_inputs.get("original_image_sizes")
         )
     return aux
 
 
+def compute_embed_digest(embedding: "torch.Tensor") -> Dict[str, Any]:
+    """Lightweight embedding fingerprint for transfer verification (as K3)."""
+    flat = embedding.reshape(-1).float()
+    return {
+        "mean": flat.mean().item(),
+        "std": flat.std().item(),
+        "min": flat.min().item(),
+        "max": flat.max().item(),
+        "first8": flat[:8].tolist(),
+        "last8": flat[-8:].tolist(),
+        "num_elements": flat.numel(),
+    }
+
+
+@dataclass
+class WorkflowTaskEmbedding:
+    """One embedding held for a factory (厂内) pull, keyed by task_id.
+
+    The New EPD encoder normally pushes embeddings to prefill; the factory
+    protocol instead has prefill pull them, so a workflow-produced embedding is
+    parked here (with the geometry the pull reply needs) until pulled. ``refs``
+    guards against eviction while a transfer is in flight, mirroring the K3
+    mm_cache acquire/release. ``created`` (monotonic) drives TTL eviction of
+    holds a dead/absent prefill never pulls; ``mr_ptr`` is the mooncake MR that
+    must be deregistered when the hold is dropped.
+    """
+
+    embedding: "torch.Tensor"
+    image_grid_thw: Optional[Any] = None
+    original_image_sizes: Optional[Any] = None
+    refs: int = 0
+    created: float = 0.0
+    mr_ptr: Optional[int] = None
+    # Address in the pre-registered hold pool, freed when the hold is dropped.
+    pool_addr: Optional[int] = None
+    size_bytes: int = 0
+    pulled_once: bool = False
+    # TaskResults handed out for this hold that prefill has not pulled yet.
+    # LRU eviction needs this to be 0, so a second request served from the
+    # same hold cannot lose it to eviction before its own pull.
+    pending_pulls: int = 0
+    modality: str = "image"
+    chunk_timestamps: Optional[List[str]] = None
+
+
+def _error_from_encode_result(result, what: str) -> MMError:
+    """Rebuild the MMError a batch_encode result row reports."""
+    _, _, _, message, code = result
+    message = message or f"No embedding staged for {what}"
+    if code == HTTPStatus.BAD_REQUEST:
+        return BadRequestError(message)
+    return MMError(message, code=code or HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+class FactoryEncodeBatcher:
+    """Coalesce concurrent factory tasks into fused ``batch_encode`` calls.
+
+    Each factory task used to be its own encode (one ViT forward per image).
+    Tasks submitted while a batch is forming join it: a batch closes when it
+    holds ``max_batch`` tasks or ``max_wait_s`` after its first task, and at
+    most ``max_inflight`` batches run at once, so the next batch loads its
+    media while the current one is in the forward. A failed fused batch is
+    retried task by task, so one bad image fails only its own task. ``release``
+    frees the request state of a task whose caller left before its batch ended.
+    """
+
+    def __init__(
+        self,
+        run_batch: Callable[..., Awaitable[List[Tuple]]],
+        *,
+        max_batch: int,
+        max_wait_s: float,
+        max_inflight: int,
+        release: Optional[Callable[[dict], Awaitable[None]]] = None,
+    ):
+        self._run_batch = run_batch
+        self._release = release
+        self.max_batch = max(1, max_batch)
+        self.max_wait_s = max(0.0, max_wait_s)
+        self.max_inflight = max(1, max_inflight)
+        self._pending: Dict[Modality, List[Tuple[dict, asyncio.Future]]] = {}
+        self._timers: Dict[Modality, asyncio.TimerHandle] = {}
+        self._inflight = 0
+        self._tasks: Set[asyncio.Task] = set()
+
+    async def submit(self, request: dict, modality: Modality) -> EmbeddingData:
+        """Encode ``request`` in some fused batch; returns its staged EmbeddingData."""
+        future = asyncio.get_running_loop().create_future()
+        self._pending.setdefault(modality, []).append((request, future))
+        if len(self._pending[modality]) >= self.max_batch:
+            self._flush(modality)
+        elif modality not in self._timers:
+            self._timers[modality] = asyncio.get_running_loop().call_later(
+                self.max_wait_s, self._on_timer, modality
+            )
+        return await future
+
+    def _on_timer(self, modality: Modality) -> None:
+        self._timers.pop(modality, None)
+        self._flush(modality)
+
+    def _flush(self, modality: Modality) -> None:
+        """Start a batch for ``modality`` if one is pending and a slot is free."""
+        if self._inflight >= self.max_inflight or not self._pending.get(modality):
+            return
+        timer = self._timers.pop(modality, None)
+        if timer is not None:
+            timer.cancel()
+        entries = self._pending[modality][: self.max_batch]
+        del self._pending[modality][: self.max_batch]
+        self._inflight += 1
+        task = asyncio.create_task(self._run(entries, modality))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _run(self, entries, modality: Modality) -> None:
+        try:
+            # Callers that gave up (task timeout) before the batch started.
+            entries = [entry for entry in entries if not entry[1].done()]
+            if not entries:
+                return
+            staged, failure = await self._encode(
+                [request for request, _ in entries], modality
+            )
+            if staged is not None:
+                results = staged
+            elif len(entries) == 1:
+                results = [_error_from_encode_result(failure[0], entries[0][0]["req_id"])]
+            else:
+                # The fused batch failed as a whole (one undecodable image
+                # fails the shared preprocess): retry the tasks still waited
+                # on one by one, so only the failing task fails. The failed
+                # batch staged an error into each request's state; drop it
+                # first or the retry trips the staged-metadata check.
+                results = []
+                for request, future in entries:
+                    await self._release_request(request)
+                    if future.done():
+                        results.append(None)
+                        continue
+                    one, one_failure = await self._encode([request], modality)
+                    results.append(
+                        one[0]
+                        if one is not None
+                        else _error_from_encode_result(
+                            one_failure[0], request["req_id"]
+                        )
+                    )
+            for (request, future), result in zip(entries, results):
+                if future.done():
+                    # The caller left mid-batch, possibly before its release
+                    # could find the request state this batch then created.
+                    await self._release_request(request)
+                    continue
+                if isinstance(result, Exception):
+                    future.set_exception(result)
+                else:
+                    future.set_result(result)
+        except BaseException as error:
+            for _, future in entries:
+                if future.done():
+                    continue
+                if isinstance(error, Exception):
+                    future.set_exception(error)
+                else:
+                    future.cancel()
+            if not isinstance(error, Exception):
+                raise
+        finally:
+            self._inflight -= 1
+            # A finished batch frees a slot: start whatever queued behind it.
+            for pending_modality in list(self._pending):
+                if self._pending[pending_modality]:
+                    self._flush(pending_modality)
+
+    async def _encode(self, requests: List[dict], modality: Modality):
+        """``(staged, None)`` with one EmbeddingData per request, or ``(None, rows)``.
+
+        A batch either stages every request or none (``rows`` then carries the
+        batch_encode error results).
+        """
+        staged: List[EmbeddingData] = []
+        results = await self._run_batch(requests, modality, out_staged=staged)
+        if len(staged) == len(requests):
+            return staged, None
+        return None, results
+
+    async def _release_request(self, request: dict) -> None:
+        if self._release is None:
+            return
+        try:
+            await self._release(request)
+        except Exception:
+            logger.exception("Releasing factory task %s failed", request["req_id"])
+
+
 class MMEncoder:
+    # Class default so instances built without __init__ (tests) read None.
+    metrics_collector: Optional[FactoryEncoderMetricsCollector] = None
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -556,6 +835,9 @@ class MMEncoder:
         # DP rank for metric labels; overridden by runtime.run_dp_worker.
         # 0 in the single-instance (non-DP) path.
         self.dp_rank = 0
+        # 厂内 dashboard metrics (encode_collector); set by attach_metrics when
+        # --enable-metrics is on. EncodeWorkflow reads it for request counters.
+        self.metrics_collector: Optional[FactoryEncoderMetricsCollector] = None
         self.profiler = EncoderProfiler(rank)
 
         self.model_config = ModelConfig.from_server_args(
@@ -613,6 +895,13 @@ class MMEncoder:
             model_preprocessor=getattr(self.model, "preprocess_mm_for_encoder", None),
             encoder_media_processor_config=encoder_media_processor_config,
         )
+        # Resolve model-side preprocessing backends (a Rust extension may be
+        # built here) at startup, not on the first request's worker thread.
+        prepare_preprocessing = getattr(
+            self.model, "prepare_encoder_preprocessing", None
+        )
+        if prepare_preprocessing is not None:
+            prepare_preprocessing()
 
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
@@ -690,6 +979,37 @@ class MMEncoder:
             self.abandoned_req_ids: Set[str] = set()
             # Need to ensure the NCCL launch order on rank0 matches the dispatch order rank>0
             self.encode_dispatch_lock = asyncio.Lock()
+
+            # Factory (厂内) EPD producer path: when polling a vit-server, the
+            # encoder holds each computed embedding here keyed by task_id so
+            # prefill can pull it (via PullZmqServer / /epd/transfer), instead
+            # of the New EPD push. Populated by encode_and_store_for_workflow;
+            # drained on pull. Empty unless --vit-server-url is set.
+            self.task_embeddings: "OrderedDict[str, WorkflowTaskEmbedding]" = (
+                OrderedDict()
+            )
+            self.task_embeddings_lock = asyncio.Lock()
+            # Content-addressed LRU bound (bytes) for the hold cache above: a
+            # pulled embedding is retained (not dropped) so sibling requests
+            # sharing the same task_id can pull it too; capacity is reclaimed by
+            # LRU eviction of unreferenced holds (see _evict_to_fit_locked),
+            # with TTL as a fallback for holds a dead prefill never pulls.
+            self.task_embeddings_bytes = 0
+            # Tasks served from an existing hold without re-encoding.
+            self.task_embedding_hits = 0
+            # task_id -> stage costs for TaskResult.time_cost_info.
+            self.task_time_costs: Dict[str, Dict[str, float]] = {}
+            self.task_embeddings_max_bytes = int(
+                envs.SGLANG_ENCODER_TASK_EMB_CACHE_GB.get() * (1024**3)
+            )
+            # K3's ScatterMemPool counterpart: one pinned buffer of the hold
+            # cap, registered with mooncake once (see _init_task_hold_pool).
+            self.task_hold_pool = None
+            # Port the factory PullZmqServer binds for prefill DEALER pulls; 0
+            # disables (no factory pull path).
+            self.pull_zmq_port = envs.SGLANG_ENCODER_PULL_ZMQ_PORT.get()
+            # Set once EncodeWorkflow starts; free_tokens reads its pending.
+            self.encode_workflow = None
 
             if get_disagg().encoder_transfer_backend == "mooncake":
                 self.delivery = MooncakeDelivery(self)
@@ -808,6 +1128,849 @@ class MMEncoder:
         if state.embedding_data is None:
             raise InternalError(f"No embedding available for request: {state.req_id}")
         return state.embedding_data
+
+    # ------------------------------------------------------------------
+    # Factory (厂内) EPD producer helpers: fetch/encode/hold-for-pull.
+    # Only exercised when --vit-server-url is set; otherwise inert.
+    # ------------------------------------------------------------------
+
+    @property
+    def free_tokens(self) -> int:
+        """Fetch-admission budget: token budget minus in-flight pipeline tokens.
+
+        The factory poll loop only fetches new tasks while this stays above its
+        admit threshold, which is what bounds how much work is in flight. With
+        no workflow attached the full budget is free.
+        """
+        budget = envs.SGLANG_ENCODER_WORKFLOW_TOKEN_BUDGET.get()
+        workflow = self.encode_workflow
+        pending = workflow.pending_num_tokens if workflow is not None else 0
+        return budget - pending
+
+    async def store_task_embedding(
+        self,
+        task_id: str,
+        embedding: "torch.Tensor",
+        image_grid_thw: Optional[Any] = None,
+        original_image_sizes: Optional[Any] = None,
+        modality: str = "image",
+        chunk_timestamps: Optional[List[str]] = None,
+    ) -> None:
+        """Hold one workflow-produced embedding for prefill to pull by task_id.
+
+        Kept on CPU and contiguous so the pull reply is a plain buffer view and
+        the transfer never blocks on a device copy. On the mooncake backend the
+        buffer is registered as an MR here (once) so ``transfer_task_embedding``
+        can RDMA it without a per-pull register; the MR is torn down when the
+        hold is dropped.
+        """
+        pool_addr = None
+        mr_ptr = None
+        stored = False
+        try:
+            pool = getattr(self, "task_hold_pool", None)
+            if pool is not None and int(embedding.nbytes) > pool.total_bytes:
+                # Can never fit, so the pool-full retry would never succeed:
+                # fall back to one MR per hold (as when no pool is configured).
+                logger.warning(
+                    "hold of %d bytes exceeds the %d byte factory hold pool; "
+                    "registering it per hold",
+                    int(embedding.nbytes),
+                    pool.total_bytes,
+                )
+                pool = None
+            if pool is not None:
+                async with self.task_embeddings_lock:
+                    # Reap TTL-expired holds first, so a pool full of dead
+                    # (never-pulled) holds does not refuse a new task.
+                    self._evict_stale_task_embeddings_locked()
+                    pool_addr, held_view = self._alloc_from_hold_pool_locked(
+                        embedding
+                    )
+                if held_view is not None:
+                    # One copy straight into pre-registered pinned memory: no
+                    # pageable staging, no per-hold MR register (K3 ScatterMemPool).
+                    held_view.copy_(embedding.reshape(held_view.shape))
+                    embedding = held_view
+                else:
+                    # The pool is full of in-flight or not-yet-pulled holds.
+                    # Falling back to per-hold pin+register here would be
+                    # unbounded in host memory and reintroduce the "overlapped
+                    # memory region" failures the pool removes. Fail the task
+                    # retryably so vit-server places it on another encoder;
+                    # free_tokens admission normally keeps the pool from filling.
+                    raise MMError(
+                        f"factory hold pool full for task_id={task_id}; retry",
+                        code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+            if pool_addr is None and embedding.is_cuda:
+                embedding = embedding.cpu()
+            if pool_addr is None and (
+                embedding.untyped_storage().nbytes() > embedding.nbytes
+            ):
+                # Per-hold fallback of a row slice out of a fused batch would
+                # keep the whole batch alive; give it its own storage.
+                embedding = embedding.clone()
+            if not embedding.is_contiguous():
+                embedding = embedding.contiguous()
+            if (
+                pool_addr is None
+                and self.use_mooncake
+                and getattr(self, "engine", None) is not None
+            ):
+                # Pin the host buffer before registering: an RDMA MR must sit on
+                # memory the OS cannot move, and the prefill landing pool is
+                # pinned too. Mirrors K3's pinned mem_pool (a plain .cpu() tensor
+                # is pageable and unsafe to RDMA from).
+                try:
+                    embedding = embedding.pin_memory()
+                except Exception as pin_err:
+                    logger.warning(
+                        "pin_memory failed for task_id=%s (%s); registering pageable",
+                        task_id,
+                        pin_err,
+                    )
+                try:
+                    self.engine.register(embedding.data_ptr(), embedding.nbytes)
+                    mr_ptr = embedding.data_ptr()
+                except Exception as reg_err:
+                    # A hold prefill cannot RDMA from must not be advertised:
+                    # fail the task so vit-server can place it elsewhere.
+                    raise InternalError(
+                        f"MR register failed for task_id={task_id}: {reg_err}"
+                    ) from reg_err
+            async with self.task_embeddings_lock:
+                self._evict_stale_task_embeddings_locked()
+                # task_id == md5(model_id + media_url) == identical content, so
+                # an existing hold carries the same embedding. Keep it (a sibling
+                # request that shares this image may be mid-pull, refs>0) and
+                # just refresh its TTL, instead of tearing down the live slot and
+                # racing a concurrent pull into a 404. The freshly-encoded
+                # duplicate is retired in the finally below.
+                old = self.task_embeddings.get(task_id)
+                if old is not None:
+                    self._mark_hold_reserved_locked(task_id, old)
+                    return
+                size_bytes = int(embedding.nbytes)
+                if pool_addr is None:
+                    self._evict_to_fit_locked(size_bytes)
+                self.task_embeddings[task_id] = WorkflowTaskEmbedding(
+                    embedding=embedding,
+                    image_grid_thw=image_grid_thw,
+                    original_image_sizes=original_image_sizes,
+                    created=time.monotonic(),
+                    mr_ptr=mr_ptr,
+                    pool_addr=pool_addr,
+                    size_bytes=size_bytes,
+                    modality=modality,
+                    chunk_timestamps=chunk_timestamps,
+                    pending_pulls=1,
+                )
+                self.task_embeddings_bytes += size_bytes
+                self.task_embeddings.move_to_end(task_id)
+                stored = True
+        finally:
+            if not stored:
+                # Duplicate, error or cancellation: give back the pool region
+                # and MR this store took, or they leak for the process lifetime.
+                if pool_addr is not None:
+                    self.task_hold_pool.free(pool_addr)
+                if mr_ptr is not None and getattr(self, "engine", None) is not None:
+                    try:
+                        self.engine.deregister(mr_ptr)
+                    except Exception as e:
+                        logger.debug(
+                            "MR deregister (unstored hold) task_id=%s: %s", task_id, e
+                        )
+
+    def _mark_hold_reserved_locked(self, task_id, entry) -> None:
+        """A TaskResult for this hold goes out: keep it until that pull lands.
+
+        Refreshes the TTL and counts one outstanding result; LRU eviction needs
+        ``pending_pulls == 0``, so neither this nor an earlier unpulled sibling
+        can lose the hold first. TTL stays the reaper for a dead prefill.
+        Caller holds task_embeddings_lock.
+        """
+        entry.created = time.monotonic()
+        entry.pending_pulls += 1
+        self.task_embeddings.move_to_end(task_id)
+
+    def _drop_task_embedding_locked(self, task_id, entry) -> None:
+        """Pop a hold and tear down its MR. Caller holds task_embeddings_lock."""
+        if self.task_embeddings.pop(task_id, None) is not None:
+            self.task_embeddings_bytes -= entry.size_bytes
+        if entry.pool_addr is not None:
+            # refs == 0 here (callers only drop unreferenced holds), so no
+            # transfer can still be reading this region.
+            entry.embedding = None
+            self.task_hold_pool.free(entry.pool_addr)
+            entry.pool_addr = None
+        if entry.mr_ptr is not None and getattr(self, "engine", None) is not None:
+            try:
+                self.engine.deregister(entry.mr_ptr)
+            except Exception as e:
+                logger.debug("MR deregister for task_id=%s returned %s", task_id, e)
+            entry.mr_ptr = None
+
+    def init_task_hold_pool(self) -> None:
+        """Allocate and register the factory hold pool once, at producer start.
+
+        Mirrors K3's ScatterMemPool: a single pinned buffer sized to the hold
+        cap is registered with mooncake up front, so holds never pin/register
+        per embedding (the per-hold register is what produced "overlapped
+        memory region" errors). Without mooncake or a cap, holds keep the old
+        per-hold path.
+        """
+        if (
+            not self.use_mooncake
+            or getattr(self, "engine", None) is None
+            or self.task_embeddings_max_bytes <= 0
+            or self.task_hold_pool is not None
+        ):
+            return
+        from sglang.srt.disaggregation.gpu_buffer_pool import GpuBufferPool
+
+        page = envs.SGLANG_ENCODER_TASK_HOLD_PAGE_KB.get() * 1024
+        if page <= 0 or self.task_embeddings_max_bytes < page:
+            # Too small for even one page: keep the per-hold path instead of
+            # crashing the encoder at startup (GpuBufferPool would raise).
+            logger.warning(
+                "Factory hold pool disabled: cap %d B < page %d B; holds use "
+                "the per-embedding register path",
+                self.task_embeddings_max_bytes,
+                page,
+            )
+            return
+        self._check_hold_pool_budget()
+        try:
+            # zero=False: every region is fully written before it is handed
+            # out, so the memset only costs startup time (tens of seconds at
+            # this size) and first-touch memory.
+            pool = GpuBufferPool(
+                self.task_embeddings_max_bytes,
+                page,
+                device="cpu",
+                pin_memory=True,
+                zero=False,
+            )
+            self.engine.register(pool.data_ptr, pool.total_bytes)
+        except Exception as error:
+            # Fail fast and leave no half-initialized pool: running without it
+            # would fall back to per-hold pin + register (unbounded host memory,
+            # "overlapped memory region"). A transient failure recovers on the
+            # container restart; a misconfiguration is reported by
+            # _check_hold_pool_budget before we get here.
+            self.task_hold_pool = None
+            raise RuntimeError(
+                "Failed to allocate/register the factory hold pool of "
+                f"{self.task_embeddings_max_bytes / 1024**3:.1f} GB pinned "
+                f"(SGLANG_ENCODER_TASK_EMB_CACHE_GB={envs.SGLANG_ENCODER_TASK_EMB_CACHE_GB.get()}); "
+                f"check the container memory limit: {error}"
+            ) from error
+        self.task_hold_pool = pool
+        logger.info(
+            "Factory hold pool: registered %.1f GB pinned (%d pages x %d KB)",
+            pool.total_bytes / 1024**3,
+            pool.num_pages,
+            page // 1024,
+        )
+
+    def _check_hold_pool_budget(self) -> None:
+        """Refuse a hold pool that cannot fit the container's memory limit.
+
+        The failure would otherwise surface as a memset of tens of seconds
+        followed by an OOM kill / crash loop, with no hint about which env var
+        is too large. Restarting cannot fix a misconfiguration, so say what is
+        wrong instead; a genuinely transient shortage still recovers on restart.
+        """
+        limit = _cgroup_memory_limit_bytes()
+        if limit <= 0:
+            return
+        vlm_cache = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "0")) * 1024 * 1024
+        # Leave room for the model loader peaks and the Python runtime; the
+        # pool is resident from startup, the cache grows on demand.
+        needed = self.task_embeddings_max_bytes + vlm_cache
+        if needed <= limit * 0.9:
+            return
+        raise RuntimeError(
+            "Factory hold pool + content cache do not fit the container memory "
+            f"limit: pool {self.task_embeddings_max_bytes / 1024**3:.1f} GB "
+            f"(SGLANG_ENCODER_TASK_EMB_CACHE_GB={envs.SGLANG_ENCODER_TASK_EMB_CACHE_GB.get()}) "
+            f"+ SGLANG_VLM_CACHE_SIZE_MB={vlm_cache // 1024**2} MB vs "
+            f"{limit / 1024**3:.1f} GB limit. Lower the pool and/or the cache, "
+            "or raise the container memory limit."
+        )
+
+    def _alloc_from_hold_pool_locked(self, embedding):
+        """Reserve pool space for ``embedding``: ``(addr, view)`` or ``(None, None)``.
+
+        LRU-evicts pulled, unreferenced holds until the region fits; when only
+        in-flight or never-pulled holds remain, the caller falls back to a
+        per-hold buffer. Caller holds task_embeddings_lock.
+        """
+        pool = self.task_hold_pool
+        nbytes = int(embedding.nbytes)
+        if nbytes <= 0 or nbytes > pool.total_bytes:
+            return None, None
+        addr = pool.try_allocate(nbytes)
+        while addr is None:
+            victim = next(
+                (
+                    (tid, e)
+                    for tid, e in self.task_embeddings.items()
+                    if (
+                        e.refs <= 0
+                        and e.pulled_once
+                        and e.pending_pulls <= 0
+                        and e.pool_addr is not None
+                    )
+                ),
+                None,
+            )
+            if victim is None:
+                logger.warning(
+                    "hold pool full (%d bytes needed, %d holds in flight or "
+                    "unpulled); failing this task for retry",
+                    nbytes,
+                    len(self.task_embeddings),
+                )
+                return None, None
+            self._drop_task_embedding_locked(*victim)
+            addr = pool.try_allocate(nbytes)
+        offset = addr - pool.data_ptr
+        view = (
+            pool._buf[offset : offset + nbytes]
+            .view(embedding.dtype)
+            .view(embedding.shape)
+        )
+        return addr, view
+
+    def _evict_to_fit_locked(self, needed_bytes: int) -> None:
+        """LRU-evict unreferenced holds until ``needed_bytes`` fits under the cap.
+
+        Mirrors K3's ``MultiModalStaticCache._evict_to_fit``: walk the holds in
+        LRU order (oldest first) and drop those with no in-flight pull
+        (``refs <= 0``) until there is room. Referenced holds are never evicted
+        so an in-flight RDMA transfer cannot have its MR torn down; if only
+        referenced holds remain, the insert is allowed to run slightly over the
+        cap rather than block, and the next store reclaims once they release.
+
+        Only holds that have already served a pull (``pulled_once``) are
+        eligible: unlike K3's cache we cannot recompute at pull time, so a
+        never-pulled hold must survive to its first pull (TTL is its only
+        reaper), otherwise eviction would reintroduce the 404 this cache fixes.
+        """
+        cap = self.task_embeddings_max_bytes
+        if cap <= 0 or self.task_embeddings_bytes + needed_bytes <= cap:
+            return
+        target = self.task_embeddings_bytes + needed_bytes - cap
+        freed = 0
+        victims = []
+        for tid, entry in self.task_embeddings.items():
+            if entry.refs <= 0 and entry.pulled_once and entry.pending_pulls <= 0:
+                victims.append((tid, entry))
+                freed += entry.size_bytes
+                if freed >= target:
+                    break
+        for tid, entry in victims:
+            logger.debug(
+                "LRU-evicting factory embedding task_id=%s size=%d", tid, entry.size_bytes
+            )
+            self._drop_task_embedding_locked(tid, entry)
+        if freed < target:
+            logger.warning(
+                "task embedding cache over budget: used=%d need=%d cap=%d "
+                "(remaining holds are in-flight or awaiting first pull); "
+                "admitting anyway",
+                self.task_embeddings_bytes,
+                needed_bytes,
+                cap,
+            )
+
+    def _evict_stale_task_embeddings_locked(self) -> None:
+        """Drop refs==0 holds older than the TTL. Caller holds the lock."""
+        ttl = envs.SGLANG_ENCODER_TASK_EMB_TTL_S.get()
+        if ttl <= 0:
+            return
+        wait = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
+        if ttl < 1.5 * wait and not getattr(self, "_ttl_warned", False):
+            # prefill only takes a ref once its pull starts, so a hold reaped
+            # between "TaskResult sent" and "pull started" becomes a 404.
+            self._ttl_warned = True
+            logger.warning(
+                "SGLANG_ENCODER_TASK_EMB_TTL_S=%.0fs is close to the prefill "
+                "wait timeout %.0fs; unpulled holds may be reclaimed before a "
+                "slow prefill pulls them",
+                ttl,
+                wait,
+            )
+        now = time.monotonic()
+        stale = [
+            tid
+            for tid, e in self.task_embeddings.items()
+            if e.refs <= 0 and (now - e.created) > ttl
+        ]
+        for tid in stale:
+            logger.warning("Evicting un-pulled factory embedding task_id=%s", tid)
+            self._drop_task_embedding_locked(tid, self.task_embeddings[tid])
+
+    def attach_metrics(self, collector: FactoryEncoderMetricsCollector) -> None:
+        """Enable 厂内 dashboard metrics, incl. the loader / process queues."""
+        self.metrics_collector = collector
+        self.preprocessor.io_executor.stage = collector.loader_stage
+        self.preprocessor.preproc_executor.stage = collector.process_stage
+
+    async def acquire_task_embedding(
+        self, task_id: str
+    ) -> Optional[WorkflowTaskEmbedding]:
+        """Take a ref on a held embedding so it survives an in-flight pull."""
+        async with self.task_embeddings_lock:
+            entry = self.task_embeddings.get(task_id)
+            if entry is not None:
+                entry.refs += 1
+                entry.pending_pulls = max(0, entry.pending_pulls - 1)
+                # This hold has now served at least one pull, so it is safe to
+                # LRU-evict later (a future sibling re-submits an encode and
+                # re-stores). A never-pulled hold is left for TTL only, so
+                # eviction can never race a first pull into a 404.
+                entry.pulled_once = True
+                # Most-recently-used: keep hot (shared) images from being the
+                # first LRU eviction victims.
+                self.task_embeddings.move_to_end(task_id)
+            return entry
+
+    async def release_task_embedding(self, task_id: str) -> None:
+        """Drop a pull ref, but retain the hold for reuse.
+
+        The hold is content-addressed (task_id == md5(model_id + media_url)),
+        so several requests that reference the same image pull the same slot.
+        Dropping it on the first release let a sibling's pull hit a 404; instead
+        keep it and let TTL eviction (``_evict_stale_task_embeddings_locked``)
+        reclaim it once it has sat idle long enough.
+        """
+        async with self.task_embeddings_lock:
+            entry = self.task_embeddings.get(task_id)
+            if entry is None:
+                return
+            entry.refs -= 1
+
+    def _advertised_http_port(self) -> int:
+        """Port prefill dials for this encoder; must match EncoderAddr.http_port.
+
+        mooncake pulls go to ``/epd/transfer`` on the HTTP port, zmq pulls to
+        the PullZmqServer port (see ``TaskProcessor``).
+        """
+        if self.use_mooncake:
+            return int(self.server_args.port)
+        return int(getattr(self, "pull_zmq_port", 0) or 0)
+
+    async def list_held_embeddings(self) -> Dict[str, Any]:
+        """Snapshot the factory hold cache in K3's ``/list_vit_caches`` format.
+
+        The vit cache collector parses this verbatim, so the top-level
+        ``model_id`` and the per-entry EncoderAddr-shaped fields (and an
+        ``http_port`` that prefill can actually dial) must match K3's
+        ``VitCacheHandler.list_vit_caches``. Hold bookkeeping is appended as
+        extra keys for operators.
+        """
+        from sglang.srt.disaggregation.encode_utils import normalize_transfer_type
+
+        model_id = os.environ.get("MODEL_ID", "")
+        transfer_type = normalize_transfer_type(
+            get_disagg().encoder_transfer_backend
+        )
+        ip = os.environ.get("POD_IP") or getattr(self, "local_ip", None)
+        http_port = self._advertised_http_port()
+        now = time.monotonic()
+        caches = []
+        async with self.task_embeddings_lock:
+            for task_id, entry in self.task_embeddings.items():
+                emb = entry.embedding
+                shape = list(emb.shape) if emb is not None else []
+                caches.append(
+                    {
+                        "ip": ip,
+                        "http_port": http_port,
+                        "transfer_type": transfer_type,
+                        "task_id": task_id,
+                        "model_id": model_id,
+                        "embedding_size": entry.size_bytes,
+                        "embedding_len": shape[0] if shape else 0,
+                        "embedding_dim": shape[1] if len(shape) > 1 else 0,
+                        "embedding_dtype": str(getattr(emb, "dtype", "")).replace(
+                            "torch.", ""
+                        ),
+                        "img_grid_thw": entry.image_grid_thw,
+                        "original_image_sizes": entry.original_image_sizes,
+                        "rdma_port": 0,
+                        "item_addr": 0,
+                        "cache_size": 0,
+                        "header_size": 0,
+                        "mooncake_session_id": "",
+                        "modality": entry.modality,
+                        "chunk_timestamps": entry.chunk_timestamps,
+                        "refs": entry.refs,
+                        "pulled_once": entry.pulled_once,
+                        "pending_pulls": entry.pending_pulls,
+                        "age_s": round(now - entry.created, 3),
+                    }
+                )
+            total_bytes = self.task_embeddings_bytes
+            cap_bytes = self.task_embeddings_max_bytes
+        return {
+            "model_id": model_id,
+            "caches": caches,
+            "count": len(caches),
+            "total_bytes": total_bytes,
+            "cap_bytes": cap_bytes,
+            "cache_hits": getattr(self, "task_embedding_hits", 0),
+        }
+
+    async def flush_task_embeddings(self) -> Dict[str, int]:
+        """Drop every hold no pull is using; in-flight ones are kept."""
+        async with self.task_embeddings_lock:
+            before_bytes = self.task_embeddings_bytes
+            before_entries = len(self.task_embeddings)
+            for tid, entry in list(self.task_embeddings.items()):
+                # A hold whose TaskResult is already on its way to vit-server
+                # must survive, exactly as it does for LRU eviction.
+                if entry.refs <= 0 and entry.pending_pulls <= 0:
+                    self._drop_task_embedding_locked(tid, entry)
+            after_bytes = self.task_embeddings_bytes
+            after_entries = len(self.task_embeddings)
+        logger.info(
+            "[flush_cache] flushed %d entries, %d bytes; remaining %d entries",
+            before_entries - after_entries,
+            before_bytes - after_bytes,
+            after_entries,
+        )
+        return {
+            "flushed_bytes": before_bytes - after_bytes,
+            "flushed_entries": before_entries - after_entries,
+            "remaining_bytes": after_bytes,
+            "remaining_entries": after_entries,
+        }
+
+    async def transfer_task_embedding(
+        self, task_id: str, session_id: str, buffer_address: int, byte_size: int
+    ) -> None:
+        """RDMA-write a held embedding into prefill's buffer (mooncake pull).
+
+        The factory ``/epd/transfer`` is pull-triggered-push: prefill hands its
+        own ``session_id``/``buffer_address`` and the encoder writes the rows it
+        is holding for ``task_id`` there, reusing the same mooncake engine and
+        transfer primitive as the New EPD push path. The source MR was
+        registered at ``store_task_embedding`` time.
+        """
+        entry = await self.acquire_task_embedding(task_id)
+        metrics = self.metrics_collector
+        if entry is None:
+            if metrics is not None:
+                metrics.record_cache_miss(int(byte_size), source="transfer")
+            raise MMError(
+                f"embedding not held for task_id={task_id}",
+                code=HTTPStatus.NOT_FOUND,
+            )
+        try:
+            embedding = entry.embedding
+            size = int(byte_size) or embedding.nbytes
+            if size != embedding.nbytes:
+                # The pool is registered as one MR, so an oversized read would
+                # silently ship a neighbouring hold's rows instead of failing.
+                raise BadRequestError(
+                    f"byte_size {size} != held embedding {embedding.nbytes} bytes "
+                    f"for task_id={task_id}"
+                )
+            if metrics is not None:
+                metrics.record_cache_hit(size, source="transfer")
+            transfer_start = time.perf_counter()
+            await self._run_mooncake_transfer(
+                session_id, embedding.data_ptr(), int(buffer_address), size
+            )
+            transfer_s = time.perf_counter() - transfer_start
+            if metrics is not None:
+                metrics.transfer_stage.observe_batch(transfer_s, 1, size)
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.observe_transfer(
+                    transfer_s, backend="mooncake"
+                )
+            digest = (
+                compute_embed_digest(embedding)
+                if envs.SGLANG_EMBED_DIGEST.get()
+                else None
+            )
+            return transfer_s * 1000.0, digest
+        finally:
+            await self.release_task_embedding(task_id)
+
+    def _record_workflow_cache(
+        self, hit: bool, nbytes: int, entry: Optional[WorkflowTaskEmbedding] = None
+    ) -> None:
+        """Count a task served from its hold as a workflow cache hit.
+
+        Only hits: a miss falls through to ``encode``, whose prefix mm_cache
+        lookup already records the hit/miss for that request.
+        """
+        collector = getattr(self, "metrics_collector", None)
+        if collector is None:
+            return
+        if hit:
+            collector.record_cache_hit(nbytes, source="workflow")
+        else:
+            collector.record_cache_miss(nbytes, source="workflow")
+        if encoder_metrics_collector is not None:
+            # Same hit/miss on the New EPD series (encoder_cache_hit_tokens/
+            # files_total), counted in rows and in images.
+            rows = nbytes // max(1, self._task_row_bytes())
+            # Same labels as the prefix path, where video frames are images;
+            # a held video counts one file per frame (one grid row each).
+            grids = entry.image_grid_thw if entry is not None else None
+            files = len(grids) if isinstance(grids, (list, tuple)) and grids else 1
+            encoder_metrics_collector.record_cache_tokens(
+                rows if hit else 0, rows, modality="image"
+            )
+            encoder_metrics_collector.record_cache_files(
+                files if hit else 0, files, modality="image"
+            )
+            encoder_metrics_collector.set_cache_state(
+                self.task_embeddings_bytes, len(self.task_embeddings)
+            )
+
+    def _task_row_bytes(self) -> int:
+        """Bytes of one embedding row, from any held entry (0 if none)."""
+        for entry in self.task_embeddings.values():
+            emb = entry.embedding
+            if emb is not None and emb.dim() == 2 and emb.shape[0] > 0:
+                return emb.shape[1] * emb.element_size()
+        return 0
+
+    async def _reuse_held_task_embedding(
+        self, task_id: str
+    ) -> Optional[WorkflowTaskEmbedding]:
+        """Return the hold for ``task_id`` (refreshing its TTL), or None.
+
+        This is the --enable-prefix-mm-cache lookup of the factory path, keyed
+        by task_id like K3's ``mm_cache.get(task_id)``: the New EPD prefix cache
+        is bypassed for mooncake transfers, and task_id is content-addressed
+        (md5(model_id + media_url)), so a held entry is the same embedding.
+        """
+        if not get_mm().enable_prefix_mm_cache:
+            return None
+        async with self.task_embeddings_lock:
+            self._evict_stale_task_embeddings_locked()
+            entry = self.task_embeddings.get(task_id)
+            if entry is None:
+                return None
+            self._mark_hold_reserved_locked(task_id, entry)
+            self.task_embedding_hits += 1
+            return entry
+
+    async def encode_video_and_store_for_workflow(
+        self, video, req_id, task_id, sample_fps: Optional[float]
+    ):
+        """Encode one factory video task as sampled frames (K3 video protocol).
+
+        For vision towers that only take images, each sampled frame is a chunk:
+        the held embedding concatenates the frame spans in time order, the grid
+        has one row per frame and ``chunk_timestamps`` one ``MM:SS`` per frame.
+        Returns the image tuple of ``encode_and_store_for_workflow`` plus the
+        timestamps.
+        """
+        from sglang.srt.disaggregation.encoder.video_frames import (
+            decode_video_frames,
+            resolve_sample_fps,
+        )
+
+        held = await self._reuse_held_task_embedding(task_id)
+        if held is not None and held.chunk_timestamps:
+            logger.info(
+                "[encode] Cache HIT for video task_id=%s frames=%d",
+                task_id,
+                len(held.chunk_timestamps),
+            )
+            self._record_workflow_cache(hit=True, nbytes=held.size_bytes, entry=held)
+            return (
+                held.embedding.shape[0],
+                held.embedding.shape[1],
+                held.embedding,
+                held.image_grid_thw,
+                held.original_image_sizes,
+                held.chunk_timestamps,
+            )
+        try:
+            fps = resolve_sample_fps(
+                sample_fps, envs.SGLANG_ENCODER_VIDEO_DEFAULT_FPS.get()
+            )
+        except (TypeError, ValueError) as e:
+            raise BadRequestError(f"Invalid sample_fps {sample_fps!r}: {e}")
+        decode_start = time.perf_counter()
+        try:
+            frames, timestamps = await asyncio.get_running_loop().run_in_executor(
+                self.executor,
+                decode_video_frames,
+                video,
+                fps,
+                envs.SGLANG_ENCODER_VIDEO_MAX_FRAMES.get(),
+                envs.SGLANG_ENCODER_VIDEO_FRAME_MAX_PIXELS.get(),
+                envs.SGLANG_ENCODER_VIDEO_GPU_DECODE.get(),
+                self.gpu_id,
+            )
+        except Exception as e:
+            raise BadRequestError(f"Failed to decode video for task {task_id}: {e}")
+        self.task_time_costs.setdefault(task_id, {})["decode_time_cost"] = round(
+            time.perf_counter() - decode_start, 4
+        )
+        result = await self.encode_and_store_for_workflow(
+            frames,
+            req_id,
+            task_id,
+            Modality.IMAGE,
+            store_modality="video",
+            chunk_timestamps=timestamps,
+        )
+        return (*result, timestamps)
+
+    async def encode_and_store_for_workflow(
+        self,
+        mm_items,
+        req_id,
+        task_id,
+        modality: Modality,
+        store_modality: Optional[str] = None,
+        chunk_timestamps: Optional[List[str]] = None,
+    ):
+        """Encode one factory task and hold its embedding for pull by task_id.
+
+        Reuses the New EPD ``encode`` compute path, then moves the staged
+        embedding out of the push-oriented ReqState into the task-keyed hold so
+        the request state can be released immediately. Returns
+        ``(embedding_len, embedding_dim, embedding, grid_thw, original_image_sizes)``
+        for the caller to build the ``EncoderAddr`` reply.
+        """
+        held = (
+            None
+            if chunk_timestamps is not None
+            else await self._reuse_held_task_embedding(task_id)
+        )
+        if held is not None:
+            logger.info(
+                "[encode] Cache HIT for task_id=%s rows=%d",
+                task_id,
+                held.embedding.shape[0],
+            )
+            self._record_workflow_cache(hit=True, nbytes=held.size_bytes, entry=held)
+            return (
+                held.embedding.shape[0],
+                held.embedding.shape[1],
+                held.embedding,
+                held.image_grid_thw,
+                held.original_image_sizes,
+            )
+        # The same image twice in one request is the same task_id twice; the
+        # sequence number keeps each copy's encode state separate.
+        self._workflow_encode_seq = getattr(self, "_workflow_encode_seq", 0) + 1
+        encode_req_id = f"{req_id}#{task_id}#{self._workflow_encode_seq}"
+        try:
+            # Align with K3: read the embedding from the encode return (this
+            # call's own staged EmbeddingData), NOT from self.req_states[req_id].
+            # A multi-image request fans out into several tasks that share one
+            # req_id, so each task encodes under its own internal request id.
+            # A video task is already a batch of frames; batching it with
+            # images would only hold the images behind its frames.
+            data = await self._encode_workflow_task(
+                mm_items,
+                encode_req_id,
+                task_id,
+                modality,
+                batchable=chunk_timestamps is None,
+            )
+            if data is None or data.embedding is None:
+                raise InternalError(f"No embedding staged for task {task_id}")
+            embedding = data.embedding
+            grid_thw = (
+                data.grid_dim.tolist()
+                if getattr(data.grid_dim, "tolist", None)
+                else data.grid_dim
+            )
+            original_image_sizes = getattr(data, "original_image_sizes", None)
+            await self.store_task_embedding(
+                task_id,
+                embedding,
+                grid_thw,
+                original_image_sizes,
+                modality=store_modality or modality.name.lower(),
+                chunk_timestamps=chunk_timestamps,
+            )
+            # store_task_embedding may have moved the tensor to CPU/contiguous;
+            # read geometry back from the held copy (reserved, so it cannot be
+            # evicted before this reply). No ref is taken here.
+            held = self.task_embeddings.get(task_id)
+            held_embedding = held.embedding if held is not None else embedding
+            return (
+                held_embedding.shape[0],
+                held_embedding.shape[1],
+                held_embedding,
+                grid_thw,
+                original_image_sizes,
+            )
+        finally:
+            # The embedding now lives in task_embeddings; free the push-side
+            # ReqState so it does not leak while awaiting the pull.
+            await self.release_request(encode_req_id)
+
+    def _factory_batcher(self) -> Optional[FactoryEncodeBatcher]:
+        """The factory task batcher, or None with SGLANG_ENCODER_FACTORY_BATCH_SIZE <= 1."""
+        max_batch = envs.SGLANG_ENCODER_FACTORY_BATCH_SIZE.get()
+        if max_batch <= 1:
+            return None
+        batcher = getattr(self, "_factory_encode_batcher", None)
+        if batcher is None:
+
+            async def release(request: dict) -> None:
+                await self.release_request(request["req_id"])
+
+            batcher = FactoryEncodeBatcher(
+                self.batch_encode,
+                max_batch=max_batch,
+                max_wait_s=envs.SGLANG_ENCODER_FACTORY_BATCH_WAIT_MS.get() / 1000.0,
+                max_inflight=envs.SGLANG_ENCODER_FACTORY_BATCH_INFLIGHT.get(),
+                release=release,
+            )
+            self._factory_encode_batcher = batcher
+        return batcher
+
+    async def _encode_workflow_task(
+        self, mm_items, req_id: str, task_id, modality: Modality, *, batchable=True
+    ) -> Optional[EmbeddingData]:
+        """Encode one factory task; returns its staged EmbeddingData."""
+        batcher = self._factory_batcher() if batchable else None
+        if batcher is not None:
+            return await batcher.submit(
+                {
+                    "req_id": req_id,
+                    "num_parts": 1,
+                    "part_idx": 0,
+                    "mm_items": mm_items,
+                    "hashes": None,
+                    "task_id": task_id,
+                },
+                modality,
+            )
+        staged: List[EmbeddingData] = []
+        result = await self.encode(
+            mm_items=mm_items,
+            modality=modality,
+            req_id=req_id,
+            num_parts=1,
+            part_idx=0,
+            out_staged=staged,
+            task_id=task_id,
+        )
+        if not staged and result is not None:
+            # Keep the encoder's own error and code (400 for a bad image), as
+            # K3 does, instead of a generic 500 "No embedding staged".
+            raise _error_from_encode_result(result, f"task {task_id}")
+        return staged[0] if staged else None
 
     async def send_to_destination(
         self, state: ReqState, destination: SendDestination
@@ -1014,6 +2177,7 @@ class MMEncoder:
         forward_start = time.perf_counter()
         with torch.inference_mode():
             new_embeddings = get_feature_fn(mm_items)
+            new_embeddings = _flatten_encoder_embedding(new_embeddings)
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
         if encoder_metrics_collector is not None:
@@ -1119,6 +2283,7 @@ class MMEncoder:
         """Flatten a batch of requests into one EncodeContext (single = N of 1)."""
         modality_str = modality.name.lower()
         preprocess_start = time.perf_counter()
+        media_load_seconds.set(0.0)
         try:
             (
                 preprocess_result,
@@ -1149,6 +2314,17 @@ class MMEncoder:
                 )
             encoder_metrics_collector.observe_mm_items_per_batch(
                 sum(items_per_req), modality=modality_str
+            )
+        if self.metrics_collector is not None and not is_health_check:
+            load_seconds = media_load_seconds.get()
+            num_tokens = sum(preprocess_result.token_counts)
+            self.metrics_collector.loader_stage.observe_batch(
+                load_seconds, len(requests), num_tokens
+            )
+            self.metrics_collector.process_stage.observe_batch(
+                time.perf_counter() - preprocess_start - load_seconds,
+                len(requests),
+                num_tokens,
             )
         target = self.model.thinker if hasattr(self.model, "thinker") else self.model
         get_feature_fn = getattr(target, f"get_{modality_str}_feature")
@@ -1700,6 +2876,91 @@ class MMEncoder:
 
         return None
 
+    def _forward_executor(self) -> Optional[concurrent.futures.ThreadPoolExecutor]:
+        """The vision-forward thread, or None to run the forward on the loop.
+
+        Enabled by SGLANG_ENCODER_FORWARD_IN_THREAD with tp_size == 1 only:
+        TP ranks issue their collectives in dispatch order on the loop. One
+        worker keeps forwards serialized as they were on the loop.
+        """
+        executor = getattr(self, "_forward_thread_pool", None)
+        if executor is not None:
+            return executor
+        if not envs.SGLANG_ENCODER_FORWARD_IN_THREAD.get():
+            return None
+        if get_parallel().tp_size != 1:
+            return None
+        initializer, initargs = None, ()
+        if str(self.device) != "cpu":
+            initializer = torch.get_device_module(self.device).set_device
+            initargs = (self.gpu_id,)
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="encoder-forward",
+            initializer=initializer,
+            initargs=initargs,
+        )
+        self._forward_thread_pool = executor
+        return executor
+
+    async def _feature_forward(
+        self, get_feature_fn, mm_items, *, to_cpu: bool
+    ) -> torch.Tensor:
+        """Run the vision forward; returns one ``[tokens, hidden]`` tensor."""
+
+        def forward() -> torch.Tensor:
+            with torch.inference_mode():
+                embedding = _flatten_encoder_embedding(get_feature_fn(mm_items))
+                if to_cpu:
+                    embedding = embedding.cpu()
+            if embedding.ndim != 2:
+                embedding = embedding.reshape(-1, embedding.shape[-1])
+            return embedding
+
+        executor = self._forward_executor()
+        if executor is None:
+            return forward()
+        # A cancelled caller still waits: the forward reads the batch's inputs.
+        return await await_task_completion_on_cancel(
+            asyncio.ensure_future(
+                asyncio.get_running_loop().run_in_executor(executor, forward)
+            ),
+            "Encoder vision forward",
+        )
+
+    def _assemble_cached_embedding(
+        self, ctx, segments, cached, missing, fresh, *, keep_on_gpu: bool
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Merge cache hits and the fresh forward in request order.
+
+        Returns the flattened embedding and its per-request parts (empty when
+        the context has no request segments).
+        """
+        if len(missing) == len(cached):
+            parts = (
+                _split_rows(fresh, [segment[2] for segment in segments])
+                if segments is not None
+                else []
+            )
+            return fresh, parts
+        fresh_parts = iter(())
+        if fresh is not None:
+            expected = sum(segments[r][2] for r in missing)
+            if fresh.shape[0] != expected:
+                raise InternalError(
+                    f"Encoder produced {fresh.shape[0]} tokens, but "
+                    f"preprocessor metadata expected {expected}"
+                )
+            fresh_parts = iter(_split_rows(fresh, [segments[r][2] for r in missing]))
+        parts = [
+            next(fresh_parts)
+            if hit is None
+            # H2D outside the cache lock so other requests are not blocked.
+            else (hit.to(self.device) if keep_on_gpu else hit)
+            for hit in cached
+        ]
+        return (torch.cat(parts) if len(parts) > 1 else parts[0]), parts
+
     async def _compute_direct_embedding(
         self,
         ctx: EncodeContext,
@@ -1710,9 +2971,6 @@ class MMEncoder:
         modality = ctx.modality
         modality_str = modality.name.lower()
         try:
-            mm_embedding = None
-            mm_hash = None
-
             mm_items = self._build_model_mm_items(
                 ctx.mm_feature,
                 ctx.preprocess_result,
@@ -1720,38 +2978,52 @@ class MMEncoder:
                 modality,
             )
 
-            cache_hit = False
-            # The prefix cache hashes the whole request; a fused multi-request
-            # batch has no per-request key, so only N=1 contexts use it.
+            # mm_cache holds CPU tensors, one entry per request keyed by the
+            # combined hash of its items. Mooncake pushes from device memory,
+            # so with keep_on_gpu a hit is copied back to the device and a
+            # miss stores a CPU copy (bounded by the mm_cache size). A fused
+            # batch needs item-wise model inputs to split per request; a
+            # legacy aggregate item only has a key for an N=1 context.
+            segments = _request_segments(ctx, mm_items)
             use_mm_cache = (
                 get_mm().enable_prefix_mm_cache
                 and not ctx.is_health_check
-                and not keep_on_gpu
-                and len(ctx.items_per_req) == 1
+                and segments is not None
             )
+            cached = [None] * len(ctx.items_per_req)
+            req_hashes = [None] * len(ctx.items_per_req)
             if use_mm_cache:
                 for mm_item in mm_items:
                     mm_item.set_pad_value()
-                mm_hashes = [mm_item.hash for mm_item in mm_items]
-                mm_hash = MultiModalStaticCache.combine_hashes(mm_hashes)
                 async with self.mm_cache_lock:
-                    mm_cache = self.mm_cache.get(mm_hashes)
-                    if mm_cache is not None:
-                        mm_embedding = mm_cache.embedding
-                        cache_hit = True
+                    for r, (item_start, item_end, _) in enumerate(segments):
+                        mm_hashes = [it.hash for it in mm_items[item_start:item_end]]
+                        req_hashes[r] = MultiModalStaticCache.combine_hashes(mm_hashes)
+                        entry = self.mm_cache.get(mm_hashes)
+                        if entry is not None:
+                            cached[r] = entry.embedding
+            missing = [r for r, hit in enumerate(cached) if hit is None]
 
-            if mm_embedding is None:
+            fresh = None
+            if missing:
+                forward_items = mm_items
+                if len(missing) < len(cached):
+                    forward_items = [
+                        mm_item
+                        for r in missing
+                        for mm_item in mm_items[segments[r][0] : segments[r][1]]
+                    ]
                 forward_start = time.perf_counter()
-                with torch.inference_mode():
-                    mm_embedding: torch.Tensor = ctx.get_feature_fn(mm_items)
-                    if not keep_on_gpu:
-                        mm_embedding = mm_embedding.cpu()
-                if len(mm_embedding.shape) != 2:
-                    mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+                fresh = await self._feature_forward(
+                    ctx.get_feature_fn, forward_items, to_cpu=not keep_on_gpu
+                )
                 if encoder_metrics_collector is not None and not ctx.is_health_check:
                     encoder_metrics_collector.observe_model_forward(
                         time.perf_counter() - forward_start, modality=modality_str
                     )
+            mm_embedding, parts = self._assemble_cached_embedding(
+                ctx, segments, cached, missing, fresh, keep_on_gpu=keep_on_gpu
+            )
 
             try:
                 self._validate_embedding_token_count(ctx, mm_embedding)
@@ -1759,34 +3031,59 @@ class MMEncoder:
                 # Old releases could cache a malformed result before the
                 # outer validation ran. Do not make that entry permanently
                 # poison every request for the same media.
-                if cache_hit:
+                hit_hashes = [h for h, c in zip(req_hashes, cached) if c is not None]
+                if hit_hashes:
                     async with self.mm_cache_lock:
-                        self.mm_cache.free(mm_hash, None)
+                        for mm_hash in hit_hashes:
+                            self.mm_cache.free(mm_hash, None)
                 raise
 
-            # Per-request cache hit metrics: tokens = embedding rows.
-            if use_mm_cache and encoder_metrics_collector is not None:
-                total_tokens = int(mm_embedding.shape[0])
-                hit_tokens = total_tokens if cache_hit else 0
-                encoder_metrics_collector.record_cache_tokens(
-                    hit_tokens, total_tokens, modality=modality_str
-                )
-                encoder_metrics_collector.record_cache_files(
-                    len(mm_items) if cache_hit else 0,
-                    len(mm_items),
-                    modality=modality_str,
-                )
-
             if use_mm_cache:
+                for (item_start, item_end, _), part, hit in zip(
+                    segments, parts, cached
+                ):
+                    # Per-request cache hit metrics: tokens = embedding rows.
+                    num_files = item_end - item_start
+                    if encoder_metrics_collector is not None:
+                        total_tokens = int(part.shape[0])
+                        encoder_metrics_collector.record_cache_tokens(
+                            total_tokens if hit is not None else 0,
+                            total_tokens,
+                            modality=modality_str,
+                        )
+                        encoder_metrics_collector.record_cache_files(
+                            num_files if hit is not None else 0,
+                            num_files,
+                            modality=modality_str,
+                        )
+                    if self.metrics_collector is not None:
+                        if hit is not None:
+                            self.metrics_collector.record_cache_hit(part.nbytes)
+                        else:
+                            self.metrics_collector.record_cache_miss(part.nbytes)
+
+            if use_mm_cache and missing:
+                # Host copies of the fresh parts only (one copy when the whole
+                # batch missed); the cache clones the slices it admits.
+                if len(missing) == len(parts):
+                    host = mm_embedding.cpu()
+                    host_parts = _split_rows(host, [part.shape[0] for part in parts])
+                else:
+                    host_parts = [
+                        parts[r].cpu() if r in missing else None
+                        for r in range(len(parts))
+                    ]
                 async with self.mm_cache_lock:
                     entries_before = len(self.mm_cache)
-                    already_present = self.mm_cache.has(mm_hash)
-                    inserted = self.mm_cache.set(
-                        mm_hash, EmbeddingResult(embedding=mm_embedding)
-                    )
+                    added = 0
+                    for r in missing:
+                        already_present = self.mm_cache.has(req_hashes[r])
+                        inserted = self.mm_cache.set(
+                            req_hashes[r], EmbeddingResult(embedding=host_parts[r])
+                        )
+                        added += 0 if already_present else (1 if inserted else 0)
                     entries_after = len(self.mm_cache)
                     if encoder_metrics_collector is not None:
-                        added = 0 if already_present else (1 if inserted else 0)
                         evictions = max(0, added - (entries_after - entries_before))
                         if evictions > 0:
                             encoder_metrics_collector.inc_cache_evictions(
@@ -1946,6 +3243,10 @@ class MMEncoder:
                 encoder_metrics_collector.observe_transfer(
                     xfer_ms / 1000.0, backend="mooncake"
                 )
+            if self.metrics_collector is not None:
+                self.metrics_collector.transfer_stage.observe_batch(
+                    xfer_ms / 1000.0, 1, embedding.nbytes
+                )
             if xfer_ret < 0:
                 raise InternalError(
                     f"Mooncake transfer_sync failed for {req_id} "
@@ -2078,16 +3379,33 @@ class MMEncoder:
         size: int,
     ) -> int:
         """Keep the send active until its blocking transfer stops using the MR."""
-        return await _await_transfer_completion(
-            asyncio.to_thread(
-                self.engine.transfer_sync,
-                session_id,
-                source_address,
-                destination_address,
-                size,
-            ),
-            f"Mooncake transfer to session={session_id}",
+        stage = (
+            self.metrics_collector.transfer_stage
+            if self.metrics_collector is not None
+            else None
         )
+        enqueued = time.perf_counter()
+        # Whoever takes this first (worker start or cancel) leaves the queue.
+        queue_claim = threading.Lock()
+        if stage is not None:
+            stage.queue_enter()
+
+        def transfer() -> int:
+            if stage is not None and queue_claim.acquire(blocking=False):
+                stage.queue_leave(wait_seconds=time.perf_counter() - enqueued)
+            return self.engine.transfer_sync(
+                session_id, source_address, destination_address, size
+            )
+
+        try:
+            return await _await_transfer_completion(
+                asyncio.to_thread(transfer),
+                f"Mooncake transfer to session={session_id}",
+            )
+        finally:
+            # Cancelled before a worker thread picked it up.
+            if stage is not None and queue_claim.acquire(blocking=False):
+                stage.queue_leave()
 
     def _register_shared_mr(self, mm_data: EmbeddingData, embedding: torch.Tensor):
         """Register one MR shared by every rank's /send; _send re-registers on failure."""
@@ -2119,6 +3437,7 @@ class MMEncoder:
         mm_embedding: Optional[torch.Tensor],
         *,
         keep_on_gpu: bool,
+        out_staged: Optional[List] = None,
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Split the fused embedding per request and stage one EmbeddingData each.
 
@@ -2159,7 +3478,9 @@ class MMEncoder:
                     **req_aux_data,
                 )
                 # Global-cache embeddings keep registering per /send instead.
-                if keep_on_gpu and not ctx.use_global_cache:
+                # Factory tasks (task_id) are copied into the pre-registered
+                # hold pool, so registering the GPU slice here would be wasted.
+                if keep_on_gpu and not ctx.use_global_cache and not req.get("task_id"):
                     self._register_shared_mr(mm_data, embedding)
                 staged_embeddings.append(mm_data)
                 results.append(
@@ -2179,6 +3500,11 @@ class MMEncoder:
             if keep_on_gpu and mm_embedding.is_cuda:
                 torch.cuda.current_stream(mm_embedding.device).synchronize()
             self._stage_embedding_batch(staged_embeddings)
+            if out_staged is not None:
+                # K3-style: hand the per-request EmbeddingData back to the caller
+                # so the factory workflow reads the embedding from the return
+                # value instead of the shared req_id-keyed ReqState.
+                out_staged.extend(staged_embeddings)
             return results
         except BaseException:
             for mm_data in staged_embeddings:
@@ -2209,8 +3535,22 @@ class MMEncoder:
                 )
         return [(0, 0, 0, msg, code)] * len(requests)
 
+    @staticmethod
+    def _embeddings_go_to_host(requests: List[dict]) -> bool:
+        """True when no device copy of this batch's embedding is ever read.
+
+        Factory tasks (task_id) are held in host memory for prefill to pull,
+        and the prefix mm_cache keeps host copies too. Producing the batch on
+        the host spares a cache hit its H2D + D2H round trip (a miss trades
+        its second D2H for a host copy); without the cache, the device output
+        goes straight into the pinned hold pool, so it stays on the device.
+        """
+        return all(req.get("task_id") for req in requests) and bool(
+            get_mm().enable_prefix_mm_cache
+        )
+
     async def batch_encode(
-        self, requests: List[dict], modality: Modality
+        self, requests: List[dict], modality: Modality, out_staged: Optional[List] = None
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Encode requests through one fused pipeline; encode() is the N=1 case.
 
@@ -2221,37 +3561,114 @@ class MMEncoder:
         is_health_check = all(
             is_health_check_request(req["req_id"]) for req in requests
         )
-        keep_on_gpu = self.use_mooncake and not is_health_check
+        keep_on_gpu = (
+            self.use_mooncake
+            and not is_health_check
+            and not self._embeddings_go_to_host(requests)
+        )
         use_global_cache = self.mm_global_cache is not None and not is_health_check
+        ready_mark = None
+        if self.metrics_collector is not None and not is_health_check:
+            ready_mark = StageReadyMark(
+                self.metrics_collector.embed_stage, len(requests)
+            )
+        ready_token = embed_ready.set(ready_mark)
+        started_at = time.perf_counter()
         try:
             if self.rank == 0:
                 async with encode_state_condition:
                     encode_state_condition.notify_all()
-            ctx = await self._prepare_encode_context_on_all_ranks(
-                requests,
-                modality,
-                use_global_cache=use_global_cache,
-                is_health_check=is_health_check,
-            )
+            try:
+                ctx = await self._prepare_encode_context_on_all_ranks(
+                    requests,
+                    modality,
+                    use_global_cache=use_global_cache,
+                    is_health_check=is_health_check,
+                )
+            finally:
+                embed_ready.reset(ready_token)
+            prepared_at = time.perf_counter()
+            self._correct_workflow_task_tokens(ctx, requests)
+            if ready_mark is not None:
+                ready_mark.start()
+            embed_start = time.perf_counter()
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
+            self._record_workflow_task_timings(
+                requests, prepared_at - started_at, time.perf_counter() - prepared_at
+            )
+            if (
+                self.metrics_collector is not None
+                and not is_health_check
+                and mm_embedding is not None
+            ):
+                self.metrics_collector.embed_stage.observe_batch(
+                    time.perf_counter() - embed_start,
+                    len(requests),
+                    int(mm_embedding.shape[0]),
+                )
 
             if self.profiler is not None:
                 for _ in requests:
                     self.profiler.step()
 
             return self._stage_embeddings(
-                ctx, requests, mm_embedding, keep_on_gpu=keep_on_gpu
+                ctx, requests, mm_embedding, keep_on_gpu=keep_on_gpu, out_staged=out_staged
             )
         except Exception as e:
             return self._stage_errors(requests, modality, e)
         finally:
+            if ready_mark is not None:
+                ready_mark.discard()
             for state in states:
                 await self._release_encode_ref(state)
 
+    def _record_workflow_task_timings(self, requests, process_s, embed_s) -> None:
+        """Stage costs for the factory TaskResult.time_cost_info (K3 fields).
+
+        process covers media loading + preprocessing, embed the vision forward;
+        a fused batch reports the batch's costs for each of its tasks.
+        """
+        if getattr(self, "encode_workflow", None) is None or self.rank != 0:
+            return
+        for req in requests:
+            task_id = req.get("task_id")
+            if task_id:
+                costs = self.task_time_costs.setdefault(task_id, {})
+                costs["process_time_cost"] = round(process_s, 4)
+                costs["embed_time_cost"] = round(embed_s, 4)
+
+    def pop_task_time_costs(self, task_id: str) -> Dict[str, float]:
+        """Take the recorded stage costs of ``task_id`` (empty if none)."""
+        return self.task_time_costs.pop(task_id, {})
+
+    def _correct_workflow_task_tokens(self, ctx, requests) -> None:
+        """Replace vit-server's token estimate with the preprocessed count.
+
+        Mirrors K3: once preprocessing knows each task's real token count, the
+        fetch budget (free_tokens) is corrected before the vision forward runs,
+        so large images and videos do not leave admission working off a guess.
+        """
+        workflow = getattr(self, "encode_workflow", None)
+        if workflow is None or self.rank != 0:
+            return
+        token_counts = ctx.preprocess_result.token_counts
+        offset = 0
+        for req, num_items in zip(requests, ctx.items_per_req):
+            task_id = req.get("task_id")
+            actual = sum(token_counts[offset : offset + num_items])
+            offset += num_items
+            if task_id:
+                workflow.update_task_tokens(task_id, int(actual))
+
     async def encode(
-        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
+        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None,
+        out_staged=None, task_id=None,
     ):
-        """Encode one request: the batch-of-1 case of batch_encode."""
+        """Encode one request: the batch-of-1 case of batch_encode.
+
+        ``task_id`` (factory workflow tasks) lets preprocessing correct the
+        task's fetch-budget estimate.
+        """
         results = await self.batch_encode(
             [
                 {
@@ -2260,9 +3677,11 @@ class MMEncoder:
                     "part_idx": part_idx,
                     "mm_items": mm_items,
                     "hashes": hashes,
+                    "task_id": task_id,
                 }
             ],
             modality,
+            out_staged=out_staged,
         )
         return results[0]
 

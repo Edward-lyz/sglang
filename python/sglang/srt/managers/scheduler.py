@@ -2709,6 +2709,7 @@ class Scheduler(
             if req.session:
                 continue
             # For non-session requests, clear features and mm_inputs
+            mm_inputs.release_pool_buffers()
             mm_inputs.release_features()
             req.multimodal_inputs = None
 

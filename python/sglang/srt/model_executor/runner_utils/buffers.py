@@ -80,6 +80,13 @@ def _allocate_pp_proxy_tensors(
             else (max_hidden_tokens, hidden_size)
         )
         pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
+    if is_mhc:
+        # mHC models whose attention consumes the previous FFN's pre-mix
+        # (DSV4.1 hc_pre_from_prev_sublayer) hand it across stages; others
+        # leave this buffer untouched.
+        pp_proxy_tensors["hc_prev_pre"] = torch.zeros(
+            (max_hidden_tokens, hc_hidden_size // hidden_size), dtype=torch.float32
+        )
     if pp_proxy_topk_size is not None:
         pp_proxy_tensors["topk_indices"] = torch.zeros(
             (max_num_tokens, pp_proxy_topk_size), dtype=torch.int32

@@ -8,6 +8,7 @@ import os
 import pickle
 import sys
 from abc import abstractmethod
+from array import array
 from collections import defaultdict
 from multiprocessing import shared_memory
 from typing import Any, Dict, List, Optional, Tuple
@@ -334,11 +335,21 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         """
         Replaces multimodal tokens in input_ids with corresponding pad_values from mm_items.
         Each modality (image, audio, video) is handled separately based on its token_id.
+
+        Only the item spans are rewritten, on a copy of the list: a round trip of
+        the whole prompt through a tensor costs ~13 ms per 90k tokens with the
+        GIL held, on the scheduler thread of every rank.
         """
         if not input_ids or not mm_inputs.mm_items:
             return input_ids
 
-        input_ids_tensor = torch.as_tensor(input_ids)
+        if envs.SGLANG_OPT_MM_PAD_INPUT_IDS_ARRAY.get() and isinstance(
+            input_ids, array
+        ):
+            return _pad_multimodal_tokens_array(input_ids, mm_inputs)
+
+        ret_input_ids = list(input_ids)
+        seq_len = len(ret_input_ids)
 
         # Replace multimodal tokens using per-item offsets
         items_by_modality = defaultdict(list)
@@ -359,10 +370,38 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
             for i, item in enumerate(items):
                 for offset in items[i].offsets:
-                    input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
+                    # Clamp like tensor slicing did, so the length never changes.
+                    start, end = max(offset[0], 0), min(offset[1] + 1, seq_len)
+                    if end > start:
+                        ret_input_ids[start:end] = [item.pad_value] * (end - start)
 
-        ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
+
+
+def _pad_multimodal_tokens_array(
+    input_ids: array, mm_inputs: MultimodalInputs
+) -> array:
+    """Same result as the tensor path, written into a copy of the int64 array.
+
+    The tensor path converts the whole prompt to a tensor and back to a Python
+    list; on a ~100k-token prompt that is ~20ms on the scheduler thread.
+    """
+    token_id_map = {
+        Modality.IMAGE: mm_inputs.im_token_id,
+        Modality.AUDIO: mm_inputs.audio_token_id,
+        Modality.VIDEO: mm_inputs.video_token_id,
+    }
+    padded = array(input_ids.typecode, input_ids)
+    for item in mm_inputs.mm_items:
+        if token_id_map.get(item.modality) is None:
+            continue
+        for start, end in item.offsets:
+            end = min(end + 1, len(padded))
+            if start < end:
+                padded[start:end] = array(padded.typecode, [item.pad_value]) * (
+                    end - start
+                )
+    return padded
 
 
 # masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus
@@ -468,6 +507,7 @@ def embed_mm_inputs(
                 prefix_length=extend_prefix_lens,
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
+                embedding_dtype=input_embedding.weight.dtype,
             )
 
             if use_deepstack.get(modality, None) and embedding is not None:
@@ -623,6 +663,88 @@ def _embed_mm_inputs_with_split(
             offset += req_len
 
     return input_embeds, other_info
+
+
+def embed_mm_inputs_split_tp0_only(
+    mm_inputs_list: List[MultimodalInputs],
+    extend_prefix_lens: List[int],
+    extend_seq_lens: List[int],
+    input_ids: torch.Tensor,
+    input_embedding: nn.Embedding,
+    multimodal_model: nn.Module = None,
+):
+    """Embed tp0-only EPD requests apart from the rest of the batch.
+
+    ``get_embedding_and_mask`` sends every item of a modality down the
+    rank-0 broadcast path once any item is tp0-only, so a request without
+    pulled rows (e.g. one encoded locally because it carried no
+    task_results) would make only rank 0 fail while the other ranks wait in
+    the broadcast forever. The split key is the ``tp0_only_embedding`` flag,
+    which every rank sets from the same descriptors, so all ranks pick the
+    same groups and issue the same collectives.
+
+    ``mm_inputs_list`` must be aligned 1:1 with the requests laid out in
+    ``input_ids`` (use an empty ``MultimodalInputs`` for text-only requests).
+    """
+    tp0_only_req_indices = []
+    other_req_indices = []
+    other_has_mm = False
+    for idx, mm_input in enumerate(mm_inputs_list):
+        items = [item for item in mm_input.mm_items if item is not None]
+        if any(item.tp0_only_embedding for item in items):
+            tp0_only_req_indices.append(idx)
+        else:
+            other_req_indices.append(idx)
+            other_has_mm = other_has_mm or bool(items)
+
+    embed_kwargs = dict(
+        input_embedding=input_embedding,
+        multimodal_model=multimodal_model,
+    )
+    # Text-only requests never reach the broadcast, so they need no split.
+    if not tp0_only_req_indices or not other_has_mm:
+        return embed_mm_inputs(
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=input_ids,
+            **embed_kwargs,
+        )
+
+    token_starts = []
+    cumulative = 0
+    for seq_len in extend_seq_lens:
+        token_starts.append(cumulative)
+        cumulative += seq_len
+
+    input_embeds = None
+    for group_req_indices in [tp0_only_req_indices, other_req_indices]:
+        sub_input_ids = torch.cat(
+            [
+                input_ids[token_starts[i] : token_starts[i] + extend_seq_lens[i]]
+                for i in group_req_indices
+            ]
+        )
+        sub_embeds, _ = embed_mm_inputs(
+            mm_inputs_list=[mm_inputs_list[i] for i in group_req_indices],
+            extend_prefix_lens=[extend_prefix_lens[i] for i in group_req_indices],
+            extend_seq_lens=[extend_seq_lens[i] for i in group_req_indices],
+            input_ids=sub_input_ids,
+            **embed_kwargs,
+        )
+        if input_embeds is None:
+            input_embeds = sub_embeds.new_empty(
+                (input_ids.shape[0], sub_embeds.shape[-1])
+            )
+        offset = 0
+        for i in group_req_indices:
+            start, seq_len = token_starts[i], extend_seq_lens[i]
+            input_embeds[start : start + seq_len] = sub_embeds[
+                offset : offset + seq_len
+            ]
+            offset += seq_len
+
+    return input_embeds, {}
 
 
 def general_mm_embed_routine(

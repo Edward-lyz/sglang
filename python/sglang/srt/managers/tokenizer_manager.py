@@ -200,6 +200,42 @@ def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
         )
 
 
+def _is_external_epd_request(request_obj) -> bool:
+    """True when the caller already had the media encoded elsewhere.
+
+    The field is optional by design: a request without ``task_results`` must
+    keep using the normal local multimodal path, including on non-EPD
+    deployments.
+    """
+    return bool(getattr(request_obj, "task_results", None))
+
+
+def _drop_unusable_task_results(request_obj) -> None:
+    """Encode locally when the encoder pool's task_results cannot be pulled.
+
+    The OpenAI layer already does this for chat requests; this covers callers
+    that hand task_results straight to /generate. A failed or malformed
+    payload is treated like a missing one, on prefill and decode alike, so
+    both lay the prompt out from the local mm processor.
+    """
+    task_results = getattr(request_obj, "task_results", None)
+    if not task_results or not envs.SGLANG_EPD_LOCAL_FALLBACK.get():
+        return
+    from sglang.srt.disaggregation.encoder.internal_protocol import (
+        unusable_task_results_reason,
+    )
+
+    reason = unusable_task_results_reason(task_results)
+    if reason is not None:
+        logger.warning(
+            "rid=%s, EPD task_results unusable (%s); falling back to local "
+            "encoding",
+            getattr(request_obj, "rid", None),
+            reason,
+        )
+        request_obj.task_results = None
+
+
 @lru_cache(maxsize=1)
 def _ragged_verify_cap_accept() -> bool:
     # The mode env is fixed at server launch; cache to keep it off the
@@ -1055,7 +1091,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else (input_text or input_ids)
             )
 
-            if (
+            _drop_unusable_task_results(obj)
+            if self._epd_decode_expands_from_task_results(obj):
+                # EPD decode node: no vision tower, must not download the image.
+                # Rebuild origin_input_ids length from the encoder task_results so
+                # it matches the prefill node for KV/state transfer; carry no
+                # embedding (mm_inputs stays None).
+                input_ids = self._expand_decode_input_ids_from_task_results(
+                    input_ids, obj.task_results
+                )
+            elif _is_external_epd_request(obj):
+                # The media was encoded by an external encoder pool. Receiving
+                # the embedding is the scheduler's job for the transports that
+                # land on scheduler ranks, and re-running the local vision
+                # tower here would silently duplicate the encode.
+                mm_inputs = await self._receive_external_epd_mm_inputs(
+                    obj, mm_processor_input
+                )
+            elif (
                 not get_disagg().language_only
                 or get_disagg().encoder_transfer_backend == "zmq_to_tokenizer"
             ):
@@ -1148,6 +1201,137 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+
+    def _epd_decode_expands_from_task_results(self, obj) -> bool:
+        """A decode EPD node that must rebuild placeholders from task_results.
+
+        The decode server has no vision tower and never downloads the image, so
+        it opts in via --require-encoder-task-results and reconstructs the
+        placeholder span length from the encoder task_results attached to the
+        request.
+        """
+        return (
+            get_disagg().disaggregation_mode == "decode"
+            and get_disagg().require_encoder_task_results
+            and bool(getattr(obj, "task_results", None))
+        )
+
+    def _expand_decode_input_ids_from_task_results(self, input_ids, task_results):
+        """Expand image placeholders on an EPD decode node from task_results.
+
+        A decode node only needs origin_input_ids at the correct length so its
+        KV/state transfer indices line up with the prefill node; it must not
+        download the image or run the encoder. DeepSeek-V4.1 bakes the image
+        delimiters into the encoder embedding, so each task_result descriptor's
+        ``embedding_len`` is exactly the number of tokens that image's
+        placeholder expands to. Replace each image placeholder token with that
+        many placeholder tokens. Returns input_ids unchanged when there is
+        nothing to expand.
+        """
+        if not task_results or input_ids is None:
+            return input_ids
+        media_token_id = getattr(self.mm_processor, "image_token_id", None)
+        if media_token_id is None:
+            return input_ids
+
+        from sglang.srt.disaggregation.encoder.internal_protocol import (
+            task_results_to_descriptors,
+        )
+
+        descriptors = task_results_to_descriptors(task_results)
+        span_lengths = getattr(self.mm_processor, "span_lengths", None)
+        token_counts = []
+        for d in descriptors:
+            grids = d.get("img_grid_thw")
+            if span_lengths is not None and grids is not None and len(grids) > 1:
+                # A frame-sampled video: one placeholder (and span) per frame.
+                spans = span_lengths(grids)
+                if sum(spans) != int(d["embedding_len"]):
+                    raise ValueError(
+                        f"frame spans {sum(spans)} != embedding_len "
+                        f"{d['embedding_len']} for task {d.get('task_id')}"
+                    )
+                token_counts.extend(spans)
+            else:
+                token_counts.append(int(d["embedding_len"]))
+        if not token_counts:
+            return input_ids
+
+        expanded, index = [], 0
+        for tok in input_ids:
+            if tok == media_token_id:
+                if index >= len(token_counts):
+                    raise ValueError(
+                        "more image placeholders than encoder task_results"
+                    )
+                expanded.extend([media_token_id] * token_counts[index])
+                index += 1
+            else:
+                expanded.append(tok)
+        if index != len(token_counts):
+            raise ValueError(
+                f"{index} image placeholders for {len(token_counts)} task_results"
+            )
+        logger.info(
+            "[EPD] decode expanded input_ids via task_results embedding_len: "
+            "%d -> %d tokens (%d images)",
+            len(input_ids),
+            len(expanded),
+            len(token_counts),
+        )
+        return expanded
+
+    async def _receive_external_epd_mm_inputs(self, obj, mm_processor_input):
+        """Consume encoder results produced by an external encoder pool.
+
+        ``zmq_to_tokenizer`` lands the embedding on this process, so it is
+        received here. The scheduler-side transports keep the receive on the
+        rank that owns the landing buffer; this method only marks the request
+        so the scheduler creates the waiting entry.
+        """
+        from sglang.srt.disaggregation.encoder.internal_protocol import (
+            task_results_to_descriptors,
+        )
+
+        try:
+            descriptors = task_results_to_descriptors(obj.task_results)
+        except ValueError as e:
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST, detail=f"Invalid task_results: {e}"
+            )
+
+        backend = get_disagg().encoder_transfer_backend
+        if backend == "zmq_to_tokenizer":
+            mm_inputs = await self.mm_receiver.recv_mm_data(
+                request_obj=obj,
+                mm_processor=self.mm_processor,
+                prompt=mm_processor_input,
+                need_wait_for_mm_inputs=True,
+            )
+            if mm_inputs is None:
+                raise fastapi.HTTPException(
+                    status_code=HTTPStatus.BAD_GATEWAY,
+                    detail=(
+                        "task_results were supplied but the encoder embedding "
+                        "could not be received."
+                    ),
+                )
+            return mm_inputs
+
+        if backend not in ("zmq_to_scheduler", "mooncake"):
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=(
+                    "task_results require an EPD encoder transfer backend; "
+                    f"got {backend!r}."
+                ),
+            )
+        # The scheduler receives from the descriptor's transport.
+        obj.need_wait_for_mm_inputs = True
+        obj.encoder_urls = [
+            f"http://{d['ip']}:{d['http_port']}" for d in descriptors
+        ]
+        return None
 
     @staticmethod
     def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
@@ -1467,6 +1651,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
+                task_results=obj.task_results,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 encoder_urls=obj.encoder_urls,
             )

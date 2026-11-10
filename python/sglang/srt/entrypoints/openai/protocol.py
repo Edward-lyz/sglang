@@ -845,6 +845,8 @@ def _has_message_level_tools(messages: Any) -> bool:
 
 
 class ChatCompletionRequest(BaseModel):
+    """OpenAI chat completion request, plus SGLang and EPD extensions."""
+
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -966,6 +968,14 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
+    # For EPD disaggregation with an external encoder pool: results already
+    # produced by the encoder, carrying the transport descriptor used to
+    # receive each embedding part. None for any non-EPD request.
+    task_results: Optional[List[Dict[str, Any]]] = None
+    # Set by the external orchestrator when the request is multimodal but its
+    # media was encoded outside this server.
+    is_mm_request: Optional[bool] = None
+
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
@@ -986,6 +996,54 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_mm_request(cls, values):
+        """A multi-modal request must carry IC's task_results, and only it may.
+
+        Ported from aiak_sglang CR 122338811 (luno-4734): fail fast at the
+        OpenAI layer with a clear 400 instead of deep in the pipeline. An empty
+        list counts as missing: IC resolves every media item or none.
+
+        With SGLANG_EPD_LOCAL_FALLBACK (default on), task_results that are
+        missing, empty, failed or malformed are dropped and the media is
+        encoded locally instead of returning 400.
+        """
+        if not isinstance(values, dict):
+            return values
+
+        is_mm_request = values.get("is_mm_request")
+        task_results = values.get("task_results")
+        detail = None
+        if is_mm_request is False and task_results:
+            detail = "task_results is only accepted when is_mm_request is true"
+        elif is_mm_request or task_results:
+            from sglang.srt.disaggregation.encoder.internal_protocol import (
+                unusable_task_results_reason,
+            )
+            from sglang.srt.environ import envs
+
+            reason = unusable_task_results_reason(task_results)
+            if reason is not None and envs.SGLANG_EPD_LOCAL_FALLBACK.get():
+                # The decision depends only on the payload, so P and D agree
+                # and both lay the prompt out from the local mm processor.
+                logger.warning(
+                    "rid=%s, EPD task_results unusable (%s); falling back to "
+                    "local encoding",
+                    values.get("rid"),
+                    reason,
+                )
+                values["task_results"] = None
+            elif is_mm_request and not task_results:
+                detail = "Multi-modal request requires task_results parameter from IC"
+
+        if detail is not None:
+            logger.error(
+                "rid=%s, status_code=400, error: %s", values.get("rid"), detail
+            )
+            raise ValueError(detail)
+        return values
 
     @model_validator(mode="before")
     @classmethod

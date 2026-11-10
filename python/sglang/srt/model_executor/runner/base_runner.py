@@ -129,6 +129,12 @@ def _allocate_decode_buffers(
             pp_proxy_tensors = {
                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
+            if is_mhc:
+                # See runner_utils.buffers._allocate_pp_proxy_tensors.
+                pp_proxy_tensors["hc_prev_pre"] = torch.zeros(
+                    (max_num_token, hc_hidden_size // hidden_size),
+                    dtype=torch.float32,
+                )
             if not is_mhc:
                 # Only Kimi K3 supplies num_blocks: its PP bank is token-major
                 # [T, blocks, H]. Other models keep the legacy [max_bs, H].

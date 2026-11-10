@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -69,6 +70,182 @@ def get_embedding_chunk(
     embedding = embedding.reshape(-1, embedding.shape[-1])
     embedding_chunk = embedding[start_index:end_index]
     return embedding_chunk, start_index, end_index
+
+
+def _chunk_row_range(
+    extend_prefix_len: int,
+    extend_seq_len: int,
+    items_offset: List[Tuple[int, int]],
+) -> Tuple[int, int]:
+    """Row range get_embedding_chunk would slice, without needing the tensor.
+
+    A rank that never received the embedding still has to agree with rank 0 on
+    how many rows this chunk covers, and the offsets it derives that from are
+    plain CPU metadata that is identical on every rank.
+    """
+    start_index, end_index = 0, 0
+    extend_start_index = extend_prefix_len
+    extend_end_index = extend_prefix_len + extend_seq_len - 1
+
+    for start, end in items_offset:
+        if extend_start_index >= start and extend_start_index <= end:
+            start_index += extend_start_index - start
+        elif extend_start_index > end:
+            start_index += end - start + 1
+
+        if extend_end_index >= start and extend_end_index <= end:
+            end_index += extend_end_index - start + 1
+        elif extend_end_index > end:
+            end_index += end - start + 1
+    return start_index, end_index
+
+
+def tp0_only_broadcast_group():
+    """The group one EPD pull is shared across, as ``(group, rank_in_group)``.
+
+    The receiver and the forward broadcast must split ranks the same way, so
+    both ask here. Attention TP ranks broadcast over attn-tp. With attention
+    CP alone (e.g. --enable-prefill-cp, attn_tp_size 1) every CP rank embeds
+    the whole prompt before the sequence is split, so one CP rank pulls and the
+    rows go out over attn-cp. None means there is nobody to share with.
+    """
+    parallel = get_parallel()
+    if parallel.attn_tp_size > 1:
+        return parallel.attn_tp_group, parallel.attn_tp_rank
+    if parallel.attn_cp_size > 1:
+        return parallel.attn_cp_group, parallel.attn_cp_rank
+    return None
+
+
+def copy_item_rows(
+    destination: torch.Tensor,
+    items: List[MultimodalDataItem],
+    start_index: int,
+    end_index: int,
+    hidden_dim: int,
+) -> int:
+    """Copy rows ``[start_index, end_index)`` of ``items`` into ``destination``.
+
+    Each item's embedding is already a pinned host tensor, so copying item by
+    item keeps every H2D a DMA. Concatenating first would build a pageable
+    buffer and copy every row twice -- once on the host, once to the device.
+    Returns the number of rows written.
+    """
+    written = 0
+    row_cursor = 0
+    for item in items:
+        rows = item.precomputed_embeddings.reshape(-1, hidden_dim)
+        item_rows = rows.shape[0]
+        begin = max(start_index, row_cursor)
+        finish = min(end_index, row_cursor + item_rows)
+        if finish > begin:
+            destination[written : written + (finish - begin)].copy_(
+                rows[begin - row_cursor : finish - row_cursor], non_blocking=True
+            )
+            written += finish - begin
+        row_cursor += item_rows
+        if row_cursor >= end_index:
+            break
+    return written
+
+
+def _broadcast_precomputed_embedding(
+    items: List[MultimodalDataItem],
+    items_size: List[int],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Copy this chunk's rows on the pulling rank and broadcast them.
+
+    Only rank 0 of ``tp0_only_broadcast_group()`` pulled the embedding from the
+    encoder. The other ranks receive the rows straight into device memory and
+    never allocate a landing buffer.
+
+    Deadlock safety: the row count comes from CPU metadata that is already
+    identical on every rank -- never from a device-side reduction -- so all
+    ranks agree on the broadcast shape and on skipping it entirely.
+    """
+    group, group_rank = tp0_only_broadcast_group()
+
+    chunks = []
+    max_iterations = min(len(items_size) - 1, len(prefix_length))
+    for i in range(max_iterations):
+        if items_size[i] == items_size[i + 1]:
+            continue
+        items_per_req = items[items_size[i] : items_size[i + 1]]
+        extend_len = extend_length[i] if i < len(extend_length) else 0
+        start_index, end_index = _chunk_row_range(
+            prefix_length[i], extend_len, items_offset_list[i]
+        )
+        chunks.append((items_per_req, start_index, end_index))
+
+    num_rows = sum(end - start for _, start, end in chunks)
+    hidden_dim = _tp0_only_hidden_dim(items)
+    mm_embedding = torch.empty((num_rows, hidden_dim), dtype=dtype, device=device)
+    if num_rows == 0:
+        # Same decision on every rank: skip the broadcast entirely.
+        return mm_embedding
+
+    if group_rank == 0:
+        direct = envs.SGLANG_OPT_MM_EMBED_DIRECT_H2D.get()
+        offset = 0
+        for items_per_req, start_index, end_index in chunks:
+            num_copy_rows = end_index - start_index
+            if direct:
+                written = copy_item_rows(
+                    mm_embedding[offset : offset + num_copy_rows],
+                    items_per_req,
+                    start_index,
+                    end_index,
+                    hidden_dim,
+                )
+                # Same failure as the concat-then-slice copy, instead of
+                # broadcasting rows of an uninitialised buffer when the item
+                # metadata is short.
+                if written != num_copy_rows:
+                    raise RuntimeError(
+                        f"mm embedding rows [{start_index}, {end_index}) exceed "
+                        f"the {written} rows the items hold"
+                    )
+            else:
+                src = torch.concat(
+                    [item.precomputed_embeddings for item in items_per_req]
+                ).reshape(-1, hidden_dim)
+                mm_embedding[offset : offset + num_copy_rows].copy_(
+                    src[start_index:end_index], non_blocking=True
+                )
+            offset += num_copy_rows
+        if direct:
+            # The direct copies read the pinned landing pool asynchronously; the
+            # pool pages must not be handed to a new pull before they ran
+            # (MultimodalInputs.release_pool_buffers waits on this event).
+            done = torch.cuda.Event()
+            done.record()
+            for items_per_req, _, _ in chunks:
+                for item in items_per_req:
+                    item.h2d_done_event = done
+
+    group.broadcast(mm_embedding, src=0)
+    return mm_embedding
+
+
+def _tp0_only_hidden_dim(items: List[MultimodalDataItem]) -> int:
+    """Hidden size announced for a tp0-only chunk.
+
+    Every rank needs this before the broadcast, so it is read from the
+    metadata each rank already has rather than from the rows themselves.
+    """
+    for item in items:
+        dim = item.model_specific_data.get("embedding_dim")
+        if dim:
+            return int(dim)
+    raise ValueError(
+        "tp0-only EPD items must carry embedding_dim; a metadata-only rank "
+        "cannot infer the broadcast shape"
+    )
 
 
 def _get_precomputed_embedding(
@@ -701,6 +878,7 @@ def get_embedding_and_mask(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    embedding_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
     """
     Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
@@ -729,9 +907,22 @@ def get_embedding_and_mask(
     )
 
     # 1. Get embedding
-    embedding = _get_precomputed_embedding(
-        embedding_items, items_size, prefix_length, extend_length, items_offset_list
-    )
+    if any(item.tp0_only_embedding for item in embedding_items):
+        # Rank 0 received the rows for the whole attn-tp group; everyone else
+        # only has the metadata needed to agree on the broadcast shape.
+        embedding = _broadcast_precomputed_embedding(
+            embedding_items,
+            items_size,
+            prefix_length,
+            extend_length,
+            items_offset_list,
+            dtype=embedding_dtype or torch.get_default_dtype(),
+            device=input_ids.device,
+        )
+    else:
+        embedding = _get_precomputed_embedding(
+            embedding_items, items_size, prefix_length, extend_length, items_offset_list
+        )
     if embedding is None:
         embedding, input_ids = _get_chunked_prefill_embedding(
             data_embedding_func,

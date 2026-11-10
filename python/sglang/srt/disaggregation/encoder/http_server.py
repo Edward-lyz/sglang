@@ -20,7 +20,7 @@ from typing import Annotated, List, Optional
 import requests as http_requests
 import uvicorn
 import zmq
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, Request
 from fastapi.responses import ORJSONResponse, Response
 
 import sglang.srt.disaggregation.encoder.server as server_module
@@ -93,11 +93,47 @@ async def _lifespan(app: FastAPI):
         return
     if local_runtime is not None:
         local_runtime.start()
+    factory_tasks = _maybe_start_factory_pull(local_runtime)
     try:
         yield
     finally:
+        for task in factory_tasks:
+            task.cancel()
         if local_runtime is not None:
             await local_runtime.stop()
+
+
+def _maybe_start_factory_pull(runtime):
+    """Start the 厂内 producer loops when --vit-server-url is configured.
+
+    Rank 0 polls the vit-server (EncodeWorkflow) and serves pulls (PullZmqServer)
+    so prefill can fetch each embedding it advertised via task_results. A no-op
+    for the community push path (no vit_server_url), leaving New EPD untouched.
+    """
+    if runtime is None or not get_disagg().vit_server_url:
+        return []
+    encoder = runtime.encoder
+    if encoder is None or getattr(encoder, "rank", 0) != 0:
+        return []
+
+    from sglang.srt.disaggregation.encode_workflow import EncodeWorkflow
+    from sglang.srt.disaggregation.encoder.pull_zmq_server import PullZmqServer
+
+    tasks = []
+    workflow = EncodeWorkflow(encoder)
+    encoder.encode_workflow = workflow
+    encoder.init_task_hold_pool()
+    tasks.append(asyncio.create_task(workflow.poll_forever()))
+    if encoder.pull_zmq_port:
+        pull_server = PullZmqServer(encoder, encoder.context, encoder.pull_zmq_port)
+        tasks.append(asyncio.create_task(pull_server.run()))
+    logger.info(
+        "Factory EPD producer started: vit_server_url=%s pull_zmq_port=%s",
+        get_disagg().vit_server_url,
+        encoder.pull_zmq_port,
+    )
+    return tasks
+
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -378,6 +414,130 @@ async def handle_encode_request(request: dict):
         )
 
 
+@app.post("/epd/transfer")
+async def handle_epd_transfer_request(request: dict):
+    """Factory (厂内) mooncake pull: RDMA-write a held embedding to prefill.
+
+    Prefill POSTs its own ``session_id``/``buffer_address``; the encoder writes
+    the rows it is holding for ``task_id`` there and acks. Wire-compatible with
+    ``factory_transport.build_epd_transfer_payload`` / ``epd_transfer_error``.
+    """
+    task_id = request.get("task_id")
+    req_id = request.get("req_id")
+    ack = {"req_id": req_id, "task_id": task_id, "part_idx": request.get("part_idx", 0)}
+    if encoder is None:
+        return ORJSONResponse(
+            status_code=int(HTTPStatus.SERVICE_UNAVAILABLE),
+            content={**ack, "status_code": 503, "message": "encoder not ready"},
+        )
+    session_id = request.get("session_id")
+    buffer_address = request.get("buffer_address")
+    byte_size = request.get("byte_size", 0)
+    if not session_id or buffer_address is None:
+        return ORJSONResponse(
+            status_code=int(HTTPStatus.BAD_REQUEST),
+            content={
+                **ack,
+                "status_code": 400,
+                "message": "session_id and buffer_address are required",
+            },
+        )
+    from sglang.srt.disaggregation.encode_health import (
+        record_transfer_attempt,
+        record_transfer_success,
+    )
+
+    # Tracked per prefill session: one dead peer must not mark the whole
+    # encoder unhealthy, but every peer failing points at local RDMA.
+    record_transfer_attempt(session_id)
+    try:
+        transfer_ms, digest = await encoder.transfer_task_embedding(
+            task_id, session_id, buffer_address, byte_size
+        )
+        record_transfer_success(session_id)
+        return ORJSONResponse(
+            content={
+                **ack,
+                "status_code": 200,
+                "message": "success",
+                "transfer_cost_ms": round(transfer_ms, 3),
+                "embed_digest": digest,
+            }
+        )
+    except MMError as e:
+        if int(e.code) in (int(HTTPStatus.NOT_FOUND), int(HTTPStatus.BAD_REQUEST)):
+            # Expired hold or a bad descriptor; the transfer path itself is fine.
+            record_transfer_success(session_id)
+        return ORJSONResponse(
+            status_code=int(e.code),
+            content={**ack, "status_code": int(e.code), "message": str(e)},
+        )
+    except Exception as e:
+        logger.error(
+            f"/epd/transfer failed req_id={req_id} task_id={task_id}: {e}",
+            exc_info=True,
+        )
+        return ORJSONResponse(
+            status_code=int(HTTPStatus.INTERNAL_SERVER_ERROR),
+            content={**ack, "status_code": 500, "message": f"transfer failed: {e}"},
+        )
+
+
+@app.get("/health/simple")
+async def health_simple():
+    """Liveness only: 200 once the encoder is initialized."""
+    if encoder is None and dp_dispatcher is None:
+        return Response(status_code=503)
+    return Response(status_code=200)
+
+
+@app.get("/health/transfer")
+async def health_transfer():
+    """Per-prefill-session embedding transfer health (factory mooncake pulls)."""
+    from sglang.srt.disaggregation.encode_health import transfer_health_state
+
+    return ORJSONResponse(
+        content={
+            "healthy": transfer_health_state.is_healthy(),
+            "unhealthy_sessions": transfer_health_state.unhealthy_sessions(),
+            "sessions": transfer_health_state.snapshot(),
+        }
+    )
+
+
+@app.post("/flush_cache")
+async def flush_cache():
+    """Drop unreferenced factory embedding holds; report what was freed."""
+    if encoder is None:
+        return ORJSONResponse(
+            status_code=int(HTTPStatus.SERVICE_UNAVAILABLE),
+            content={"error": "encoder not ready"},
+        )
+    return ORJSONResponse(content=await encoder.flush_task_embeddings())
+
+
+@app.api_route("/list_vit_caches", methods=["GET", "POST"])
+async def handle_list_vit_caches():
+    """Introspect the factory embedding hold cache (debugging / ops).
+
+    Returns the embeddings this encoder is currently holding for pull, plus the
+    cache byte usage vs its LRU cap.
+    """
+    if encoder is None:
+        return ORJSONResponse(
+            status_code=int(HTTPStatus.SERVICE_UNAVAILABLE),
+            content={"status": "error", "message": "encoder not ready"},
+        )
+    try:
+        return ORJSONResponse(content=await encoder.list_held_embeddings())
+    except Exception as e:
+        logger.error("/list_vit_caches failed: %s", e, exc_info=True)
+        return ORJSONResponse(
+            status_code=int(HTTPStatus.INTERNAL_SERVER_ERROR),
+            content={"status": "error", "message": str(e)},
+        )
+
+
 @app.post("/send")
 async def handle_send_request(request: dict):
     """Mooncake-only: drive the RDMA push of a staged embedding. The zmq
@@ -540,9 +700,44 @@ async def handle_scheduler_receive_url_request(request: dict):
     return ORJSONResponse(content=None)
 
 
+def _factory_health_gate(path: str) -> Optional[Response]:
+    """Factory (厂内) producer checks that K3's health endpoint performed.
+
+    Returns a response to short-circuit the probe, or None to continue:
+      - ``/ready`` with the preStop drain flag set: stop fetching new tasks and
+        keep answering 200 so in-flight tasks finish and prefill can still pull.
+      - every mooncake pull to this encoder failing for too long: 503, so the
+        platform restarts an encoder whose RDMA path is broken.
+      - the vit-server polling loop died: 503.
+    """
+    from sglang.srt.disaggregation.encode_health import transfer_health_state
+    from sglang.srt.entrypoints.http_server import stopped_by_external
+
+    workflow = getattr(encoder, "encode_workflow", None)
+    if workflow is None:
+        return None
+    if path.rstrip("/") == "/ready" and stopped_by_external():
+        if not workflow.stopped:
+            logger.warning("Stop signal received: draining, no new vit-server tasks")
+            workflow.graceful_stop()
+        return Response(content="Encoder is shutting down", status_code=200)
+    if not transfer_health_state.is_healthy():
+        logger.error(
+            "Health check failed: embedding transfer unhealthy, sessions=%s",
+            transfer_health_state.unhealthy_sessions(),
+        )
+        return Response(status_code=503)
+    if not workflow.is_alive and not workflow.stopped:
+        logger.error("Health check failed: vit-server polling loop is not alive")
+        return Response(status_code=503)
+    return None
+
+
 @app.get("/health")
+@app.get("/health_forward")
+@app.get("/ready")
 @app.get("/health_generate")
-async def health_generate():
+async def health_generate(request: Request = None):
     """
     Health check endpoint for the encoder server.
     Performs a dummy encode to verify the encoder is functional.
@@ -568,6 +763,9 @@ async def health_generate():
         return Response(status_code=200)
     if encoder is None:
         return Response(status_code=503)
+    gated = _factory_health_gate(request.url.path if request is not None else "")
+    if gated is not None:
+        return gated
 
     # Pick the first available modality for the dummy encode
     if encoder.supports_modality(Modality.IMAGE):

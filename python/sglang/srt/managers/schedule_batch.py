@@ -56,6 +56,7 @@ import dataclasses
 import logging
 import re
 import sys
+import weakref
 from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -356,6 +357,18 @@ class MultimodalInputFormat(Enum):
 MultimodalDataValue: TypeAlias = object
 
 
+class _EventDone:
+    """``done()`` over a CUDA event, for the EPD deferred pool release."""
+
+    def __init__(self, event):
+        """Wrap a recorded ``torch.cuda.Event``."""
+        self.event = event
+
+    def done(self) -> bool:
+        """Whether the GPU work before the event has completed."""
+        return self.event.query()
+
+
 class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=True):
     """
     One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
@@ -380,6 +393,11 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     precomputed_embeddings: Optional[MultimodalDataValue] = None
     # Keep precomputed_embeddings on GPU after use (EPD pool/GPU receive path)
     keep_device_embedding: bool = False
+    # EPD with SGLANG_ENCODER_TP0_ONLY_RECEIVE: only attn-tp rank 0 holds
+    # precomputed_embeddings, and the other ranks get the rows through a
+    # broadcast inside the forward pass. Set identically on every rank so they
+    # agree on whether to broadcast.
+    tp0_only_embedding: bool = False
 
     # Processor-owned tensors/arrays/scalars/transports. msgspec rejects a
     # precise union with multiple custom types, but accepts Ext-decoded values
@@ -686,6 +704,57 @@ class MultimodalInputs:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
+    # EPD: pinned-pool addresses backing zero-copy precomputed-embedding views
+    # on the rank that pulled them. See release_pool_buffers().
+    pool_buffer_addrs: Optional[List[int]] = None
+    # GC backstop that returns the regions if release_pool_buffers never runs.
+    pool_release_finalizer: Optional[Any] = None
+
+    def release_pool_buffers(self):
+        """Return pinned-pool pages once prefill has consumed the embeddings.
+
+        The rows are a zero-copy view into the pool, so they cannot outlive the
+        pages; clearing the views here is what makes returning them safe.
+        Idempotent, and a no-op on a rank that never pulled.
+        """
+        addrs = self.pool_buffer_addrs
+        if not addrs:
+            return
+        self.pool_buffer_addrs = None
+        if self.pool_release_finalizer is not None:
+            # Released explicitly below; the backstop must not free it again.
+            self.pool_release_finalizer.detach()
+            self.pool_release_finalizer = None
+        pending = []
+        for item in self.mm_items:
+            item.precomputed_embeddings = None
+            event = getattr(item, "h2d_done_event", None)
+            if event is not None:
+                item.h2d_done_event = None
+                if not event.query():
+                    pending.append(_EventDone(event))
+
+        from sglang.srt.disaggregation.encoder.factory_transport import (
+            EmbeddingLandingPool,
+        )
+        from sglang.srt.disaggregation.encoder.receiver import (
+            _defer_pool_release,
+            drain_deferred_pool_releases,
+        )
+
+        pool = EmbeddingLandingPool.get_instance_if_exists()
+        if pool is None:
+            return
+        drain_deferred_pool_releases()
+        for address in addrs:
+            try:
+                # An async H2D copy of these rows may still be queued.
+                _defer_pool_release(pending, pool, address)
+            except Exception as error:
+                logger.warning(
+                    "release_pool_buffers: failed to free addr=%s: %s", address, error
+                )
+
     def release_features(self):
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
@@ -776,7 +845,32 @@ class MultimodalInputs:
             if val is not None:
                 setattr(mm_inputs, arg, val)
 
+        mm_inputs.take_pool_buffers_from(obj)
         return mm_inputs
+
+    def take_pool_buffers_from(self, obj) -> None:
+        """Move ownership of EPD landing-pool regions from ``obj`` to self.
+
+        The pulled rows in ``mm_items`` are views into the pinned landing pool.
+        The receiver bound the region to the processor output, whose GC
+        finalizer would return it to the pool as soon as that object is
+        dropped here -- while these items still read it, so the next pull
+        could overwrite this request's image rows with another request's.
+        """
+        addrs = getattr(obj, "pool_buffer_addrs", None)
+        if not addrs:
+            return
+        self.pool_buffer_addrs = addrs
+        obj.pool_buffer_addrs = None
+        finalizer = getattr(obj, "pool_release_finalizer", None)
+        obj.pool_release_finalizer = None
+        if finalizer is not None:
+            detached = finalizer.detach()
+            if detached is not None:
+                _, func, args, kwargs = detached
+                self.pool_release_finalizer = weakref.finalize(
+                    self, func, *args, **(kwargs or {})
+                )
 
     def contains_image_inputs(self) -> bool:
         return any(item.is_image() for item in self.mm_items)
@@ -2006,6 +2100,7 @@ class Req(ReqDllmMixin):
         # Session requests share historical multimodal inputs with their prior
         # request. The session owns and releases those features when it closes.
         if self.multimodal_inputs is not None and self.session is None:
+            self.multimodal_inputs.release_pool_buffers()
             self.multimodal_inputs.release_features()
         self.multimodal_inputs = None
         self.grammar = None
