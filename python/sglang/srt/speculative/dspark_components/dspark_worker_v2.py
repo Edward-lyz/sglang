@@ -23,6 +23,7 @@ from sglang.srt.speculative.draft_swa_pool import (
     DraftWindowSlotMap,
     compact_draft_pool_multiplier,
     compute_compact_draft_pool_slots,
+    upload_host_ints,
 )
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
@@ -963,6 +964,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     req_pool_indices_cpu=[int(req.req_pool_idx)],
                     committed_lens_cpu=[committed],
                     target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    return_count=False,
                 )
                 req_loc = cache_loc[compact_offset : compact_offset + keep_len]
                 slot_map.map_slots(
@@ -1032,6 +1034,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices_cpu=req_pool_indices,
             committed_lens_cpu=committed,
             target_req_to_token=target_req_to_token,
+            # The freed count is unused here, and reading it back would wait
+            # out the previous forward.
+            return_count=False,
         )
 
         # Batched window-tail mapping: ONE map_slots call per step. The former
@@ -1059,20 +1064,31 @@ class DSparkWorkerV2(BaseSpecWorker):
                 active_reqs.append(req_pool_idx)
         if starts:
             device_ = target_req_to_token.device
-            starts_t = torch.tensor(starts, dtype=torch.int64, device=device_)
-            lens_t = torch.tensor(
-                [e - s for s, e in zip(starts, ends)], dtype=torch.int64, device=device_
+            starts_t = upload_host_ints(starts, device=device_)
+            lens_t = upload_host_ints(
+                [e - s for s, e in zip(starts, ends)], device=device_
             )
             span = int(max(e - s for s, e in zip(starts, ends)))
             pos = torch.arange(span, dtype=torch.int64, device=device_)
             idx = starts_t.unsqueeze(1) + pos.unsqueeze(0)
             keep = pos.unsqueeze(0) < lens_t.unsqueeze(1)
-            reqs_t = torch.tensor(active_reqs, dtype=torch.int64, device=device_)
+            reqs_t = upload_host_ints(active_reqs, device=device_)
             gathered = target_req_to_token[reqs_t.unsqueeze(1), idx]
             # map_slots is idempotent per id, so one flattened call over every
             # request's [start, end) range is equivalent to the per-request
-            # calls it replaces.
-            slot_map.map_slots(gathered[keep])
+            # calls it replaces. Rows are ragged, but trimming with
+            # ``gathered[keep]`` would be a masked_select -- a host-device sync at
+            # the very top of the step, i.e. one that waits out the PREVIOUS
+            # forward. Pad to -1 instead: map_slots resolves -1 through the
+            # trailing sentinel and skips it.
+            #
+            # assert_capacity=False for the same reason: the check reads the free
+            # count back, which is exactly the sync this path exists to avoid.
+            # The overflow is latched on the device and raised by the next
+            # checked call (the next prefill's map_slots).
+            slot_map.map_slots(
+                torch.where(keep, gathered, -1).reshape(-1), assert_capacity=False
+            )
             slot_map.note_mapped_extents(active_reqs, ends)
 
     def release_draft_kv(self, *, req_pool_idx: int) -> None:
@@ -1088,6 +1104,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         slot_map.release_request(
             req_pool_idx=req_pool_idx,
             target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+            # Runs inside the scheduler's release path, on the same stream as the
+            # forward: the freed count is unused, so do not read it back.
+            return_count=False,
         )
 
     def _forward_decode(

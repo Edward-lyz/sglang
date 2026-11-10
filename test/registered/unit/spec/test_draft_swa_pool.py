@@ -242,6 +242,57 @@ class TestFailureModes(CustomTestCase):
         self.assertEqual(slot_map.num_free_slots, free_before)
 
 
+class TestSyncFreeBookkeeping(CustomTestCase):
+    """The map/free paths keep no host-side counts, so the invariants the old
+    ``torch.unique`` + readback chain got for free need pinning down."""
+
+    def test_free_stack_stays_a_permutation_of_the_draft_pages(self):
+        """Masked pushes must not duplicate, drop, or alias a draft page."""
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                slot_map, req_to_token = _make(page_size=page_size)
+                for r in range(_MAX_REQS):
+                    slot_map.map_slots(req_to_token[r, :12], req_pool_idx=r, end_pos=12)
+                    _run_decode(
+                        slot_map, req_to_token, req=r, start_pos=12, steps=20, accept=2
+                    )
+                    # No swa slot may be handed to two full ids at once.
+                    live = slot_map.full_to_swa[:-1]
+                    live = live[live > 0]
+                    self.assertEqual(int(live.numel()), int(live.unique().numel()))
+                for r in range(_MAX_REQS):
+                    slot_map.release_request(
+                        req_pool_idx=r, target_req_to_token=req_to_token
+                    )
+                self.assertTrue(
+                    torch.equal(
+                        slot_map._free_pages[: int(slot_map._free_top)].sort().values,
+                        torch.arange(1, slot_map.num_draft_pages),
+                    ),
+                    "free stack is no longer a permutation of the draft pages",
+                )
+
+    def test_duplicate_ids_are_freed_once(self):
+        """Dedup is by scatter race now; a repeated id must not double-push."""
+        slot_map, req_to_token = _make(page_size=4)
+        ids = req_to_token[0, :8]
+        free_before = slot_map.num_free_slots
+        slot_map.map_slots(ids.repeat(3), req_pool_idx=0, end_pos=8)
+        self.assertLess(slot_map.num_free_slots, free_before)
+        slot_map.free_slots(
+            torch.cat([ids, ids, torch.full((5,), -1, dtype=torch.int64)])
+        )
+        self.assertEqual(slot_map.num_free_slots, free_before)
+
+    def test_unchecked_exhaustion_raises_on_the_next_checked_call(self):
+        """assert_capacity=False cannot raise in place; the latch must not be lost."""
+        slot_map, req_to_token = _make(num_swa_slots=6)  # 5 usable
+        slot_map.map_slots(req_to_token[0, :5], assert_capacity=False)
+        slot_map.map_slots(req_to_token[1, :3], assert_capacity=False)
+        with self.assertRaises(RuntimeError):
+            slot_map.map_slots(req_to_token[2, :1], req_pool_idx=2, end_pos=1)
+
+
 class TestPagedGeometry(CustomTestCase):
     def test_paged_frontier_is_page_aligned_and_keeps_the_window(self):
         """With page_size > 1 the eviction frontier must land on a page boundary."""

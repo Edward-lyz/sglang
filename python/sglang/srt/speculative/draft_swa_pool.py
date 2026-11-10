@@ -36,6 +36,29 @@ out page-aligned draft ids: the free list is therefore a *page* list, and a full
 page is mapped to one draft page whose within-page offsets are reused verbatim.
 Slot 0 stays the unmapped sentinel, so the whole page 0 is reserved and ids are
 handed out from page 1 upward.
+
+Sync discipline
+---------------
+Every table here (including the free-page stack and its top) lives on the draft
+device, and no method reads any of it back on the hot path. Two idioms buy that:
+
+  * never compact. ``x[mask]``, ``torch.unique`` and ``mask.sum()`` all have a
+    data-dependent output, so the host must learn a count -- a D2H copy queued
+    behind the whole stream, i.e. one that waits out the PREVIOUS forward.
+    Instead the arrays keep their original length and everything that must not be
+    touched is parked on a *sink* index (a pad entry whose value is already the
+    value being written).
+  * dedup by racing, not by sorting. ``_first_occurrence`` picks one
+    representative per distinct page using scatter semantics.
+  * no Python scalars in the hot path. As the value of an indexed assignment a
+    scalar becomes a CPU 0-dim tensor that ATen copies to the device, and a
+    pageable H2D copy appends a cudaStreamSynchronize -- measured at 1.6ms,
+    because it waits out the queued forward. As a ``torch.where`` operand it
+    costs an extra fill_ kernel. The ``_c_*`` constants exist for both.
+
+The only readback left is ``_assert_capacity``, which the decode path opts out of
+(``assert_capacity=False``) and pays for by deferring the exhaustion raise to the
+next prefill.
 """
 
 from __future__ import annotations
@@ -68,12 +91,29 @@ def _synchronized(method):
     return wrapper
 
 
+def upload_host_ints(values, *, device) -> torch.Tensor:
+    """Upload a small host int list to ``device`` without stalling the host.
+
+    ``torch.tensor(values, device=cuda)`` takes the pageable-H2D path, which
+    appends a cudaStreamSynchronize: the host then blocks until everything already
+    queued drains, so a few-byte index upload ends up serializing the step behind
+    the previous forward (same idiom note as DSpark's prefill uploads). Staging
+    through pinned memory keeps the copy asynchronous; torch's caching host
+    allocator records the copy event, so the staging block is not recycled before
+    the copy lands.
+    """
+    device = torch.device(device)
+    host = torch.tensor(values, dtype=torch.int64, pin_memory=device.type == "cuda")
+    return host.to(device=device, non_blocking=True)
+
+
 class DraftWindowSlotMap:
     """Full (target-global) slot id -> draft-local SWA slot id, window-bounded.
 
-    Sync discipline: the mapping tables live on the draft device, so any host
-    branch on their contents is a D2H sync. Only counts required by the
-    host-managed free-page stack are read back.
+    Sync discipline: the mapping tables AND the free-page stack (top included)
+    live on the draft device, and neither ``map_slots`` nor ``free_slots`` reads
+    any of it back -- see the module docstring. Only ``_assert_capacity`` and the
+    count properties sync, and none of them is on the decode path.
     """
 
     def __init__(
@@ -116,21 +156,67 @@ class DraftWindowSlotMap:
             self.num_full_slots + self.page_size + 1, dtype=torch.int64, device=device
         )
         self.full_to_swa[-1] = -1
+        # Masked-write sinks. The last entry is the -1 sentinel; the one before it
+        # is a pad entry that is never a real full id and must stay 0, so writing
+        # 0 there is the no-op that replaces compaction.
+        self._sentinel_idx = self.full_to_swa.numel() - 1
+        self._zero_sink = self.full_to_swa.numel() - 2
 
         # full page -> draft page. 0 = unmapped. A full page's within-page slots
         # must all resolve to the SAME draft page, so page alignment survives the
-        # full -> swa translation.
+        # full -> swa translation. The trailing entry is this table's sink: it
+        # holds -1, so parked elements never look like they need a draft page and
+        # writing -1 back leaves it intact.
         self.num_full_pages = (self.num_full_slots + 2 * self.page_size) // self.page_size
+        self._poison_page = self.num_full_pages
         self.full_page_to_draft_page = torch.zeros(
-            self.num_full_pages, dtype=torch.int64, device=device
+            self.num_full_pages + 1, dtype=torch.int64, device=device
+        )
+        self.full_page_to_draft_page[self._poison_page] = -1
+        # Scratch for the sync-free dedup (see _first_occurrence). Lock-protected
+        # like the tables, and never read at an index it was not just written at,
+        # so it needs no clearing between calls.
+        self._page_claim = torch.zeros(
+            self.num_full_pages + 1, dtype=torch.int64, device=device
         )
 
         # Free draft pages as a stack. Page 0 is reserved; ids run from page 1.
+        # The top lives ON THE DEVICE so pop/push positions are computed with
+        # device ops -- that is what keeps map_slots/free_slots readback-free. One
+        # trailing slot is the push sink; a stack of at most num_draft_pages - 1
+        # entries never reaches it.
         self.num_draft_pages = self.num_swa_slots // self.page_size
-        self._free_pages = torch.arange(
+        self._free_pages = torch.zeros(
+            self.num_draft_pages + 1, dtype=torch.int64, device=device
+        )
+        self._free_pages[: self.num_draft_pages - 1] = torch.arange(
             1, self.num_draft_pages, dtype=torch.int64, device=device
         )
-        self._num_free_pages = int(self._free_pages.numel())
+        self._stack_sink = self.num_draft_pages
+        self._free_top = torch.full(
+            (), self.num_draft_pages - 1, dtype=torch.int64, device=device
+        )
+        # Sticky: set when a pop wanted more pages than the stack held. Read only
+        # by _assert_capacity, i.e. never on the decode path.
+        self._exhausted = torch.zeros((), dtype=torch.bool, device=device)
+
+        # Device-resident constants. Two reasons never to spell these as Python
+        # scalars in the hot path:
+        #   * as the VALUE of an indexed assignment, ATen builds a CPU 0-dim
+        #     tensor and copies it over -- a pageable H2D, which appends a
+        #     cudaStreamSynchronize and waits out the previous forward (measured:
+        #     1.6ms). Same trap ``upload_host_ints`` documents.
+        #   * as a ``torch.where`` operand, it materializes a 0-dim device tensor
+        #     with an extra fill_ kernel. No sync, but a launch per call.
+        def _const(value: int) -> torch.Tensor:
+            return torch.full((), value, dtype=torch.int64, device=device)
+
+        self._c_zero = _const(0)
+        self._c_minus_one = _const(-1)
+        self._c_zero_sink = _const(self._zero_sink)
+        self._c_sentinel = _const(self._sentinel_idx)
+        self._c_poison_page = _const(self._poison_page)
+        self._c_stack_sink = _const(self._stack_sink)
         # Within-page offsets, kept resident: free_slots builds a
         # [num_candidate_pages, page_size] index grid from it on every eviction.
         self._within_page = torch.arange(
@@ -152,8 +238,12 @@ class DraftWindowSlotMap:
 
     @property
     def num_free_slots(self) -> int:
-        """Number of free slots across all free pages."""
-        return self._num_free_pages * self.page_size
+        """Number of free slots across all free pages.
+
+        Reads the device-resident stack top, so this syncs -- diagnostics and
+        tests only, never the decode path.
+        """
+        return int(self._free_top) * self.page_size
 
     @property
     def num_live_slots(self) -> int:
@@ -192,26 +282,57 @@ class DraftWindowSlotMap:
         """Full ids -> swa ids. Unmapped ids come back as 0."""
         return self.full_to_swa[full_indices]
 
-    def _alloc_pages(self, num_pages: int) -> torch.Tensor:
-        if num_pages > self._num_free_pages:
-            raise RuntimeError(
-                f"Draft SWA slot pool exhausted: need {num_pages} pages, "
-                f"{self._num_free_pages} free of {self.num_draft_pages - 1}. "
-                f"Raise the draft pool size or lower --speculative-draft-window-size."
-            )
-        take = self._free_pages[self._num_free_pages - num_pages : self._num_free_pages]
-        self._num_free_pages -= num_pages
-        return take
+    def _first_occurrence(self, keys: torch.Tensor, sel: torch.Tensor) -> torch.Tensor:
+        """One True per distinct key among ``sel``, without a readback.
+
+        Deduping by compaction (``torch.unique``) forces a sync: its output size
+        is data-dependent. Instead every selected element races to claim its key
+        in a scratch table -- scatter semantics guarantee exactly ONE writer per
+        index survives -- and an element is the representative iff the surviving
+        writer is itself. Elements outside ``sel`` are parked on the poison key
+        and dropped, so they can never steal a real page's claim.
+        """
+        ids = torch.arange(keys.numel(), dtype=torch.int64, device=keys.device)
+        keys = torch.where(sel, keys, self._c_poison_page)
+        self._page_claim[keys] = ids
+        return sel & (self._page_claim[keys] == ids)
+
+    def _assert_capacity(self, num_new: torch.Tensor) -> None:
+        """Turn pool exhaustion into a raise. Costs one readback; not hot-path.
+
+        Called before any table is touched, so a raise leaves the map intact.
+        ``_exhausted`` carries over an overflow from an earlier
+        ``assert_capacity=False`` call, which had no way to raise at the time.
+        """
+        num_new, num_free, exhausted = (
+            torch.stack([num_new, self._free_top, self._exhausted.long()])
+            .cpu()
+            .tolist()
+        )
+        if not exhausted and num_new <= num_free:
+            return
+        latched = (
+            " (an earlier unchecked allocation already overflowed)" if exhausted else ""
+        )
+        raise RuntimeError(
+            f"Draft SWA slot pool exhausted: need {num_new} pages, "
+            f"{num_free} free of {self.num_draft_pages - 1}{latched}. "
+            f"Raise the draft pool size or lower --speculative-draft-window-size."
+        )
 
     @_synchronized
     def map_slots(
-        self, full_indices: torch.Tensor, *, req_pool_idx=None, end_pos=None
+        self,
+        full_indices: torch.Tensor,
+        *,
+        req_pool_idx=None,
+        end_pos=None,
+        assert_capacity: bool = True,
     ) -> torch.Tensor:
         """Assign a swa slot to each full id and return the swa ids.
 
         Idempotent per id: an already-mapped full id keeps its swa slot, so a
-        re-injected token does not leak. Raises when the pool is exhausted --
-        silently dropping a mapping would make the draft read slot 0.
+        re-injected token does not leak.
 
         The assigned swa id preserves the full id's within-page offset
         (``swa_id % page_size == full_id % page_size``), which the paged
@@ -221,46 +342,58 @@ class DraftWindowSlotMap:
         ``req_to_token`` row this call mapped, so ``release_request`` knows how far
         to sweep. Pass them for every per-request write (prefill and verify
         block); omitting them leaves the high-water mark untouched.
+
+        ``assert_capacity=False`` skips the exhaustion check, which is the one
+        readback in this path; the overflow is then latched on the device and
+        raised by the next checked call. Pass it on the decode path, where a sync
+        would wait out the previous forward.
         """
         if full_indices.numel() == 0:
             return full_indices.new_empty((0,), dtype=torch.int64)
-
         if req_pool_idx is not None and end_pos is not None:
             idx = int(req_pool_idx)
             self.mapped_high_water[idx] = max(
                 int(self.mapped_high_water[idx]), int(end_pos)
             )
 
-        full_indices = full_indices.to(dtype=torch.int64, device=self.full_to_swa.device)
-        current = self.full_to_swa[full_indices]
-        need_mask = current == 0
-
-        # need_full never contains -1: full_to_swa[-1] == -1, so a -1 full id is
-        # never in the `current == 0` set.
-        need_full = full_indices[need_mask]
-
-        if self.page_size == 1:
-            num_need = int(need_mask.sum())  # host count needed only by this branch
-            if num_need == 0:
-                return current
-            self.full_to_swa[need_full] = self._alloc_pages(num_need)
-            return self.full_to_swa[full_indices]
-
-        full_pages = need_full // self.page_size
-        offsets = need_full % self.page_size
-
-        # Reuse the draft page already assigned to a full page; allocate a new one
-        # only for never-mapped pages (unconditional: the old .any() guard was a sync).
-        assigned = self.full_page_to_draft_page[full_pages]
-        new_full_pages = torch.unique(full_pages[assigned == 0])
-        # The one unavoidable readback: _alloc_pages slices the host-side free
-        # stack, so it needs the page count as a Python int.
-        self.full_page_to_draft_page[new_full_pages] = self._alloc_pages(
-            int(new_full_pages.numel())
+        full_indices = full_indices.to(
+            dtype=torch.int64, device=self.full_to_swa.device
         )
+        # A -1 full id resolves through the trailing sentinel to -1, so it is
+        # never in the `== 0` set and never consumes a slot.
+        need = self.full_to_swa[full_indices] == 0
+        pages = torch.where(need, full_indices // self.page_size, self._c_poison_page)
+        # A full page already backed by a draft page keeps it (that is what
+        # makes within-page offsets survive translation); only never-mapped
+        # pages allocate, one per distinct page in this batch.
+        new_pages = self._first_occurrence(
+            pages, need & (self.full_page_to_draft_page[pages] == 0)
+        )
+        rank = torch.cumsum(new_pages, 0) - 1
+        num_new = new_pages.sum()
+        if assert_capacity:
+            self._assert_capacity(num_new)
+        else:
+            self._exhausted.logical_or_(num_new > self._free_top)
 
-        draft_pages = self.full_page_to_draft_page[full_pages]
-        self.full_to_swa[need_full] = draft_pages * self.page_size + offsets
+        # Pop num_new pages off the stack. The slice runs upward from the new
+        # top so ascending full pages get ascending draft pages, keeping
+        # contiguous full ids contiguous in the draft space.
+        take = self._free_pages[
+            (self._free_top - num_new + rank).clamp_(0, self._stack_sink)
+        ]
+        self.full_page_to_draft_page[
+            torch.where(new_pages, pages, self._c_poison_page)
+        ] = torch.where(new_pages, take, self._c_minus_one)
+        self._free_top.sub_(num_new).clamp_(min=0)
+
+        # Re-read: this picks up both the pages just allocated and the ones
+        # this batch reused, so duplicates inside the batch agree for free.
+        draft_pages = self.full_page_to_draft_page[pages]
+        swa = draft_pages * self.page_size + full_indices % self.page_size
+        self.full_to_swa[torch.where(need, full_indices, self._c_zero_sink)] = (
+            torch.where(need, swa, self._c_zero)
+        )
         return self.full_to_swa[full_indices]
 
     @_synchronized
@@ -280,7 +413,9 @@ class DraftWindowSlotMap:
                 hw[idx] = end_pos
 
     @_synchronized
-    def free_slots(self, full_indices: torch.Tensor) -> int:
+    def free_slots(
+        self, full_indices: torch.Tensor, *, return_count: bool = True
+    ) -> int:
         """Unmap the given full ids and return their swa slots to the pool.
 
         Only mapped ids consume work; duplicates and unmapped ids are dropped, so
@@ -288,48 +423,55 @@ class DraftWindowSlotMap:
 
         Draft pages are recycled only once every full page's slots are freed, so
         a partially-freed page never leaves a gap in another request's page.
+
+        ``return_count=False`` skips the freed-slot count, the one readback in
+        this path -- pass it on the decode path, where a sync would wait out the
+        previous forward. The returned count is then 0, not the real count.
         """
         if full_indices.numel() == 0:
             return 0
-        full_indices = full_indices.to(dtype=torch.int64, device=self.full_to_swa.device)
-        full_indices = torch.unique(full_indices[full_indices >= 0])
+        full_indices = full_indices.to(
+            dtype=torch.int64, device=self.full_to_swa.device
+        )
         swa = self.full_to_swa[full_indices]
+        # Unmapped ids read 0 and the -1 sentinel reads -1, so both drop out.
         mapped = swa > 0
-        num_freed = int(mapped.sum())
-        if num_freed == 0:
-            return 0
 
-        freed_full = full_indices[mapped]
+        # Unmap. Writing 0 is idempotent, so duplicate ids need no dedup, and
+        # everything not being freed is parked on the always-zero sink.
+        self.full_to_swa[torch.where(mapped, full_indices, self._c_zero_sink)] = (
+            self._c_zero
+        )
 
-        if self.page_size == 1:
-            self._free_pages[self._num_free_pages : self._num_free_pages + num_freed] = (
-                swa[mapped]
+        # Recycle a page only when its whole full page is unmapped. One
+        # candidate element per distinct page, so a page is pushed once.
+        pages = torch.where(mapped, full_indices // self.page_size, self._c_poison_page)
+        candidates = self._first_occurrence(pages, mapped)
+        # Non-candidates read the -1 sentinel row, which is never all-zero.
+        rows = torch.where(
+            candidates, pages * self.page_size, self._c_sentinel
+        ).unsqueeze(1)
+        rows = (rows + self._within_page).clamp_(max=self._sentinel_idx)
+        released = candidates & (self.full_to_swa[rows] == 0).all(dim=1)
+
+        draft_pages = self.full_page_to_draft_page[
+            torch.where(released, pages, self._c_poison_page)
+        ]
+        valid = released & (draft_pages > 0)
+        # Push at device-computed stack positions; the rest go to the sink.
+        rank = torch.cumsum(valid, 0) - 1
+        self._free_pages[
+            torch.where(valid, self._free_top + rank, self._c_stack_sink).clamp_(
+                0, self._stack_sink
             )
-            self._num_free_pages += num_freed
-            self.full_to_swa[freed_full] = 0
-            return num_freed
+        ] = draft_pages
+        self._free_top.add_(valid.sum()).clamp_(max=self.num_draft_pages - 1)
+        self.full_page_to_draft_page[torch.where(valid, pages, self._c_poison_page)] = (
+            torch.where(valid, self._c_zero, self._c_minus_one)
+        )
 
-        self.full_to_swa[freed_full] = 0
-
-        # Recycle a page only when its whole full page is unmapped (vectorized:
-        # the old per-page Python loop paid one `.all()` sync per page).
-        candidates = torch.unique(freed_full // self.page_size)
-        # Clamp away from the trailing -1 sentinel (repeated index is all()-safe).
-        rows = (candidates * self.page_size).unsqueeze(1) + self._within_page
-        rows = rows.clamp_(max=self.full_to_swa.numel() - 2)
-        released = candidates[(self.full_to_swa[rows] == 0).all(dim=1)]
-
-        draft_pages = self.full_page_to_draft_page[released]
-        valid = draft_pages > 0
-        # Second and last readback: the host-side free stack needs the count.
-        num_valid = int(valid.sum())
-        if num_valid:
-            self._free_pages[
-                self._num_free_pages : self._num_free_pages + num_valid
-            ] = draft_pages[valid]
-            self._num_free_pages += num_valid
-            self.full_page_to_draft_page[released[valid]] = 0
-        return num_freed
+        # Counts each occurrence of a duplicated id; the pool state does not.
+        return int(mapped.sum()) if return_count else 0
 
     # ---- window eviction ------------------------------------------------
 
@@ -351,6 +493,7 @@ class DraftWindowSlotMap:
         req_pool_indices_cpu,
         committed_lens_cpu,
         target_req_to_token: torch.Tensor,
+        return_count: bool = True,
     ) -> int:
         """Free every swa slot that fell out of the window; return the count.
 
@@ -361,6 +504,9 @@ class DraftWindowSlotMap:
         with a single ``free_slots`` call. The former per-request loop paid
         ``free_slots``'s full chain (``torch.unique`` plus several D2H syncs)
         once per request per step, which dominated the decode hot path at batch.
+
+        ``return_count=False`` forwards to ``free_slots``: no readback, and the
+        returned count is 0.
         """
         # Host-side frontier advance; collect the ranges that actually moved.
         starts: list[int] = []
@@ -380,31 +526,37 @@ class DraftWindowSlotMap:
 
         # One batched gather of every request's stale range (mirrors the map-side
         # batching in _maintain_draft_swa_window). ``keep`` trims each row to its
-        # own [start, end) span, so positions beyond a shorter request's end are
-        # never read.
+        # own [start, end) span; the trim pads with -1 rather than compacting with
+        # a boolean-mask select, which would be a host-device sync right at the
+        # top of the step. ``free_slots`` drops -1 for free.
         device = target_req_to_token.device
-        starts_t = torch.tensor(starts, dtype=torch.int64, device=device)
-        lens_t = torch.tensor(
-            [e - s for s, e in zip(starts, ends)], dtype=torch.int64, device=device
-        )
-        reqs_t = torch.tensor(advancing_reqs, dtype=torch.int64, device=device)
+        starts_t = upload_host_ints(starts, device=device)
+        lens_t = upload_host_ints([e - s for s, e in zip(starts, ends)], device=device)
+        reqs_t = upload_host_ints(advancing_reqs, device=device)
         span = int(max(e - s for s, e in zip(starts, ends)))
         pos = torch.arange(span, dtype=torch.int64, device=device)
         idx = starts_t.unsqueeze(1) + pos.unsqueeze(0)
         keep = pos.unsqueeze(0) < lens_t.unsqueeze(1)
-        stale = target_req_to_token[reqs_t.unsqueeze(1), idx][keep]
+        gathered = target_req_to_token[reqs_t.unsqueeze(1), idx]
+        # Scalar -1 (not ``_c_minus_one``): this row is built on the TARGET
+        # device, which the map's own constants need not share.
+        stale = torch.where(keep, gathered, -1).reshape(-1)
 
         # Free the union once, then advance the frontiers (host-only) only after
         # the free succeeds: a mid-free failure must not leave a request reporting
         # slots as freed that are still mapped.
-        num_freed = self.free_slots(stale)
+        num_freed = self.free_slots(stale, return_count=return_count)
         for req_pool_idx, new_frontier in zip(advancing_reqs, ends):
             self.evict_frontier[req_pool_idx] = new_frontier
         return num_freed
 
     @_synchronized
     def release_request(
-        self, *, req_pool_idx: int, target_req_to_token: torch.Tensor
+        self,
+        *,
+        req_pool_idx: int,
+        target_req_to_token: torch.Tensor,
+        return_count: bool = True,
     ) -> int:
         """Free everything still mapped for a finished request and reset it.
 
@@ -414,12 +566,17 @@ class DraftWindowSlotMap:
 
         Draft KV is never shared across requests (it is a function of this
         request's target hidden states), so a finished request keeps nothing.
+
+        ``return_count=False`` forwards to ``free_slots``: no readback, and the
+        returned count is 0.
         """
         idx = int(req_pool_idx)
         high_water = int(self.mapped_high_water[idx])
         num_freed = 0
         if high_water > 0:
-            num_freed = self.free_slots(target_req_to_token[idx, :high_water])
+            num_freed = self.free_slots(
+                target_req_to_token[idx, :high_water], return_count=return_count
+            )
         self.evict_frontier[idx] = 0
         self.mapped_high_water[idx] = 0
         return num_freed
