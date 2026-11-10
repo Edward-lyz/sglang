@@ -82,6 +82,86 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _cp_embed_reduce_scatter(embed, input_ids, forward_batch):
+    """[fusion-opt] SGLANG_FUSE_CP_EMBED_REDUCE_SCATTER: this rank's interleave-CP shard of
+    the vocab-parallel embedding via one reduce-scatter of rank-major ids, instead of an
+    all-reduce over all T rows followed by the shard copy. Every row has exactly one
+    non-zero contributor (the vocab shard owning its id), so the sum is exact and the
+    result is bitwise the stock one. None when the layout does not qualify."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_FUSE_CP_EMBED_REDUCE_SCATTER.get():
+        return None
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.cp.base import get_cp_strategy
+    from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+    from sglang.srt.runtime_context import get_parallel
+
+    meta = getattr(forward_batch, "attn_cp_metadata", None)
+    parallel = get_parallel()
+    cp, tp = parallel.attn_cp_size, parallel.tp_size
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "fusion-opt cp_embed_reduce_scatter gate",
+        "embed RS gate: meta=%s strategy=%s use_attn_tp=%s enable_tp=%s emb_tp=%s tp=%s "
+        "cp=%s tp_rank=%s cp_rank=%s gather_index=%s logical=%s actual=%s",
+        meta is not None,
+        type(get_cp_strategy()).__name__,
+        getattr(embed, "use_attn_tp_group", None),
+        getattr(embed, "enable_tp", None),
+        getattr(embed, "tp_size", None),
+        tp,
+        cp,
+        parallel.tp_rank,
+        parallel.attn_cp_rank,
+        None if meta is None else meta.gather_index is not None,
+        None if meta is None else meta.per_rank_logical_token,
+        None if meta is None else meta.per_rank_actual_token,
+    )
+    if (
+        meta is None
+        or not isinstance(get_cp_strategy(), InterleaveCPStrategy)
+        or getattr(embed, "use_attn_tp_group", False)
+        or not getattr(embed, "enable_tp", False)
+        or getattr(embed, "tp_size", 1) != tp
+        or tp != cp
+        or parallel.tp_rank != parallel.attn_cp_rank
+        or meta.gather_index is not None
+        or len(set(meta.per_rank_actual_token)) != 1
+    ):
+        return None
+    total = int(meta.total_seq_lens)
+    rank_len = max(meta.per_rank_actual_token)
+    if total == 0 or rank_len == 0:
+        return None
+    m = torch.arange(cp * rank_len, device=input_ids.device)
+    t = (m % rank_len) * cp + m // rank_len
+    ids_rm = torch.where(
+        t < total, input_ids[t.clamp(max=total - 1)], torch.zeros_like(input_ids[:1])
+    )
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "fusion-opt cp_embed_reduce_scatter",
+        "CP embedding via reduce-scatter (total=%d rank_len=%d cp=%d)",
+        total,
+        rank_len,
+        cp,
+    )
+    partial = embed._embed_local_shard(ids_rm)
+    out = partial.new_empty((rank_len, partial.shape[1]))
+    get_tp_group().reduce_scatter_tensor(out, partial)
+    # rows past this rank's logical count are the CP padding pad_local_rows zero-fills
+    logical = meta.per_rank_logical_token or meta.per_rank_actual_token
+    local_len = logical[parallel.attn_cp_rank]
+    if local_len < rank_len:
+        out[local_len:].zero_()
+    if meta.per_rank_logical_token is None or meta.per_rank_logical_token == meta.per_rank_actual_token:
+        return out[:local_len]
+    return out
+
+
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner) -> None:
         super().__init__(model_runner)
@@ -388,6 +468,7 @@ class EagerRunner(BaseRunner):
 
         input_embeds = kwargs.get("input_embeds")
         complete_input_ids = forward_batch.input_ids
+        local_embeds = None
         if input_embeds is None:
             # CP vision fix: merge image features into the embeddings BEFORE the CP
             # shard, mirroring DeepseekV4ForCausalLM.forward. The CP path calls the
@@ -414,13 +495,30 @@ class EagerRunner(BaseRunner):
                     model.config.image_token_id,
                 )
             else:
-                input_embeds = model.get_input_embeddings()(complete_input_ids)
+                local_embeds = _cp_embed_reduce_scatter(
+                    model.get_input_embeddings(), complete_input_ids, forward_batch
+                )
+                if local_embeds is not None:
+                    # [fusion-opt] already CP-local; hand the shard helper a 1-column
+                    # stand-in so the positions / ids / metadata sharding stays as is.
+                    input_embeds = complete_input_ids.new_zeros(
+                        (complete_input_ids.shape[0], 1)
+                    )
+                else:
+                    input_embeds = model.get_input_embeddings()(complete_input_ids)
         with cp_shard_model_inputs(
             input_embeds,
             forward_batch.positions,
             forward_batch,
             complete_input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
+            if local_embeds is not None:
+                assert local_embeds.shape[0] == sharded_input_embeds.shape[0], (
+                    local_embeds.shape,
+                    sharded_input_embeds.shape,
+                )
+                sharded_input_embeds = local_embeds
+                local_embeds = None
             # [MEM-R3] The full-order embedding is [T, hidden] (640 MiB at a 65532-token
             # chunk) and exists only to produce the CP-local shard above; the body runs
             # on `sharded_input_embeds`. Holding the reference here would pin it for the

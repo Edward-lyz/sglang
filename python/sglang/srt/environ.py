@@ -1726,6 +1726,12 @@ class Envs:
     # [fusion-opt] shared expert: silu*up + clamp + per-32 ue8m0 quant in one kernel
     # feeding the DeepGEMM MXFP8 down_proj (block-fp8 [32,32] checkpoints).
     SGLANG_FUSE_SHARED_SILU_QUANT_DEEPGEMM = EnvBool(False)
+    # [fusion-opt] Prefill-CP SWA KV store: norm/RoPE/fp8 the local rows first, gather
+    # the 584 B (V4) / 528 B (V4.1) cache rows instead of 1024 B bf16 kv, then copy.
+    SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST = EnvBool(False)
+    # [fusion-opt] Prefill-CP embedding: reduce-scatter the vocab-parallel partial
+    # embedding of rank-major ids instead of all-reduce of all rows + interleave shard.
+    SGLANG_FUSE_CP_EMBED_REDUCE_SCATTER = EnvBool(False)
     # DeepGEMM mega mHC: one `deep_gemm.mega_mhc` launch replaces the whole
     # attn->FFN mHC boundary of the DeepSeek-V4.1 predecessor-pre scheme
     # (hc_post + hc_combine + the sublayer input RMSNorm + the next pre-norm
