@@ -17,6 +17,26 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.elementwise import fused_k_norm_rope_flashmla
+from sglang.srt.environ import envs
+
+_CE_GATHER_GROUPS: set = set()
+
+
+def _ce_all_gather(x: torch.Tensor) -> torch.Tensor:
+    """[fusion-opt] SGLANG_FUSE_CP_SWA_GATHER_CE: CP all-gather of ``x`` (rank-major)
+    through torch symmetric memory's low-contention all-gather -- peer pulls on the
+    copy engines instead of an NCCL kernel, so the gather takes no SMs from compute
+    it overlaps (DeepInfer gathers its CP KV through userbuffer copies likewise)."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    from sglang.srt.distributed.parallel_state import get_attn_cp_group
+
+    group_name = get_attn_cp_group().device_group.group_name
+    if group_name not in _CE_GATHER_GROUPS:
+        symm_mem.enable_symm_mem_for_group(group_name)
+        _CE_GATHER_GROUPS.add(group_name)
+    out = torch.ops.symm_mem._low_contention_all_gather(x.contiguous(), group_name)
+    return torch.ops._c10d_functional.wait_tensor(out)
 
 
 @triton.jit
@@ -131,8 +151,13 @@ def cp_store_swa_kv_local_first(
         layout=layout,
     )
     # 2. all-gather the staging pages (rank-major)
-    gathered = torch.empty((cp_size * npages, page_bytes), dtype=torch.uint8, device=dev)
-    attn_cp_all_gather_into_tensor(gathered, staging)
+    if envs.SGLANG_FUSE_CP_SWA_GATHER_CE.get():
+        gathered = _ce_all_gather(staging)
+    else:
+        gathered = torch.empty(
+            (cp_size * npages, page_bytes), dtype=torch.uint8, device=dev
+        )
+        attn_cp_all_gather_into_tensor(gathered, staging)
 
     # 3. global token t -> flat staging row; same map as the interleave gather
     # (interleave map computed in the kernel: no index tensors / launches per layer)

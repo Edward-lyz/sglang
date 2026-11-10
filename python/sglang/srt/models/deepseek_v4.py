@@ -12,6 +12,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     Iterable,
     List,
     NamedTuple,
@@ -273,6 +274,17 @@ def _get_mhc_ops() -> MhcOps:
 
 
 logger = logging.getLogger(__name__)
+
+_CP_SWA_STORE_STREAMS: Dict[torch.device, torch.cuda.Stream] = {}
+
+
+def _cp_swa_store_stream(device: torch.device) -> torch.cuda.Stream:
+    """Side stream of SGLANG_FUSE_CP_SWA_STORE_OVERLAP, one per device."""
+    stream = _CP_SWA_STORE_STREAMS.get(device)
+    if stream is None:
+        stream = _CP_SWA_STORE_STREAMS[device] = torch.cuda.Stream(device=device)
+    return stream
+
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
@@ -1556,6 +1568,49 @@ class MQALayer(MqaAttentionBase):
         )
         return ok
 
+    def _cp_store_swa_kv_local_first(
+        self, kv_local, positions, forward_batch, attn_backend
+    ) -> None:
+        from sglang.kernels.ops.attention.dsv4.cp_kv_store import (
+            cp_store_swa_kv_local_first,
+        )
+
+        pool = get_token_to_kv_pool()
+        parallel = get_parallel()
+        cp_store_swa_kv_local_first(
+            kvcache=pool.get_swa_raw_buffer(self.layer_id),
+            page_size=pool.swa_page_size,
+            layout=pool.kv_layout,
+            kv_local=kv_local,
+            positions_local=positions,
+            swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+            forward_batch=forward_batch,
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
+            cp_rank=parallel.attn_cp_rank,
+            cp_size=parallel.attn_cp_size,
+        )
+
+    def _cp_store_swa_kv_local_first_on_side_stream(
+        self, kv_local, positions, forward_batch, attn_backend
+    ) -> torch.cuda.Stream:
+        """[fusion-opt] SGLANG_FUSE_CP_SWA_STORE_OVERLAP: _cp_store_swa_kv_local_first on
+        a side stream; the caller joins it before its next collective so every rank keeps
+        the same order of collectives on the CP group."""
+        main = torch.cuda.current_stream()
+        side = _cp_swa_store_stream(kv_local.device)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            self._cp_store_swa_kv_local_first(
+                kv_local, positions, forward_batch, attn_backend
+            )
+        # main frees qkv_a right after; keep its block off the free list until the
+        # side stream's reads are done
+        kv_local.record_stream(side)
+        positions.record_stream(side)
+        return side
+
     def _compute_kv_bf16(
         self,
         x: torch.Tensor,
@@ -2099,13 +2154,37 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
+            # [fusion-opt] SGLANG_FUSE_CP_SWA_STORE_OVERLAP: the local-first SWA store
+            # (local norm/RoPE/fp8, CP all-gather, scatter) only needs the kv half of
+            # qkv_a, so issue it on a side stream before the q path and let its
+            # all-gather run under q_norm + wq_b; joined before the next collective.
+            swa_side = None
+            if (
+                use_cp
+                and not unified
+                and not kv_written
+                and envs.SGLANG_FUSE_CP_SWA_STORE_OVERLAP.get()
+                and self._cp_kv_store_local_first_ok(attn_backend)
+            ):
+                kv_local = (
+                    qkv_a[..., self.q_lora_rank :]
+                    if qkv_a is not None
+                    else self.wkv(x_linear)[0]
+                )
+                swa_side = self._cp_store_swa_kv_local_first_on_side_stream(
+                    kv_local, positions, forward_batch, attn_backend
+                )
+                del kv_local
             q_lora, q_for_wqb = self._q_norm_for_wq_b(q_lora)
             if fused_o:
                 q, _ = self.wq_b(q_for_wqb)
                 q = q.view(-1, self.n_local_heads, self.head_dim)
             else:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
-            if unified:
+            if swa_side is not None:
+                torch.cuda.current_stream().wait_stream(swa_side)
+                kv = None
+            elif unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
@@ -2116,29 +2195,15 @@ class MQALayer(MqaAttentionBase):
                 # local rows into cache-format staging pages, all-gather those (584 B V4 /
                 # 528 B V4.1 vs 1024 B per row) and copy rows into the SWA cache; bitwise the
                 # same cache bytes as the stock path below.
-                from sglang.kernels.ops.attention.dsv4.cp_kv_store import (
-                    cp_store_swa_kv_local_first,
-                )
-
-                pool = get_token_to_kv_pool()
-                parallel = get_parallel()
-                cp_store_swa_kv_local_first(
-                    kvcache=pool.get_swa_raw_buffer(self.layer_id),
-                    page_size=pool.swa_page_size,
-                    layout=pool.kv_layout,
-                    kv_local=(
+                self._cp_store_swa_kv_local_first(
+                    (
                         qkv_a[..., self.q_lora_rank :]
                         if qkv_a is not None
                         else self.wkv(x_linear)[0]
                     ),
-                    positions_local=positions,
-                    swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
-                    forward_batch=forward_batch,
-                    kv_weight=self.kv_norm.weight.data,
-                    eps=self.eps,
-                    freqs_cis=self.freqs_cis,
-                    cp_rank=parallel.attn_cp_rank,
-                    cp_size=parallel.attn_cp_size,
+                    positions,
+                    forward_batch,
+                    attn_backend,
                 )
                 kv = None
             elif use_cp:
