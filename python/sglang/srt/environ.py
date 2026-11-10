@@ -977,6 +977,10 @@ class Envs:
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
+    # Per-layer token capacity of the expanded FP8 MLA prefix K/V kept across
+    # one long request's prefill chunks (0 = off); see MLAExpandedPrefixKV.
+    SGLANG_MLA_EXPANDED_KV_CACHE_TOKENS = EnvInt(0)
+    SGLANG_MLA_EXPANDED_KV_CACHE_MIN_FREE_GB = EnvFloat(20.0)
 
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)  # This argument is deprecated

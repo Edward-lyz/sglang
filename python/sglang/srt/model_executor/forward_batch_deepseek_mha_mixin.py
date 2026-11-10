@@ -1,6 +1,7 @@
 # Mixin class for metadata management of Deepseek MHA forward (chunked prefix cache)
 # More details can be found in python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py
 
+import logging
 from typing import List, Optional
 
 import torch
@@ -14,6 +15,125 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class MLAExpandedPrefixKV:
+    """FP8 K/V of one long request's MLA prefix, kept across its prefill chunks.
+
+    The KV pool stores only the MLA latent, so every chunk of a chunked prefill
+    re-expands the whole prefix through kv_b_proj: L tokens per chunk, ~L^2/x
+    per request. This keeps the expanded FP8 K/V of every MLA layer on this
+    stage for the request being prefilled, so a chunk only expands the tokens
+    added since the previous chunk and attends to the prefix in one segment.
+
+    One request at a time, keyed by rid; a different rid restarts expansion
+    from token 0, which costs what the latent path costs for that chunk.
+    Buffers are allocated once every local MLA layer has registered, and only
+    if SGLANG_MLA_EXPANDED_KV_CACHE_MIN_FREE_GB stays free afterwards;
+    otherwise the feature is off for the process.
+    """
+
+    def __init__(self):
+        self.capacity = envs.SGLANG_MLA_EXPANDED_KV_CACHE_TOKENS.get()
+        self.state = "probe" if self.capacity > 0 else "off"
+        self.layer_shapes = {}  # layer_id -> (num_heads, k_head_dim, v_head_dim)
+        self.slot = {}  # layer_id -> index into k_buf / v_buf
+        self.k_buf: Optional[torch.Tensor] = None
+        self.v_buf: Optional[torch.Tensor] = None
+        self.rid = {}
+        self.valid = {}
+
+    @property
+    def ready(self) -> bool:
+        """Whether the buffers are allocated and the cache can be used."""
+        return self.state == "ready"
+
+    def register_layer(self, layer_id, num_heads, k_head_dim, v_head_dim, supported):
+        """Record a local MLA layer's K/V shape; an unsupported layer disables."""
+        if self.state != "probe":
+            return
+        if not supported:
+            logger.info("[MLA EKV] layer %d unsupported; disabled", layer_id)
+            self.state = "off"
+            return
+        self.layer_shapes.setdefault(layer_id, (num_heads, k_head_dim, v_head_dim))
+
+    def try_allocate(self, device: torch.device):
+        """Allocate the buffers once every layer registered and memory allows."""
+        if self.state != "probe":
+            return
+        pool = get_token_to_kv_pool()
+        pool = getattr(pool, "full_kv_pool", pool)
+        if pool.dtype != torch.float8_e4m3fn:
+            logger.info("[MLA EKV] KV cache dtype %s is not fp8; disabled", pool.dtype)
+            self.state = "off"
+            return
+        n = len(pool.kv_buffer)
+        if len(self.layer_shapes) < n:
+            return  # not every local MLA layer has run yet
+        shapes = set(self.layer_shapes.values())
+        if len(shapes) != 1:
+            self.state = "off"
+            return
+        num_heads, k_dim, v_dim = shapes.pop()
+        need = n * self.capacity * num_heads * (k_dim + v_dim)
+        free, _ = torch.cuda.mem_get_info(device)
+        free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+        min_free = int(envs.SGLANG_MLA_EXPANDED_KV_CACHE_MIN_FREE_GB.get() * (1 << 30))
+        if free - need < min_free:
+            logger.info(
+                "[MLA EKV] need %.1f GB for %d layers, free %.1f GB, min free "
+                "%.1f GB; disabled",
+                need / 2**30,
+                n,
+                free / 2**30,
+                min_free / 2**30,
+            )
+            self.state = "off"
+            return
+        try:
+            shape = (n, self.capacity, num_heads)
+            fp8 = torch.float8_e4m3fn
+            self.k_buf = torch.empty(shape + (k_dim,), dtype=fp8, device=device)
+            self.v_buf = torch.empty(shape + (v_dim,), dtype=fp8, device=device)
+        except torch.OutOfMemoryError:
+            self.k_buf = self.v_buf = None
+            logger.info("[MLA EKV] allocation OOM; disabled")
+            self.state = "off"
+            return
+        self.slot = {lid: i for i, lid in enumerate(sorted(self.layer_shapes))}
+        self.state = "ready"
+        logger.info(
+            "[MLA EKV] ready: %d layers x %d tokens, %.1f GB",
+            n,
+            self.capacity,
+            need / 2**30,
+        )
+
+    def begin(self, layer_id: int, rid: str, prefix_len: int):
+        """Return (k_buf, v_buf, first prefix token not yet expanded)."""
+        if self.rid.get(layer_id) != rid:
+            self.rid[layer_id] = rid
+            self.valid[layer_id] = 0
+        i = self.slot[layer_id]
+        return self.k_buf[i], self.v_buf[i], min(self.valid[layer_id], prefix_len)
+
+    def commit(self, layer_id: int, valid_len: int):
+        """Mark the first ``valid_len`` prefix tokens of the layer as expanded."""
+        self.valid[layer_id] = valid_len
+
+
+_MLA_EXPANDED_PREFIX_KV: Optional[MLAExpandedPrefixKV] = None
+
+
+def get_mla_expanded_prefix_kv() -> MLAExpandedPrefixKV:
+    """Process-wide MLAExpandedPrefixKV, created on first use."""
+    global _MLA_EXPANDED_PREFIX_KV
+    if _MLA_EXPANDED_PREFIX_KV is None:
+        _MLA_EXPANDED_PREFIX_KV = MLAExpandedPrefixKV()
+    return _MLA_EXPANDED_PREFIX_KV
 
 
 class ForwardBatchDeepSeekMHAMixin:
@@ -52,9 +172,25 @@ class ForwardBatchDeepSeekMHAMixin:
     mha_one_shot: Optional[bool] = None
     # KV Indices for MHA_ONE_SHOT forward method
     mha_one_shot_kv_indices: Optional[torch.Tensor] = None
+    # Prefix K/V comes from MLAExpandedPrefixKV in a single segment
+    mla_ekv: bool = False
 
     def get_max_chunk_capacity(self):
         return envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()
+
+    def _mla_ekv_eligible(self, device: torch.device) -> bool:
+        store = get_mla_expanded_prefix_kv()
+        if store.state == "off" or self.batch_size != 1 or not self.rids:
+            return False
+        from sglang.srt.runtime_context import get_parallel
+
+        if get_parallel().dcp_enabled:
+            return False
+        store.try_allocate(device)
+        return store.ready and (
+            self.extend_prefix_lens_cpu[0] + self.extend_seq_lens_cpu[0]
+            <= store.capacity
+        )
 
     def set_prefix_chunk_idx(self, idx: int):
         self.prefix_chunk_idx = idx
@@ -139,8 +275,16 @@ class ForwardBatchDeepSeekMHAMixin:
 
         self.prefix_chunk_idx = -1
 
+        # A single long request whose expanded prefix K/V is cached attends to
+        # the whole prefix in one segment (see MLAExpandedPrefixKV).
+        self.mla_ekv = self._mla_ekv_eligible(device)
+
         # chunk_capacity is the maximum number of tokens in each chunk
-        chunk_capacity = self.get_max_chunk_capacity()
+        chunk_capacity = (
+            max(self.extend_prefix_lens_cpu)
+            if self.mla_ekv
+            else self.get_max_chunk_capacity()
+        )
         self.prefix_chunk_len = chunk_capacity // self.batch_size
 
         self.num_prefix_chunks = (
@@ -183,7 +327,7 @@ class ForwardBatchDeepSeekMHAMixin:
         ).values.tolist()
 
         self.prefix_chunk_num_tokens = prefix_chunk_seq_lens_cpu.sum(dim=1).tolist()
-        assert max(self.prefix_chunk_num_tokens) <= self.get_max_chunk_capacity()
+        assert max(self.prefix_chunk_num_tokens) <= chunk_capacity
 
         # Per-chunk flag: does any sequence have kv_len == 0?
         # Pure CPU check (prefix_chunk_seq_lens_cpu is on CPU), no GPU sync.

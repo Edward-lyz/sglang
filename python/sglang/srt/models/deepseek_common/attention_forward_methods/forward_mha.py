@@ -21,6 +21,9 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    get_mla_expanded_prefix_kv,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -48,6 +51,9 @@ if _is_cuda:
     from sgl_kernel import merge_state_v2
 
     from sglang.kernels.ops.attention.concat_mla import concat_mla_k
+    from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+        mla_kv_pack_quantize_fp8,
+    )
 elif _is_musa:
     from sgl_kernel import concat_mla_k
 
@@ -402,6 +408,15 @@ class DeepseekMHAForwardMixin:
         has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
             forward_batch.extend_prefix_lens_cpu
         )
+        ekv = get_mla_expanded_prefix_kv()
+        if ekv.state == "probe":
+            ekv.register_layer(
+                self.attn_mha.layer_id,
+                self.num_local_heads,
+                self.qk_nope_head_dim + self.qk_rope_head_dim,
+                self.v_head_dim,
+                supported=self._mla_ekv_supported(forward_batch),
+            )
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
             forward_batch.prepare_chunked_prefix_cache_info(q.device)
@@ -466,6 +481,70 @@ class DeepseekMHAForwardMixin:
         forward_batch.set_attn_attend_prefix_cache(False)
         return self.forward_normal_core(q, k, v, forward_batch)
 
+    def _mla_ekv_supported(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
+        # The cached K/V is the unscaled FP8 the TRT-LLM ragged kernel would
+        # quantize to itself; subclasses swap the prefill kernel, and other
+        # backends / scaled KV keep the latent path.
+        from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+        backend = _resolve_attn_backend(forward_batch)
+        return (
+            type(backend) is TRTLLMMLABackend
+            and backend.data_type == torch.float8_e4m3fn
+            and getattr(self.attn_mha, "k_scale_float", None) in (None, 1.0)
+            and getattr(self.attn_mha, "v_scale_float", None) in (None, 1.0)
+        )
+
+    def _chunked_prefix_attn_mha_ekv(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        accum_output: torch.Tensor,
+        accum_lse: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        # Expand only the prefix tokens added since this request's previous
+        # chunk into the cached FP8 K/V, then attend to the prefix at once.
+        layer_id = self.attn_mha.layer_id
+        prefix_len = forward_batch.extend_prefix_lens_cpu[0]
+        store = get_mla_expanded_prefix_kv()
+        k_all, v_all, start = store.begin(layer_id, forward_batch.rids[0], prefix_len)
+        kv_indices = forward_batch.prefix_chunk_kv_indices[0]
+        step = forward_batch.get_max_chunk_capacity()
+        for s in range(start, prefix_len, step):
+            e = min(s + step, prefix_len)
+            kv_a_normed, k_pe = self._get_mla_kv_buffer(
+                kv_indices[s:e], torch.bfloat16, forward_batch
+            )
+            kv = self.kv_b_proj(kv_a_normed)[0]
+            kv = kv.view(
+                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            mla_kv_pack_quantize_fp8(
+                kv[..., : self.qk_nope_head_dim],
+                k_pe,
+                kv[..., self.qk_nope_head_dim :],
+                k_out=k_all[s:e],
+                v_out=v_all[s:e],
+            )
+            del kv, kv_a_normed, k_pe
+        store.commit(layer_id, prefix_len)
+
+        forward_batch.set_prefix_chunk_idx(0)
+        output, lse = self.attn_mha(
+            q,
+            k_all[:prefix_len],
+            v_all[:prefix_len],
+            forward_batch,
+            save_kv_cache=False,
+            key_value_num_tokens=prefix_len,
+        )
+        tmp_output = torch.empty_like(accum_output)
+        tmp_lse = torch.empty_like(accum_lse)
+        merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
+        return tmp_output
+
     def _chunked_prefix_attn_mha(
         self: DeepseekV2AttentionMLA,
         q: torch.Tensor,
@@ -473,6 +552,10 @@ class DeepseekMHAForwardMixin:
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if forward_batch.mla_ekv:
+            return self._chunked_prefix_attn_mha_ekv(
+                q, accum_output, accum_lse, forward_batch
+            )
         # kv_b_proj consumes BF16 latent KV. TokenSpeed repacks the resulting
         # dense K/V to FP8; other backends keep BF16 compute inputs.
         backend = _resolve_attn_backend(forward_batch)
