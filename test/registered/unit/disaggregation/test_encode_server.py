@@ -629,10 +629,16 @@ class TestEncoderDelivery(CustomTestCase):
             encoder, ctx = self._make_prefix_cache_encoder_and_context(get_feature_fn)
             encoder.device = device
             encoder.metrics_collector = Mock()
+            community_metrics = Mock()
 
-            with patch(
-                "sglang.srt.disaggregation.encoder.server.get_mm",
-                return_value=SimpleNamespace(enable_prefix_mm_cache=True),
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.get_mm",
+                    return_value=SimpleNamespace(enable_prefix_mm_cache=True),
+                ),
+                patch.object(
+                    encoder_server, "encoder_metrics_collector", community_metrics
+                ),
             ):
                 first = await encoder._compute_direct_embedding(ctx, keep_on_gpu=True)
                 second = await encoder._compute_direct_embedding(ctx, keep_on_gpu=True)
@@ -648,6 +654,24 @@ class TestEncoderDelivery(CustomTestCase):
             )
             encoder.metrics_collector.record_cache_hit.assert_called_once_with(
                 first.nbytes
+            )
+            # Community encoder_cache_* series share the same gate.
+            self.assertEqual(
+                community_metrics.record_cache_tokens.call_args_list,
+                [
+                    unittest.mock.call(0, 2, modality="image"),
+                    unittest.mock.call(2, 2, modality="image"),
+                ],
+            )
+            self.assertEqual(
+                community_metrics.record_cache_files.call_args_list,
+                [
+                    unittest.mock.call(0, 1, modality="image"),
+                    unittest.mock.call(1, 1, modality="image"),
+                ],
+            )
+            community_metrics.set_cache_state.assert_called_with(
+                encoder.mm_cache.current_size, 1
             )
 
         asyncio.run(run())
