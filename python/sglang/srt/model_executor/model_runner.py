@@ -1137,6 +1137,9 @@ class ModelRunner:
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
+    def maybe_precompile_model_kernels_after_loading(self) -> None:
+        maybe_precompile_model_kernels_after_loading(self.model, self.device)
+
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
             return

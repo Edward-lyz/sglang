@@ -187,6 +187,7 @@ class BaseMultimodalProcessor(ABC):
     auto_mm_processor_worker_num = 1
     auto_mm_io_worker_num = 4
     supports_mm_processor_concurrency = False
+    supports_metadata_only_mm_data = False
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -452,40 +453,50 @@ class BaseMultimodalProcessor(ABC):
         )
         assert all(isinstance(modality, Modality) for modality in modality_list)
 
-        # Embeddings may arrive as one tensor or a list of per-part tensors
-        # (one per pulled task); slice per-item views instead of concatenating.
-        embedding_parts_per_modality = {
-            modality: list(emb) if isinstance(emb, (list, tuple)) else [emb]
-            for modality, emb in embeddings.items()
-        }
-        # modality -> (part index, rows consumed within that part)
-        consumed_per_modality = {}
-
         mm_items = []
-        for modality, offset in zip(modality_list, offsets):
-            num_tokens = offset[1] - offset[0] + 1
-            embedding_parts = embedding_parts_per_modality[modality]
-            part_idx, embedding_start = consumed_per_modality.get(modality, (0, 0))
-            while embedding_start >= embedding_parts[part_idx].shape[0]:
-                part_idx += 1
-                embedding_start = 0
-            embedding_slice = embedding_parts[part_idx][
-                embedding_start : embedding_start + num_tokens
-            ]
-            # An item never spans parts: each pulled task covers whole images.
-            assert embedding_slice.shape[0] == num_tokens, (
-                f"embedding part {part_idx} for {modality} has "
-                f"{embedding_parts[part_idx].shape[0] - embedding_start} rows "
-                f"left, but the item at offset {offset} needs {num_tokens}"
-            )
-            consumed_per_modality[modality] = (part_idx, embedding_start + num_tokens)
-            mm_items.append(
-                MultimodalDataItem(
-                    modality=modality,
-                    offsets=[offset],
-                    precomputed_embeddings=embedding_slice,
+        if embeddings is None:
+            for modality, offset in zip(modality_list, offsets):
+                mm_items.append(
+                    MultimodalDataItem(
+                        modality=modality,
+                        offsets=[offset],
+                        precomputed_embeddings=None,
+                        format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
+                    )
                 )
-            )
+        else:
+            embedding_parts_per_modality = {
+                modality: list(emb) if isinstance(emb, (list, tuple)) else [emb]
+                for modality, emb in embeddings.items()
+            }
+            consumed_per_modality = {}
+            for modality, offset in zip(modality_list, offsets):
+                num_tokens = offset[1] - offset[0] + 1
+                embedding_parts = embedding_parts_per_modality[modality]
+                part_idx, embedding_start = consumed_per_modality.get(modality, (0, 0))
+                while embedding_start >= embedding_parts[part_idx].shape[0]:
+                    part_idx += 1
+                    embedding_start = 0
+                embedding_slice = embedding_parts[part_idx][
+                    embedding_start : embedding_start + num_tokens
+                ]
+                assert embedding_slice.shape[0] == num_tokens, (
+                    f"embedding part {part_idx} for {modality} has "
+                    f"{embedding_parts[part_idx].shape[0] - embedding_start} rows "
+                    f"left, but the item at offset {offset} needs {num_tokens}"
+                )
+                consumed_per_modality[modality] = (
+                    part_idx,
+                    embedding_start + num_tokens,
+                )
+                mm_items.append(
+                    MultimodalDataItem(
+                        modality=modality,
+                        offsets=[offset],
+                        precomputed_embeddings=embedding_slice,
+                        format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
+                    )
+                )
 
         return MultimodalProcessorOutput(
             input_ids=input_ids,

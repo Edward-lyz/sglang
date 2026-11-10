@@ -30,9 +30,6 @@ from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
-from sglang.srt.layers.quantization.fp8_utils import (
-    materialize_bpreshuffle_fp8_scale_tuple,
-)
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
@@ -98,23 +95,6 @@ def _select_local_dcp_heads_for_autotune(
     """Select this rank's head shard without communicating dummy outputs."""
     rank = get_parallel().attn_dcp_rank
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
-def _is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
-    if not get_parallel().dcp_enabled:
-        return False
-    if forward_batch.forward_mode.is_decode():
-        return True
-    if not forward_batch.forward_mode.is_target_verify() or not _is_cuda:
-        return False
-
-    server_args = get_server_args()
-    decode_backend = (
-        server_args.decode_attention_backend or server_args.attention_backend
-    )
-    return (
-        server_args.speculative_algorithm == "DSPARK"
-        and server_args.speculative_attention_mode == "decode"
-        and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
-    )
 
 
 if _is_cuda:
@@ -283,7 +263,11 @@ class DeepseekMLAForwardMixin:
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
             get_server_args().dcp_replicate_q_proj
-            and _is_dcp_mla_decode_phase(forward_batch)
+            and get_parallel().dcp_enabled
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
@@ -623,7 +607,10 @@ class DeepseekMLAForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
-            if _is_dcp_mla_decode_phase(forward_batch):
+            if (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            ):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
@@ -776,7 +763,10 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif _is_dcp_mla_decode_phase(forward_batch):
+                elif (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                ) and get_parallel().dcp_enabled:
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -850,7 +840,10 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if _is_dcp_mla_decode_phase(forward_batch):
+        if (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ) and get_parallel().dcp_enabled:
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,

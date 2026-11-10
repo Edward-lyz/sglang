@@ -478,7 +478,6 @@ class MambaPool:
         self.size = size
         self.device = device
         self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
-        self.linear_state_kind = cache_params.state_kind
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         # ReplaySSM spec-verify (Part B of #28511): GDN REUSES the linear_replayssm
@@ -3651,7 +3650,7 @@ class HybridLinearKVPool(KVCache):
 
     def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
         # Hybrid layer ids are global model-layer ids, while the backing pool
-        # is dense over only full-attention layers. Shape discovery does not
+        # is dense over only full-attention layers.  Shape discovery does not
         # need a global layer lookup, so delegate it to that backing pool.
         return self.full_kv_pool.get_kv_buffer_shape()
 

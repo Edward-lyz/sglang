@@ -184,8 +184,6 @@ class KVArgsRegisterInfo:
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
-    transfer_infos: dict[int, dict[str, TransferInfo]]
-
     def __init__(
         self,
         args: KVArgs,
@@ -202,8 +200,6 @@ class MooncakeKVManager(CommonKVManager):
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
-            self.session_cooldowns: dict[str, float] = {}  # 【新增】专门用于记录失败时间戳的字典
-            self.session_cooldown_seconds = float(os.getenv("SGLANG_MOONCAKE_COOLDOWN", "120.0"))
             self.session_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -1524,50 +1520,19 @@ class MooncakeKVManager(CommonKVManager):
                         # Early exit if the request has failed
                         with self.session_lock:
                             if req.mooncake_session_id in self.failed_sessions:
-                                # Check cooldown: if the failed session's cooldown has
-                                # expired, release the session and continue transferring;
-                                # otherwise keep treating it as failed.
-                                continue_transfer = False
-                                if req.mooncake_session_id in self.session_cooldowns:
-                                    time_since_fail = (
-                                        time.time()
-                                        - self.session_cooldowns[req.mooncake_session_id]
-                                    )
-                                    if time_since_fail >= self.session_cooldown_seconds:
-                                        self.failed_sessions.remove(
-                                            req.mooncake_session_id
-                                        )
-                                        del self.session_cooldowns[
-                                            req.mooncake_session_id
-                                        ]
-                                        self.session_failures[
-                                            req.mooncake_session_id
-                                        ] = 0
-                                        logger.info(
-                                            f"Session {req.mooncake_session_id} "
-                                            f"cooldown expired, released."
-                                        )
-                                        continue_transfer = True
-                                    else:
-                                        logger.info(
-                                            f"Session {req.mooncake_session_id} is "
-                                            f"still cooling down, will check again later."
-                                        )
-                                if not continue_transfer:
-                                    self.record_failure(
-                                        kv_chunk.room,
-                                        f"Decode instance could be dead, remote mooncake "
-                                        f"session {req.mooncake_session_id} is not alive",
-                                    )
-                                    self.update_status(kv_chunk.room, KVPoll.Failed)
-                                    self.sync_status_to_decode_endpoint(
-                                        req.endpoint,
-                                        req.dst_port,
-                                        req.room,
-                                        KVPoll.Failed,
-                                        prefill_unique_rank,
-                                    )
-                                    break
+                                self.record_failure(
+                                    kv_chunk.room,
+                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                )
+                                self.update_status(kv_chunk.room, KVPoll.Failed)
+                                self.sync_status_to_decode_endpoint(
+                                    req.endpoint,
+                                    req.dst_port,
+                                    req.room,
+                                    KVPoll.Failed,
+                                    prefill_unique_rank,
+                                )
+                                break
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
@@ -1676,12 +1641,6 @@ class MooncakeKVManager(CommonKVManager):
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
                                 if self.session_failures[req.mooncake_session_id] >= 1:
                                     self.failed_sessions.add(req.mooncake_session_id)
-                                    # 【新增】记录第一次失败的时间戳
-                                    if req.mooncake_session_id not in self.session_cooldowns:
-                                        self.session_cooldowns[req.mooncake_session_id] = time.time()
-                                        logger.error(
-                                            f"Session {req.mooncake_session_id} failed, cooldown started."
-                                        )
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
                                     )
@@ -1793,51 +1752,10 @@ class MooncakeKVManager(CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
-                _targets = [
-                    f"{r.endpoint}:{r.dst_port}"
-                    for r in self.transfer_infos.get(kv_chunk.room, {}).values()
-                    if not r.is_dummy
-                ]
-                logger.error(
-                    f"Transfer worker encountered an error processing "
-                    f"room {kv_chunk.room}: {e}. "
-                    f"is_last={kv_chunk.is_last_chunk}, "
-                    f"index_slice={kv_chunk.index_slice}, "
-                    f"targets={_targets}. "
-                    f"bootstrap_port={self.bootstrap_port}.",
-                    exc_info=True,
+                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
+                raise RuntimeError(
+                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
-                # Mark the current request as failed and notify decode endpoint
-                try:
-                    self.record_failure(
-                        kv_chunk.room,
-                        f"Transfer worker exception: {e}",
-                    )
-                    self.update_status(kv_chunk.room, KVPoll.Failed)
-
-                    # Best-effort notify decode endpoint
-                    local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
-                    reqs = self.transfer_infos.get(kv_chunk.room, {}).values()
-                    for req in reqs:
-                        if not req.is_dummy:
-                            try:
-                                self.sync_status_to_decode_endpoint(
-                                    req.endpoint,
-                                    req.dst_port,
-                                    req.room,
-                                    KVPoll.Failed,
-                                    local_rank,
-                                )
-                            except Exception:
-                                pass
-                except Exception:
-                    logger.error(
-                        f"Failed to clean up after transfer worker error for room {kv_chunk.room}",
-                        exc_info=True,
-                    )
-                finally:
-                    # Clean up transfer_infos to prevent memory leak
-                    self.transfer_infos.pop(kv_chunk.room, None)
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -1920,8 +1838,6 @@ class MooncakeKVManager(CommonKVManager):
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
-                        if mooncake_session_id in self.session_cooldowns:
-                            del self.session_cooldowns[mooncake_session_id]
                         if mooncake_session_id in self.session_failures:
                             del self.session_failures[mooncake_session_id]
                     logger.debug(
@@ -2020,60 +1936,6 @@ class MooncakeKVManager(CommonKVManager):
                         "Failed to get kvcache from prefill instance, it might be dead",
                     )
                     self.update_status(bootstrap_room, status)
-
-        def heartbeat_checker():
-            while True:
-                time.sleep(self.heartbeat_interval)
-                with self.connection_lock:
-                    addresses = list(self.prefill_info_table.keys())
-
-                for bootstrap_addr in addresses:
-                    session = None
-                    try:
-                        with self.session_pool_lock:
-                            session = self.session_pool[bootstrap_addr]
-                        response = session.get(
-                            f"http://{bootstrap_addr}/health",
-                            timeout=(2, 3),
-                            headers={"Connection": "keep-alive"},
-                        )
-                        if response.status_code == 200:
-                            self.heartbeat_failures[bootstrap_addr] = 0
-
-                            current_rooms = self.addr_to_rooms_tracker[
-                                bootstrap_addr
-                            ].copy()
-
-                            for bootstrap_room in current_rooms:
-                                # Remove KVPoll.Success requests from the tracker
-                                if bootstrap_room not in self.request_status:
-                                    self.addr_to_rooms_tracker[bootstrap_addr].discard(
-                                        bootstrap_room
-                                    )
-                        else:
-                            logger.info(
-                                f"Attempting to reconnect to {bootstrap_addr}..."
-                            )
-                            self.heartbeat_failures[bootstrap_addr] = (
-                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                            )
-                            with self.session_pool_lock:
-                                if bootstrap_addr in self.session_pool:
-                                    del self.session_pool[bootstrap_addr]
-                    except Exception as e:
-                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
-                        self.heartbeat_failures[bootstrap_addr] = (
-                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                        )
-
-                    if (
-                        self.heartbeat_failures.get(bootstrap_addr, 0)
-                        >= self.max_failures
-                    ):
-                        self._handle_node_failure(bootstrap_addr)
-                        with self.session_pool_lock:
-                            if bootstrap_addr in self.session_pool:
-                                del self.session_pool[bootstrap_addr]
 
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()
@@ -2250,13 +2112,6 @@ class MooncakeKVSender(CommonKVSender):
             return status
         else:
             return self.conclude_state
-
-    def clear(self) -> None:
-        """Remove the bootstrap room entry from the KV manager's request status."""
-        if self.bootstrap_room in self.kv_mgr.request_status:
-            self.kv_mgr.request_status.pop(self.bootstrap_room)
-
-            # self.kv_mgr.transfer_finish_times.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank

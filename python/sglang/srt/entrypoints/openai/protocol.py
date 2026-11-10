@@ -460,6 +460,7 @@ class CompletionRequest(BaseModel):
 
     # For tracing
     trace_config: Optional[Dict[str, Any]] = None
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -968,13 +969,22 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def validate_mm_request(cls, values):
-        """Multi-modal request must carry task_results from IC."""
-        if (
-            isinstance(values, dict)
-            and values.get("is_mm_request", False)
-            and values.get("task_results") is None
-        ):
+        """A multi-modal request must carry IC's task_results, and only it may.
+
+        An empty list counts as missing: IC resolves every media item or none.
+        """
+        if not isinstance(values, dict):
+            return values
+
+        is_mm_request = values.get("is_mm_request")
+        task_results = values.get("task_results")
+        detail = None
+        if is_mm_request and not task_results:
             detail = "Multi-modal request requires task_results parameter from IC"
+        elif is_mm_request is False and task_results:
+            detail = "task_results is only accepted when is_mm_request is true"
+
+        if detail is not None:
             logger.error(
                 "rid=%s, status_code=400, error: %s",
                 values.get("rid"),

@@ -80,6 +80,7 @@ class FakeKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         self.curr_idx += len(kv_indices)
         logger.debug(

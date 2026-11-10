@@ -1,5 +1,6 @@
 import logging
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -7,7 +8,6 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -15,7 +15,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -108,7 +107,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                ps=ps,
+                ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
@@ -132,8 +131,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
-        self._pp_context_feature_indices: Optional[list[int]] = None
-        self._linear_accept_index_cache: Optional[torch.Tensor] = None
 
         if self.ps.tp_rank == 0:
             logger.info(
@@ -157,13 +154,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         target_model = self.target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
-        needs_lm_head = not (
-            self._is_pd_prefill
-            and self.ps.pp_size > 1
-            and self.ps.pp_rank + 1 < self.ps.pp_size
-            and not self._draft_is_moe
-        )
-        if needs_lm_head and (lm_head is None or not hasattr(lm_head, "weight")):
+        if lm_head is None or not hasattr(lm_head, "weight"):
             raise RuntimeError(
                 "DSpark requires the target model to expose `lm_head` with `weight`."
             )
@@ -171,23 +162,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             embed_tokens=self._resolve_target_embed_tokens(target_model),
             lm_head=lm_head,
         )
-        # Set by attach_shared_modules: a shared target embed / lm_head that
-        # shards its vocab over the global TP group (dp attention without
-        # --enable-dp-lm-head, or SGLANG_ENABLE_EMBED_DP_SHARD) makes the draft
-        # gather rows across attention-DP ranks, so every rank must join.
-        self._dp_vocab_sync = bool(
-            getattr(self.draft_model, "lm_head_dp_gather", False)
-            or getattr(self.draft_model, "embed_dp_gather", False)
-        )
-        # Largest captured draft row count: the capacity every DP-gathered vocab
-        # collective pads to when the batch fits, so graph replays (which bake
-        # it) and eager / idle joins always agree on the shape.
-        self._dp_graph_rows = (
-            max(server_args.cuda_graph_config.decode.bs) * int(self.gamma)
-            if self._dp_vocab_sync and self._decode_graph_allowed
-            else None
-        )
-        self.draft_model.dp_embed_rows_capacity = self._dp_graph_rows
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -226,8 +200,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
-            dp_vocab_sync=self._dp_vocab_sync,
-            dp_graph_rows=self._dp_graph_rows,
         )
         self._verify_epilogue = None
         if (
@@ -295,58 +267,11 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
-            self._init_pp_context_feature_indices()
-
-    @property
-    def _draft_weight_sharded(self) -> bool:
-        # Runtime weight sharding adds a node-local AllGather to the dense
-        # draft's forward. Idle DP ranks must still run that forward (empty
-        # batch) so all shard-group members enter the AG; probe live because
-        # prune_to_ctx_kv_injection() drops the shard bookkeeping.
-        return bool(getattr(self.draft_model, "_weight_shard_layers", None))
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
         return target_model.model.get_input_embeddings()
-
-    def _init_pp_context_feature_indices(self) -> None:
-        if self.ps.pp_size <= 1:
-            return
-        if not hasattr(self.draft_model, "project_target_hidden_partial"):
-            return
-
-        target_layer_ids = getattr(
-            self.model_runner.spec_aux_config, "dflash_target_layer_ids", None
-        )
-        if not target_layer_ids:
-            return
-
-        target_model = self.target_worker.model_runner.model
-        start_layer = int(getattr(target_model, "start_layer", 0))
-        end_layer = int(getattr(target_model, "end_layer", 0))
-        target_layer_to_feature = {
-            int(layer_id): idx for idx, layer_id in enumerate(target_layer_ids)
-        }
-        local_feature_indices = [
-            target_layer_to_feature[layer_id]
-            for layer_id in range(start_layer, end_layer)
-            if layer_id in target_layer_to_feature
-        ]
-        if not local_feature_indices:
-            return
-
-        self._pp_context_feature_indices = local_feature_indices
-        if self.ps.tp_rank == 0:
-            logger.info(
-                "DSpark PP-local context projection will accumulate feature indices %s "
-                "from target layers %s for PP rank %s local layers [%s, %s).",
-                local_feature_indices,
-                list(target_layer_ids),
-                self.ps.pp_rank,
-                start_layer,
-                end_layer,
-            )
 
     @property
     def carries_confidence(self) -> bool:
@@ -369,55 +294,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
-    def _vocab_graph_capture_context(self):
-        """Put the lm_head shard group's pynccl comm in graph mode for the draft
-        capture.
-
-        The draft graphs are captured with the ambient TP group patched to
-        attn-TP, so the module-level ``graph_capture()`` only switches THAT
-        group into graph mode (pynccl enabled). The DP-gathered lm-head
-        collectives run on the shard group (the global TP group), whose pynccl
-        comm would stay disabled and fall back to torch.distributed -- which is
-        not capturable and stalls the capture.
-        """
-        if not self._dp_vocab_sync:
-            return nullcontext()
-        group = getattr(self.draft_model, "lm_head_group", None)
-        pynccl_comm = getattr(group, "pynccl_comm", None)
-        if pynccl_comm is None:
-            return nullcontext()
-        return pynccl_comm.change_state(enable=True)
-
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        if (
-            memory_pool_config is not None
-            and self._is_pd_prefill
-            and not self._draft_is_moe
-            and self.ps.pp_rank < self.ps.pp_size - 1
-        ):
-            page_size = int(self.page_size)
-
-            def _minimal_capacity(capacity):
-                if capacity is None or capacity == 0:
-                    return capacity
-                return page_size
-
-            memory_pool_config = MemoryPoolConfig(
-                max_total_num_tokens=page_size,
-                max_running_requests=memory_pool_config.max_running_requests,
-                full_max_total_num_tokens=_minimal_capacity(
-                    memory_pool_config.full_max_total_num_tokens
-                ),
-                swa_max_total_num_tokens=_minimal_capacity(
-                    memory_pool_config.swa_max_total_num_tokens
-                ),
-                mem_fraction_static=memory_pool_config.mem_fraction_static,
-            )
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
@@ -445,7 +327,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
-        with self._draft_context(), self._vocab_graph_capture_context():
+        with self._draft_context():
             if capture_decode_cuda_graph:
                 self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
@@ -495,81 +377,48 @@ class DSparkWorkerV2(BaseSpecWorker):
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
-    def _linear_accept_indices(self, bs: int) -> torch.Tensor:
-        num_indices = bs * self.verify_num_draft_tokens
-        if (
-            self._linear_accept_index_cache is None
-            or self._linear_accept_index_cache.numel() < num_indices
-        ):
-            self._linear_accept_index_cache = torch.arange(
-                num_indices, dtype=torch.int64, device=self.device
-            )
-        return self._linear_accept_index_cache[:num_indices].view(
-            bs, self.verify_num_draft_tokens
-        )
-
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
-        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        if getattr(batch, "return_logprob", False):
+            raise ValueError(
+                "DSpark speculative decoding does not support return_logprob yet."
+            )
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
+            return self._forward_prefill(batch, on_publish)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
+        self, batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if self.server_args.enable_dp_attention:
                 self.target_worker.forward_batch_generation(
-                    batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
         batch_output = self.target_worker.forward_batch_generation(
-            batch,
-            pp_proxy_tensors=pp_proxy_tensors,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
         logits_output = batch_output.logits_output
-        output_pp_proxy_tensors = batch_output.pp_hidden_states_proxy_tensors
-        # The target aux hidden is consumed locally on this rank only: it feeds
-        # this rank's context projection (dspark_ctx_acc), which is the sole
-        # DSpark tensor the next PP rank reads. Pop it from the outgoing proxy
-        # so it is not redundantly shipped across the PP wire (the downstream
-        # rank reads hidden_states / residual / dspark_ctx_acc, never this).
-        target_hidden = (
-            logits_output.hidden_states
-            if logits_output is not None
-            else (
-                output_pp_proxy_tensors.tensors.pop("dspark_aux_hidden_states", None)
-                if output_pp_proxy_tensors is not None
-                else None
-            )
-        )
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
-        if target_hidden is None and self.ps.pp_size > 1:
-            target_hidden = torch.empty(
-                (0, 0), dtype=torch.float16, device=self.device
-            )
-        if target_hidden is None:
+        if logits_output.hidden_states is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
             )
-        has_local_target_hidden = target_hidden.numel() > 0
         if batch.extend_lens is None or batch.prefix_lens is None:
             raise RuntimeError(
                 "DSpark expected extend_lens / prefix_lens in extend mode, got None."
@@ -579,86 +428,29 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
-        # Non-last PP ranks return PPProxyTensors and do not sample tokens, so
-        # next_token_ids is None there. Positions are still needed for local
-        # draft-KV injection, and should live on this worker's device.
-        device = self.device
-        num_real_tokens = int(sum(batch.extend_lens))
-        # Build on host first, then upload with non_blocking=True (same idiom as
-        # ForwardBatch.init_new). Passing device= to torch.tensor() makes PyTorch
-        # take the pageable-H2D path, which appends a cudaStreamSynchronize: the
-        # host would block until the whole target forward drains, leaving the GPU
-        # queue empty for the PP consensus-ring waits that follow.
-        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32).to(
-            device, non_blocking=True
-        )
-        draft_seq_lens = torch.tensor(batch.prefix_lens, dtype=torch.int32).to(
-            device, non_blocking=True
+        device = next_token_ids.device
+        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+        draft_seq_lens = torch.tensor(
+            batch.prefix_lens, dtype=torch.int32, device=device
         )
         positions, _ = compute_position(
             self.model_runner.server_args.attention_backend,
             draft_seq_lens,
             ctx_lens,
-            num_real_tokens,
+            int(sum(batch.extend_lens)),
         )
-        # mlp-sync (DP attention / MoE a2a) pads extend batches to a multiple of
-        # attn_tp_size, but only the last PP rank un-pads its output
-        # (post_forward_mlp_sync_batch trims logits_output.hidden_states) —
-        # earlier ranks publish the padded rows. Trim both sides to the real
-        # tokens so the cross-stage accumulation shares one row convention.
-        incoming_ctx = (
-            pp_proxy_tensors.tensors.get("dspark_ctx_acc")
-            if pp_proxy_tensors is not None
-            else None
+        self._kv_injector.inject_target_hidden(
+            target_hidden=logits_output.hidden_states,
+            cache_loc=batch.out_cache_loc,
+            positions=positions,
         )
-        if incoming_ctx is not None and incoming_ctx.shape[0] > num_real_tokens:
-            incoming_ctx = incoming_ctx[:num_real_tokens]
-        local_ctx = None
-        if (
-            self.ps.pp_size > 1
-            and has_local_target_hidden
-            and self._pp_context_feature_indices is not None
-        ):
-            local_ctx = self.draft_model.project_target_hidden_partial(
-                target_hidden, self._pp_context_feature_indices
-            )
-            if local_ctx.shape[0] > num_real_tokens:
-                local_ctx = local_ctx[:num_real_tokens]
-        ctx_acc = None
-        if incoming_ctx is not None and local_ctx is not None:
-            ctx_acc = (
-                incoming_ctx.to(device=local_ctx.device, dtype=local_ctx.dtype)
-                + local_ctx
-            )
-        elif incoming_ctx is not None:
-            ctx_acc = incoming_ctx.to(device=self.device, non_blocking=True)
-        elif local_ctx is not None:
-            ctx_acc = local_ctx
-
-        if output_pp_proxy_tensors is not None:
-            if ctx_acc is not None:
-                output_pp_proxy_tensors.tensors["dspark_ctx_acc"] = ctx_acc
-        elif ctx_acc is not None:
-            self._kv_injector.inject_projected_context(
-                projected_context=ctx_acc,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-            )
-        elif has_local_target_hidden and not (self.ps.pp_size > 1 and not self._draft_is_moe):
-            self._kv_injector.inject_target_hidden(
-                target_hidden=target_hidden,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-            )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-        if logits_output is not None:
-            logits_output.hidden_states = None
+        logits_output.hidden_states = None
 
-        if next_token_ids is not None:
-            batch_output.next_draft_input = make_next_draft_input(
-                bonus_tokens=next_token_ids,
-                new_seq_lens=batch.seq_lens,
-            )
+        batch_output.next_draft_input = make_next_draft_input(
+            bonus_tokens=next_token_ids,
+            new_seq_lens=batch.seq_lens,
+        )
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
@@ -723,23 +515,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
             if self.server_args.enable_dp_attention:
-                if (
-                    self._draft_is_moe
-                    or self._dp_vocab_sync
-                    or self._draft_weight_sharded
-                ):
-                    # Same TP context as the busy path's propose, so the draft
-                    # side of an idle rank issues its collectives on the same
-                    # groups.
-                    with self._draft_context():
-                        self._proposer.run_idle_participation(batch)
+                if self._draft_is_moe:
+                    self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )
-                # Mirror the busy path: exactly one AG submission per step on
-                # every rank (the proposer's prefetch is idempotent).
-                if self._draft_weight_sharded:
-                    self._proposer.prefetch_weight_shard()
             return self._decode_idle_result(on_publish=on_publish)
 
         batch.seq_lens.record_stream(
@@ -879,15 +659,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
-        # Fire AG 0 here, right where the accept-epilogue kernels
-        # (finalize_accept_lens / build_out_tokens / index ops) are about to be
-        # enqueued: the gate resolves at the epilogue start on the device, so
-        # the AG covers [accept epilogue + ReplaySSM commit fold]. The proposer's
-        # prefetch is idempotent per step, and the idle path mirrors this with
-        # exactly one submission per step (NCCL pairs the shard-group AGs by
-        # sequence number).
-        if self._draft_weight_sharded:
-            self._proposer.prefetch_weight_shard()
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
@@ -900,15 +671,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
-        if batch.return_logprob:
-            compute_spec_v2_logprobs(
-                batch,
-                logits_output,
-                accept.out_tokens.reshape(-1),
-                self._linear_accept_indices(bs),
-                self.verify_num_draft_tokens - 1,
-            )
-
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
