@@ -194,3 +194,29 @@ def get_valid_kv_indices(
         bs,
         topk,
     )
+
+
+def act_quant_fp4(
+    x: torch.Tensor, block_size: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """C4: quantize 128-wide DSA indexer activations to packed E2M1 FP4.
+
+    Delegates to the baseline DSV4 Triton quantizer (32-value UE8M0 groups),
+    which produces the exact layout the DeepGEMM fp8_fp4 MQA-logits kernels
+    consume. Returns:
+        - packed data with shape ``(*x.shape[:-1], 64)`` and dtype int8
+        - packed UE8M0 scales with shape ``(*x.shape[:-1], 1)`` and dtype int32
+    """
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert block_size == 128, "DSA FP4 indexer currently requires block_size=128"
+    assert x.size(-1) == 128, "DSA FP4 indexer currently requires head_dim=128"
+
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        quantize_fp4_indexer_tensor,
+    )
+
+    original_shape = x.shape[:-1]
+    y_flat, s_flat = quantize_fp4_indexer_tensor(x.view(-1, 128).contiguous())
+    y = y_flat.view(*original_shape, 64)
+    s = s_flat.view(*original_shape, 1)
+    return y, s

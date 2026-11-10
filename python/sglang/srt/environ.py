@@ -766,7 +766,17 @@ class Envs:
     )
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
-    SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # C4: pack the DSA indexer Q/K activations to packed E2M1 FP4 (Blackwell+
+    # DeepGEMM fp8_fp4 MQA logits paths). Off by default. Canonical DSA_* name;
+    # falls back to the old SGLANG_NSA_FP4_INDEXER for backward compatibility.
+    SGLANG_DSA_FP4_INDEXER = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NSA_FP4_INDEXER"
+    )
+    # Fused DSA indexer drops the Hadamard rotation the source branch always
+    # applied to indexer Q/K before fp8 quantization -> noisy indexer logits
+    # -> occasional wrong top-k block selection -> long-context accuracy
+    # regression. Default OFF; set =0 to re-enable the fused path for tuning.
+    SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(True)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

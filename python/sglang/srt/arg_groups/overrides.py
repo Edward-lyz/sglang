@@ -1542,10 +1542,15 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
     if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
+    # C4: "mxfp4" selects the native OCP MXFP4 latent KV cache (400B row)
+    # consumed by the FlashMLA DSV4 sparse-decode kernel on SM100+.
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
-    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+        "mxfp4",
+    ], "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3, or mxfp4 kv_cache_dtype"
+    if kv_cache_dtype == "mxfp4" and major < 10:
+        raise ValueError("MXFP4 DSA KV cache requires an SM100+ CUDA device")
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}
@@ -1635,6 +1640,24 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     if not user_set_prefill and not user_set_decode and is_hip():
         declared["dsa_prefill_backend"] = "tilelang"
         declared["dsa_decode_backend"] = "tilelang"
+    elif kv_cache_dtype == "mxfp4":
+        # C4: MXFP4 latent KV requires a FlashMLA prefill backend and the
+        # flashmla_kv sparse-decode backend (the only decode path that reads
+        # the 400B MXFP4 row via the DSV4 kernel).
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "flashmla_auto"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "flashmla_kv"
+        _prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
+        _decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+        if _prefill not in ("flashmla_auto", "flashmla_kv", "flashmla_sparse"):
+            raise ValueError(
+                "MXFP4 DSA KV cache requires a FlashMLA prefill backend"
+            )
+        if _decode != "flashmla_kv":
+            raise ValueError(
+                "MXFP4 DSA KV cache requires --dsa-decode-backend flashmla_kv"
+            )
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"

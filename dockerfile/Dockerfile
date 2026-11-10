@@ -14,7 +14,7 @@ FROM iregistry.baidu-int.com/zhangyanzhe/sglang-test:v0.5.17-cu130 as base
 # unset http_proxy
 # unset https_proxy
 # python3 -m sglang.compile_deep_gemm --model $path_to_deepseek --tp 8 --trust-remote-code
-# 2. 基础镜像内置 flash_mla 0b475cc，当前镜像会覆盖安装 9d77d8a，以支持 DSV4 head_num=64 Decode。
+# 2. 基础镜像内置 flash_mla 0b475cc；当前镜像覆盖安装 5b200a9(cu13)，支持 DSV4 head_num=64 Decode 及 400B MXFP4 KV cache(c4)。
 ## ===========================================================================================
 
 
@@ -24,6 +24,7 @@ RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
 RUN cd /tmp/aiak_sglang && find . -name "*.py" -exec cp --parents {} /sgl-workspace/sglang \; && \
     cp -R python/sglang/kernels/jit /sgl-workspace/sglang/python/sglang/kernels && \
+    cp -R python/sglang/jit_kernel /sgl-workspace/sglang/python/sglang && \
     git log -1 --format="%H %s %an %ad" > /sgl-workspace/sglang/aiak-last-commit && \
     rm -rf /tmp/aiak_sglang
 
@@ -44,8 +45,23 @@ RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac_test/vllm/deep_ep/deve
 RUN pip uninstall deep_gemm -y
 RUN rm -r /usr/local/lib/python3.12/dist-packages/deep_gemm
 RUN pip install --no-cache-dir --force-reinstall https://cce-ai-datasets.bj.bcebos.com/hac_test/vllm/DeepGemm/develop/torch2.11.0/deep_gemm-2.5.0+4400f34-py3-none-any.whl
+# c4(cache-4bit): cu13 FlashMLA (DSV4 400B MXFP4 sparse decode) 暂用仓库内 vendored wheel 安装；
+# TODO: 上传该 wheel 到 BOS 后可改回 https URL 安装（去掉 COPY，改回注释掉的那行）。
+# RUN python3 -m pip install --no-cache-dir --force-reinstall --no-deps 'https://cce-ai-datasets.bj.bcebos.com/hac_test/vllm/FlashMLA/develop/torch2.11.0/flash_mla-1.0.0+5b200a9-cp312-cp312-linux_x86_64.whl'
+COPY aiak_sglang/dockerfile/flash_mla-1.0.0+5b200a9-cp312-cp312-linux_x86_64.whl /tmp/flash_mla-1.0.0+5b200a9-cp312-cp312-linux_x86_64.whl
 RUN python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
-    'https://cce-ai-datasets.bj.bcebos.com/hac_test/vllm/FlashMLA/develop/torch2.9.1/flash_mla-1.0.0+9d77d8a-cp312-cp312-linux_x86_64.whl'
+    /tmp/flash_mla-1.0.0+5b200a9-cp312-cp312-linux_x86_64.whl && \
+    rm -f /tmp/flash_mla-1.0.0+5b200a9-cp312-cp312-linux_x86_64.whl
+
+# c4(cache-4bit): overlay the FlashMLA DSV4 400B MXFP4 sparse-decode bridge onto
+# the installed sgl_kernel wrapper (the repo copy under kernels/aot is NOT the
+# module imported at runtime as sgl_kernel.flash_mla). Resolve the install dir via
+# sysconfig purelib (no `import sgl_kernel`, which fails/empties during a GPU-less
+# build and would silently copy the bridge to /flash_mla.py). Assert it landed.
+RUN SGLK="$(python3 -c 'import sysconfig,os;print(os.path.join(sysconfig.get_paths()["purelib"],"sgl_kernel"))')" && \
+    cp /sgl-workspace/sglang/python/sglang/kernels/aot/python/sgl_kernel/flash_mla.py "$SGLK/flash_mla.py" && \
+    grep -q is_mxfp4_kvcache "$SGLK/flash_mla.py"
+
 
 # Install deepgemm cache
 RUN cd /root && wget https://ai-data.bj.bcebos.com/mae/cache_glm5.1_0620_merged.tar.gz  && tar -xzvf cache_glm5.1_0620_merged.tar.gz && rm /root/.cache -rf && mv cache_glm5.1_0620_merged/.cache /root/.cache && rm cache_glm5.1_0620_merged.tar.gz

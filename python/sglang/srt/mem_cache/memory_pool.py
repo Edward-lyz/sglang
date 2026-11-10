@@ -132,6 +132,16 @@ def conv_window_dedup_enabled(
     )
 
 
+def use_dsa_fp4_indexer() -> bool:
+    """C4: whether the DSA indexer should pack Q/K activations to FP4.
+    Requires CUDA + Blackwell + the SGLANG_DSA_FP4_INDEXER toggle."""
+    if not _is_cuda:
+        return False
+    from sglang.srt.utils import is_blackwell_supported
+
+    return is_blackwell_supported() and envs.SGLANG_DSA_FP4_INDEXER.get()
+
+
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
@@ -4321,6 +4331,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
+    index_k_scale_bytes_per_token = 4
     index_k_with_scale_buffer_dtype = torch.uint8
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
@@ -4340,6 +4351,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
         index_topk_pattern: Optional[list[str]] = None,
+        use_fp4_indexer: Optional[bool] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -4384,6 +4396,20 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 self.indexer_layer_num = len(self.indexer_layer_mapping)
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
+        # C4: FP4 indexer packs the 128-dim key to 64 bytes (2x E2M1/byte);
+        # fp8 keeps 128 bytes. Scale stays 4 bytes/token in both modes.
+        self.use_fp4_indexer = (
+            use_dsa_fp4_indexer() if use_fp4_indexer is None else use_fp4_indexer
+        )
+        self.index_k_data_bytes_per_token = (
+            index_head_dim // 2 if self.use_fp4_indexer else index_head_dim
+        )
+        self.index_k_bytes_per_token = (
+            self.index_k_data_bytes_per_token + self.index_k_scale_bytes_per_token
+        )
+        self.index_k_scale_offset_in_page = (
+            self.page_size * self.index_k_data_bytes_per_token
+        )
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
@@ -4402,8 +4428,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _index_buffer_shape(self, num_pages: int) -> tuple[int, int]:
         return (
             num_pages,
-            self.page_size
-            * (self.index_head_dim + self.index_head_dim // self.quant_block_size * 4),
+            self.page_size * self.index_k_bytes_per_token,
         )
 
     def _create_index_buffers(self):
@@ -4592,6 +4617,101 @@ class DSATokenToKVPool(MLATokenToKVPool):
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
+
+
+class DSATokenToKVPoolMXFP4(DSATokenToKVPool):
+    """C4: DSA latent KV cache with one FlashMLA-compatible 400-byte row/token.
+
+    Each row stores 256 packed E2M1 bytes, 16 E8M0 scale bytes and 64 BF16 RoPE
+    values (128 bytes). A single allocation keeps addresses stable across CUDA
+    Graph capture and can be consumed directly by the DSV4 FlashMLA kernel.
+    """
+
+    packed_dim = 256
+    scale_dim = 16
+    rope_dim = 64
+    bytes_per_token = packed_dim + scale_dim + rope_dim * torch.bfloat16.itemsize
+
+    def __init__(self, *args, **kwargs):
+        kwargs["dtype"] = torch.uint8
+        super().__init__(*args, **kwargs)
+        self.kv_cache_dim = self.bytes_per_token
+        self.dsa_kv_cache_store_mxfp4 = True
+
+    def _create_buffers(self):
+        self.store_dtype = torch.uint8
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.kv_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, 1, self.bytes_per_token),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    @classmethod
+    def _views(cls, buffer: torch.Tensor):
+        packed = buffer[..., : cls.packed_dim]
+        scales = buffer[..., cls.packed_dim : cls.packed_dim + cls.scale_dim]
+        rope = buffer[..., cls.packed_dim + cls.scale_dim :].view(torch.bfloat16)
+        return packed, scales, rope
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        if cache_k_nope.shape[-1] != self.kv_lora_rank:
+            raise ValueError(
+                f"MXFP4 DSA latent dim must be {self.kv_lora_rank}, "
+                f"got {cache_k_nope.shape[-1]}"
+            )
+        if cache_k_rope.shape[-1] != self.qk_rope_head_dim:
+            raise ValueError(
+                f"MXFP4 DSA RoPE dim must be {self.qk_rope_head_dim}, "
+                f"got {cache_k_rope.shape[-1]}"
+            )
+
+        from sglang.srt.layers.quantization.kvfp4_tensor import MXFP4KVQuantizeUtil
+
+        buffer = self.kv_buffer[layer.layer_id - self.start_layer]
+        packed, scales, rope = self._views(buffer)
+        MXFP4KVQuantizeUtil.quantize_and_store_paged(
+            cache_k_nope.to(torch.bfloat16),
+            cache_k_rope.to(torch.bfloat16),
+            loc,
+            packed,
+            scales,
+            rope,
+        )
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        from sglang.srt.layers.quantization.kvfp4_tensor import MXFP4KVQuantizeUtil
+
+        buffer = self.kv_buffer[layer.layer_id - self.start_layer]
+        packed, scales, rope = self._views(buffer)
+        output = MXFP4KVQuantizeUtil.dequantize_paged(
+            packed,
+            scales,
+            loc,
+            dtype=dst_dtype or torch.bfloat16,
+            bf16_tail=rope,
+        )
+        return output[..., : self.kv_lora_rank], output[..., self.kv_lora_rank :]
+
 
 
 def move_kv_cache_native(

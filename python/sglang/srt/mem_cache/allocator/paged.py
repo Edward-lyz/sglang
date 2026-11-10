@@ -274,6 +274,29 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
+    def free_group_end(self):
+        """C4: release grouped ranges without losing per-request page
+        boundaries. A grouped range can end in a partial page; concatenating
+        token ranges before striding by page_size shifts the page boundary of
+        every subsequent request and leaks pages. Extract page ids from each
+        range first, then combine them for one allocator update."""
+        self.is_not_in_free_group = True
+        page_id_chunks = [
+            free_index[:: self.page_size] // self.page_size
+            for free_index in self.free_group
+            if free_index.numel() > 0
+        ]
+        self.free_group = []
+        if not page_id_chunks:
+            return
+        free_page_ids = torch.cat(page_id_chunks)
+        if self.need_sort:
+            self.release_pages = torch.cat((free_page_ids, self.release_pages))
+        else:
+            self.free_pages = torch.cat((free_page_ids, self.free_pages))
+        if self.debug_mode:
+            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(

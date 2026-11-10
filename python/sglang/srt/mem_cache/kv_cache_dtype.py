@@ -52,6 +52,15 @@ def configure_kv_cache_dtype(
             kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype == "mxfp8":
         kv_cache_dtype = torch.float8_e4m3fn
+    elif server_args_kv_cache_dtype == "mxfp4":
+        # C4: OCP MXFP4 latent KV for the DSA sparse-decode path. The row is
+        # a raw byte blob (256B packed E2M1 + 16B E8M0 scale + 128B bf16 rope),
+        # so the storage dtype is uint8; the DSATokenToKVPoolMXFP4 pool owns
+        # the real layout.
+        if _is_hip:
+            raise ValueError("MXFP4 DSA KV cache is only supported on CUDA")
+        kv_cache_dtype = torch.uint8
+        logger.warning("Using OCP MXFP4 E2M1 DSA KV cache storage.")
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
     elif server_args_kv_cache_dtype == "fp4_e2m1":

@@ -10,6 +10,17 @@ except Exception as _e:
 else:
     _flashmla_import_error = None
 
+# C4: the AOT sgl-kernel extension only accepts the 656-byte FP8 sparse row.
+# FlashMLA DSV4 adds the 400-byte MXFP4 sparse-decode path; import it lazily.
+try:
+    from flash_mla.flash_mla_interface import (
+        dsv4_flash_mla_with_kvcache as _dsv4_flash_mla_with_kvcache,
+        dsv4_get_mla_metadata as _dsv4_get_mla_metadata,
+    )
+except Exception:
+    _dsv4_flash_mla_with_kvcache = None
+    _dsv4_get_mla_metadata = None
+
 _IMPORT_ERROR = ImportError(
     "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
 )
@@ -45,6 +56,7 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
+    is_mxfp4_kvcache: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -64,6 +76,23 @@ def get_mla_metadata(
 
     if cache_seqlens is None:
         return FlashMLASchedMeta(), None
+
+    # C4: the MXFP4 (400B) sparse-decode path is served by the FlashMLA
+    # DSV4 kernel, which needs its own scheduler metadata tensors.
+    if is_mxfp4_kvcache and topk is not None:
+        if _dsv4_get_mla_metadata is None:
+            raise ImportError(
+                "MXFP4 DSA decode requires flash_mla.flash_mla_interface."
+                "dsv4_get_mla_metadata, which is unavailable in this image."
+            )
+        return _dsv4_get_mla_metadata(
+            cache_seqlens,
+            num_q_tokens_per_head_k,
+            num_heads_k,
+            num_heads_q,
+            is_fp8_kvcache,
+            topk,
+        )
 
     assert num_q_tokens_per_head_k is not None
     assert num_heads_k is not None
@@ -129,6 +158,41 @@ def flash_mla_with_kvcache(
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+    # C4: MXFP4 sparse decode. The 400-byte packed row is served by the
+    # FlashMLA DSV4 kernel (SM100), instantiated for 64/128 query heads. In
+    # TP>1 SGLang passes only the local heads; pad up for the kernel then trim.
+    if (
+        indices is not None
+        and k_cache.shape[-1] == 400
+        and _dsv4_flash_mla_with_kvcache is not None
+    ):
+        original_hq = q.shape[2]
+        q_for_kernel = q
+        if original_hq not in (64, 128):
+            target_hq = 64 if original_hq < 64 else 128
+            q_for_kernel = torch.zeros(
+                (*q.shape[:2], target_hq, q.shape[3]),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            q_for_kernel[:, :, :original_hq, :].copy_(q)
+        out, lse = _dsv4_flash_mla_with_kvcache(
+            q=q_for_kernel,
+            k_cache=k_cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=head_dim_v,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            is_fp8_kvcache=is_fp8_kvcache,
+            indices=indices,
+        )
+        if q_for_kernel is not q:
+            out = out[:, :, :original_hq, :]
+            lse = lse[:, :original_hq, :]
+        return out, lse
     if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
         return _flash_mla_with_kvcache_sched_meta(
             q=q,

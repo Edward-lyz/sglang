@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
+    DSATokenToKVPoolMXFP4,
     HybridLinearKVPool,
     HybridReqToTokenPool,
     KVCache,
@@ -1131,8 +1132,18 @@ class KVCacheConfigurator:
             PoolCls = LayerSplitDSATokenToKVPool
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+        elif self.server_args.kv_cache_dtype == "mxfp4":
+            # C4: 400-byte packed MXFP4 latent KV for the FlashMLA DSV4
+            # sparse-decode path.
+            PoolCls = DSATokenToKVPoolMXFP4
         else:
             PoolCls = DSATokenToKVPool
+        # HiSparseDSATokenToKVPool does not accept use_fp4_indexer; only the
+        # base / layer-split / MXFP4 pools do.
+        if not self.server_args.enable_hisparse:
+            from sglang.srt.mem_cache.memory_pool import use_dsa_fp4_indexer
+
+            pool_kwargs["use_fp4_indexer"] = use_dsa_fp4_indexer()
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.server_args.page_size,
@@ -1867,6 +1878,17 @@ def calculate_mla_kv_cache_dim(
     # (excluding TRTLLM and HIP raw-layout kernels).
     # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
     # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
+    # C4: MXFP4 stores the latent as a 400-byte row: 256 packed E2M1 bytes
+    # (kv_lora_rank/2) + 16 E8M0 scale bytes (kv_lora_rank/32) + rope in bf16.
+    if server_args.kv_cache_dtype == "mxfp4":
+        assert (
+            kv_lora_rank % 32 == 0
+        ), f"kv_lora_rank {kv_lora_rank} must be a multiple of 32 for MXFP4"
+        return (
+            kv_lora_rank // 2
+            + kv_lora_rank // 32
+            + qk_rope_head_dim * rope_storage_dtype.itemsize
+        )
     if kv_cache_dtype == torch.float8_e4m3fn:
         assert (
             kv_lora_rank % quant_block_size == 0

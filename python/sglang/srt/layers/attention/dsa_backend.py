@@ -407,6 +407,14 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+        # C4: MXFP4 latent KV also stores a pre-quantized cache row, so it
+        # shares the fp8 'already quantized' fast paths via *_store_quantized.
+        self.dsa_kv_cache_store_mxfp4 = getattr(
+            model_runner.token_to_kv_pool, "dsa_kv_cache_store_mxfp4", False
+        )
+        self.dsa_kv_cache_store_quantized = (
+            self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_mxfp4
+        )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
@@ -2151,9 +2159,19 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if self.dsa_kv_cache_store_mxfp4:
+                        # C4: dequantize the packed MXFP4 rows back to bf16
+                        # (nope + rope) for the bf16 sparse-prefill kernel.
+                        cache_k_nope, cache_k_rope = (
+                            forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+                                layer, page_table_1_flattened
+                            )
+                        )
+                        kv_cache = _cat([cache_k_nope, cache_k_rope], dim=-1)
+                    else:
+                        kv_cache = dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
@@ -2609,7 +2627,7 @@ class DeepseekSparseAttnBackend(
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if not self.dsa_kv_cache_store_fp8:
+        if not self.dsa_kv_cache_store_quantized:
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
@@ -3116,7 +3134,7 @@ class DeepseekSparseAttnBackend(
 
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
-            if self.dsa_kv_cache_store_fp8:
+            if self.dsa_kv_cache_store_quantized:
                 if (
                     is_blackwell()
                     and forward_batch is not None
@@ -3142,7 +3160,7 @@ class DeepseekSparseAttnBackend(
         """
         if (
             # disable for MTP
-            self.dsa_kv_cache_store_fp8
+            self.dsa_kv_cache_store_quantized
             # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8
             # dispatch lives inside the RAGGED branch of forward_extend; without this the
             # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
@@ -3187,6 +3205,7 @@ class DeepseekSparseAttnBackend(
             num_heads_q=num_heads_q,
             is_fp8_kvcache=True,
             topk=self.dsa_index_topk,
+            is_mxfp4_kvcache=self.dsa_kv_cache_store_mxfp4,
         )
 
         return DSAFlashMLAMetadata(

@@ -202,11 +202,34 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * kv_size
                 )
 
+            if (
+                is_deepseek_dsa(model_config.hf_config)
+                and kvc.server_args.kv_cache_dtype == "mxfp4"
+            ):
+                # C4: MXFP4 latent KV is a fixed 400-byte row per token/layer.
+                from sglang.srt.mem_cache.memory_pool import (
+                    DSATokenToKVPoolMXFP4,
+                )
+
+                cell_size = (
+                    DSATokenToKVPoolMXFP4.bytes_per_token * effective_num_layers
+                )
+
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
+                from sglang.srt.mem_cache.memory_pool import (
+                    use_dsa_fp4_indexer,
+                )
+
+                # C4: the FP4 indexer packs the key to index_head_dim/2 bytes.
+                index_data_bytes = (
+                    index_head_dim // 2
+                    if use_dsa_fp4_indexer()
+                    else index_head_dim
+                )
                 indexer_size_per_token = (
-                    index_head_dim
+                    index_data_bytes
                     + index_head_dim // DSATokenToKVPool.quant_block_size * 4
                 )
                 element_size = torch._utils._element_size(
