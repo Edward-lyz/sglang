@@ -21,6 +21,11 @@ export ENABLE_W8A8_BLOCK_FP8_GROUPED_GEMM_TMA="FALSE"
 export ENABLE_W8A8_BLOCK_FP8_GROUPED_GEMM_TUNED="1"
 export EP_STATS_DUMP_THRESH="0.95"
 export LD_LIBRARY_PATH=/usr/local/lib/:/usr/lib/x86_64-linux-gnu:/usr/local/nvshmem/lib:${LD_LIBRARY_PATH}
+export MOONCAKE_ASYNC_SEND="TRUE"
+export MOONCAKE_META_SERVER_PASSWORD=test-deepseek
+export MOONCAKE_META_SERVER_URL=redis://10.220.21.235:6379
+export MOONCAKE_SEND_RECV_TIMEOUT="60"
+export MOONCAKE_USE_RDMA="TRUE"
 export NCCL_DEBUG="INFO"
 export NCCL_IB_ADAPTIVE_ROUTING="1"
 export NCCL_IB_GID_INDEX="3"
@@ -96,6 +101,7 @@ echo "Master IP: $MASTER_IP"
 [[ -v MODEL_ID ]] || { echo "MODEL_ID not exist" >&2; exit 1; }
 [[ -v HTTP_PORT ]] || { echo "HTTP_PORT not exist" >&2; exit 1; }
 
+export TORCHINDUCTOR_COMPILE_THREADS=1
 python3 -m sglang.launch_server \
     --host 0.0.0.0 \
     --log-level info \
@@ -127,7 +133,7 @@ python3 -m sglang.launch_server \
     --moe-dense-tp-size 1 \
     --attention-backend nsa \
     --enable-nsa-prefill-context-parallel \
-    --nsa-prefill-backend flashmla_sparse \
+    --nsa-prefill-backend trtllm \
     --nsa-prefill-cp-mode "round-robin-split" \
     --speculative-algorithm EAGLE \
     --speculative-eagle-topk 1 \

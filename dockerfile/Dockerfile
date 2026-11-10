@@ -22,6 +22,8 @@ COPY aiak_sglang /tmp/aiak_sglang
 
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
+RUN cp -Rf /tmp/aiak_sglang/scripts /sgl-workspace/sglang/
+
 RUN cd /tmp/aiak_sglang && find . -name "*.py" -exec cp --parents {} /sgl-workspace/sglang \; && \
     cp -R python/sglang/kernels/jit /sgl-workspace/sglang/python/sglang/kernels && \
     cp -R python/sglang/jit_kernel /sgl-workspace/sglang/python/sglang && \

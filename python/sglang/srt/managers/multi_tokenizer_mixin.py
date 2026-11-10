@@ -299,6 +299,7 @@ def _handle_output_by_index(output, i):
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
+            per_token_strs=_extract_field_by_index(output, "per_token_strs", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),

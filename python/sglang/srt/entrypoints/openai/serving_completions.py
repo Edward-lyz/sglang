@@ -134,7 +134,28 @@ class OpenAIServingCompletion(OpenAIServingBase):
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
+            # AttentionStore parameters are flattened for the internal request.
+            as_kv_cache_params=None,
+            as_max_hit_host_ip=None,
+            as_max_hit_token_len=None,
         )
+
+        if request.kv_transfer_params is not None:
+            kv_cache_dict = (
+                request.kv_cache_params.model_dump()
+                if request.kv_cache_params
+                else {}
+            )
+            adapted_request.as_kv_cache_params = {
+                key: str(value) if value is not None else ""
+                for key, value in kv_cache_dict.items()
+            }
+            adapted_request.as_max_hit_host_ip = (
+                request.kv_transfer_params.max_hit_host_ip
+            )
+            adapted_request.as_max_hit_token_len = (
+                request.kv_transfer_params.max_hit_token_len
+            )
 
         return adapted_request, request
 

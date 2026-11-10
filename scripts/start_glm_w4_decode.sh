@@ -27,6 +27,12 @@ export EP_STATS_DUMP_THRESH="0.95"
 export GC_COLLECT_GEN_STEP="10000"
 export GROUPED_GEMM_EXPECTED_M="4096"
 export LD_LIBRARY_PATH=/usr/local/lib/:/usr/lib/x86_64-linux-gnu:/usr/local/nvshmem/lib:${LD_LIBRARY_PATH}
+export MOONCAKE_ASYNC_SEND="FALSE"
+export MOONCAKE_META_SERVER_PASSWORD=test-deepseek
+export MOONCAKE_META_SERVER_URL=redis://10.220.21.235:6379
+export MOONCAKE_REMOTE_TP_SIZE="1"
+export MOONCAKE_SEND_RECV_TIMEOUT="10"
+export MOONCAKE_USE_RDMA="TRUE"
 export NCCL_BUFFSIZE="524288"
 export NCCL_DEBUG="INFO"
 export NCCL_IB_ADAPTIVE_ROUTING="1"
@@ -142,7 +148,7 @@ python3 -m sglang.launch_server \
     --chunked-prefill-size -1 \
     --split-graph-list 2 14 78 \
     --attention-backend nsa \
-    --nsa-decode-backend flashmla_kv \
+    --nsa-decode-backend trtllm \
     --speculative-algorithm EAGLE \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \

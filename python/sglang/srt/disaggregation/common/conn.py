@@ -307,7 +307,15 @@ class CommonKVManager(BaseKVManager):
         return src_token_lens
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
-        return self.request_status[bootstrap_room]
+        status = self.request_status.get(bootstrap_room)
+        if status is None:
+            # The transfer for this room already concluded and clear() removed
+            # the entry (e.g. a parallel sample sharing the room completed
+            # first, or the request was torn down). Treat as complete so a
+            # poll on a cleared room never raises KeyError and takes down the
+            # whole scheduler.
+            return KVPoll.Success
+        return status
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         if bootstrap_room not in self.request_status:

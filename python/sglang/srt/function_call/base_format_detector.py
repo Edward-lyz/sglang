@@ -359,6 +359,19 @@ class BaseFormatDetector(ABC):
         constraints and parse the model's native output format instead."""
         return False
 
+    def uses_native_structural_tag_for_required(self) -> bool:
+        """Return True if ``tool_choice="required"`` should be constrained with
+        the model-native structural tag.
+
+        Detectors whose native tag does not always embed the parameter schema
+        (for example GLM-47, where the schema is only included when the tool
+        declares ``strict=true``) route required/named requests to the plain
+        JSON Schema constraint instead. Such detectors must override this and
+        return False so the streaming response parser expects the JSON array
+        that the JSON Schema constraint produces.
+        """
+        return True
+
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         """

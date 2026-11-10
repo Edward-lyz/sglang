@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import os
 import signal
+import time
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -105,8 +106,29 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Init running status
         self.init_running_status(server_args)
 
+        # Detokenizer metrics live in this process, separately from the
+        # scheduler/tokenizer collectors.
+        self.init_metrics(server_args)
+
         # Init dispatcher
         self.init_request_dispatcher()
+
+    def init_metrics(self, server_args: ServerArgs):
+        """Initialize the detokenizer's optional Prometheus metrics."""
+        self.enable_metrics = server_args.enable_metrics
+        self.metrics_collector = None
+        if self.enable_metrics:
+            from sglang.srt.observability.metrics_collector import (
+                DetokenizerMetricsCollector,
+            )
+
+            self.metrics_collector = DetokenizerMetricsCollector(
+                labels={
+                    "model_name": server_args.served_model_name,
+                    "node_rank": server_args.node_rank,
+                    "dp_rank": 0,
+                }
+            )
 
     def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):
         context = zmq.Context(2)
@@ -293,6 +315,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Initialize decode status
         read_ids, surr_ids = [], []
+        token_num = 0
         for i in range(bs):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
@@ -357,6 +380,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Incremental decoding
         output_strs = []
+        per_token_strs = []
         for i in range(bs):
             rid = recv_obj.rids[i]
             try:
@@ -391,6 +415,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     printable = find_printable_text(new_text)
                     s.sent_offset = s.decoded_text_len + len(printable)
                     output_strs.append(printable[pending:] if pending else printable)
+                per_token_strs.append(
+                    self._per_token_texts(
+                        surr_ids[i],
+                        read_ids[i],
+                        surr_texts[i],
+                        recv_obj.skip_special_tokens[i],
+                        recv_obj.spaces_between_special_tokens[i],
+                    )
+                )
                 continue
 
             if rid in self.decode_status:
@@ -405,8 +438,49 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             incremental_output = output_str[s.sent_offset :]
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
+            per_token_strs.append(None)
 
-        return output_strs
+        return output_strs, per_token_strs
+
+    def _per_token_texts(
+        self,
+        surr_ids,
+        read_ids,
+        surr_text,
+        skip_special_tokens,
+        spaces_between_special_tokens,
+    ):
+        """Split a multi-token (speculative) step into per-token decoded texts.
+
+        The step-level decode emits one string per scheduler step; under
+        speculative decode a step commits several tokens at once, so one SSE
+        delta covers multiple tokens and downstream streaming counters that
+        count deltas under-report the real token count. This helper re-decodes
+        the step's tokens incrementally so each token gets its own text. Tokens
+        that only complete part of a multi-byte UTF-8 char are held back (""),
+        mirroring the step-level pending logic, so the assembled text stays
+        clean.
+
+        Returns None for single-token steps (caller falls back to output_strs).
+        """
+        base = list(surr_ids)
+        new_only = list(read_ids)[len(base) :]
+        if len(new_only) <= 1:
+            return None
+        clean_acc = surr_text.rstrip("�") if surr_text.endswith("�") else surr_text
+        out = []
+        for k in range(1, len(new_only) + 1):
+            cur = self.tokenizer.decode(
+                base + new_only[:k],
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
+            )
+            if cur.endswith("�"):
+                out.append("")
+            else:
+                out.append(cur[len(clean_acc) :])
+                clean_acc = cur
+        return out
 
     @staticmethod
     def _b64_encode_per_request(
@@ -429,11 +503,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
-        output_strs = (
-            self._decode_batch_token_id_output(recv_obj)
-            if len(recv_obj.rids) > 0
-            else []
-        )
+        start = time.perf_counter()
+        if len(recv_obj.rids) > 0:
+            output_strs, per_token_strs = self._decode_batch_token_id_output(
+                recv_obj
+            )
+        else:
+            output_strs, per_token_strs = [], []
+        if self.enable_metrics:
+            self.metrics_collector.observe_detokenizer_time(
+                time.perf_counter() - start
+            )
+        detokenize_completed_time = time.time()
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
@@ -441,6 +522,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
+            per_token_strs=per_token_strs,
             output_ids=recv_obj.output_ids,
             prompt_tokens=recv_obj.prompt_tokens,
             reasoning_tokens=recv_obj.reasoning_tokens,
@@ -478,12 +560,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,
             customized_info=recv_obj.customized_info,
+            trace_infos=recv_obj.trace_infos,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
+            detokenize_completed_time=detokenize_completed_time,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
@@ -519,7 +603,7 @@ def run_detokenizer_process(
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
-    configure_logger(server_args)
+    configure_logger(server_args, " Detokenizer")
     parent_process = psutil.Process().parent()
 
     manager = None

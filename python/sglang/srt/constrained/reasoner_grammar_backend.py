@@ -247,6 +247,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         reasoning_parser: ReasoningParser,
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
         enable_strict_thinking: bool = False,
+        eos_token_ids: Optional[set] = None,
     ):
         super().__init__()
         self.grammar_backend = grammar_backend
@@ -260,6 +261,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             )
         self.think_end_ids = think_end_ids
         self._enable_strict_thinking = enable_strict_thinking
+        self.eos_token_ids = set(eos_token_ids or [])
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
         )
@@ -285,12 +287,13 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         reasoning_parser: ReasoningParser,
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
     ) -> Optional[List[int]]:
-        excluded_ids = []
-        if (not self.enable_strict_thinking) or (
-            not reasoning_parser.detector.think_excluded_tokens
-        ):
+        if not self.enable_strict_thinking:
             return None
-        for token in reasoning_parser.detector.think_excluded_tokens:
+        if hasattr(tokenizer, "special_tokens"):
+            excluded_ids = set(tokenizer.special_tokens.values())
+        else:
+            excluded_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+        for token in reasoning_parser.detector.think_excluded_tokens or []:
             new_ids = tokenizer.encode(token, add_special_tokens=False)
             if not new_ids:
                 raise ValueError(
@@ -298,8 +301,10 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                     f"tokenizer. All excluded tokens must be encodable for strict "
                     f"reasoning mode to function correctly."
                 )
-            excluded_ids += new_ids
-        return excluded_ids
+            excluded_ids.update(new_ids)
+        excluded_ids -= set(self.think_end_ids)
+        excluded_ids -= self.eos_token_ids
+        return sorted(excluded_ids) or None
 
     def _make_grammar_object(
         self, grammar: Optional[BaseGrammarObject], reasoning: bool

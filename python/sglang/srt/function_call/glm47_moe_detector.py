@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.environ import ToolStrictLevel
 from sglang.srt.function_call.base_format_detector import (
     BaseFormatDetector,
     StructuralTag,
@@ -16,10 +17,20 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from xgrammar.structural_tag import (
+    ConstStringFormat,
+    JSONSchemaFormat,
+    RegexFormat,
+    SequenceFormat,
+    TagFormat,
+    TagsWithSeparatorFormat,
+    TriggeredTagsFormat,
+)
 from sglang.srt.function_call.utils import (
     infer_type_from_json_schema,
     safe_literal_eval,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +48,57 @@ def _glm47_native_structural_tag_available() -> bool:
         return True
     except Exception:
         return False
+
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _schema_needs_legacy_structural_tag(parameters) -> bool:
+    """Return True when the native glm_4_7 tag cannot represent this schema.
+
+    The native tag encodes ``<arg_key>`` as ``xml_variable_name``, i.e. an
+    identifier. Property names containing ``$ # &``, spaces, dots, slashes or
+    non-ASCII characters cannot be expressed and the model rewrites them
+    (``price$limit`` -> ``price_limit``, ``field.name`` -> ``field_name``).
+    The native tag also resolves ``$ref`` per tool, so a reference that is not
+    present in the tool's own ``$defs`` fails compilation.
+
+    In both cases fall back to the legacy regex tag (used by the pre-0.5.17
+    branch), whose ``<arg_key>`` accepts arbitrary text.
+    """
+    if not isinstance(parameters, dict):
+        return False
+
+    properties = parameters.get("properties")
+    if isinstance(properties, dict):
+        for name in properties:
+            if not _IDENTIFIER_RE.match(str(name)):
+                return True
+
+    defs = parameters.get("$defs") or {}
+
+    def _has_unresolved_ref(node) -> bool:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                if ref.rsplit("/", 1)[-1] not in defs:
+                    return True
+            return any(_has_unresolved_ref(value) for value in node.values())
+        if isinstance(node, list):
+            return any(_has_unresolved_ref(value) for value in node)
+        return False
+
+    return _has_unresolved_ref(parameters)
+
+
+def _tools_need_legacy_structural_tag(tools) -> bool:
+    for tool in tools or []:
+        function = getattr(tool, "function", None)
+        if function is None:
+            continue
+        if _schema_needs_legacy_structural_tag(function.parameters):
+            return True
+    return False
 
 
 class StreamState(str, Enum):
@@ -815,7 +877,25 @@ class Glm47MoeDetector(BaseFormatDetector):
         return arguments
 
     def supports_structural_tag(self) -> bool:
+        # Restore baseline behaviour: use the xgrammar-native glm_4_7
+        # structural tag (source branch ds-dev-community-glm-0312-w4 ran this
+        # via the probe returning True under xgrammar 0.2.1). b915380841 had
+        # hard-coded this to False, dropping all FC constraint and regressing
+        # evalscope schema_accuracy 0.997->0.844. NOTE: tools whose parameters
+        # use $ref pointing outside their own schema will FATAL in the native
+        # path (xgrammar per-tool EBNF ref resolver); handle $ref separately.
         return _glm47_native_structural_tag_available()
+
+    def uses_native_structural_tag_for_required(self) -> bool:
+        """
+        uses_native_structural_tag_for_required
+        """
+        # tool_choice="required" / named tools use the plain JSON Schema
+        # constraint (FunctionCallParser.get_structure_constraint), because the
+        # native glm_4_7 tag only embeds the parameter schema when the tool is
+        # strict. The response is therefore a JSON array and must be parsed by
+        # JsonArrayParser rather than this XML-based parser.
+        return False
 
     def get_structural_tag(
         self,
@@ -826,11 +906,71 @@ class Glm47MoeDetector(BaseFormatDetector):
     ) -> Optional[StructuralTag]:
         if not self.supports_structural_tag():
             return None
+        # For "auto", keep the native tag (which drives the schema_accuracy
+        # baseline) unless the tools contain property names or $ref entries the
+        # native grammar cannot represent; those use the legacy regex tag.
+        if tool_choice == "auto" and _tools_need_legacy_structural_tag(tools):
+            return self._get_legacy_structural_tag(
+                tools or [], parallel_tool_calls=parallel_tool_calls
+            )
         return super().get_structural_tag(
             tools=tools,
             tool_choice=tool_choice,
             thinking_mode=thinking_mode,
             parallel_tool_calls=parallel_tool_calls,
+        )
+
+    def _get_legacy_structural_tag(
+        self, tools: List[Tool], parallel_tool_calls: bool = True
+    ) -> StructuralTag:
+        """Pre-0.5.17 GLM-47 structural tag.
+
+        ``<arg_key>`` accepts arbitrary text (``.*``), so property names that
+        are not valid identifiers are preserved verbatim.
+        """
+        return StructuralTag(
+            format=TriggeredTagsFormat(
+                triggers=[self.bot_token],
+                tags=[
+                    TagFormat(
+                        begin=self.bot_token,
+                        end=self.eot_token,
+                        content=SequenceFormat(
+                            elements=[ConstStringFormat(value=f"{tool.function.name}")]
+                            + (
+                                [
+                                    JSONSchemaFormat(json_schema=property_schema)
+                                    for property_schema in tool.function.parameters[
+                                        "properties"
+                                    ]
+                                ]
+                                if self.tool_strict_level == ToolStrictLevel.PARAMETER
+                                and tool.function.parameters is not None
+                                and tool.function.strict
+                                else [
+                                    TagsWithSeparatorFormat(
+                                        tags=[
+                                            TagFormat(
+                                                begin="<arg_key>",
+                                                end="</arg_value>",
+                                                content=RegexFormat(
+                                                    pattern=r"^.*</arg_key><arg_value>.*$"
+                                                ),
+                                            )
+                                        ],
+                                        separator="",
+                                        at_least_one=False,
+                                        stop_after_first=False,
+                                    )
+                                ]
+                            ),
+                        ),
+                    )
+                    for tool in tools
+                ],
+                at_least_one=False,
+                stop_after_first=(not parallel_tool_calls),
+            )
         )
 
     def structure_info(self) -> _GetInfoFunc:

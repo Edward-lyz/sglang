@@ -268,6 +268,23 @@ class FileDeleteResponse(BaseModel):
     deleted: bool
 
 
+class KVTransferParams(BaseModel):
+    """Parameters used to locate and transfer prefix KV cache blocks."""
+
+    # AttentionStore prefix-cache location and remote-hit hints.
+    as_block_hashs: Optional[List[int]] = None
+    as_kv_cache_params: Optional[dict] = None
+    max_hit_host_ip: Optional[List[str]] = None
+    max_hit_token_len: Optional[List[int]] = None
+
+
+class KVCacheParams(BaseModel):
+    """Request-level KV cache policy parameters."""
+
+    need_caching: bool = False
+    expire_at: int = 0
+
+
 class BatchRequest(BaseModel):
     input_file_id: (
         str  # The ID of an uploaded file that contains requests for the new batch
@@ -389,6 +406,10 @@ class CompletionRequest(BaseModel):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+
+    # For AttentionStore (AS) secondary cache
+    kv_transfer_params: Optional[KVTransferParams] = None
+    kv_cache_params: Optional[KVCacheParams] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -813,6 +834,7 @@ class ChatCompletionRequest(BaseModel):
     no_stop_trim: bool = False
     ignore_eos: bool = False
     continue_final_message: bool = False
+    continuation_token_ids: Optional[List[int]] = None
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_id: Optional[str] = None
@@ -851,6 +873,10 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
+    # For AttentionStore (AS) secondary cache
+    kv_transfer_params: Optional[KVTransferParams] = None
+    kv_cache_params: Optional[KVCacheParams] = None
+
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
@@ -871,6 +897,18 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_continuation_exclusivity(cls, values):
+        """Validate that continuation_token_ids and continue_final_message are mutually exclusive."""
+        cont_ids = values.get("continuation_token_ids")
+        cont_final = values.get("continue_final_message", False)
+        if cont_ids and len(cont_ids) > 0 and cont_final:
+            raise ValueError(
+                "continuation_token_ids and continue_final_message cannot be used together"
+            )
+        return values
 
     @model_validator(mode="before")
     @classmethod
@@ -1097,6 +1135,8 @@ class ChatCompletionResponseChoice(BaseModel):
     prompt_token_ids: Optional[List[int]] = None
     token_ids: Optional[List[int]] = None
     meta_info: Optional[Dict[str, Any]] = None
+    # incremental; excludes continuation_token_ids prefix
+    output_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -1109,6 +1149,8 @@ class ChatCompletionResponseChoice(BaseModel):
             data.pop("token_ids", None)
         if self.meta_info is None:
             data.pop("meta_info", None)
+        if self.output_token_ids is None:
+            data.pop("output_token_ids", None)
         return data
 
 
@@ -1155,6 +1197,15 @@ class ChatCompletionResponseStreamChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    # incremental; excludes continuation_token_ids prefix
+    output_token_ids: Optional[List[int]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.output_token_ids is None:
+            data.pop("output_token_ids", None)
+        return data
 
 
 class ChatCompletionStreamResponse(BaseModel):

@@ -261,7 +261,20 @@ class FunctionCallParser:
                 if structural_tag is not None:
                     return ("structural_tag", structural_tag)
 
-            if is_required or should_constrain_auto:
+            # GLM-47 keeps the model-native structural tag for "auto" only.
+            # For "required" / named tools the constraint is the plain JSON
+            # Schema below, which always embeds the tool parameters. This
+            # matches the pre-0.5.17 branch behaviour: the native glm_4_7 tag
+            # only includes the parameter schema when the tool declares
+            # strict=true, so with the protocol default strict=false it
+            # constrains nothing but the <tool_call>/<arg_key>/<arg_value>
+            # envelope (special-character field names such as price$limit are
+            # rewritten, and unresolvable $ref entries are not detected).
+            # Other detectors keep using their native tag for "required".
+            use_native_for_required = (
+                self.detector.uses_native_structural_tag_for_required()
+            )
+            if should_constrain_auto or (is_required and use_native_for_required):
                 structural_tag_tools = self.tools
                 if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
                     structural_tag_tools = [
@@ -285,10 +298,8 @@ class FunctionCallParser:
 
                 # Fallback to legacy structural tag if model-native tag is not supported.
                 if self.detector.supports_structural_tag():
-                    # For "required"/named: always use structural_tag to preserve the
-                    # model's native tool call format. Schema is only included when
-                    # strict=True, per OpenAI protocol semantics.
-                    # For "auto": only constrain when strict is enabled.
+                    # at_least_one keeps "required"/named constrained to at
+                    # least one tool call.
                     tag = self.get_legacy_structural_tag(at_least_one=is_required)
                     return ("structural_tag", tag)
 

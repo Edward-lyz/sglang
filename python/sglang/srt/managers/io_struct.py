@@ -290,6 +290,10 @@ class GenerateReqInput:
     no_logs: bool = False
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+    # Optional content-detection / online trace configuration.
+    trace_config: Optional[Dict[str, Any]] = None
+    # Function call continuation: token IDs to replay for grammar state recovery
+    continuation_token_ids: Optional[List[int]] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
@@ -318,6 +322,11 @@ class GenerateReqInput:
 
     # For Unlimited-OCR
     images_config: Optional[dict] = None
+
+    # AttentionStore (AS) secondary cache parameters.
+    as_kv_cache_params: Optional[Union[List[dict], dict]] = None
+    as_max_hit_host_ip: Optional[Union[List[List[str]], List[str]]] = None
+    as_max_hit_token_len: Optional[Union[List[List[int]], List[int]]] = None
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
@@ -500,6 +509,7 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_as_params(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -744,6 +754,44 @@ class GenerateReqInput:
         elif isinstance(self.decode_tp_size, list):
             self.decode_tp_size = self.decode_tp_size * self.parallel_sample_num
 
+    def _normalize_as_params(self, num):
+        """Normalize AttentionStore parameters for batch processing."""
+        if self.as_kv_cache_params is None:
+            self.as_kv_cache_params = [None] * num
+        elif not isinstance(self.as_kv_cache_params, list):
+            self.as_kv_cache_params = [self.as_kv_cache_params] * num
+        elif len(self.as_kv_cache_params) == self.batch_size:
+            self.as_kv_cache_params = self.as_kv_cache_params * self.parallel_sample_num
+        elif len(self.as_kv_cache_params) != num:
+            raise ValueError(
+                "The length of as_kv_cache_params should match the batch size "
+                "or expanded batch size."
+            )
+
+        if self.as_max_hit_host_ip is None or not self.as_max_hit_host_ip:
+            self.as_max_hit_host_ip = [None] * num
+        elif not isinstance(self.as_max_hit_host_ip[0], list):
+            self.as_max_hit_host_ip = [self.as_max_hit_host_ip] * num
+        elif len(self.as_max_hit_host_ip) == self.batch_size:
+            self.as_max_hit_host_ip = self.as_max_hit_host_ip * self.parallel_sample_num
+        elif len(self.as_max_hit_host_ip) != num:
+            raise ValueError(
+                "The length of as_max_hit_host_ip should match the batch size "
+                "or expanded batch size."
+            )
+
+        if self.as_max_hit_token_len is None or not self.as_max_hit_token_len:
+            self.as_max_hit_token_len = [None] * num
+        elif not isinstance(self.as_max_hit_token_len[0], list):
+            self.as_max_hit_token_len = [self.as_max_hit_token_len] * num
+        elif len(self.as_max_hit_token_len) == self.batch_size:
+            self.as_max_hit_token_len = self.as_max_hit_token_len * self.parallel_sample_num
+        elif len(self.as_max_hit_token_len) != num:
+            raise ValueError(
+                "The length of as_max_hit_token_len should match the batch size "
+                "or expanded batch size."
+            )
+
     def _get_positional_embed_overrides_item(
         self, i: int
     ) -> Optional[PositionalEmbeds]:
@@ -829,11 +877,28 @@ class GenerateReqInput:
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
+            trace_config=self.trace_config,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
             received_time=self.received_time,
+            # AttentionStore parameters normalized above for batched requests.
+            as_kv_cache_params=(
+                self.as_kv_cache_params[i]
+                if self.as_kv_cache_params is not None
+                else None
+            ),
+            as_max_hit_host_ip=(
+                self.as_max_hit_host_ip[i]
+                if self.as_max_hit_host_ip is not None
+                else None
+            ),
+            as_max_hit_token_len=(
+                self.as_max_hit_token_len[i]
+                if self.as_max_hit_token_len is not None
+                else None
+            ),
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
                 if self.multi_item_delimiter_indices is not None
@@ -880,10 +945,15 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
+    # Function call continuation: token IDs to replay for grammar state recovery
+    continuation_token_ids: Optional[List[int]] = None
 
     # Session info for continual prompting
     session_id: Optional[str] = None
     session_params: Optional[SessionParams] = None
+
+    # Timestamp when tokenizer dispatches the request to the scheduler
+    dispatch_to_scheduler_time: Optional[float] = None
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
@@ -944,6 +1014,18 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
 
+    # Return scheduler-finalized prompt token IDs without entering generation.
+    tokenize_only: bool = False
+
+    # Optional content-detection / online trace configuration.
+    trace_config: Optional[Dict[str, Any]] = None
+
+    # AttentionStore parameters. ``as_block_hashs`` is generated after tokenization.
+    as_block_hashs: Optional[Any] = None
+    as_kv_cache_params: Optional[dict] = None
+    as_max_hit_host_ip: Optional[List[str]] = None
+    as_max_hit_token_len: Optional[List[int]] = None
+
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
         self.mm_data_mooncake = wrap_as_pickle(self.mm_data_mooncake)
@@ -953,6 +1035,15 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
         self.mm_inputs = unwrap_from_pickle(self.mm_inputs)
         self.mm_data_mooncake = unwrap_from_pickle(self.mm_data_mooncake)
         self.time_stats = unwrap_from_pickle(self.time_stats)
+
+
+class TokenizeReqOutput(BaseReq, kw_only=True):
+    """Scheduler-finalized prompt token IDs for a tokenize-only request."""
+
+    input_ids: List[int]
+    input_ids_unpadded: List[int]
+    error_message: Optional[str] = None
+    status_code: int = 200
 
 
 class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
@@ -1373,9 +1464,15 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
+    # Trace metadata produced by the scheduler, aligned with rids.
+    trace_infos: Optional[List[Optional[Dict[str, Any]]]] = None
+
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
+    # Wall-clock timestamp emitted by the detokenizer after decoding a batch.
+    detokenize_completed_time: Optional[float] = None
 
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
@@ -1407,6 +1504,10 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output decoded strings
     output_strs: List[str]
+    # Optional per-token split of output_strs for multi-token (speculative)
+    # steps. Aligned with rids: one list per request; "" marks a token held
+    # back for incomplete UTF-8. None => no split (use output_strs).
+    per_token_strs: Optional[List[List[str]]] = None
     # The token ids
     output_ids: Optional[List[array]]
 
@@ -1464,9 +1565,15 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
+    # Trace metadata produced by the scheduler, aligned with rids.
+    trace_infos: Optional[List[Optional[Dict[str, Any]]]] = None
+
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
+    # Wall-clock timestamp emitted by the detokenizer after decoding a batch.
+    detokenize_completed_time: Optional[float] = None
 
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
@@ -1903,6 +2010,32 @@ class SlowDownReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class AbortLowAcceptRateReqInput(BaseReq, kw_only=True):
+    """Abort requests with low MTP accept rate and a long context."""
+
+    accept_rate: float
+    context_len: int
+
+    def __post_init__(self):
+        if not 0 <= self.accept_rate <= 1:
+            raise ValueError(
+                f"Invalid accept_rate: {self.accept_rate!r}. Expected value in [0, 1]."
+            )
+        if self.context_len < 0:
+            raise ValueError(
+                f"Invalid context_len: {self.context_len!r}. Expected non-negative value."
+            )
+
+
+class AbortLowAcceptRateReqOutput(BaseReq, kw_only=True):
+    """Report the requests aborted by a low-acceptance-rate request."""
+
+    success: bool
+    aborted_count: int = 0
+    aborted_rids: List[str] = msgspec.field(default_factory=list)
+    message: str = ""
+
+
 class AbortReq(BaseReq, kw_only=True):
     # Whether to abort all requests
     abort_all: bool = False
@@ -1912,6 +2045,39 @@ class AbortReq(BaseReq, kw_only=True):
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
+        if self.rid is None:
+            self.rid = ""
+
+
+class TraceType:
+    """Trace payload categories that can be requested for a generation."""
+
+    KV = "kv"
+    METADATA = "metadata"
+    PROMPT = "prompt"
+    SAMPLE = "sample"
+    LOGPROBS = "logprobs"
+    ALL = "all"
+
+
+class TraceTrigger:
+    """Events that control when a request trace is emitted."""
+
+    IMMEDIATE = "immediate"
+    ON_FINISH = "on_finish"
+
+
+class TraceReq(BaseReq, kw_only=True):
+    """Scheduler control message for request-scoped tracing."""
+
+    dump_dir: Optional[str] = None
+    trace_type: str = TraceType.KV
+    trigger: str = TraceTrigger.IMMEDIATE
+    payload: Optional[Dict[str, Any]] = None
+    return_logprob: bool = False
+    return_online: bool = False
+
+    def __post_init__(self):
         if self.rid is None:
             self.rid = ""
 

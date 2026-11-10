@@ -45,7 +45,6 @@ from sglang.srt.disaggregation.utils import (
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
-    poll_and_all_reduce_pp,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -65,8 +64,6 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
-from sglang.srt.runtime_context import get_disagg
-from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -76,8 +73,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
-
-_is_npu = is_npu()
 
 
 def should_force_retry(req: Req) -> bool:
@@ -148,34 +143,11 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
-        if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
-            if self.is_mla_backend:
-                raise RuntimeError(
-                    "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
-                    "(e.g. GQA, MHA). MLA models should not set this flag."
-                )
-            server_args = self.scheduler.server_args
-            page_size = self.scheduler.token_to_kv_pool_allocator.page_size
-            cps = server_args.chunked_prefill_size or 8192
-            # Staging slices each send into a fixed page-aligned grid, so an
-            # unbounded (-1) or non-page-aligned chunk size has no valid grid.
-            if cps <= 0 or cps % page_size != 0:
-                raise RuntimeError(
-                    f"SGLANG_DISAGG_STAGING_BUFFER requires a positive "
-                    f"chunked_prefill_size that is a multiple of page_size "
-                    f"({page_size}); got {server_args.chunked_prefill_size}."
-                )
-            if self.pp_size > 1:
-                # Staging writer accounting has no pp dimension.
-                raise RuntimeError(
-                    "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
-                )
-            if server_args.enable_prefill_context_parallel:
-                # CP rewrites index_slice per rank, breaking the chunk grid.
-                raise RuntimeError(
-                    "SGLANG_DISAGG_STAGING_BUFFER does not support "
-                    "prefill context parallelism."
-                )
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
+            raise RuntimeError(
+                "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
+                "(e.g. GQA, MHA). MLA models should not set this flag."
+            )
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -336,8 +308,7 @@ class PrefillBootstrapQueue:
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
-            num_kv_indices_to_send,
-            self.scheduler.token_to_kv_pool_allocator.page_size,
+            num_kv_indices_to_send, self.token_to_kv_pool.page_size
         )
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
         req.pending_bootstrap = False
@@ -371,15 +342,13 @@ class PrefillBootstrapQueue:
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
-        pp_good_rids: Optional[List[str]] = None,
-        pp_bad_rids: Optional[List[str]] = None,
-    ) -> List[Req] | tuple[List[Req], List[Req]]:
+        rids_to_check: Optional[List[str]] = None,
+    ) -> List[Req]:
         """
         pop the reqs which has finished bootstrapping
 
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
-        pp_good_rids: RIDs that PP consensus determined as WaitingForInput.
-        pp_bad_rids: RIDs that PP consensus determined as Failed.
+        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
 
         bootstrapped_reqs = []
@@ -392,32 +361,21 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        if self.pp_size > 1:
-            polls = poll_and_all_reduce_pp(
-                (req.rid for req in self.queue),
-                KVPoll.WaitingForInput,
-                pp_good_rids,
-                pp_bad_rids,
-            )
-            uncovered = [i for i, poll in enumerate(polls) if poll is None]
-            if uncovered:
-                local_polls = poll_and_all_reduce_attn_cp_tp_group(
-                    [self.queue[i].disagg_kv_sender for i in uncovered],
-                    self.scheduler.attn_cp_cpu_group,
-                    self.scheduler.attn_tp_cpu_group,
-                )
-                for i, local_poll in zip(uncovered, local_polls):
-                    if local_poll == KVPoll.Failed:
-                        polls[i] = KVPoll.Failed
-        else:
-            polls = poll_and_all_reduce_attn_cp_tp_group(
-                [req.disagg_kv_sender for req in self.queue],
-                self.scheduler.attn_cp_cpu_group,
-                self.scheduler.attn_tp_cpu_group,
-            )
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in self.queue],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
+        )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if poll is None:
+            if (
+                rids_to_check is not None
+                and req.rid not in rids_to_check
+                and poll != KVPoll.Failed
+            ):
+                # In PP mode, successful bootstrap still requires cross-rank
+                # consensus. Local failures are terminal and must be drained
+                # even if an earlier PP rank has already removed the request.
                 continue
 
             if poll == KVPoll.Failed:
@@ -446,6 +404,19 @@ class PrefillBootstrapQueue:
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
+            elif poll == KVPoll.Transferring:
+                # KV transfer still in progress; keep waiting in the bootstrap queue.
+                continue
+            elif poll == KVPoll.Success:
+                # Room already reached terminal Success while the req is still
+                # un-finalized in the bootstrap queue. A queued req has not sent KV
+                # yet, so this is an anomalous/stale room state; the sender has
+                # cached this Success, so admitting would prematurely complete the
+                # request and risk serving with incomplete KV. Fail this request
+                # gracefully (retryable) instead of taking down the engine.
+                self.scheduler.handle_bootstrap_failure(req)
+                indices_to_remove.add(i)
+                failed_reqs.append(req)
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
@@ -745,6 +716,11 @@ class SchedulerDisaggregationPrefillMixin:
                 if not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
+                if self.metrics_reporter.enable_metrics:
+                    self.metrics_collector.observe_prompt_calculation_time(
+                        req.time_stats.prefill_transfer_queue_entry_time
+                        - req.time_stats.forward_entry_time
+                    )
 
                 if req.grammar is not None:
                     try:
@@ -754,7 +730,7 @@ class SchedulerDisaggregationPrefillMixin:
                         prepare_abort(
                             req,
                             error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                            status_code=HTTPStatus.REQUEST_TIMEOUT,
                         )
                     req.grammar.finished = req.finished()
             else:
@@ -805,6 +781,24 @@ class SchedulerDisaggregationPrefillMixin:
                     ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+
+        # The P response only carries the first token and transfer metadata.
+        # Once the final KV chunk has been submitted, complete the P-side
+        # request immediately so the router can begin forwarding D's stream
+        # while the transfer drains in the background.
+        stream_reqs = [
+            req
+            for req in batch.reqs
+            if req.inflight_middle_chunks <= 0 and req.finished_reason is None
+        ]
+        for req in stream_reqs:
+            req.finished_reason = FINISH_LENGTH(length=0)
+        if stream_reqs:
+            self.output_streamer.stream_output(
+                stream_reqs,
+                any(req.return_logprob for req in stream_reqs),
+                None,
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
@@ -868,13 +862,25 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                if not isinstance(req.finished_reason, FINISH_ABORT):
-                    req.finished_reason = FINISH_LENGTH(length=0)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
+                if self.metrics_reporter.enable_metrics:
+                    self.metrics_collector.observe_kvcache_transfer_time(
+                        req.time_stats.prefill_kv_transfer_finish_time
+                        - req.time_stats.prefill_transfer_queue_entry_time
+                    )
+                    # Align with source branch ds-dev-community-glm-0312-w4:
+                    # the P/D prefill also observes time_to_first_token (first
+                    # token latency from bootstrap queue entry to KV transfer
+                    # finish), which the migration dropped. Without it the
+                    # metric is never exposed on the prefill /metrics.
+                    self.metrics_collector.observe_time_to_first_token(
+                        req.time_stats.prefill_kv_transfer_finish_time
+                        - req.time_stats.prefill_bootstrap_queue_entry_time
+                    )
             elif poll == KVPoll.Failed:
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
@@ -885,6 +891,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
+            if self.metrics_reporter.enable_metrics and not isinstance(
+                req.finished_reason, FINISH_ABORT
+            ):
+                self.metrics_collector.observe_request_first_token_forward_time(
+                    req.time_stats.get_request_first_token_forward_time()
+                )
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -904,12 +916,8 @@ class SchedulerDisaggregationPrefillMixin:
                 if "speed_gb_s" in metrics:
                     self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
-        # Stream requests which have finished transfer
-        self.output_streamer.stream_output(
-            done_reqs,
-            any(req.return_logprob for req in done_reqs),
-            None,
-        )
+        # P-side output was streamed when the final KV chunk was submitted;
+        # this pass only releases transfer resources.
         for req in done_reqs:
             req: Req
 
@@ -944,7 +952,7 @@ class SchedulerDisaggregationPrefillMixin:
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
-                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                req, error_message, status_code=HTTPStatus.REQUEST_TIMEOUT
             )
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
@@ -993,7 +1001,7 @@ class SchedulerDisaggregationPrefillMixin:
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        prepare_abort(req, error_message, status_code=HTTPStatus.REQUEST_TIMEOUT)
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
@@ -1014,6 +1022,16 @@ class SchedulerDisaggregationPrefillMixin:
             # the request entered the waiting queue, so finalize should not fail.
             assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
             return True
+        elif poll == KVPoll.Transferring:
+            # KV transfer still in progress; keep waiting.
+            return False
+        elif poll == KVPoll.Success:
+            # A parked (already forwarded) req whose room is in terminal Success
+            # without an initialized sender — anomalous/stale, so transfer tracking
+            # is unreliable. Fail this request gracefully (retryable) instead of
+            # admitting and risking serving with incomplete KV.
+            self.handle_bootstrap_failure(req)
+            return False
         else:
             raise RuntimeError(
                 f"Unexpected poll state {poll} for req {req.rid} in handle_pending_bootstrap"
@@ -1087,11 +1105,7 @@ class SchedulerDisaggregationPrefillMixin:
         cached_end = len(req.prefix_indices) - req.host_hit_length
         if cached_end <= req.start_send_idx:
             return
-        if cached_end % self.token_to_kv_pool_allocator.page_size != 0:
-            # DCP radix hits can end on a logical cache-page boundary that is
-            # not a complete physical DCP page. The regular final send covers
-            # the full range; only skip this optional early-send optimization.
-            return
+        assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
         # be writing these prefix pages on forward_stream. Record a completion
@@ -1206,37 +1220,24 @@ class SchedulerDisaggregationPrefillMixin:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
-            # as main KV on the same page_size.
-            payloads = {
-                StateType.MAMBA: _mamba_payload,
-                StateType.SWA: _swa_payload,
-                StateType.DSA: _dsa_payload,
-                StateType.MINIMAX_INDEX_K: _dsa_payload,
-                StateType.SWA_RING: _swa_ring_payload,
-                StateType.C128_STATE: _c128_state_payload,
-            }
-            if _is_npu and isinstance(
-                self.token_to_kv_pool_allocator.get_kvcache(),
-                DeepSeekV4TokenToKVPool,
-            ):
-                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-                    dsv4_state_payloads,
-                )
-
-                payloads.update(
-                    dsv4_state_payloads(
-                        self.req_to_token_pool,
-                        req.req_pool_idx,
-                        seq_len,
-                        page_size,
-                        self.sliding_window_size,
-                        prefix_len=0,
-                    )
-                )
-            state_indices = [
-                payloads[st]() if st in payloads else None for st in state_types
-            ]
+            state_indices = []
+            for st in state_types:
+                if st == StateType.MAMBA:
+                    state_indices.append(_mamba_payload())
+                elif st == StateType.SWA:
+                    state_indices.append(_swa_payload())
+                elif st == StateType.DSA:
+                    state_indices.append(_dsa_payload())
+                elif st == StateType.MINIMAX_INDEX_K:
+                    # Index rows live at the same loc as main KV on the same
+                    # page_size, so reuse the full-seq page-ids.
+                    state_indices.append(_dsa_payload())
+                elif st == StateType.SWA_RING:
+                    state_indices.append(_swa_ring_payload())
+                elif st == StateType.C128_STATE:
+                    state_indices.append(_c128_state_payload())
+                else:
+                    state_indices.append(None)
 
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, start_idx:end_idx
@@ -1253,7 +1254,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
-        max_attempts = get_disagg().optimistic_prefill_attempts
+        max_attempts = self.server_args.optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()

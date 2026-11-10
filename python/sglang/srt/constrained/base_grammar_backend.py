@@ -400,6 +400,7 @@ def create_grammar_backend(
             reasoning_parser,
             tokenizer,
             enable_strict_thinking=server_args.enable_strict_thinking,
+            eos_token_ids=eos_token_ids,
         )
 
     return grammar_backend
