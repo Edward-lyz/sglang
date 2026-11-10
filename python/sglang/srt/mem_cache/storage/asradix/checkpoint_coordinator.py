@@ -34,6 +34,7 @@ from .coordinator import (
 from .types import (
     AttentionStoreEndpointBinding,
     AttentionStoreWriteContext,
+    AttentionStoreWriteOwner,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ class _SPAWriteTask:
     params: dict
     release_after_write: Callable[[], None] = _noop_release
     release: Callable[[], None] = _noop_release
+    owner: Optional[AttentionStoreWriteOwner] = None
 
     @property
     def requested_blocks(self) -> int:
@@ -72,6 +74,7 @@ class _KDAWriteTask:
     write_key: Optional[tuple[int, int]] = None
     release_after_write: Callable[[], None] = _noop_release
     release: Callable[[], None] = _noop_release
+    owner: Optional[AttentionStoreWriteOwner] = None
 
     @property
     def requested_blocks(self) -> int:

@@ -221,6 +221,29 @@ class AttentionStoreBinding:
         return self.page_endpoint.bytes_per_block
 
 
+@dataclass(frozen=True)
+class AttentionStoreWriteOwner:
+    """Identify the scheduler work that owns an asynchronous AS write.
+
+    ``maintenance_round`` is the scheduler/cache lifecycle coordinate.  It is
+    deliberately not called a checkpoint: KDA checkpoints are model-state
+    snapshots and are unrelated to write retirement.
+    """
+
+    maintenance_round: int
+    pp_batch_plan_id: Optional[int] = None
+    mb_id: Optional[int] = None
+    rid: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.maintenance_round < 0:
+            raise ValueError("AttentionStore maintenance round must be non-negative")
+        if self.pp_batch_plan_id is not None and self.pp_batch_plan_id < 0:
+            raise ValueError("AttentionStore PP batch plan ID must be non-negative")
+        if self.mb_id is not None and self.mb_id < 0:
+            raise ValueError("AttentionStore microbatch ID must be non-negative")
+
+
 @dataclass
 class AttentionStoreWriteContext:
     """Capture request state across a local cache commit."""
@@ -230,3 +253,4 @@ class AttentionStoreWriteContext:
     snapshot: torch.Tensor
     is_insert: bool
     prepared_write: Any = None
+    owner: Optional[AttentionStoreWriteOwner] = None

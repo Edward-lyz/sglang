@@ -7,7 +7,7 @@ import hashlib
 import logging
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional, Sequence, Tuple
 
 import torch
@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 
 from .transport import _once
-from .types import AttentionStoreWriteContext
+from .types import AttentionStoreWriteContext, AttentionStoreWriteOwner
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +115,7 @@ class _PendingWrite:
     future: concurrent.futures.Future
     task: Any
     logical_id: bytes
+    owner: Optional[AttentionStoreWriteOwner]
 
 
 class AttentionStoreCoordinator:
@@ -123,7 +124,7 @@ class AttentionStoreCoordinator:
     Subclasses capture stable request inputs and implement type-specific I/O.
     The base class owns submission ordering and the two resource horizons:
     staging is released when the writer returns, while cache-node retention is
-    released only after the task crosses the ordered retirement checkpoint.
+    released only after the task crosses the ordered maintenance frontier.
     """
 
     write_thread_name = "as_writer"
@@ -135,6 +136,10 @@ class AttentionStoreCoordinator:
         self._pending_writes: list[_PendingWrite] = []
         self._page_id_copy_stream = None
         self._closed = False
+        # Synchronous cache commit hooks use this only for dummy tasks and for
+        # writes whose concrete task is created below the cache integration
+        # layer. It is never read by the writer thread.
+        self._owner_hint: Optional[AttentionStoreWriteOwner] = None
 
     def prepare_page_ids(self, cache, slot_ids: torch.Tensor) -> _PreparedPageIds:
         """Stage validated page metadata without blocking the scheduler."""
@@ -256,8 +261,43 @@ class AttentionStoreCoordinator:
         )
         self._release_task_resource(cache, task, task.release, "retained resource")
 
+    def _resolve_write_owner(self, cache, task) -> Optional[AttentionStoreWriteOwner]:
+        """Resolve the scheduler owner attached to an asynchronous write.
+
+        The dynamic cache context wins over request metadata: a request can be
+        reused by a later microbatch while an earlier async result is being
+        processed. Task metadata is the fallback for writes created outside the
+        scheduler result context.
+        """
+        owner = getattr(cache, "_as_active_write_owner", None)
+        if owner is None:
+            owner = getattr(task, "owner", None)
+        if owner is None:
+            request = getattr(task, "request", None)
+            owner = getattr(request, "_as_write_owner", None)
+        if owner is None:
+            owner = self._owner_hint
+        if owner is not None and not isinstance(owner, AttentionStoreWriteOwner):
+            raise RuntimeError(f"invalid AttentionStore write owner: {owner!r}")
+        if owner is not None and owner.rid is None:
+            owner = replace(owner, rid=str(getattr(task, "rid", "")))
+        return owner
+
+    @staticmethod
+    def _set_task_owner(task, owner: Optional[AttentionStoreWriteOwner]) -> None:
+        if owner is not None:
+            task.owner = owner
+
     def submit_write(self, cache, task) -> None:
         """Submit a write task to the ordered background executor."""
+        owner = self._resolve_write_owner(cache, task) or self._owner_hint
+        if getattr(cache, "pp_world_size", getattr(cache, "pp_size", 1)) > 1:
+            if owner is None:
+                raise RuntimeError(
+                    "AttentionStore PP write has no cache maintenance owner: "
+                    f"rid={getattr(task, 'rid', '<unknown>')}"
+                )
+            self._set_task_owner(task, owner)
         try:
             logical_id = self._task_logical_id(task)
             future = self._ensure_executor().submit(self._run_write, cache, task)
@@ -265,13 +305,23 @@ class AttentionStoreCoordinator:
             self._discard_unsubmitted(cache, task)
             raise
         self._pending_writes.append(
-            _PendingWrite(future=future, task=task, logical_id=logical_id)
+            _PendingWrite(
+                future=future,
+                task=task,
+                logical_id=logical_id,
+                owner=owner,
+            )
         )
 
-    def submit_completed(self, task, result: int = 0) -> None:
+    def submit_completed(self, task, result: int = 0, owner=None) -> None:
         """Queue an already completed task for ordered retirement."""
         if self._closed:
             raise RuntimeError("AttentionStore coordinator is already closed")
+        owner = owner or getattr(task, "owner", None) or self._owner_hint
+        if owner is not None and owner.rid is None:
+            owner = replace(owner, rid=str(getattr(task, "rid", "")))
+        if owner is not None:
+            self._set_task_owner(task, owner)
         future = concurrent.futures.Future()
         future.set_result(result)
         self._pending_writes.append(
@@ -279,6 +329,7 @@ class AttentionStoreCoordinator:
                 future=future,
                 task=task,
                 logical_id=self._task_logical_id(task),
+                owner=owner,
             )
         )
 
@@ -368,6 +419,18 @@ class AttentionStoreCoordinator:
         for block_hash_id in block_hash_ids:
             identity.update(struct.pack(">Q", block_hash_id))
 
+        owner = getattr(task, "owner", None)
+        if owner is None:
+            identity.update(b"\x00")
+        else:
+            identity.update(b"\x01")
+            identity.update(struct.pack(">Q", int(owner.maintenance_round)))
+            for value in (owner.pp_batch_plan_id, owner.mb_id):
+                identity.update(struct.pack(">q", -1 if value is None else int(value)))
+            rid = (owner.rid or "").encode("utf-8", "surrogatepass")
+            identity.update(struct.pack(">Q", len(rid)))
+            identity.update(rid)
+
         # KDA's write_key is a logical (cache length, terminal hash) pair.
         # Do not include checkpoint_slot: it is a rank-local Mamba pool slot.
         write_key = getattr(task, "write_key", None)
@@ -454,15 +517,26 @@ class AttentionStoreCoordinator:
                 f"release: rid={rid} timeout_s={self.pp_retirement_wait_timeout_s}"
             )
 
-    def check_events(self, cache, checkpoint_seq: Optional[int] = None) -> None:
-        """Retire writes at the scheduler's fixed cache checkpoint."""
+    def check_events(self, cache, maintenance_round: Optional[int] = None) -> None:
+        """Retire writes from cache rounds completed before this round.
+
+        The scheduler calls this before admitting the current round.  A write
+        created during round N is therefore retained until round N+1, which
+        prevents the current batch from releasing a node while its proxy or
+        result lifecycle is still in flight.
+        """
         is_pp = getattr(cache, "pp_world_size", getattr(cache, "pp_size", 1)) > 1
         if is_pp:
-            if checkpoint_seq is None:
+            if maintenance_round is None:
                 raise RuntimeError(
-                    "missing PP scheduler step for AttentionStore retirement"
+                    "missing PP cache maintenance round for AttentionStore retirement"
                 )
-            self._drain(cache, synchronize=True, bounded_wait=True)
+            self._drain(
+                cache,
+                synchronize=True,
+                bounded_wait=True,
+                retire_before_round=maintenance_round,
+            )
             return
 
         if not self._pending_writes:
@@ -479,16 +553,47 @@ class AttentionStoreCoordinator:
         del self._pending_writes[:completed]
         self._retire(cache, pending_writes, timeout=1.0)
 
-    def _drain(self, cache, *, synchronize: bool, bounded_wait: bool = False) -> None:
+    def _drain(
+        self,
+        cache,
+        *,
+        synchronize: bool,
+        bounded_wait: bool = False,
+        retire_before_round: Optional[int] = None,
+    ) -> None:
         if not self._pending_writes and not synchronize:
             return
-        if synchronize:
-            if not self._synchronized_pending_state(cache):
-                return
-        pending_writes = tuple(self._pending_writes)
+        if synchronize and not self._synchronized_pending_state(cache):
+            return
+
+        if retire_before_round is None:
+            retire_count = len(self._pending_writes)
+        else:
+            last_round = -1
+            for pending in self._pending_writes:
+                owner = pending.owner
+                if owner is None:
+                    raise RuntimeError(
+                        "AttentionStore PP pending write has no cache maintenance owner: "
+                        f"rid={getattr(pending.task, 'rid', '<unknown>')}"
+                    )
+                if owner.maintenance_round < last_round:
+                    raise RuntimeError(
+                        "AttentionStore pending writes are out of maintenance order: "
+                        f"previous_round={last_round} current_round={owner.maintenance_round}"
+                    )
+                last_round = owner.maintenance_round
+            retire_count = sum(
+                pending.owner.maintenance_round < retire_before_round
+                for pending in self._pending_writes
+            )
+
+        if retire_count == 0:
+            return
+        pending_writes = tuple(self._pending_writes[:retire_count])
+        del self._pending_writes[:retire_count]
         if bounded_wait:
             self._wait_for_pending_writes(cache, pending_writes)
-        self._pending_writes = []
         self._retire(
             cache,
             pending_writes,
@@ -503,6 +608,7 @@ class AttentionStoreCoordinator:
             cache,
             synchronize=synchronize,
             bounded_wait=synchronize and is_pp,
+            retire_before_round=None,
         )
 
     def before_reset(self, cache) -> None:

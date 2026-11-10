@@ -2250,6 +2250,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
 
+    # AttentionStore PP write ownership. Kept at the end of the dataclass so
+    # adding this host-only field does not change existing positional callers.
+    cache_write_owner: Optional[Any] = None
+
     @classmethod
     def init_new(
         cls,
@@ -3345,6 +3349,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             extend_num_tokens=self.extend_num_tokens,
+            cache_write_owner=self.cache_write_owner,
         )
 
     def maybe_evict_swa(self):

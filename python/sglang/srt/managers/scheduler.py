@@ -180,6 +180,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    PlannedAdmission,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -3680,8 +3681,16 @@ class Scheduler(
         authoritative_plan: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch, Tuple[Dict[str, Any], ...]]:
         authoritative_admissions = (
-            tuple(authoritative_plan.get("admissions", ()))
+            tuple(
+                PlannedAdmission.from_wire(admission)
+                for admission in authoritative_plan.get("admissions", ())
+            )
             if authoritative_plan is not None
+            else None
+        )
+        authoritative_admissions_by_rid = (
+            {admission.rid: admission for admission in authoritative_admissions}
+            if authoritative_admissions is not None
             else None
         )
 
@@ -3697,10 +3706,12 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        # Fixed PP checkpoint; it must precede every early return.
+        # Fixed PP cache-maintenance round; it must precede every early return.
         if self.enable_asradix_cache:
             self.tree_cache.check_ascache_events(
-                checkpoint_seq=getattr(self, "_pp_current_scheduler_step", None)
+                maintenance_round=getattr(
+                    self, "_pp_current_cache_maintenance_round", None
+                )
             )
 
         # A downstream PP stage may have queued requests beyond PP0's committed
@@ -3794,8 +3805,21 @@ class Scheduler(
         skip_waiting_admission = False
         resumed_chunked_req = self.chunked_req
         if resumed_chunked_req is not None:
-            resumed_chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(resumed_chunked_req)
+            planned_chunk_admission = (
+                None
+                if authoritative_admissions_by_rid is None
+                else authoritative_admissions_by_rid.get(resumed_chunked_req.rid)
+            )
+            authoritative_chunk_admitted = authoritative_admissions is None or (
+                planned_chunk_admission is not None
+                and planned_chunk_admission.source == "chunked"
+            )
+            if authoritative_chunk_admitted:
+                resumed_chunked_req.init_next_round_input()
+                self.chunked_req = adder.add_chunked_req(
+                    resumed_chunked_req,
+                    planned_admission=planned_chunk_admission,
+                )
             if authoritative_admissions is None:
                 post_chunk_budget_state = adder.budget_state()
                 # NO_TOKEN takes precedence over chunk exhaustion in
@@ -3886,6 +3910,11 @@ class Scheduler(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
+                planned_admission=(
+                    None
+                    if authoritative_admissions_by_rid is None
+                    else authoritative_admissions_by_rid[req.rid]
+                ),
             )
 
             if self.enable_lora and res != AddReqResult.ABORT:
@@ -3943,7 +3972,7 @@ class Scheduler(
             expected_local_admissions = tuple(
                 admission
                 for admission in authoritative_admissions
-                if admission.get("rid") not in aborted_rids
+                if admission.rid not in aborted_rids
             )
             if local_admissions != expected_local_admissions:
                 raise RuntimeError(

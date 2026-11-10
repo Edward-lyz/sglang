@@ -29,6 +29,7 @@ from .coordinator import (
 from .types import (
     AttentionStoreEndpointBinding,
     AttentionStoreWriteContext,
+    AttentionStoreWriteOwner,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class _PageWriteTask:
     write_params: Any
     release_after_write: Callable[[], None] = _noop_release
     release: Callable[[], None] = _noop_release
+    owner: Optional[AttentionStoreWriteOwner] = None
 
     @property
     def requested_blocks(self) -> int:
@@ -373,7 +375,9 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
                 context.snapshot,
             )
 
-    def enqueue_dummy(self, rid: str) -> None:
+    def enqueue_dummy(
+        self, rid: str, owner: Optional[AttentionStoreWriteOwner] = None
+    ) -> None:
         """Queue a no-op task to preserve TP retirement ordering."""
         task = _PageWriteTask(
             rid=rid,
@@ -381,8 +385,9 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             block_hash_ids=(),
             data_id_list=[],
             write_params={},
+            owner=owner,
         )
-        self.submit_completed(task)
+        self.submit_completed(task, owner=owner)
 
     def do_write(self, cache, task: _PageWriteTask) -> int:
         """Write a prepared page task to its endpoint."""

@@ -29,8 +29,19 @@ import os
 import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -437,6 +448,67 @@ class AddReqResult(Enum):
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
     ABORT = auto()  # Fatal cache-read inconsistency; never run forward
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedAdmission:
+    """One request admission committed by the PP0 authoritative plan."""
+
+    rid: str
+    source: str
+    extend_range: Tuple[int, int]
+
+    def __post_init__(self) -> None:
+        try:
+            start, end = self.extend_range
+            normalized_range = (int(start), int(end))
+            start, end = normalized_range
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid planned admission extend range: {self.extend_range!r}"
+            ) from exc
+        object.__setattr__(self, "extend_range", normalized_range)
+        if not isinstance(self.rid, str) or not self.rid:
+            raise ValueError(f"invalid planned admission rid: {self.rid!r}")
+        if self.source not in ("waiting", "chunked"):
+            raise ValueError(f"invalid planned admission source: {self.source!r}")
+        if start < 0 or end <= start:
+            raise ValueError(
+                f"invalid planned admission extend range: {self.extend_range!r}"
+            )
+
+    def to_wire(self) -> Dict[str, Any]:
+        """Return the dict representation used by the PP plan relay."""
+        return {
+            "rid": self.rid,
+            "source": self.source,
+            "extend_range": self.extend_range,
+        }
+
+    @classmethod
+    def from_wire(cls, value: Any) -> PlannedAdmission:
+        """Parse one admission from the PP plan relay representation."""
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError(f"invalid planned admission: {value!r}")
+        start, end = value["extend_range"]
+        return cls(
+            rid=value["rid"],
+            source=value["source"],
+            extend_range=(int(start), int(end)),
+        )
+
+    @classmethod
+    def from_req(cls, req: Req, source: str) -> PlannedAdmission:
+        """Build an admission plan from a request's committed token range."""
+        if req.extend_range is None:
+            raise RuntimeError(f"request has no extend range: rid={req.rid}")
+        return cls(
+            rid=req.rid,
+            source=source,
+            extend_range=(int(req.extend_range.start), int(req.extend_range.end)),
+        )
 
 
 class PrefillAdder:
@@ -882,7 +954,12 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(
+        self,
+        req: Req,
+        planned_admission: Optional[PlannedAdmission] = None,
+    ):
+        """Admit a resumed chunk, optionally replaying PP0's exact range."""
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -911,12 +988,25 @@ class PrefillAdder:
                 waiting_queue_len=self.waiting_queue_len,
             )
 
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
-        truncated = cand_extend_input_len > _rem_tokens
-        new_len = min(cand_extend_input_len, _rem_tokens)
-        req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        prefix_len = len(req.prefix_indices)
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - prefix_len
+        if planned_admission is None:
+            truncated = cand_extend_input_len > _rem_tokens
+            new_len = min(cand_extend_input_len, _rem_tokens)
+        else:
+            self._validate_planned_admission(req, planned_admission, "chunked")
+            start, end = self._validate_authoritative_extend_range(
+                req, planned_admission.extend_range, prefix_len=prefix_len
+            )
+            new_len = end - start
+            if new_len > _rem_tokens:
+                raise RuntimeError(
+                    "PP authoritative resumed chunk exceeds the local token budget: "
+                    f"rid={req.rid} planned={planned_admission.extend_range} "
+                    f"available={_rem_tokens}"
+                )
+            truncated = end < len(req.full_untruncated_fill_ids)
+        req.set_extend_range(prefix_len, prefix_len + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -950,6 +1040,50 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
             else:
                 self.tree_cache.dec_lock_ref(last_node)
+
+    @staticmethod
+    def _validate_planned_admission(
+        req: Req, planned_admission: PlannedAdmission, expected_source: str
+    ) -> None:
+        if planned_admission.rid != req.rid:
+            raise RuntimeError(
+                "PP planned admission request mismatch: "
+                f"planned={planned_admission.rid} local={req.rid}"
+            )
+        if planned_admission.source != expected_source:
+            raise RuntimeError(
+                "PP planned admission source mismatch: "
+                f"rid={req.rid} planned={planned_admission.source} "
+                f"expected={expected_source}"
+            )
+
+    @staticmethod
+    def _validate_authoritative_extend_range(
+        req: Req,
+        extend_range: Tuple[int, int],
+        prefix_len: Optional[int],
+    ) -> Tuple[int, int]:
+        try:
+            start, end = extend_range
+            start = int(start)
+            end = int(end)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"invalid PP authoritative extend range for rid={req.rid}: "
+                f"{extend_range}"
+            ) from exc
+        full_input_len = len(req.full_untruncated_fill_ids)
+        if (
+            start < 0
+            or end <= start
+            or end > full_input_len
+            or (prefix_len is not None and start != prefix_len)
+        ):
+            raise RuntimeError(
+                f"invalid PP authoritative extend range for rid={req.rid}: "
+                f"planned={(start, end)} prefix={prefix_len} full={full_input_len}"
+            )
+        return start, end
 
     def _sync_attention_store_read_abort(
         self, req: Req, result: AddReqResult
@@ -1091,7 +1225,11 @@ class PrefillAdder:
         return self._sync_attention_store_read_abort(req, self.budget_state())
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        planned_admission: Optional[PlannedAdmission] = None,
     ):
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
@@ -1102,7 +1240,11 @@ class PrefillAdder:
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+        if (
+            planned_admission is None
+            and req.sampling_params.ignore_eos
+            and getattr(self.tree_cache, "disable", True)
+        ):
             return self.add_one_req_ignore_eos(req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
@@ -1112,10 +1254,30 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
+        full_input_len = len(req.full_untruncated_fill_ids)
+        current_prefix_len = len(req.prefix_indices)
+        if planned_admission is None:
+            authoritative_start = authoritative_end = None
+            cand_extend_input_len = full_input_len - current_prefix_len
+            budgeted_max_new = max_new
+        else:
+            self._validate_planned_admission(req, planned_admission, "waiting")
+            authoritative_start, authoritative_end = (
+                self._validate_authoritative_extend_range(
+                    req, planned_admission.extend_range, prefix_len=None
+                )
+            )
+            if current_prefix_len > authoritative_start:
+                raise RuntimeError(
+                    "PP authoritative prefix is shorter than the local device prefix: "
+                    f"rid={req.rid} local={current_prefix_len} "
+                    f"planned={authoritative_start}"
+                )
+            # Include any host-hit prefix still awaiting load-back, but reserve
+            # and schedule no token beyond PP0's committed end position.
+            cand_extend_input_len = authoritative_end - current_prefix_len
+            budgeted_max_new = max_new if authoritative_end == full_input_len else 0
+        total_tokens = cand_extend_input_len + budgeted_max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
@@ -1135,13 +1297,11 @@ class PrefillAdder:
             # charged separately via swa_host_hit_length).
             swa_needed = self._swa_budget_for_req(
                 real_input_tokens,
-                self._swa_new_tokens(req),
+                budgeted_max_new,
                 swa_host_hit_length=req.swa_host_hit_length,
             )
             if swa_needed >= self.rem_swa_tokens:
-                swa_cap = self._swa_chunk_cap(
-                    self._swa_new_tokens(req), req.swa_host_hit_length
-                )
+                swa_cap = self._swa_chunk_cap(budgeted_max_new, req.swa_host_hit_length)
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
                     return self._sync_attention_store_read_abort(
                         req, AddReqResult.NO_TOKEN
@@ -1190,12 +1350,12 @@ class PrefillAdder:
                 # self.rem_swa_tokens may decrease after the lock acquisition
                 swa_needed = self._swa_budget_for_req(
                     real_input_tokens,
-                    self._swa_new_tokens(req),
+                    budgeted_max_new,
                     swa_host_hit_length=req.swa_host_hit_length,
                 )
                 if swa_needed >= self.rem_swa_tokens:
                     swa_cap = self._swa_chunk_cap(
-                        self._swa_new_tokens(req), req.swa_host_hit_length
+                        budgeted_max_new, req.swa_host_hit_length
                     )
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
                         return self._sync_attention_store_read_abort(
@@ -1248,9 +1408,21 @@ class PrefillAdder:
             if read_result == AddReqResult.ABORT:
                 return read_result
 
-            input_tokens = self.ceil_paged_tokens(
-                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
-            )
+            if planned_admission is None:
+                input_tokens = self.ceil_paged_tokens(
+                    len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                )
+            else:
+                authoritative_start, authoritative_end = (
+                    self._validate_authoritative_extend_range(
+                        req,
+                        planned_admission.extend_range,
+                        prefix_len=len(req.prefix_indices),
+                    )
+                )
+                input_tokens = self.ceil_paged_tokens(
+                    authoritative_end - authoritative_start
+                )
 
             if (
                 self.rem_chunk_tokens is None
@@ -1262,7 +1434,43 @@ class PrefillAdder:
                 # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
-            if self.dllm_config is not None:
+            if planned_admission is not None:
+                if self.dllm_config is not None:
+                    available_chunk_tokens = self.rem_dllm_tokens
+                else:
+                    available_chunk_tokens = chunk_tokens_limit
+                if (
+                    available_chunk_tokens is not None
+                    and input_tokens > available_chunk_tokens
+                ):
+                    raise RuntimeError(
+                        "PP authoritative request exceeds the local chunk budget: "
+                        f"rid={req.rid} planned={planned_admission.extend_range} "
+                        f"available={available_chunk_tokens}"
+                    )
+
+                truncated = authoritative_end < len(req.full_untruncated_fill_ids)
+                req.set_extend_range(authoritative_start, authoritative_end)
+                self.can_run_list.append(req)
+                if truncated:
+                    self.new_chunked_req = req
+                self._req_inc_lock_ref(req)
+                self._update_prefill_budget(
+                    prefix_len,
+                    authoritative_end - authoritative_start,
+                    (
+                        0
+                        if truncated
+                        else min(
+                            req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKENS,
+                        )
+                    ),
+                    req.retracted_stain,
+                    req.host_hit_length,
+                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                )
+            elif self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 

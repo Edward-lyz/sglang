@@ -7,6 +7,7 @@ import math
 import time
 from array import array
 from collections import defaultdict, deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
@@ -33,12 +34,14 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.schedule_policy import PlannedAdmission
 from sglang.srt.managers.scheduler_components.request_receiver import PPBatchPlanMessage
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.storage.asradix.types import AttentionStoreWriteOwner
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -130,7 +133,7 @@ def _pp_merge_abort_records(
         for record in records:
             rid = str(record["rid"])
             candidate = dict(record)
-            key = (int(candidate.get("plan_seq", -1)), rid)
+            key = (int(candidate.get("pp_batch_plan_id", -1)), rid)
             previous = by_request.get(key)
             if previous is None or (
                 int(candidate.get("origin_pp_rank", -1)),
@@ -150,9 +153,9 @@ def _pp_control_has_current_aborts(control: Optional[Dict[str, Any]]) -> bool:
 
     if control is None:
         return False
-    plan_seq = int(control.get("plan_seq", -1))
+    pp_batch_plan_id = int(control.get("pp_batch_plan_id", -1))
     return any(
-        int(record.get("plan_seq", -1)) == plan_seq
+        int(record.get("pp_batch_plan_id", -1)) == pp_batch_plan_id
         for record in control.get("aborts", ())
     )
 
@@ -344,12 +347,20 @@ class SchedulerPPMixin:
         transport: Optional[bool] = None,
     ) -> Dict[str, Any]:
         requests = []
-        admissions = tuple(
+        planned_admissions = tuple(
             getattr(batch, "_pp_prefill_admissions", ()) if batch is not None else ()
         )
+        if not all(
+            isinstance(admission, PlannedAdmission) for admission in planned_admissions
+        ):
+            raise RuntimeError(
+                "PP batch admissions must be PlannedAdmission objects: "
+                f"admissions={planned_admissions}"
+            )
+        admissions = tuple(admission.to_wire() for admission in planned_admissions)
         if batch is not None:
             for req in batch.reqs:
-                req._pp_plan_seq = int(self._pp_next_plan_seq)
+                req._pp_batch_plan_id = int(self._pp_next_batch_plan_id)
                 decision = getattr(req, "_as_pp_match_decision", None)
                 requests.append(
                     {
@@ -363,18 +374,16 @@ class SchedulerPPMixin:
         if prior_chunked_req is None:
             chunked_transition = {"rid": None, "action": "none"}
         elif any(
-            admission.get("source") == "chunked"
-            and admission.get("rid") == prior_chunked_req.rid
-            for admission in admissions
+            admission.source == "chunked" and admission.rid == prior_chunked_req.rid
+            for admission in planned_admissions
         ):
             chunked_transition = {
                 "rid": prior_chunked_req.rid,
                 "action": "resume",
             }
         elif any(
-            admission.get("source") == "waiting"
-            and admission.get("rid") == prior_chunked_req.rid
-            for admission in admissions
+            admission.source == "waiting" and admission.rid == prior_chunked_req.rid
+            for admission in planned_admissions
         ):
             # Non-overlap mode may release/requeue a yielded chunk and admit it
             # again in the same scheduler pass. It is still a yield transition;
@@ -399,17 +408,18 @@ class SchedulerPPMixin:
                 "action": "yield",
             }
 
-        plan_seq = self._pp_next_plan_seq
-        self._pp_next_plan_seq += 1
+        pp_batch_plan_id = self._pp_next_batch_plan_id
+        self._pp_next_batch_plan_id += 1
         tombstones = self._pp_abort_tombstones_for_plan()
         local_aborts = tuple(
-            {**record, "plan_seq": int(plan_seq)} for record in local_aborts
+            {**record, "pp_batch_plan_id": int(pp_batch_plan_id)}
+            for record in local_aborts
         )
         for record in local_aborts:
             logger.error(
-                "PP request cancellation originated: plan_seq=%s mb_id=%s "
+                "PP request cancellation originated: pp_batch_plan_id=%s mb_id=%s "
                 "rid=%s origin_pp_rank=%s reason_code=%s reason=%s",
-                plan_seq,
+                pp_batch_plan_id,
                 mb_id,
                 record["rid"],
                 record["origin_pp_rank"],
@@ -417,9 +427,10 @@ class SchedulerPPMixin:
                 record["reason"],
             )
         return {
-            "version": 3,
+            "version": 4,
             "mb_id": int(mb_id),
-            "plan_seq": int(plan_seq),
+            "maintenance_round": int(self._pp_current_cache_maintenance_round),
+            "pp_batch_plan_id": int(pp_batch_plan_id),
             "transport": batch is not None if transport is None else bool(transport),
             "chunked_transition": chunked_transition,
             "admissions": admissions,
@@ -450,7 +461,7 @@ class SchedulerPPMixin:
         ttl = self.ps.pp_size + self.pp_loop_size
         for record in records:
             rid = str(record["rid"])
-            key = (int(record.get("plan_seq", -1)), rid)
+            key = (int(record.get("pp_batch_plan_id", -1)), rid)
             previous = self._pp_abort_tombstones.get(key)
             merged = _pp_merge_abort_records(
                 (() if previous is None else (previous["record"],)),
@@ -462,22 +473,22 @@ class SchedulerPPMixin:
             }
 
     def _pp_apply_abort_records_to_local_queue(
-        self, records: Tuple[Dict[str, Any], ...], current_plan_seq: int
+        self, records: Tuple[Dict[str, Any], ...], current_batch_plan_id: int
     ) -> None:
         """Remove locally queued requests identified by propagated abort records."""
 
         if not records:
             return
         by_request = {
-            (int(record.get("plan_seq", -1)), record["rid"]): record
+            (int(record.get("pp_batch_plan_id", -1)), record["rid"]): record
             for record in records
         }
         kept_waiting = []
         for req in self.waiting_queue:
-            req_plan_seq = int(getattr(req, "_pp_plan_seq", -1))
-            record = by_request.get((req_plan_seq, req.rid))
-            if record is None and req_plan_seq == -1:
-                record = by_request.get((current_plan_seq, req.rid))
+            req_pp_batch_plan_id = int(getattr(req, "_pp_batch_plan_id", -1))
+            record = by_request.get((req_pp_batch_plan_id, req.rid))
+            if record is None and req_pp_batch_plan_id == -1:
+                record = by_request.get((current_batch_plan_id, req.rid))
             if record is None:
                 kept_waiting.append(req)
                 continue
@@ -487,10 +498,12 @@ class SchedulerPPMixin:
         self.waiting_queue = kept_waiting
 
         if self.chunked_req is not None:
-            chunked_plan_seq = int(getattr(self.chunked_req, "_pp_plan_seq", -1))
-            record = by_request.get((chunked_plan_seq, self.chunked_req.rid))
-            if record is None and chunked_plan_seq == -1:
-                record = by_request.get((current_plan_seq, self.chunked_req.rid))
+            chunked_pp_batch_plan_id = int(
+                getattr(self.chunked_req, "_pp_batch_plan_id", -1)
+            )
+            record = by_request.get((chunked_pp_batch_plan_id, self.chunked_req.rid))
+            if record is None and chunked_pp_batch_plan_id == -1:
+                record = by_request.get((current_batch_plan_id, self.chunked_req.rid))
             if record is not None:
                 if not self.chunked_req.finished():
                     self.chunked_req._as_cache_read_abort_reason = record.get("reason")
@@ -511,7 +524,8 @@ class SchedulerPPMixin:
         upstream_rids = tuple(upstream_contract.get("rids", ()))
         local_rids = tuple(local_contract.get("rids", ()))
         local_aborts = tuple(
-            {**record, "plan_seq": int(plan["plan_seq"])} for record in local_aborts
+            {**record, "pp_batch_plan_id": int(plan["pp_batch_plan_id"])}
+            for record in local_aborts
         )
         chunked_rid = upstream_contract.get("chunked_rid")
         for record in local_aborts:
@@ -523,9 +537,9 @@ class SchedulerPPMixin:
         local_abort_rids = {record["rid"] for record in local_aborts}
         for record in local_aborts:
             logger.error(
-                "PP request cancellation originated: plan_seq=%s mb_id=%s "
+                "PP request cancellation originated: pp_batch_plan_id=%s mb_id=%s "
                 "rid=%s origin_pp_rank=%s reason_code=%s reason=%s",
-                plan["plan_seq"],
+                plan["pp_batch_plan_id"],
                 mb_id,
                 record["rid"],
                 record["origin_pp_rank"],
@@ -572,13 +586,13 @@ class SchedulerPPMixin:
             return plan
 
         known_abort_keys = {
-            (int(record.get("plan_seq", -1)), str(record.get("rid", "")))
+            (int(record.get("pp_batch_plan_id", -1)), str(record.get("rid", "")))
             for record in plan.get("aborts", ())
         }
         acknowledged_rids = [
             rid
             for rid, record in self._pp_local_chunk_abort_records.items()
-            if (int(record["plan_seq"]), rid) in known_abort_keys
+            if (int(record["pp_batch_plan_id"]), rid) in known_abort_keys
         ]
         for rid in acknowledged_rids:
             del self._pp_local_chunk_abort_records[rid]
@@ -606,11 +620,11 @@ class SchedulerPPMixin:
         active_rids = tuple(
             rid for rid in plan["contract"].get("rids", ()) if rid not in aborted_rids
         )
-        current_plan_seq = int(plan["plan_seq"])
+        current_batch_plan_id = int(plan["pp_batch_plan_id"])
         current_aborts = tuple(
             {
                 **self._pp_local_chunk_abort_records[rid],
-                "plan_seq": current_plan_seq,
+                "pp_batch_plan_id": current_batch_plan_id,
             }
             for rid in sorted(aborted_rids)
         )
@@ -633,8 +647,8 @@ class SchedulerPPMixin:
         )
         logger.error(
             "PP projected in-flight plans for locally aborted chunk: "
-            "plan_seq=%s rids=%s",
-            current_plan_seq,
+            "pp_batch_plan_id=%s rids=%s",
+            current_batch_plan_id,
             tuple(sorted(aborted_rids)),
         )
         self._pp_validate_authoritative_plan_schema(int(plan["mb_id"]), outgoing)
@@ -662,22 +676,31 @@ class SchedulerPPMixin:
     def _pp_install_authoritative_batch_plan(
         self, mb_id: int, plan: Dict[str, Any]
     ) -> None:
-        if not isinstance(plan, dict) or plan.get("version") != 3:
+        if not isinstance(plan, dict) or plan.get("version") != 4:
             raise RuntimeError(f"invalid PP batch plan at mb_id={mb_id}: {plan}")
         if int(plan.get("mb_id", -1)) != mb_id:
             raise RuntimeError(
                 f"PP batch plan mb_id mismatch: local={mb_id} remote={plan.get('mb_id')}"
             )
         self._pp_validate_authoritative_plan_schema(mb_id, plan)
-        plan_seq = int(plan["plan_seq"])
-        if plan_seq <= self._pp_last_received_plan_seq:
+        pp_batch_plan_id = int(plan["pp_batch_plan_id"])
+        expected_round = getattr(self, "_pp_current_cache_maintenance_round", None)
+        if (
+            expected_round is not None
+            and int(plan["maintenance_round"]) != expected_round
+        ):
+            raise RuntimeError(
+                "PP cache maintenance round mismatch: "
+                f"local={expected_round} remote={plan['maintenance_round']} mb_id={mb_id}"
+            )
+        if pp_batch_plan_id <= self._pp_last_received_batch_plan_id:
             raise RuntimeError(
                 "stale or reordered PP batch plan: "
-                f"last={self._pp_last_received_plan_seq} received={plan_seq}"
+                f"last={self._pp_last_received_batch_plan_id} received={pp_batch_plan_id}"
             )
-        self._pp_last_received_plan_seq = plan_seq
+        self._pp_last_received_batch_plan_id = pp_batch_plan_id
         self._pp_apply_abort_records_to_local_queue(
-            tuple(plan.get("aborts", ())), plan_seq
+            tuple(plan.get("aborts", ())), pp_batch_plan_id
         )
 
         local_reqs = list(self.waiting_queue) + list(self.running_batch.reqs)
@@ -692,7 +715,7 @@ class SchedulerPPMixin:
                     f"PP batch plan references unavailable rid={rid} mb_id={mb_id}"
                 )
             req._as_pp_match_decision_required = True
-            req._pp_plan_seq = int(plan["plan_seq"])
+            req._pp_batch_plan_id = int(plan["pp_batch_plan_id"])
             decision = entry.get("as_match")
             if decision is None:
                 if hasattr(req, "_as_pp_match_decision"):
@@ -705,22 +728,32 @@ class SchedulerPPMixin:
         mb_id: int, plan: Dict[str, Any]
     ) -> None:
         try:
-            plan_seq = int(plan["plan_seq"])
+            pp_batch_plan_id = int(plan["pp_batch_plan_id"])
+            maintenance_round = int(plan["maintenance_round"])
             transport = plan["transport"]
             transition = plan["chunked_transition"]
             action = transition["action"]
             transition_rid = transition["rid"]
-            admissions = tuple(plan["admissions"])
-            admission_pairs = tuple(
-                (entry["rid"], entry["source"]) for entry in admissions
+            admissions = tuple(
+                PlannedAdmission.from_wire(entry) for entry in plan["admissions"]
             )
+            admission_pairs = tuple((entry.rid, entry.source) for entry in admissions)
             request_rids = {entry["rid"] for entry in plan["requests"]}
-            contract_rids = tuple(plan["contract"]["rids"])
+            contract = plan["contract"]
+            contract_rids = tuple(contract["rids"])
+            contract_prefix_lens = tuple(
+                int(value) for value in contract["prefix_lens"]
+            )
+            contract_extend_ranges = tuple(
+                (int(value[0]), int(value[1])) for value in contract["extend_ranges"]
+            )
+            contract_extend_num_tokens = int(contract["extend_num_tokens"])
+            contract["chunked_rid"]
             aborts = tuple(plan.get("aborts", ()))
             abort_keys = tuple(
-                (int(record["plan_seq"]), record["rid"]) for record in aborts
+                (int(record["pp_batch_plan_id"]), record["rid"]) for record in aborts
             )
-        except (KeyError, TypeError, ValueError) as exc:
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(
                 f"invalid PP batch plan shape at mb_id={mb_id}: {plan}"
             ) from exc
@@ -732,7 +765,8 @@ class SchedulerPPMixin:
             if source == "chunked"
         ]
         if (
-            plan_seq < 0
+            pp_batch_plan_id < 0
+            or maintenance_round < 0
             or not isinstance(transport, bool)
             or action not in ("none", "resume", "hold", "yield", "abort")
             or (action == "none") != (transition_rid is None)
@@ -743,10 +777,25 @@ class SchedulerPPMixin:
                 for rid, source in admission_pairs
             )
             or len(set(admission_rids)) != len(admission_rids)
+            or admission_rids != contract_rids
+            or set(contract_rids) != request_rids
+            or len(set(contract_rids)) != len(contract_rids)
+            or len(contract_prefix_lens) != len(contract_rids)
+            or len(contract_extend_ranges) != len(contract_rids)
+            or any(
+                prefix_len < 0 or start != prefix_len or end <= start
+                for prefix_len, (start, end) in zip(
+                    contract_prefix_lens, contract_extend_ranges
+                )
+            )
+            or contract_extend_num_tokens
+            != sum(end - start for start, end in contract_extend_ranges)
+            or tuple(admission.extend_range for admission in admissions)
+            != contract_extend_ranges
             or len(set(abort_keys)) != len(abort_keys)
             or any(not isinstance(rid, str) or not rid for _, rid in abort_keys)
             or not {
-                rid for abort_seq, rid in abort_keys if abort_seq == plan_seq
+                rid for abort_seq, rid in abort_keys if abort_seq == pp_batch_plan_id
             }.isdisjoint(contract_rids)
             or chunked_admissions not in ([], [(0, transition_rid)])
             or ((action == "resume") != bool(chunked_admissions))
@@ -777,15 +826,15 @@ class SchedulerPPMixin:
 
     def _pp_select_authoritative_waiting_reqs(
         self,
-        planned_admissions: Tuple[Dict[str, Any], ...],
+        planned_admissions: Tuple[PlannedAdmission, ...],
         resumed_chunked_req: Optional[Req],
     ) -> List[Req]:
         """Resolve PP0's explicit admission sources in their committed order."""
         waiting_by_rid = {req.rid: req for req in self.waiting_queue}
         candidates = []
         for admission in planned_admissions:
-            rid = admission["rid"]
-            source = admission["source"]
+            rid = admission.rid
+            source = admission.source
             if source == "chunked":
                 local_rid = (
                     resumed_chunked_req.rid if resumed_chunked_req is not None else None
@@ -808,12 +857,12 @@ class SchedulerPPMixin:
     def _pp_prefill_admissions(
         can_run_list: List[Req],
         resumed_chunked_req: Optional[Req],
-    ) -> Tuple[Dict[str, Any], ...]:
+    ) -> Tuple[PlannedAdmission, ...]:
         return tuple(
-            {
-                "rid": req.rid,
-                "source": ("chunked" if req is resumed_chunked_req else "waiting"),
-            }
+            PlannedAdmission.from_req(
+                req,
+                source=("chunked" if req is resumed_chunked_req else "waiting"),
+            )
             for req in can_run_list
         )
 
@@ -836,8 +885,9 @@ class SchedulerPPMixin:
         """Build transport control metadata from an authoritative batch plan."""
 
         return {
-            "version": 1,
-            "plan_seq": int(plan["plan_seq"]),
+            "version": 2,
+            "maintenance_round": int(plan["maintenance_round"]),
+            "pp_batch_plan_id": int(plan["pp_batch_plan_id"]),
             "mb_id": int(plan["mb_id"]),
             "transport": bool(plan["transport"]),
             "contract": plan["contract"],
@@ -922,8 +972,11 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 if self.enable_asradix_cache:
-                    self._pp_current_scheduler_step = self._pp_next_scheduler_step
-                    self._pp_next_scheduler_step += 1
+                    self._pp_current_cache_maintenance_round = (
+                        self._pp_next_cache_maintenance_round
+                    )
+                    self._pp_next_cache_maintenance_round += 1
+                    self._pp_bind_cache_write_owner(None, mb_id)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -946,6 +999,7 @@ class SchedulerPPMixin:
                     self.mbs[mb_id] = plan.batch_to_run
                 self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self._pp_bind_cache_write_owner(cur_batch, mb_id)
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
@@ -1064,8 +1118,11 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 if self.enable_asradix_cache:
-                    self._pp_current_scheduler_step = self._pp_next_scheduler_step
-                    self._pp_next_scheduler_step += 1
+                    self._pp_current_cache_maintenance_round = (
+                        self._pp_next_cache_maintenance_round
+                    )
+                    self._pp_next_cache_maintenance_round += 1
+                    self._pp_bind_cache_write_owner(None, mb_id)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -1162,10 +1219,16 @@ class SchedulerPPMixin:
                     self._pp_mb_controls[mb_id] = self._pp_control_from_plan(
                         authoritative_plan
                     )
+                    self._pp_bind_cache_write_owner(
+                        batch,
+                        mb_id,
+                        pp_batch_plan_id=int(authoritative_plan["pp_batch_plan_id"]),
+                    )
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self._pp_bind_cache_write_owner(cur_batch, mb_id)
                 self.cur_batch_for_debug = cur_batch
                 transport_expected = bool(
                     self._pp_batch_contract_guard_enabled
@@ -1348,8 +1411,11 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 if self.enable_asradix_cache:
-                    self._pp_current_scheduler_step = self._pp_next_scheduler_step
-                    self._pp_next_scheduler_step += 1
+                    self._pp_current_cache_maintenance_round = (
+                        self._pp_next_cache_maintenance_round
+                    )
+                    self._pp_next_cache_maintenance_round += 1
+                    self._pp_bind_cache_write_owner(None, mb_id)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -1391,6 +1457,7 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self._pp_bind_cache_write_owner(cur_batch, mb_id)
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
@@ -1544,10 +1611,10 @@ class SchedulerPPMixin:
         self._pp_mb_controls: List[Optional[Dict[str, Any]]] = [
             None
         ] * self.pp_loop_size
-        self._pp_next_plan_seq = 0
-        self._pp_last_received_plan_seq = -1
-        self._pp_next_scheduler_step = 0
-        self._pp_current_scheduler_step = None
+        self._pp_next_batch_plan_id = 0
+        self._pp_last_received_batch_plan_id = -1
+        self._pp_next_cache_maintenance_round = 0
+        self._pp_current_cache_maintenance_round = None
         self._pp_abort_tombstones: Dict[Tuple[int, str], Dict[str, Any]] = {}
         self._pp_local_chunk_abort_records: Dict[str, Dict[str, Any]] = {}
         self._pp_pending_cache_read_aborts: Dict[int, Tuple[Req, Dict[str, Any]]] = {}
@@ -2201,10 +2268,65 @@ class SchedulerPPMixin:
         )
         return output_result
 
+    def _pp_bind_cache_write_owner(
+        self: Scheduler,
+        batch: Optional[ScheduleBatch],
+        mb_id: int,
+        pp_batch_plan_id: Optional[int] = None,
+    ) -> None:
+        """Bind cache commits made in this scheduler round to PP work."""
+        if not self.enable_asradix_cache:
+            return
+        maintenance_round = getattr(self, "_pp_current_cache_maintenance_round", None)
+        if maintenance_round is None:
+            raise RuntimeError("missing PP cache maintenance round for batch owner")
+        existing_owner = getattr(batch, "cache_write_owner", None)
+        if pp_batch_plan_id is None and existing_owner is not None:
+            pp_batch_plan_id = existing_owner.pp_batch_plan_id
+        owner = AttentionStoreWriteOwner(
+            maintenance_round=int(maintenance_round),
+            pp_batch_plan_id=(
+                None if pp_batch_plan_id is None else int(pp_batch_plan_id)
+            ),
+            mb_id=int(mb_id),
+        )
+        # Keep a round owner active during scheduler-side cache commits (for
+        # example, stashing a previous chunk before admission). The result
+        # path installs the more specific batch owner temporarily below.
+        self.tree_cache.set_attention_store_write_owner(owner)
+        if batch is None:
+            return
+        batch.cache_write_owner = owner
+        for req in batch.reqs:
+            req._as_write_owner = AttentionStoreWriteOwner(
+                maintenance_round=owner.maintenance_round,
+                pp_batch_plan_id=owner.pp_batch_plan_id,
+                mb_id=owner.mb_id,
+                rid=req.rid,
+            )
+
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
-        self.process_batch_result(batch, output_result)
+        owner = getattr(batch, "cache_write_owner", None)
+        current_round = getattr(self, "_pp_current_cache_maintenance_round", None)
+        if owner is not None and current_round is not None:
+            # A result can be delayed by PP async depth.  The logical owner
+            # remains the batch plan, but retirement ordering must use the
+            # round in which this commit is actually enqueued.
+            owner = AttentionStoreWriteOwner(
+                maintenance_round=int(current_round),
+                pp_batch_plan_id=owner.pp_batch_plan_id,
+                mb_id=owner.mb_id,
+            )
+        cache = self.tree_cache
+        context = (
+            cache.attention_store_write_context(owner)
+            if owner is not None and hasattr(cache, "attention_store_write_context")
+            else nullcontext()
+        )
+        with context:
+            self.process_batch_result(batch, output_result)
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,
@@ -2264,7 +2386,10 @@ class SchedulerPPMixin:
             raise RuntimeError(f"missing PP cancellation control for mb_id={mb_id}")
         if (
             remote_control.get("version") != expected_control.get("version")
-            or remote_control.get("plan_seq") != expected_control.get("plan_seq")
+            or remote_control.get("pp_batch_plan_id")
+            != expected_control.get("pp_batch_plan_id")
+            or remote_control.get("maintenance_round")
+            != expected_control.get("maintenance_round")
             or remote_control.get("mb_id") != mb_id
             or not remote_control.get("transport")
         ):
@@ -2285,14 +2410,14 @@ class SchedulerPPMixin:
 
         abort_records = tuple(remote_control.get("aborts", ()))
         remote_abort_by_key = {
-            (int(record.get("plan_seq", -1)), record.get("rid")): record
+            (int(record.get("pp_batch_plan_id", -1)), record.get("rid")): record
             for record in abort_records
         }
         missing_known_aborts = tuple(
             record
             for record in expected_control.get("aborts", ())
             if remote_abort_by_key.get(
-                (int(record.get("plan_seq", -1)), record.get("rid"))
+                (int(record.get("pp_batch_plan_id", -1)), record.get("rid"))
             )
             != record
         )
@@ -2304,7 +2429,8 @@ class SchedulerPPMixin:
         current_abort_records = tuple(
             record
             for record in abort_records
-            if int(record.get("plan_seq", -1)) == int(expected_control["plan_seq"])
+            if int(record.get("pp_batch_plan_id", -1))
+            == int(expected_control["pp_batch_plan_id"])
         )
         abort_by_rid = {record["rid"]: record for record in current_abort_records}
         surviving_aborts = set(final_rids).intersection(abort_by_rid)
@@ -2322,9 +2448,9 @@ class SchedulerPPMixin:
         if self.pp_group.is_first_rank and current_abort_records:
             self._pp_register_abort_tombstones(current_abort_records)
             logger.error(
-                "PP request cancellation finalized: plan_seq=%s mb_id=%s "
+                "PP request cancellation finalized: pp_batch_plan_id=%s mb_id=%s "
                 "aborted_rids=%s surviving_rids=%s",
-                expected_control["plan_seq"],
+                expected_control["pp_batch_plan_id"],
                 mb_id,
                 tuple(record["rid"] for record in current_abort_records),
                 final_rids,

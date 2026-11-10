@@ -7,7 +7,9 @@ import hashlib
 import logging
 import struct
 import time
-from typing import Any, Optional, Tuple
+from contextlib import contextmanager
+from dataclasses import replace
+from typing import Any, Iterator, Optional, Tuple
 
 import torch
 
@@ -23,7 +25,11 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 from .coordinator import AttentionStoreCoordinator
 from .plans import AttentionStoreCachePlan
-from .types import AttentionStoreBinding, AttentionStoreInitContext
+from .types import (
+    AttentionStoreBinding,
+    AttentionStoreInitContext,
+    AttentionStoreWriteOwner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -424,44 +430,96 @@ class AttentionStoreIntegrationMixin:
         """Report that AttentionStore loads need no host-cache readiness wait."""
         return 0
 
+    def set_attention_store_write_owner(
+        self, owner: Optional[AttentionStoreWriteOwner]
+    ) -> None:
+        """Set the owner for scheduler-side cache commits in this round."""
+        self._as_active_write_owner = owner
+        self.attention_store_coordinator._owner_hint = owner
+
+    @contextmanager
+    def attention_store_write_context(
+        self, owner: Optional[AttentionStoreWriteOwner]
+    ) -> Iterator[None]:
+        """Associate cache commits made in this scope with scheduler work."""
+        previous_owner = getattr(self, "_as_active_write_owner", None)
+        coordinator = self.attention_store_coordinator
+        previous_hint = coordinator._owner_hint
+        self.set_attention_store_write_owner(owner)
+        try:
+            yield
+        finally:
+            self._as_active_write_owner = previous_owner
+            coordinator._owner_hint = previous_hint
+
+    def _as_request_write_owner(self, req):
+        """Combine current creation round with the request's batch identity."""
+        active = getattr(self, "_as_active_write_owner", None)
+        request_owner = getattr(req, "_as_write_owner", None)
+        owner = active or request_owner
+        if active is not None and request_owner is not None:
+            owner = replace(
+                active,
+                pp_batch_plan_id=(
+                    active.pp_batch_plan_id
+                    if active.pp_batch_plan_id is not None
+                    else request_owner.pp_batch_plan_id
+                ),
+                mb_id=active.mb_id if active.mb_id is not None else request_owner.mb_id,
+                rid=req.rid,
+            )
+        elif owner is not None and owner.rid is None:
+            owner = replace(owner, rid=req.rid)
+        return owner
+
     def cache_finished_req(self, req, is_insert: bool = True, **kwargs) -> None:
         """Commit a finished request locally and schedule its remote write."""
-        coordinator = self.attention_store_coordinator
-        effective_is_insert = (
-            is_insert
-            and not self.disable
-            and not getattr(self, "disable_finished_insert", False)
-        )
-        context = coordinator.capture_finished(self, req, effective_is_insert)
-        try:
-            if context is not None:
-                coordinator.before_local_commit(self, context)
-            super().cache_finished_req(req, effective_is_insert, **kwargs)
-            if context is not None:
-                coordinator.after_local_commit(self, context)
-        except Exception:
-            if context is not None:
-                coordinator.abort_local_commit(self, context)
-            raise
+        owner = self._as_request_write_owner(req)
+        with self.attention_store_write_context(owner):
+            coordinator = self.attention_store_coordinator
+            effective_is_insert = (
+                is_insert
+                and not self.disable
+                and not getattr(self, "disable_finished_insert", False)
+            )
+            context = coordinator.capture_finished(self, req, effective_is_insert)
+            try:
+                if context is not None:
+                    context.owner = owner
+                    coordinator.before_local_commit(self, context)
+                super().cache_finished_req(req, effective_is_insert, **kwargs)
+                if context is not None:
+                    if context.prepared_write is not None:
+                        context.prepared_write.owner = context.owner
+                    coordinator.after_local_commit(self, context)
+            except Exception:
+                if context is not None:
+                    coordinator.abort_local_commit(self, context)
+                raise
 
     def cache_unfinished_req(self, req, chunked=False) -> None:
         """Commit an unfinished request locally and schedule its remote write."""
-        coordinator = self.attention_store_coordinator
-        context = coordinator.capture_unfinished(self, req)
-        try:
-            if context is not None:
-                coordinator.before_local_commit(self, context)
-            super().cache_unfinished_req(req, chunked=chunked)
-            if context is not None:
-                coordinator.after_local_commit(self, context)
-        except Exception:
-            if context is not None:
-                coordinator.abort_local_commit(self, context)
-            raise
+        owner = self._as_request_write_owner(req)
+        with self.attention_store_write_context(owner):
+            coordinator = self.attention_store_coordinator
+            context = coordinator.capture_unfinished(self, req)
+            try:
+                if context is not None:
+                    context.owner = owner
+                    coordinator.before_local_commit(self, context)
+                super().cache_unfinished_req(req, chunked=chunked)
+                if context is not None:
+                    if context.prepared_write is not None:
+                        context.prepared_write.owner = context.owner
+                    coordinator.after_local_commit(self, context)
+            except Exception:
+                if context is not None:
+                    coordinator.abort_local_commit(self, context)
+                raise
 
-    def check_ascache_events(self, checkpoint_seq: Optional[int] = None) -> None:
-        """Retire completed AttentionStore writes."""
-        self.attention_store_coordinator.check_events(self, checkpoint_seq)
+    def check_ascache_events(self, maintenance_round: Optional[int] = None) -> None:
+        """Retire writes from earlier cache maintenance rounds."""
+        self.attention_store_coordinator.check_events(self, maintenance_round)
 
     def drain_attention_store_writes(self) -> None:
         """Wait for all pending AttentionStore writes."""
