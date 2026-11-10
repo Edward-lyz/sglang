@@ -9,6 +9,11 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.layers.attention.linear.kernels.kda_cute_checkpoint import (
+    CuTeCheckpointPlan,
+    build_cute_checkpoint_plan,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class KDANativeCheckpointResult:
@@ -23,6 +28,8 @@ class KDANativePlanSink:
 
     offsets: Optional[torch.Tensor] = None
     owner_rows: Optional[torch.Tensor] = None
+    build_cute_plan: bool = False
+    cute_plan: Optional[CuTeCheckpointPlan] = None
 
 
 def _cpu_vector(value, name):
@@ -78,6 +85,7 @@ def fill_native_plan_from_existing_cpu_data(
     if sink is None:
         return
     sink.offsets = sink.owner_rows = None
+    sink.cute_plan = None
     if not exact_checkpoint_tracking:
         raise ValueError("native checkpoint plans require exact KDA tracking")
     for name, value in (
@@ -121,6 +129,10 @@ def fill_native_plan_from_existing_cpu_data(
         )
     dense_offsets = torch.zeros_like(extends, dtype=torch.int64)
     dense_offsets[owner_rows] = delta.to(torch.int64)
+    if sink.build_cute_plan:
+        sink.cute_plan = build_cute_checkpoint_plan(
+            extends, dense_offsets, device=device
+        )
     sink.offsets = dense_offsets.to(device=device, non_blocking=True)
     sink.owner_rows = owner_rows.to(device=device, dtype=torch.int64, non_blocking=True)
 

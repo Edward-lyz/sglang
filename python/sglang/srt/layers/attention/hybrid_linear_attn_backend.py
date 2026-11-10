@@ -200,7 +200,11 @@ class MambaAttnBackendBase(AttentionBackend):
                         query_start_loc, forward_batch
                     )
                     if getattr(self, "_kda_native_checkpoint_plan_enabled", False):
-                        native_plan = KDANativePlanSink()
+                        native_plan = KDANativePlanSink(
+                            build_cute_plan=getattr(
+                                self, "_kda_cute_checkpoint_plan_enabled", False
+                            )
+                        )
 
                     (
                         track_ssm_h_src,
@@ -240,6 +244,9 @@ class MambaAttnBackendBase(AttentionBackend):
             ),
             kda_native_checkpoint_rows=(
                 native_plan.owner_rows if native_plan is not None else None
+            ),
+            kda_cute_checkpoint_plan=(
+                native_plan.cute_plan if native_plan is not None else None
             ),
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
@@ -295,19 +302,32 @@ class MambaAttnBackendBase(AttentionBackend):
                 (tracked_lens < conv_state_len) | (tracked_lens > extend_lens)
             ):
                 metadata = {
-                    "rids": forward_batch.rids,
-                    "forward_mode": str(forward_batch.forward_mode),
+                    "rids": getattr(forward_batch, "rids", None),
+                    "forward_mode": str(getattr(forward_batch, "forward_mode", None)),
                     "conv_state_len": conv_state_len,
                     "tracked_relative_lens": tracked_lens.tolist(),
                     "tracked_extend_lens": extend_lens.tolist(),
-                    "prefix_lens_cpu": forward_batch.extend_prefix_lens_cpu,
-                    "extend_lens_cpu": forward_batch.extend_seq_lens_cpu,
+                    "prefix_lens_cpu": getattr(
+                        forward_batch, "extend_prefix_lens_cpu", None
+                    ),
+                    "extend_lens_cpu": getattr(
+                        forward_batch, "extend_seq_lens_cpu", None
+                    ),
                     "prefix_lens": forward_batch.extend_prefix_lens.tolist(),
                     "extend_lens": forward_batch.extend_seq_lens.tolist(),
                     "track_seqlens": forward_batch.mamba_track_seqlens.tolist(),
                     "track_mask": forward_batch.mamba_track_mask.tolist(),
-                    "track_indices": forward_batch.mamba_track_indices.tolist(),
-                    "req_pool_indices": forward_batch.req_pool_indices.tolist(),
+                    "track_indices": (
+                        forward_batch.mamba_track_indices.tolist()
+                        if getattr(forward_batch, "mamba_track_indices", None)
+                        is not None
+                        else None
+                    ),
+                    "req_pool_indices": (
+                        forward_batch.req_pool_indices.tolist()
+                        if getattr(forward_batch, "req_pool_indices", None) is not None
+                        else None
+                    ),
                     "query_start_loc": query_start_loc.tolist(),
                 }
                 raise ValueError(

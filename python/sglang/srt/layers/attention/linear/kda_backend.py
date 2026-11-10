@@ -439,6 +439,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 False,
             )
         )
+        self._kda_cute_checkpoint_plan_enabled = (
+            self._kda_native_checkpoint_plan_enabled
+            and getattr(
+                self.kernel_dispatcher.extend_kernel,
+                "native_checkpoint_capability",
+                None,
+            )
+            == "cute_prefix_suffix_fp32_c32"
+        )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -786,6 +795,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ),
             native_checkpoint_offsets=metadata.kda_native_checkpoint_offsets,
             native_checkpoint_rows=metadata.kda_native_checkpoint_rows,
+            cute_checkpoint_plan=metadata.kda_cute_checkpoint_plan,
         )
         if isinstance(core_attn_out, KDANativeCheckpointResult):
             return self._scatter_native_checkpoint_result(

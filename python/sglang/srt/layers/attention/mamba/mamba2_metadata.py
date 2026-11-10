@@ -66,6 +66,8 @@ class ForwardMetadata:
     # Dense checkpoint/final/output buffers belong to each kernel result only.
     kda_native_checkpoint_offsets: Optional[torch.Tensor] = None
     kda_native_checkpoint_rows: Optional[torch.Tensor] = None
+    # Exact CuTe gather/segment instructions; no layer output or state buffers.
+    kda_cute_checkpoint_plan: Optional[object] = None
 
 
 @dataclass(kw_only=True)

@@ -166,7 +166,7 @@ def _get_compiled(
         v = torch.empty(T, H, D, dtype=bf, device=dev)
         g = torch.empty(T, H, D, dtype=bf, device=dev)
         beta = torch.empty(T, H, dtype=bf, device=dev)
-        alog = torch.empty(H, dtype=torch.float32, device=dev)
+        a_log = torch.empty(H, dtype=torch.float32, device=dev)
         dtb = torch.empty(H, D, dtype=torch.float32, device=dev)
         st = torch.empty(N * H, D, D, dtype=torch.float32, device=dev)
         ns = torch.empty(N * H, D, D, dtype=torch.float32, device=dev)
@@ -197,7 +197,7 @@ def _get_compiled(
             mk(v),
             mk(g),
             mk(beta, 4),
-            from_dlpack(alog, assumed_align=16),
+            from_dlpack(a_log, assumed_align=16),
             from_dlpack(dtb, assumed_align=16),
             mk(st),
             mk(ns),
@@ -254,7 +254,7 @@ def _get_compiled(
             v,
             g,
             beta,
-            alog,
+            a_log,
             dtb,
             st,
             ns,
@@ -407,7 +407,7 @@ def _launch_forward(
         fepoch = 1
         G = chains
     else:
-        (soff, schain, spt0, sptn, ssrc, sdst, G, mid, mfl, fepoch) = sched
+        soff, schain, spt0, sptn, ssrc, sdst, G, mid, mfl, fepoch = sched
     if export is None:
         exp_ws, expt = _dummy_exp(dev)
         do_export, export_seq, nc2 = 0, 0, 1
@@ -911,11 +911,15 @@ def _plan(
     key = (
         0 if cu_seqlens is None else cu_seqlens.data_ptr(),
         # Inference tensors carry no version counter: key on their values.
-        0
-        if cu_seqlens is None
-        else tuple(cu_seqlens.tolist())
-        if cu_seqlens.is_inference()
-        else cu_seqlens._version,
+        (
+            0
+            if cu_seqlens is None
+            else (
+                tuple(cu_seqlens.tolist())
+                if cu_seqlens.is_inference()
+                else cu_seqlens._version
+            )
+        ),
         1 if cu_seqlens is None else int(cu_seqlens.numel()),
         H,
         T,
@@ -965,16 +969,18 @@ def _plan(
     else:
         has_split = False
     if not approximate:
-        (soff, schain, spt0, sptn, ssrc, sdst, G, nbuf) = _piece_schedule(
+        soff, schain, spt0, sptn, ssrc, sdst, G, nbuf = _piece_schedule(
             lens, H, nslots, dev, store_final_state
         )
     if nbuf > 0:
-        native_handoff = H in (64, 96) and (_is_mixed(lens) or _is_uniform_1024(lens))
+        # Exact scheduling must preserve the resident FP32 state at every
+        # producer/consumer boundary. Narrowing other shapes to BF16 makes
+        # the result depend on how independent sequences are packed.
         mid = torch.empty(
             nbuf,
             D,
             D,
-            dtype=torch.float32 if native_handoff else torch.bfloat16,
+            dtype=torch.float32,
             device=dev,
         )
         mfl = torch.zeros(nbuf, dtype=torch.int32, device=dev)
@@ -1032,7 +1038,9 @@ def fwd(
     nseq = 1 if cu_seqlens is None else int(cu_seqlens.numel()) - 1
     fixed = nseq == 1
     store_final_state = final_state is not None
-    allow_approximate_split = allow_approximate_split and _stream_state_is_safe(initial_state)
+    allow_approximate_split = allow_approximate_split and _stream_state_is_safe(
+        initial_state
+    )
 
     (
         cu32,
@@ -1106,9 +1114,10 @@ def fwd(
         restore_tail=False,
         reg_mode=reg_mode,
         full_chunks=full_chunks,
-        # H64 generic also benefits from deleting the runtime lower-bound
-        # scalar; the same specialization regresses generic H96.
-        lower_bound_m5=(full_chunks or H == 64) and lower_bound == -5.0,
+        # H96 must use the same FP32 lower-bound arithmetic for full chunks
+        # and odd tails. The constant-M5 variant changes aligned rows when
+        # they are packed with an odd-tail sequence.
+        lower_bound_m5=H != 96 and (full_chunks or H == 64) and lower_bound == -5.0,
         approximate_split=allow_approximate_split and has_split,
         prep_peel=H == 96 and generic,
         cluster_size=cluster_size,

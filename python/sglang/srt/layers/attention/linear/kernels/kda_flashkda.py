@@ -4,6 +4,10 @@ from typing import Optional, Union
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.kernels.kda_cute_checkpoint import (
+    CuTeCheckpointAdapter,
+    CuTeCheckpointPlan,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_native_checkpoint import (
     KDANativeCheckpointResult,
     probe_pinned_style_native,
@@ -98,11 +102,17 @@ class FlashKDAKernel(LinearAttnKernelBase):
         self._native_checkpoint_adapter = None
         self.native_checkpoint_capability = "disabled"
         # Register optional ops before reflection.
-        _load_flash_kda()
-        (
-            self._native_checkpoint_adapter,
-            self.native_checkpoint_capability,
-        ) = probe_pinned_style_native(torch, enabled=True)
+        flash_kda = _load_flash_kda()
+        if envs.SGLANG_OPT_FLASH_KDA_CUTE.get():
+            # CuTe has its own explicit adapter. Never infer its support from
+            # an unrelated external torch.ops.flash_kda registration.
+            self._native_checkpoint_adapter = CuTeCheckpointAdapter(flash_kda.fwd)
+            self.native_checkpoint_capability = "cute_prefix_suffix_fp32_c32"
+        else:
+            (
+                self._native_checkpoint_adapter,
+                self.native_checkpoint_capability,
+            ) = probe_pinned_style_native(torch, enabled=True)
         self.native_checkpoint_supported = self._native_checkpoint_adapter is not None
 
     def decode(
@@ -143,9 +153,8 @@ class FlashKDAKernel(LinearAttnKernelBase):
     ) -> Union[
         torch.Tensor, tuple[torch.Tensor, torch.Tensor], KDANativeCheckpointResult
     ]:
-        # Legacy FlashKDA cannot expose per-chunk states. Only the explicitly
-        # supported native ABI plus a validated exact plan may handle interior
-        # snapshots; all other cases retain the whole-batch Triton fallback.
+        # Interior snapshots require an explicit external ABI or CuTe adapter
+        # and an exact validated plan. Other cases keep whole-batch fallback.
         # Boundary-aligned tracks read the committed final state out of the pool
         # instead (track_ssm_final_src), never index h, and stay on the fused
         # path with a zero-row h stand-in -- same escape hatch as NvidiaKDAKernel.
@@ -157,6 +166,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         )
         offsets = kwargs.get("native_checkpoint_offsets")
         owner_rows = kwargs.get("native_checkpoint_rows")
+        cute_plan = kwargs.get("cute_checkpoint_plan")
         native_checkpoint_capable_for_plan = bool(
             needs_interior_snapshot
             and self._native_plan_is_eligible(
@@ -173,6 +183,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 offsets,
                 owner_rows,
                 track_h_src,
+                cute_plan,
             )
         )
         # Preserve the legacy short-circuit (and avoid extra length readbacks)
@@ -212,6 +223,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
             dt_bias=dt_bias,
             lower_bound=lower_bound,
             native_checkpoint_offsets=offsets if native_checkpoint_used else None,
+            cute_checkpoint_plan=cute_plan if native_checkpoint_used else None,
         )
         if isinstance(out, KDANativeCheckpointResult):
             return out
@@ -238,6 +250,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         offsets,
         owner_rows,
         track_h_src,
+        cute_plan=None,
     ) -> bool:
         """Check tensor metadata only, without reading CUDA values per layer.
 
@@ -246,9 +259,20 @@ class FlashKDAKernel(LinearAttnKernelBase):
         """
         if getattr(self, "_native_checkpoint_adapter", None) is None:
             return False
-        if offsets is None or owner_rows is None or A_log is None or dt_bias is None:
-            return False
         if q.ndim != 4 or q.shape[0] != 1 or q.shape[3] != 128:
+            return False
+        if isinstance(self._native_checkpoint_adapter, CuTeCheckpointAdapter):
+            if (
+                not isinstance(cute_plan, CuTeCheckpointPlan)
+                or q.shape[2] != 96
+                or ssm_states.dtype != torch.float32
+                or cute_plan.prefix_tokens.device != q.device
+                or sum(cute_plan.lengths) != q.shape[1]
+                or len(cute_plan.lengths) != cache_indices.numel()
+                or cute_plan.active_rows.numel() != track_h_src.numel()
+            ):
+                return False
+        if offsets is None or owner_rows is None or A_log is None or dt_bias is None:
             return False
         if any(x.shape != q.shape for x in (k, v, g)):
             return False
@@ -349,6 +373,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
         native_checkpoint_offsets: Optional[torch.Tensor] = None,
+        cute_checkpoint_plan: Optional[CuTeCheckpointPlan] = None,
     ) -> Union[torch.Tensor, KDANativeCheckpointResult]:
         flash_kda = _load_flash_kda()
 
@@ -407,6 +432,24 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 initial_state=initial_state,
                 final_state=final_state,
                 cu_seqlens=cu_seqlens,
+            )
+        elif isinstance(self._native_checkpoint_adapter, CuTeCheckpointAdapter):
+            checkpoint_states = torch.empty_like(initial_state)
+            self._native_checkpoint_adapter.invoke(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=float(scale),
+                out=out_buf,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                initial_state=initial_state,
+                final_state=final_state,
+                checkpoint_state=checkpoint_states,
+                plan=cute_checkpoint_plan,
             )
         else:
             # This exact ABI and plan were checked before dispatch. Buffers are

@@ -60,6 +60,10 @@ RUN pip install distro
 RUN pip install decord
 RUN pip install PyNvVideoCodec
 
+# Python NVTX bindings for Nsight Systems application ranges.
+RUN python3 -m pip install --no-cache-dir nvtx && \
+    python3 -c 'import nvtx; nvtx.annotate("image-build-nvtx-check")(lambda: None)()'
+
 # Warmup flashinfer trtllm-gen fused MoE module to pre-create cubin symlinks.
 # Avoids a FileExistsError race in ensure_symlink() when multiple TP workers
 # trigger the JIT module load concurrently on the first container start.
