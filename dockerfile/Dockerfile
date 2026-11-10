@@ -37,7 +37,7 @@ RUN pip config set global.index-url http://mirrors.baidubce.com/pypi/simple/ && 
     pip config set global.trusted-host mirrors.baidubce.com
 
 # Install deepgemm cache
-RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/cache_k3_0728_2.tar.gz && tar -xzvf cache_k3_0728_2.tar.gz && rm cache_k3_0728_2.tar.gz
+RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/cache_k3_0802.tar.gz && tar -xzvf cache_k3_0802.tar.gz && rm cache_k3_0802.tar.gz
 
 RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/sglang-prestop-pyspy-dump.sh
 
