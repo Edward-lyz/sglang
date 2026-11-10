@@ -73,7 +73,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         )
 
     if server_args.disaggregation_mode == "decode" and server_args.dcp_size > 1:
-        if server_args.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+        if server_args.disaggregation_transfer_backend not in ("mooncake", "nixl", "fake"):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
                 "mooncake or nixl, got "
