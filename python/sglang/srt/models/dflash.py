@@ -370,6 +370,10 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(default=16)
+        # feature_indices tuple -> column index into fc.weight. The PP-local
+        # feature set is fixed at startup, so the index is built once (see
+        # `_partial_fc_column_index`).
+        self._partial_fc_index_cache: dict[Tuple[int, ...], torch.Tensor] = {}
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -414,15 +418,38 @@ class DFlashDraftModel(nn.Module):
                 f"but got shape={tuple(target_hidden.shape)}."
             )
 
-        cols = []
-        for idx in feature_indices:
-            start = idx * hidden_size
-            cols.extend(range(start, start + hidden_size))
-        index = torch.tensor(cols, dtype=torch.long, device=self.fc.weight.device)
+        index = self._partial_fc_column_index(tuple(feature_indices), hidden_size)
         weight = self.fc.weight.index_select(1, index)
         if target_hidden.dtype != weight.dtype:
             target_hidden = target_hidden.to(weight.dtype)
         return F.linear(target_hidden, weight)
+
+    def _partial_fc_column_index(
+        self, feature_indices: Tuple[int, ...], hidden_size: int
+    ) -> torch.Tensor:
+        """fc.weight column index for `feature_indices`, built once per feature set.
+
+        Building it per forward from a host list (`torch.tensor(cols, device=...)`)
+        takes the pageable-H2D path, which appends a cudaStreamSynchronize: the
+        host would park until the whole target forward drained, delaying every PP
+        ring send that follows and idling the downstream stages' GPUs.
+        """
+        index = self._partial_fc_index_cache.get(feature_indices)
+        if index is None:
+            device = self.fc.weight.device
+            index = torch.cat(
+                [
+                    torch.arange(
+                        idx * hidden_size,
+                        (idx + 1) * hidden_size,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    for idx in feature_indices
+                ]
+            )
+            self._partial_fc_index_cache[feature_indices] = index
+        return index
 
     @torch.no_grad()
     def forward(

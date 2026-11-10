@@ -74,6 +74,14 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
+def _pp_payload_has_cpu_tensor(tensor_dict: Dict[str, torch.Tensor]) -> bool:
+    """True if any payload tensor lives in host memory (gloo, not NCCL)."""
+    return any(
+        isinstance(tensor, torch.Tensor) and tensor.is_cpu
+        for tensor in tensor_dict.values()
+    )
+
+
 def _pp_ordered_intersection(left: List[str], right: List[str]) -> List[str]:
     right_set = set(right)
     return [rid for rid in left if rid in right_set]
@@ -2391,6 +2399,15 @@ class SchedulerPPMixin:
                     )
                 ):
                     self.device_module.current_stream().wait_event(q_event)
+                    if _pp_payload_has_cpu_tensor(pp_outputs_to_send.tensors):
+                        # `copy_to_cpu` replaces next_token_ids with pinned host
+                        # pages filled by an async D2H that q_event gates, and
+                        # `send_tensor_dict` routes CPU tensors over gloo — the
+                        # host reads those pages itself. The stream wait above
+                        # only orders the device, so without a host-side wait we
+                        # isend uninitialized memory and PP0 decodes garbage
+                        # token ids.
+                        q_event.synchronize()
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,

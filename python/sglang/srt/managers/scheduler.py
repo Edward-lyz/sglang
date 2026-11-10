@@ -4526,8 +4526,15 @@ class Scheduler(
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
                 if batch_result.new_seq_lens is not None:
+                    # Extend steps hand back the batch's own seq_lens tensor, so
+                    # seq_lens_cpu still matches and the D2H is pure waste. It is
+                    # not free: a blocking .to("cpu") parks the host until the
+                    # whole forward drains, emptying the GPU queue right before
+                    # the PP consensus-ring waits. Decode returns a new tensor
+                    # (accept lengths) and still needs the copy.
+                    seq_lens_replaced = batch_result.new_seq_lens is not batch.seq_lens
                     batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
+                    if seq_lens_replaced and batch.seq_lens_cpu is not None:
                         batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
                         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 batch.input_ids = None  # rebuilt next iter from draft_token

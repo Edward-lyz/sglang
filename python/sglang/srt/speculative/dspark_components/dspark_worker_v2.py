@@ -528,9 +528,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         # draft-KV injection, and should live on this worker's device.
         device = self.device
         num_real_tokens = int(sum(batch.extend_lens))
-        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-        draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, device=device
+        # Build on host first, then upload with non_blocking=True (same idiom as
+        # ForwardBatch.init_new). Passing device= to torch.tensor() makes PyTorch
+        # take the pageable-H2D path, which appends a cudaStreamSynchronize: the
+        # host would block until the whole target forward drains, leaving the GPU
+        # queue empty for the PP consensus-ring waits that follow.
+        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32).to(
+            device, non_blocking=True
+        )
+        draft_seq_lens = torch.tensor(batch.prefix_lens, dtype=torch.int32).to(
+            device, non_blocking=True
         )
         positions, _ = compute_position(
             self.model_runner.server_args.attention_backend,
