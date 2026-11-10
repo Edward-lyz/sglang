@@ -72,21 +72,23 @@ def _memzero_u8_kernel(P, N, TILE: tl.constexpr):
     which runs the bool fill well under HBM bandwidth). Zeroes the WHOLE keep buffer,
     so it stays valid for every consumer read (including the non-Triton fallback that
     reads published[:, :width] unmasked) — same semantics as torch.zeros, just faster."""
-    off = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    # int64: N = rows * width passes 2^31 for large decode batches x long contexts.
+    off = tl.program_id(0).to(tl.int64) * TILE + tl.arange(0, TILE)
     tl.store(P + off, tl.zeros((TILE,), tl.uint8), off < N)
 
 
-def candidate_scores_rowloop(logits, seq_lens, out, scores, num_warps=4):
+def candidate_scores_rowloop(logits, seq_lens, out, scores, block_size=8, num_warps=4):
     """Row-loop block scoring: writes live-tile masked logits into `out[rows,width]`
-    and block-max into `scores[rows,blocks]`. `scores` must be pre-filled with -inf so
-    dead blocks stay -inf; `out`'s dead tail is left unwritten (never read downstream)."""
+    and block-max into `scores[rows,blocks]` (blocks of `block_size` columns, the size
+    `scores` was allocated for). `scores` must be pre-filled with -inf so dead blocks
+    stay -inf; `out`'s dead tail is left unwritten (never read downstream)."""
     rows, width = logits.shape
     blocks = scores.shape[1]
-    group_pad = triton.next_power_of_2(8)
+    group_pad = triton.next_power_of_2(block_size)
     tile = max(1, 1024 // group_pad)
     scores.fill_(-float("inf"))
     _scores_rowloop_kernel[(rows,)](
-        logits, seq_lens, out, scores, width, logits.stride(0), blocks, 8, group_pad, tile,
+        logits, seq_lens, out, scores, width, logits.stride(0), blocks, block_size, group_pad, tile,
         num_warps=num_warps,
     )
 
@@ -118,6 +120,6 @@ def candidate_source_scores_and_keep(logits, seq_lens, topk_blocks, block_size, 
     if out is None:
         out = torch.empty((rows, width), dtype=torch.float32, device=logits.device)
     scores = torch.empty((rows, blocks), dtype=torch.float32, device=logits.device)
-    candidate_scores_rowloop(logits, seq_lens, out, scores)
+    candidate_scores_rowloop(logits, seq_lens, out, scores, block_size)
     keep = block_topk_keep(scores, seq_lens, width, topk_blocks, block_size)
     return out, keep

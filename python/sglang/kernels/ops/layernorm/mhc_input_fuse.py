@@ -59,7 +59,8 @@ def sglfuse_mhc_pre_input(
     jj = jv[:, None]
     kk = jv[None, :]
     for i in tl.static_range(BLOCK_M):
-        row = pid * BLOCK_M + i
+        # int64: row * KFLAT (20480) passes 2^31 from M = 104858 rows.
+        row = (pid * BLOCK_M + i).to(tl.int64)
         if row < M:
             mbase = row * MIX
             acc = tl.zeros([GPAD, GROUP], dtype=tl.float32)
@@ -147,10 +148,12 @@ def fused_mhc_pre_input_quant(mixes, x_flat, hc_scale, hc_base, weight,
                               rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
                               hc_mult=_HC, hidden=_HID):
     """4->1 (op51+52+53+54). -> (q_fp8[M,5120] e4m3, sf[M*160] uint8 128x4-swizzled ue8m0,
-    post[M,4], comb[M,4,4]). Caller wraps (q_fp8, sf) as Mxfp8SwizzledInput for the GEMM."""
+    post[M,4], comb[M,4,4]); sf holds ceil(M/128)*128*160 bytes.
+    Caller wraps (q_fp8, sf) as Mxfp8SwizzledInput for the GEMM."""
     M, dev, mixes_f, scale, base, w = _prep(mixes, x_flat, hc_scale, hc_base, weight, hc_mult, hidden)
     q = torch.empty((M, _HID), device=dev, dtype=torch.float8_e4m3fn)
-    sf = torch.empty((M * _G,), device=dev, dtype=torch.uint8)
+    # The 128x4 swizzle addresses whole 128-row tiles: size for ceil(M/128)*128 rows.
+    sf = torch.empty((triton.cdiv(M, 128) * 128 * _G,), device=dev, dtype=torch.uint8)
     post = torch.empty((M, _HC), device=dev, dtype=torch.float32)
     comb = torch.empty((M, _HC, _HC), device=dev, dtype=torch.float32)
     normed = torch.empty((1,), device=dev, dtype=torch.bfloat16)

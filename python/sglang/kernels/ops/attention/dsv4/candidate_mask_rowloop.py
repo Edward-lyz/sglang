@@ -35,7 +35,9 @@ def _candidate_mask_rowloop_kernel(
 ):
     row = tl.program_id(0).to(tl.int64)
     seqlen = tl.load(LENS + row)
-    ntiles = (seqlen + TILE - 1) // TILE  # only the live tiles; dead tail skipped
+    # Only the live tiles; dead tail skipped. An empty row still gets its first
+    # tile set to -inf (as the live-prefix kernel does) instead of stale memory.
+    ntiles = tl.maximum((seqlen + TILE - 1) // TILE, 1)
     for t in range(ntiles):
         cols = t * TILE + tl.arange(0, TILE)
         in_width = cols < WIDTH

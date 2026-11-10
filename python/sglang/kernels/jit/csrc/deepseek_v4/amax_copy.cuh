@@ -9,6 +9,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 
@@ -43,6 +44,7 @@ struct AmaxParams {
   int64_t stride_scores;       // in elements
   int64_t stride_amax_scores;  // in elements
   uint32_t topk;               // rows with <= topk blocks are skipped, 0 = never skip
+  uint32_t max_keys;           // keys a row may hold: min(out width, ceil(scores width / 8))
 };
 
 /// grid = (rows, ceil(max_keys / kKeysPerCTA)); a CTA owns kKeysPerCTA consecutive
@@ -59,8 +61,10 @@ __global__ __launch_bounds__(AmaxConfig::kBlockSize, AmaxConfig::kOccupancy)  //
   const auto tx = threadIdx.x;
 
   PDLWaitPrimary<kUsePDL>();  // seq_len and scores are the previous kernels' outputs
-  const auto seq_len = static_cast<uint32_t>(params.seq_len[bx]);
-  const auto num_keys = (seq_len + C::kBlockTokens - 1) / C::kBlockTokens;
+  // Clamp: a negative or over-long seq_len must not read or write past the row.
+  const auto raw_len = params.seq_len[bx];
+  const auto seq_len = raw_len > 0 ? static_cast<uint32_t>(raw_len) : 0u;
+  const auto num_keys = min((seq_len + C::kBlockTokens - 1) / C::kBlockTokens, params.max_keys);
   const auto first_key = by * C::kKeysPerCTA;
   if (num_keys <= params.topk || first_key >= num_keys) {
     return PDLTriggerSecondary<kUsePDL>();
@@ -104,7 +108,8 @@ __global__ __launch_bounds__(AmaxConfig::kBlockSize, AmaxConfig::kOccupancy)  //
 /// `i < ceil(seq_len[b] / 8)`, the last of them +inf; rows with at most `topk`
 /// blocks untouched. `scores` rows must stay 32 B aligned (stride % 8 == 0).
 /// The grid covers `amax_scores`' width, so the caller sizes it for the longest
-/// row: `seq_len[b] <= 8 * amax_scores.shape[1]` for every row (not checked).
+/// row: `seq_len[b] <= 8 * amax_scores.shape[1]`. Longer (or negative) lengths
+/// are clamped to the row instead of reading/writing past it.
 template <bool kPDL>
 struct AmaxCopyKernel {
   static void amax8_varlen(
@@ -148,6 +153,8 @@ struct AmaxCopyKernel {
         .stride_scores = S.unwrap(),
         .stride_amax_scores = O.unwrap(),
         .topk = topk,
+        .max_keys = static_cast<uint32_t>(
+            std::min<int64_t>(max_keys, div_ceil(L.unwrap(), static_cast<int64_t>(C::kBlockTokens)))),
     };
     const auto grid = dim3(
         static_cast<uint32_t>(B.unwrap()),

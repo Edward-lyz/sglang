@@ -25,6 +25,7 @@ slots (FB attribute name maps 1:1 to slot name).
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
@@ -739,9 +740,14 @@ def build_decode_registry(
                         buf.fill_(ctx.padded_num_tokens)
                         return
                     version = _write_version(buf)
-                    if version is not None and _global_fill_cache.get(key) == (
-                        ctx.padded_num_tokens,
-                        version,
+                    cached = _global_fill_cache.get(key)
+                    # The weakref guards against a freed buffer whose address (and
+                    # version count) a new buffer happens to reuse.
+                    if (
+                        version is not None
+                        and cached is not None
+                        and cached[:2] == (ctx.padded_num_tokens, version)
+                        and cached[2]() is buf
                     ):
                         return
                     buf.fill_(ctx.padded_num_tokens)
@@ -749,7 +755,11 @@ def build_decode_registry(
                     if version is None:
                         _global_fill_cache.pop(key, None)
                     else:
-                        _global_fill_cache[key] = (ctx.padded_num_tokens, version)
+                        _global_fill_cache[key] = (
+                            ctx.padded_num_tokens,
+                            version,
+                            weakref.ref(buf),
+                        )
                     return
                 buf.fill_(ctx.padded_num_tokens)
 

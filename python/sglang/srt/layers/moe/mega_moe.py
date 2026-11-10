@@ -218,7 +218,31 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        _warn_mega_moe_cap_once(max_tokens_per_rank, cap)
+        return False
+    return True
+
+
+_mega_moe_cap_warned = False
+
+
+def _warn_mega_moe_cap_once(num_tokens: int, cap: int) -> None:
+    """Say once that a forward left MegaMoE for the slower fallback path.
+
+    With prefill CP the per-rank share of a full chunk (chunk / cp) can sit
+    exactly at the cap, so any padding pushes a forward over it silently.
+    """
+    global _mega_moe_cap_warned
+    if not _mega_moe_cap_warned:
+        _mega_moe_cap_warned = True
+        logger.warning(
+            "MegaMoE skipped: %d tokens on this rank > "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=%d; this forward "
+            "uses the fallback MoE path (raise the cap above chunk/cp plus padding).",
+            num_tokens,
+            cap,
+        )
 
 
 def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:

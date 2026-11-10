@@ -493,9 +493,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self._swa_req_ring or free_index.numel() == 0:
             return
         if self._swa_seg_batch is not None and start_pos % self.page_size == 0:
-            # Keep only the page reps (a view): segments of any length concatenate
-            # without breaking the per-segment [::page_size] page alignment.
-            self._swa_seg_batch.append(free_index[:: self.page_size])
+            # Keep only the page reps: segments of any length concatenate without
+            # breaking the per-segment [::page_size] page alignment. Copied, since
+            # free_index may view req_to_token rows that change before the batch ends
+            # (one small copy per evicted page group; evictions are once per page).
+            self._swa_seg_batch.append(free_index[:: self.page_size].clone())
             return
         self._free_swa_pages(free_index, start_pos=start_pos)
 

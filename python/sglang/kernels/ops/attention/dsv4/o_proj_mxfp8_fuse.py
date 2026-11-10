@@ -38,12 +38,14 @@ def sglfuse_oproj_mxfp8(
     SUBG: tl.constexpr, GROUP: tl.constexpr, GPAD: tl.constexpr, BLOCK_M: tl.constexpr,
 ):
     """Fused MLA o_proj wo_b-input MXFP8 swizzled quantization."""
-    pid = tl.program_id(0)
+    # int64 offsets: in the einsum layout s_g = T*R, so gg*s_g and row*s_t
+    # are token-count sized and must not wrap at long prefill chunks.
+    pid = tl.program_id(0).to(tl.int64)
     r0 = pid * BLOCK_M
     gid = tl.arange(0, GPAD)
     ks = tl.arange(0, GROUP)
     gmask = gid < NG
-    gg = gid // SUBG
+    gg = (gid // SUBG).to(tl.int64)
     sub = gid % SUBG
     in_col = gg[:, None] * s_g + sub[:, None] * GROUP + ks[None, :]
     out_col = gid[:, None] * GROUP + ks[None, :]

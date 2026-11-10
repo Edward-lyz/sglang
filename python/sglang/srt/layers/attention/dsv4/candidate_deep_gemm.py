@@ -233,6 +233,13 @@ class DeepGemmCandidateIndexer:
         table on the forward metadata."""
         metadata = inputs.metadata
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
+        # Dense [rows, page-table width] logits, not row-chunked on decode: the
+        # upstream logits kernel indexes them with 32-bit offsets.
+        num_logits = seq_lens.shape[0] * metadata.max_compressed_seq_len
+        assert num_logits < 2**31, (
+            f"decode candidate logits {seq_lens.shape[0]} x "
+            f"{metadata.max_compressed_seq_len} exceed 2^31 elements"
+        )
         logits = fp4_paged_mqa_logits(
             (inputs.q_fp4, inputs.q_sf),
             inputs.k_cache,
@@ -424,7 +431,11 @@ class DeepGemmCandidateIndexer:
         table = published
         assert isinstance(table, PrefillSparseBlockTable), "prefill block table missing"
         rows, start = [], 0
+        assert len(tail_lens) == len(table.rows_per_request)
         for n, t in zip(table.rows_per_request, tail_lens):
+            # rows_per_request is this rank's count; a global (CP) tail length
+            # larger than it would index negative rows, which torch wraps silently.
+            assert 0 <= t <= n, f"tail {t} exceeds the {n} rows of this request"
             rows.append(torch.arange(start + n - t, start + n))
             start += n
         rows = torch.cat(rows).to(table.blocks.device)

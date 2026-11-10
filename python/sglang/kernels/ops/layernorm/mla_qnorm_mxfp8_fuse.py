@@ -35,7 +35,8 @@ def sglfuse_mla_qnorm_mxfp8(
 ):
     """Fused MLA q-path RMSNorm + wq_b-input MXFP8 swizzled quantization."""
     pid = tl.program_id(0)
-    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    # int64 so rows*s_row / rows*K cannot wrap for long prefill chunks.
+    rows = (pid * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     row_mask = rows < M
     k = tl.arange(0, BLOCK_K)
     kmask = k < K
