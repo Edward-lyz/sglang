@@ -3674,16 +3674,22 @@ class Scheduler(
             else None
         )
 
-        # A downstream PP stage may have queued requests beyond PP0's committed
-        # microbatch. An empty authoritative plan means it must stay idle.
-        if authoritative_admissions == ():
-            return None, running_batch
-
-        # Check if the grammar is ready in the grammar queue
+        # Check if the grammar is ready in the grammar queue.
+        # NOTE: This must run before the empty-plan early return below. The
+        # grammar PP sync pairs one async send on a PP rank with one recv on
+        # the next rank per scheduler iteration in which the grammar queue is
+        # non-empty. Skipping it on an idle microbatch leaves PP0's send
+        # unmatched, and PP0 deadlocks in _drain_pp_sync_work on its next
+        # grammar sync while later ranks block waiting for pipeline messages.
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
+
+        # A downstream PP stage may have queued requests beyond PP0's committed
+        # microbatch. An empty authoritative plan means it must stay idle.
+        if authoritative_admissions == ():
+            return None, running_batch
 
         if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
