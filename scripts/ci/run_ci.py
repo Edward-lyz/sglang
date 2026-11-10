@@ -43,7 +43,6 @@ import ast
 import datetime
 import fnmatch
 import glob
-import html
 import json
 import os
 import subprocess
@@ -589,11 +588,6 @@ def _format_duration(seconds: float) -> str:
     return f"{sec}s"
 
 
-def _status_badge(status: str) -> str:
-    """Return a styled HTML badge for a test status."""
-    escaped = html.escape(status.upper())
-    return f'<span class="badge {html.escape(status)}">{escaped}</span>'
-
 
 def _safe_report_stem(value: str) -> str:
     """Return a filesystem-safe report file stem."""
@@ -641,8 +635,8 @@ def _write_run_reports(
     report_name: str,
     metadata: Mapping[str, object],
     results: List[TestRunResult],
-) -> Tuple[Path, Path]:
-    """Write HTML and JSON reports for a CI run and return their paths."""
+) -> Path:
+    """Write a JSON report for a CI run and return its path."""
     output_dir = Path(report_dir)
     if not output_dir.is_absolute():
         output_dir = REPO_ROOT / output_dir
@@ -650,7 +644,6 @@ def _write_run_reports(
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     stem = f"{_safe_report_stem(report_name)}-{timestamp}"
-    html_path = output_dir / f"{stem}.html"
     json_path = output_dir / f"{stem}.json"
 
     all_cases = [case for item in results for case in item.cases]
@@ -683,137 +676,7 @@ def _write_run_reports(
         "results": [asdict(item) for item in results],
     }
     json_path.write_text(json.dumps(json_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    report_rows = []
-    for item in sorted(
-        results,
-        key=lambda r: (r.status == "passed", r.status == "skipped", -r.elapsed),
-    ):
-        case_failed = sum(1 for case in item.cases if case.status == "failed")
-        case_skipped = sum(1 for case in item.cases if case.status == "skipped")
-        case_passed = sum(1 for case in item.cases if case.status == "passed")
-        case_summary = f"{case_passed}/{case_failed}/{case_skipped}"
-        junit_link = ""
-        if item.junit_xml:
-            try:
-                junit_link = os.path.relpath(item.junit_xml, output_dir)
-            except ValueError:
-                junit_link = item.junit_xml
-        junit_cell = ""
-        if junit_link:
-            junit_href = html.escape(json.dumps(junit_link), quote=False)
-            junit_cell = f'<a href={junit_href}>XML</a>'
-
-        item_cases = sorted(
-            item.cases,
-            key=lambda c: (c.status == "passed", c.status == "skipped", -c.elapsed),
-        )
-        if not item_cases:
-            item_cases = [
-                TestCaseResult(
-                    target=item.name,
-                    classname="",
-                    name=item.name,
-                    status=item.status,
-                    elapsed=item.elapsed,
-                    message=item.reason,
-                    details=item.reason,
-                )
-            ]
-
-        for case in item_cases:
-            case_name = case.name
-            if case.classname:
-                case_name = f"{case.classname}::{case.name}"
-            detail_cell = ""
-            if case.details:
-                detail_cell = (
-                    "<details><summary>详情</summary>"
-                    f"<pre>{html.escape(case.details)}</pre></details>"
-                )
-            report_rows.append(
-                "<tr>"
-                f"<td>{_status_badge(case.status)}</td>"
-                f"<td>{html.escape(item.source)}</td>"
-                f"<td class='name'>{html.escape(case_name)}</td>"
-                f"<td class='reason'>{html.escape(case.message)}</td>"
-                f"<td class='detail-cell'>{detail_cell}</td>"
-                f"<td>{case_summary}</td>"
-                f"<td>{_format_duration(case.elapsed)}</td>"
-                f"<td>{junit_cell}</td>"
-                f"<td class='command'>{html.escape(item.command)}</td>"
-                "</tr>"
-            )
-
-    command_line = " ".join(html.escape(arg) for arg in sys.argv)
-    html_doc = f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<title>SGLang CI Report</title>
-<style>
-body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f5f7fb; }}
-header {{ padding: 28px 36px; color: #fff; background: linear-gradient(135deg, #263a8b, #12aab5); }}
-h1 {{ margin: 0 0 8px; font-size: 28px; }}
-.meta {{ opacity: .92; font-size: 14px; }}
-main {{ padding: 24px 36px 40px; }}
-.cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 22px; }}
-.card {{ padding: 16px; border-radius: 14px; background: #fff; box-shadow: 0 6px 18px rgba(30, 41, 59, .08); }}
-.card .num {{ display: block; font-size: 28px; font-weight: 700; }}
-.card .label {{ color: #64748b; font-size: 13px; }}
-section {{ margin-top: 20px; padding: 18px; border-radius: 14px; background: #fff; box-shadow: 0 6px 18px rgba(30, 41, 59, .08); }}
-h2 {{ margin: 0 0 12px; font-size: 18px; }}
-.table-wrap {{ width: 100%; overflow-x: auto; }}
-table {{ min-width: 1180px; width: max-content; border-collapse: collapse; font-size: 13px; }}
-th, td {{ padding: 10px 8px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; }}
-th {{ color: #475569; background: #f8fafc; position: sticky; top: 0; }}
-a {{ color: #2563eb; text-decoration: none; }}
-.name, .command, .reason {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
-.name {{ min-width: 180px; max-width: 420px; overflow-wrap: break-word; word-break: normal; }}
-.command {{ min-width: 520px; max-width: 760px; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; color: #475569; }}
-.reason {{ min-width: 360px; max-width: 720px; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; }}
-.detail-cell {{ min-width: 240px; max-width: 560px; }}
-.badge {{ display: inline-block; min-width: 64px; padding: 4px 8px; border-radius: 999px; color: #fff; font-weight: 700; text-align: center; font-size: 12px; }}
-.passed {{ background: #16a34a; }}
-.failed {{ background: #dc2626; }}
-.timeout {{ background: #ea580c; }}
-.skipped {{ background: #64748b; }}
-pre {{ padding: 12px; overflow: auto; border-radius: 10px; background: #0f172a; color: #e2e8f0; }}
-</style>
-</head>
-<body>
-<header>
-<h1>SGLang CI 测试报告</h1>
-<div class="meta">生成时间：{html.escape(str(metadata.get('generated_at', '')))} · 硬件：{html.escape(str(metadata.get('hardware', '')))} · Nightly：{html.escape(str(metadata.get('nightly', '')))}</div>
-</header>
-<main>
-<div class="cards">
-<div class="card"><span class="num">{total}</span><span class="label">总数</span></div>
-<div class="card"><span class="num">{passed}</span><span class="label">通过</span></div>
-<div class="card"><span class="num">{failed}</span><span class="label">失败</span></div>
-<div class="card"><span class="num">{timed_out}</span><span class="label">超时</span></div>
-<div class="card"><span class="num">{skipped}</span><span class="label">跳过</span></div>
-<div class="card"><span class="num">{_format_duration(elapsed_total)}</span><span class="label">总耗时</span></div>
-</div>
-<section>
-<h2>执行信息</h2>
-<pre>{command_line}</pre>
-</section>
-<section>
-<h2>测试明细</h2>
-<div class="table-wrap">
-<table>
-<thead><tr><th>状态</th><th>来源</th><th>用例</th><th>失败原因</th><th>详情</th><th>用例 P/F/S</th><th>耗时</th><th>JUnit</th><th>命令</th></tr></thead>
-<tbody>{''.join(report_rows) or '<tr><td colspan="9">未生成测试明细。</td></tr>'}</tbody>
-</table>
-</div>
-</section>
-</main>
-</body>
-</html>
-"""
-    html_path.write_text(html_doc, encoding="utf-8")
-    return html_path, json_path
+    return json_path
 
 
 def cmd_run(
@@ -1416,8 +1279,7 @@ def cmd_run(
         "total_targets": total_targets,
         "report_name": report_name,
     }
-    html_path, json_path = _write_run_reports(report_dir, report_name, metadata, results)
-    print(f"  {BOLD}Report:{NC} {html_path}")
+    json_path = _write_run_reports(report_dir, report_name, metadata, results)
     print(f"  {BOLD}JSON:  {NC} {json_path}")
     print("=" * 60)
 
