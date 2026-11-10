@@ -1346,9 +1346,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         # The scheduler receives from the descriptor's transport.
         obj.need_wait_for_mm_inputs = True
-        obj.encoder_urls = [
-            f"http://{d['ip']}:{d['http_port']}" for d in descriptors
-        ]
+        obj.encoder_urls = [f"http://{d['ip']}:{d['http_port']}" for d in descriptors]
         return None
 
     @staticmethod
@@ -1649,6 +1647,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                skip_radix_cache_insert=obj.skip_radix_cache_insert,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,

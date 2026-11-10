@@ -742,6 +742,7 @@ async def health_generate(request: Request) -> Response:
         if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
+            gri.skip_radix_cache_insert = True
     else:
         gri = EmbeddingReqInput(
             rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
@@ -2483,6 +2484,7 @@ async def _send_disaggregation_warmup_requests(
             "bootstrap_room": dp_rank,
             "input_ids": [10, 11, 12, 13],
             "routed_dp_rank": dp_rank,
+            "skip_radix_cache_insert": True,
         }
         async with session.post(
             url + "/generate", json=json_data, ssl=ssl_context

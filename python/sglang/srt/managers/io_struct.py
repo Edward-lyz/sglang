@@ -244,6 +244,8 @@ class GenerateReqInput:
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # Skip radix cache insertion for internal warmup/health requests.
+    skip_radix_cache_insert: bool = False
     # Whether to return hidden states
     return_hidden_states: Union[
         List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
@@ -924,6 +926,7 @@ class GenerateReqInput:
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
+            skip_radix_cache_insert=self.skip_radix_cache_insert,
             return_hidden_states=(
                 self.return_hidden_states[i]
                 if isinstance(self.return_hidden_states, list)
@@ -1097,6 +1100,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Append defaulted fields to preserve the positional IPC schema.
+    # Internal warmup/health requests opt out; fake-prefill user requests cache.
+    skip_radix_cache_insert: bool = False
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
