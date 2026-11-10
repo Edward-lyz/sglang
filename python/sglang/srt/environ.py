@@ -434,6 +434,14 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
+    # Decode-side LAZY KV allocation for PD disaggregation (mooncake only).
+    # When enabled, decode claims the request first, then allocates KV after
+    # prefill reports compute completion. Must be set identically on prefill
+    # and decode: the prefill advertises its value over /route and decode
+    # rejects the request at bootstrap if the two disagree.
+    SGLANG_DISAGGREGATION_DECODE_LAZY_ALLOC = EnvBool(False)
+    # Maximum time prefill waits for decode KV indices after compute completion.
+    SGLANG_DISAGGREGATION_LAZY_INDICES_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     # PP + PD prefill: cut the last chunk's "wait one PP round" latency. On

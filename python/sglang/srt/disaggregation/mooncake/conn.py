@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
 import zmq
+from aiohttp import web
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
@@ -230,6 +232,15 @@ class KVArgsRegisterInfo:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    LAZY_COMPUTE_DONE_STATUS = 99
+    # failure_records is only drained by failure_exception(). A record written
+    # after its room already concluded (a late Failed / ABORT) is never read, so
+    # records older than the TTL are dropped. A live record is consumed within a
+    # scheduler iteration. One that outlives the TTL (e.g. the request sat in the
+    # prefill queue longer than that before its sender was polled) only loses its
+    # reason: the error then reads "unknown reason from another rank".
+    FAILURE_RECORD_TTL_S = 300.0
+    FAILURE_RECORD_PURGE_INTERVAL_S = 60.0
 
     transfer_infos: dict[int, dict[str, TransferInfo]]
 
@@ -258,6 +269,33 @@ class MooncakeKVManager(CommonKVManager):
         self._draft_kv_entry_ptrs_gpu = None
         self._draft_gather_max_ctas = 0
         self._draft_gather_pool = None
+        self.lazy_alloc = envs.SGLANG_DISAGGREGATION_DECODE_LAZY_ALLOC.get()
+        self.lazy_claims: Dict[int, Dict[str, tuple]] = {}
+        self.lazy_pending_send: Dict[int, dict] = {}
+        self.lazy_lock = threading.Lock()
+        self.lazy_compute_done_time: Dict[int, float] = {}
+        self.lazy_indices_timeout = (
+            envs.SGLANG_DISAGGREGATION_LAZY_INDICES_TIMEOUT.get()
+        )
+        self.lazy_compute_done_tracker: Dict[int, Set[int]] = defaultdict(set)
+        # Lazy: rooms whose CLAIMs all arrived before the prefill KVSender was
+        # created. The bootstrap thread cannot tell "sender not built yet" from
+        # "already concluded+cleared" (both are absent from request_status), so
+        # it parks the room here and MooncakeKVSender.__init__ drains it --
+        # whichever of {last CLAIM, sender creation} happens second transitions.
+        self.lazy_claim_ready_rooms: Set[int] = set()
+        # Lazy: decode notifications are fire-and-forget on dedicated PUSH
+        # sockets (see _lazy_notify_decode). They are sent from the scheduler
+        # thread (`send()` / `poll()`), so they must never block: the shared
+        # sockets from _connect() use SNDTIMEO=30s + RECONNECT_IVL=-1, and a
+        # blocking send to a dead decode used to stall 30s and then raise
+        # zmq.Again out of the scheduler event loop (kill_process_tree). The
+        # lock only guards the dict and the non-blocking sends, so it is never
+        # held for long. Only prefill notifies decode.
+        self._lazy_notify_socks: Dict[str, zmq.Socket] = {}
+        self._lazy_notify_lock = threading.Lock()
+        self._failure_record_times: Dict[int, float] = {}
+        self._failure_record_last_purge = time.time()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -821,6 +859,197 @@ class MooncakeKVManager(CommonKVManager):
             self.enable_staging,
             elapsed,
         )
+
+    def lazy_stash_and_notify(
+        self,
+        room: int,
+        kv_indices: npt.NDArray[np.int32],
+        index_slice: slice,
+        aux_index: Optional[int],
+        state_indices: Optional[List[int]],
+        num_kv_tokens: Optional[int] = None,
+    ):
+        """Lazy-alloc (prefill side): after compute, stash the computed KV and
+        notify every decode endpoint that computation is done, so decode can
+        allocate its KV and send the indices back (handled in the bootstrap
+        thread)."""
+        # A room missing from request_status (or already Failed) was concluded
+        # by its sender (abort/timeout) before compute finished; stashing
+        # would leak an entry that nothing will pop.
+        if (
+            room not in self.request_status
+            or self.request_status[room] == KVPoll.Failed
+        ):
+            return
+        # Stash BEFORE notifying so the deferred transfer is ready by the time
+        # decode's indices message arrives.
+        with self.lazy_lock:
+            self.lazy_pending_send[room] = {
+                "kv_indices": kv_indices,
+                "index_slice": index_slice,
+                "is_last": True,
+                "aux_index": aux_index,
+                "state_indices": state_indices,
+                "num_kv_tokens": num_kv_tokens,
+            }
+            self.lazy_compute_done_time[room] = time.time()
+            endpoints = [
+                (decode_ip, decode_port)
+                for decode_ip, decode_port, _ in self.lazy_claims.get(
+                    room, {}
+                ).values()
+            ]
+        if not endpoints:
+            logger.warning(
+                "Lazy compute-done for room=%s but no decode claim recorded "
+                "yet; the lazy indices timeout will reclaim the room.",
+                room,
+            )
+        # Same id the eager Success path sends (transfer worker's
+        # prefill_unique_rank): decode counts distinct ids against
+        # required_prefill_response_num, which includes the CP factor, so an id
+        # without attn_cp_rank collapses two CP ranks into one and the count
+        # never reaches the expectation.
+        prefill_unique_rank = (
+            self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+            + self.pp_rank * self.attn_cp_size
+            + self.attn_cp_rank
+        )
+        for decode_ip, decode_port in endpoints:
+            self._lazy_notify_decode(
+                decode_ip,
+                decode_port,
+                room,
+                self.LAZY_COMPUTE_DONE_STATUS,
+                prefill_unique_rank,
+            )
+
+    def _lazy_notify_decode(
+        self,
+        decode_ip: str,
+        decode_port: int,
+        room: int,
+        status: int,
+        prefill_unique_rank: int,
+    ) -> None:
+        """Send one decode notification without blocking; drop it on failure.
+
+        Called from the scheduler thread (via `send()` / `poll()`), so it must
+        neither block nor raise. A dropped notification is recoverable: decode
+        never sends indices (or keeps waiting) and the lazy timeouts on both
+        sides reclaim the room.
+
+        Uses dedicated sockets rather than sync_status_to_decode_endpoint: that
+        path shares _connect()'s socket and per-endpoint send lock with the
+        transfer workers, whose blocking send to a dead decode holds the lock
+        for SNDTIMEO (30s), so even a NOBLOCK send would wait on the lock.
+        Reconnect stays enabled so a decode restarted on the same port is
+        reached again; stale messages it may receive name rooms it does not
+        know, which the compute-done handler and update_status ignore.
+        """
+        na = NetworkAddress(decode_ip, decode_port)
+        endpoint = na.to_tcp()
+        try:
+            with self._lazy_notify_lock:
+                sock = self._lazy_notify_socks.get(endpoint)
+                if sock is None:
+                    sock = self._zmq_ctx.socket(zmq.PUSH)
+                    if na.is_ipv6:
+                        sock.setsockopt(zmq.IPV6, 1)
+                    sock.setsockopt(zmq.LINGER, 0)
+                    sock.connect(endpoint)
+                    self._lazy_notify_socks[endpoint] = sock
+                sock.send_multipart(
+                    [
+                        str(room).encode("ascii"),
+                        str(status).encode("ascii"),
+                        str(prefill_unique_rank).encode("ascii"),
+                    ],
+                    flags=zmq.NOBLOCK,
+                )
+        except Exception as e:
+            logger.warning(
+                "Dropped lazy notification to decode %s for room %s (status=%s): "
+                "%s. The room's lazy timeout will reclaim it.",
+                endpoint,
+                room,
+                status,
+                e,
+            )
+
+    def lazy_room_is_dummy(self, room: int) -> bool:
+        """Lazy-alloc (prefill side): True when this rank holds only dummy
+        CLAIMs for the room -- MLA asymmetric-TP topologies replicate the KV
+        across prefill attn_tp ranks and decode reads it from the real one,
+        so dummy replicas skip the stash/notify entirely (matching the eager
+        convention where dummy transfers never sync status to decode).
+        An empty claim set is NOT dummy (CLAIMs precede compute, so this only
+        happens if decode died before claiming): fall back to real-rank
+        behavior and let the no-claim warning + timeout paths handle it."""
+        with self.lazy_lock:
+            claims = self.lazy_claims.get(room)
+            return bool(claims) and all(claim[2] for claim in claims.values())
+
+    def record_failure(self, bootstrap_room: int, failure_reason: str):
+        """Record a failure reason, dropping records older than the TTL.
+
+        Purging piggybacks on this call (at most once per purge interval), so no
+        extra thread is needed: the table stops growing as soon as failures stop,
+        and while they continue it holds at most one TTL worth of records.
+        """
+        now = time.time()
+        with self.failure_lock:
+            self.failure_records[bootstrap_room] = failure_reason
+            self._failure_record_times[bootstrap_room] = now
+            if (
+                now - self._failure_record_last_purge
+                < self.FAILURE_RECORD_PURGE_INTERVAL_S
+            ):
+                return
+            self._failure_record_last_purge = now
+            cutoff = now - self.FAILURE_RECORD_TTL_S
+            stale = [
+                room for room, ts in self._failure_record_times.items() if ts < cutoff
+            ]
+            for room in stale:
+                del self._failure_record_times[room]
+                self.failure_records.pop(room, None)
+        if stale:
+            logger.debug("Purged %d stale failure records", len(stale))
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        """Mooncake override: Failed wins over any other status.
+
+        The shared implementation only guards "cleared room + late Failed"; for
+        an existing entry, max(Failed=0, WaitingForInput=2) == WaitingForInput,
+        so a late non-Failed status could still resurrect a room already marked
+        Failed. Mooncake has two sources of that interleaving: the Success and
+        Failed pushes from different prefill ranks arrive over unordered ZMQ
+        sockets, and the lazy control messages (CLAIM / compute-done / indices /
+        ABORT) come from independent streams. A resurrected room would be
+        re-read as live by the scheduler poll and would stop being cleanable.
+
+        Like the shared implementation this is an unlocked read-modify-write, so
+        a reader that loads a pre-Failed status can still store over a
+        concurrent Failed. Closing that window needs a dedicated lock: 
+        ``lazy_lock`` cannot be reused because the lazy compute-done handler
+        already calls this while holding it (threading.Lock is not reentrant).
+        """
+        if bootstrap_room not in self.request_status:
+            # Do not resurrect a cleared entry with Failed: once clear() has
+            # popped the room from request_status, any late update_status(Failed)
+            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
+            # pollute a future request that reuses the same bootstrap_room.
+            if status == KVPoll.Failed:
+                return
+            self.request_status[bootstrap_room] = status
+        else:
+            if status == KVPoll.Failed:
+                self.request_status[bootstrap_room] = KVPoll.Failed
+            elif self.request_status[bootstrap_room] != KVPoll.Failed:
+                self.request_status[bootstrap_room] = max(
+                    self.request_status[bootstrap_room], status
+                )
 
     def _transfer_data_arrays(
         self,
@@ -2677,6 +2906,45 @@ class MooncakeKVManager(CommonKVManager):
                                 )
                         else:
                             mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                            if (
+                                len(waiting_req_bytes) == 7
+                                and waiting_req_bytes[5] in (b"CLAIM", b"ABORT")
+                                and waiting_req_bytes[6] in (b"REAL", b"DUMMY")
+                            ):
+                                lazy_room = int(room)
+                                phase = waiting_req_bytes[5]
+                                if phase == b"CLAIM":
+                                    promote = False
+                                    with self.lazy_lock:
+                                        claims = self.lazy_claims.setdefault(lazy_room, {})
+                                        claims[mooncake_session_id] = (
+                                            waiting_req_bytes[1].decode("ascii"),
+                                            int(waiting_req_bytes[2].decode("ascii")),
+                                            waiting_req_bytes[6] == b"DUMMY",
+                                        )
+                                        claim_count = len(claims)
+                                        # All CLAIMs are in. Decide under lazy_lock so this
+                                        # stays atomic against the sender-init drain: a
+                                        # present non-Failed room flips now, an absent one
+                                        # (sender not built, or concluded+cleared) is parked
+                                        # for MooncakeKVSender.__init__, Failed is left
+                                        # alone. .get() tolerates a concurrent clear().
+                                        if claim_count == int(waiting_req_bytes[4].decode("ascii")):
+                                            st = self.request_status.get(lazy_room)
+                                            if st not in (None, KVPoll.Failed):
+                                                promote = True
+                                            elif st is None:
+                                                self.lazy_claim_ready_rooms.add(lazy_room)
+                                    if promote:
+                                        self.update_status(lazy_room, KVPoll.WaitingForInput)
+                                else:
+                                    self.record_failure(lazy_room, "Decode aborted lazy request")
+                                    self.update_status(lazy_room, KVPoll.Failed)
+                                    with self.lazy_lock:
+                                        self.lazy_claims.pop(lazy_room, None)
+                                        self.lazy_pending_send.pop(lazy_room, None)
+                                        self.lazy_compute_done_time.pop(lazy_room, None)
+                                continue
                             if room == "None":
                                 decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                                 decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
@@ -2753,7 +3021,44 @@ class MooncakeKVManager(CommonKVManager):
                                         ),
                                         0,
                                     )
-                                    if self._pp_pd_sideband_bootstrap:
+                                    if self.lazy_alloc:
+                                        # Same guard as lazy_stash_and_notify: a room absent
+                                        # from request_status (or Failed) was concluded by
+                                        # its sender, so a late indices message must not
+                                        # resurrect or enqueue it. .get() tolerates a
+                                        # concurrent clear().
+                                        room_active = self.request_status.get(room) not in (
+                                            None,
+                                            KVPoll.Failed,
+                                        )
+                                        with self.lazy_lock:
+                                            pending = self.lazy_pending_send.pop(room, None)
+                                            # indices arrived: stop the compute-done timeout
+                                            self.lazy_compute_done_time.pop(room, None)
+                                        if pending is not None and room_active:
+                                            self.add_transfer_request(
+                                                room,
+                                                pending["kv_indices"],
+                                                pending["index_slice"],
+                                                True,
+                                                aux_index=pending["aux_index"],
+                                                state_indices=pending["state_indices"],
+                                                num_kv_tokens=pending.get("num_kv_tokens"),
+                                            )
+                                        else:
+                                            # Stash already released (timeout/abort) or room
+                                            # dead: nothing will be enqueued, so drop the
+                                            # registration rather than leak it (its only
+                                            # other cleanup is the transfer worker's finally,
+                                            # which requires an enqueue).
+                                            self.transfer_infos.pop(room, None)
+                                            if self.lazy_room_is_dummy(room) and room_active:
+                                                # Dummy rank (MLA asymmetric-TP): decode
+                                                # reads this room's KV from the real TP
+                                                # replica, so conclude locally like the
+                                                # eager transfer_worker dummy branch.
+                                                self.update_status(room, KVPoll.Success)
+                                    elif self._pp_pd_sideband_bootstrap:
                                         # The "all PP ranks are ready" AND moves off the PP
                                         # ring and onto this socket; see
                                         # CommonKVManager.on_local_pp_bootstrap_ready.
@@ -2829,6 +3134,24 @@ class MooncakeKVManager(CommonKVManager):
                             status = int(status.decode("ascii"))
                             bootstrap_room = int(bootstrap_room.decode("ascii"))
                             prefill_rank = int(prefill_rank.decode("ascii"))
+
+                            if status == self.LAZY_COMPUTE_DONE_STATUS:
+                                with self.lazy_lock:
+                                    if (
+                                        bootstrap_room in self.request_status
+                                        and self.request_status[bootstrap_room] != KVPoll.Failed
+                                    ):
+                                        self.lazy_compute_done_tracker[bootstrap_room].add(
+                                            prefill_rank
+                                        )
+                                        expected = self.required_prefill_response_num_table.get(
+                                            bootstrap_room, 1
+                                        )
+                                        if len(self.lazy_compute_done_tracker[bootstrap_room]) >= expected:
+                                            self.update_status(
+                                                bootstrap_room, KVPoll.WaitingForInput
+                                            )
+                                continue
 
                             if status == KVPoll.Success:
                                 if bootstrap_room in self.request_status:
@@ -3161,7 +3484,28 @@ class MooncakeKVSender(CommonKVSender):
         )
         self.conclude_state = None
         self.init_time = time.time()
+        # Lazy-alloc: non-final chunks buffered here until the final chunk
+        # stashes the full concatenated KV (decode has no indices yet).
+        self.lazy_kv_chunks: List[npt.NDArray[np.int32]] = []
+        # The stash is transferred as ONE chunk, so num_kv_tokens must cover
+        # every buffered chunk -- the DCP path rejects a None (see
+        # send_kvcache_dcp: "PD DCP transfer requires num_kv_tokens").
+        self.lazy_num_kv_tokens: int = 0
         self._init_trace_ctx()
+        if self.kv_mgr.lazy_alloc:
+            # Lazy: finish the transition the bootstrap thread parked because
+            # this sender did not exist yet (see lazy_claim_ready_rooms).
+            promote = False
+            with self.kv_mgr.lazy_lock:
+                if self.bootstrap_room in self.kv_mgr.lazy_claim_ready_rooms:
+                    self.kv_mgr.lazy_claim_ready_rooms.discard(
+                        self.bootstrap_room
+                    )
+                    promote = True
+            if promote:
+                self.kv_mgr.update_status(
+                    self.bootstrap_room, KVPoll.WaitingForInput
+                )
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -3175,6 +3519,52 @@ class MooncakeKVSender(CommonKVSender):
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
+            return
+
+        if self.kv_mgr.lazy_alloc:
+            # Lazy: the room has no transfer_infos yet, so add_transfer_request
+            # would silently drop the chunk. Buffer non-final chunks and stash
+            # the FULL concatenation on the final one.
+            if self.kv_mgr.lazy_room_is_dummy(self.bootstrap_room):
+                # Dummy (MLA asymmetric-TP): decode reads this room's KV from the
+                # real TP replica, so neither stash nor notify -- that keeps
+                # decode's compute-done count to real ranks. Still record the
+                # time so the timeout guard applies; the room concludes Success
+                # when decode's empty (dummy) indices arrive.
+                if is_last_chunk:
+                    self.lazy_num_kv_tokens = 0
+                    with self.kv_mgr.lazy_lock:
+                        self.kv_mgr.lazy_compute_done_time[self.bootstrap_room] = (
+                            time.time()
+                        )
+                return
+            if not is_last_chunk:
+                self.lazy_kv_chunks.append(kv_indices)
+                self.lazy_num_kv_tokens += num_kv_tokens or 0
+                self._record_transfer_indices(kv_indices, state_indices)
+                return
+            if self.lazy_kv_chunks:
+                kv_indices = np.concatenate(self.lazy_kv_chunks + [kv_indices])
+                self.lazy_kv_chunks = []
+            # One deferred transfer carries every chunk, so the token count has
+            # to be the running total; keep None as None so a non-DCP peer still
+            # gets the "unknown" semantics instead of a bogus 0.
+            total_kv_tokens = self.lazy_num_kv_tokens + (num_kv_tokens or 0)
+            self.lazy_num_kv_tokens = 0
+            if num_kv_tokens is None and not total_kv_tokens:
+                total_kv_tokens = None
+            self.kv_mgr.lazy_stash_and_notify(
+                self.bootstrap_room,
+                kv_indices,
+                # The stash covers the whole concatenated KV, so the slice must
+                # match the (possibly CP-filtered) array length, not the
+                # unfiltered curr_idx running total.
+                slice(0, len(kv_indices)),
+                self.aux_index if send_aux else None,
+                state_indices,
+                num_kv_tokens=total_kv_tokens,
+            )
+            self._record_transfer_indices(kv_indices, state_indices)
             return
 
         if not is_last_chunk:
@@ -3211,10 +3601,68 @@ class MooncakeKVSender(CommonKVSender):
                 timeout_result = self._check_bootstrap_timeout()
                 if timeout_result is not None:
                     return timeout_result
+            elif status == KVPoll.WaitingForInput and self.kv_mgr.lazy_alloc:
+                timeout_result = self._check_lazy_indices_timeout()
+                if timeout_result is not None:
+                    return timeout_result
 
             return status
         else:
             return self.conclude_state
+
+    def _check_lazy_indices_timeout(self) -> Optional[KVPoll]:
+        """Lazy: after compute-done was stashed, guard against decode never
+        returning kv indices (e.g. decode died) so prefill does not hold the
+        stashed KV forever. Check-and-pop under the same lazy_lock the
+        bootstrap thread takes when the indices arrive: if they landed before
+        we got the lock, lazy_compute_done_time is already gone, so this
+        decision cannot race with an in-flight transfer."""
+        endpoints: List[Tuple[str, int]] = []
+        with self.kv_mgr.lazy_lock:
+            done_time = self.kv_mgr.lazy_compute_done_time.get(self.bootstrap_room)
+            if done_time is None:
+                return None
+            if time.time() - done_time < self.kv_mgr.lazy_indices_timeout:
+                return None
+            elapsed = time.time() - done_time
+            self.kv_mgr.lazy_pending_send.pop(self.bootstrap_room, None)
+            self.kv_mgr.lazy_compute_done_time.pop(self.bootstrap_room, None)
+            claims = self.kv_mgr.lazy_claims.pop(self.bootstrap_room, {})
+            endpoints = [
+                (decode_ip, decode_port)
+                for decode_ip, decode_port, _ in claims.values()
+            ]
+        logger.warning_once(
+            "Some lazy-alloc requests timed out waiting for decode kv indices "
+            "after compute-done. Relax with "
+            "'export SGLANG_DISAGGREGATION_LAZY_INDICES_TIMEOUT=600'."
+        )
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+            "waiting for decode kv indices (lazy).",
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        # Notify the decode endpoints so they fail immediately instead of
+        # holding allocated KV slots until their own waiting_timeout fires.
+        # Same id as lazy_stash_and_notify, for consistency across the lazy
+        # notifications (decode ignores the rank on Failed).
+        prefill_unique_rank = (
+            self.kv_mgr.attn_tp_rank * (self.kv_mgr.pp_size * self.kv_mgr.attn_cp_size)
+            + self.kv_mgr.pp_rank * self.kv_mgr.attn_cp_size
+            + self.kv_mgr.attn_cp_rank
+        )
+        for decode_ip, decode_port in endpoints:
+            # Non-blocking fire-and-forget: poll() runs on the scheduler thread.
+            self.kv_mgr._lazy_notify_decode(
+                decode_ip,
+                decode_port,
+                self.bootstrap_room,
+                KVPoll.Failed,
+                prefill_unique_rank,
+            )
+        self.conclude_state = KVPoll.Failed
+        return KVPoll.Failed
 
     def clear(self) -> None:
         """Remove the bootstrap room entry from the KV manager's request status."""
@@ -3227,6 +3675,15 @@ class MooncakeKVSender(CommonKVSender):
         # what drains the bookkeeping on failure paths too, since
         # failure_exception() calls clear().
         super().clear()
+
+        if self.kv_mgr.lazy_alloc:
+            # Lazy: release the per-room lazy bookkeeping (claims, stashed KV
+            # indices, compute-done timer) so a concluded room leaks nothing.
+            with self.kv_mgr.lazy_lock:
+                self.kv_mgr.lazy_claims.pop(self.bootstrap_room, None)
+                self.kv_mgr.lazy_pending_send.pop(self.bootstrap_room, None)
+                self.kv_mgr.lazy_compute_done_time.pop(self.bootstrap_room, None)
+                self.kv_mgr.lazy_claim_ready_rooms.discard(self.bootstrap_room)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
@@ -3274,7 +3731,144 @@ class MooncakeKVReceiver(CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
+        self.lazy_claim_time: Optional[float] = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+
+    def init(self, prefill_dp_rank: int):
+        """Bootstrap the receiver and, in lazy mode, claim the room.
+
+        Raises when prefill and decode disagree on lazy-alloc: every later
+        request would fail the same way, so the mismatch is treated as a
+        deployment error rather than a per-request failure.
+        In lazy mode it then pulls the room back to Bootstrapping and sends
+        CLAIM so prefill may start computing; KV is allocated only after
+        prefill reports compute-done.
+        """
+        super().init(prefill_dp_rank)
+        if self.conclude_state is not None:
+            return
+        # Both sides must agree on lazy-alloc. A mismatch is a deployment error
+        # that no later request can survive, so this raises (see the helper).
+        self._check_lazy_alloc_agreement()
+        if not self.kv_mgr.lazy_alloc:
+            return
+        # Lazy: super().init() left the room at WaitingForInput, which is where
+        # eager decode sends its indices from. Lazy must not allocate -- nor
+        # send indices -- before prefill's compute-done, so pull the room back
+        # to Bootstrapping and claim it so prefill may start computing. The
+        # reset is guarded by the current value so a room already marked Failed
+        # (e.g. its prefill endpoint died during bootstrap) is never revived;
+        # the decode thread flips it to WaitingForInput once every prefill rank
+        # holding this request's KV reported compute-done.
+        if (
+            self.kv_mgr.request_status.get(self.bootstrap_room)
+            == KVPoll.WaitingForInput
+        ):
+            self.kv_mgr.request_status[self.bootstrap_room] = KVPoll.Bootstrapping
+        self.lazy_claim_time = time.time()
+        self._send_lazy_control(b"CLAIM")
+
+    def _check_lazy_alloc_agreement(self) -> None:
+        """Raise when prefill and decode disagree on
+        SGLANG_DISAGGREGATION_DECODE_LAZY_ALLOC.
+
+        The flag changes the handshake on both sides, so a mismatch neither
+        errors nor completes on its own: a lazy decode never sends kv indices
+        until prefill reports compute-done, which an eager prefill never does;
+        and a lazy prefill drops the indices an eager decode sent before it had
+        stashed the KV. Either way the request just parks until the 300s waiting
+        timeout, and the reason it reports points at the timeout, not the
+        config.
+
+        This is a deployment error, not a per-request one: every request routed
+        to this prefill would fail the same way, so raise and let the engine
+        stop instead of failing requests one by one. Raising here reaches the
+        scheduler's event loop, which has no handler for it, so the process
+        exits and the misconfiguration shows up in the log.
+
+        The prefill's value is advertised by its bootstrap server (/route); a
+        prefill whose code predates lazy-alloc does not advertise it and reads
+        as eager, which is what it is.
+        """
+        decode_lazy = bool(self.kv_mgr.lazy_alloc)
+        peer_lazy = None
+        for info in self.bootstrap_infos or []:
+            info_lazy = bool(info.get("lazy_alloc", False))
+            if info_lazy != decode_lazy:
+                peer_lazy = info_lazy
+                break
+        if peer_lazy is None:
+            return
+
+        raise RuntimeError(
+            "SGLANG_DISAGGREGATION_DECODE_LAZY_ALLOC mismatch between prefill and "
+            f"decode: decode={decode_lazy}, prefill={peer_lazy}. Both must be "
+            "started with the same value; every request routed to this prefill "
+            "would hang until the lazy timeout. "
+            f"{self.bootstrap_addr=} {self.bootstrap_room=}"
+        )
+
+    def _ensure_bootstrap_infos_or_fail(self) -> bool:
+        if self.bootstrap_infos is not None:
+            return True
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        return False
+
+    def lazy_abort(self, reason: str):
+        """Fail a lazy request from the decode side and tell prefill to drop it.
+
+        Marks the receiver Failed with ``reason`` and sends ABORT so prefill
+        releases the stashed KV. No-op once the receiver has already concluded.
+        """
+        if self.conclude_state is not None:
+            return
+        self.kv_mgr.record_failure(self.bootstrap_room, reason)
+        self.conclude_state = KVPoll.Failed
+        self._send_lazy_control(b"ABORT")
+
+    def abort(self):
+        """Lazy: abort through the lazy control channel, not the generic one.
+
+        The scheduler calls this for /abort_request and for a client disconnect.
+        The base implementation notifies prefill with the generic 4-part ABORT,
+        which prefill's bootstrap thread dispatches on ``msg[0]`` to its
+        non-lazy branch -- that branch only marks the room Failed and leaves
+        ``lazy_pending_send`` / ``lazy_compute_done_time`` in place, so prefill
+        holds the stashed KV until its own indices timeout (measured: an aborted
+        request kept prefill busy for the full 30s). The lazy ABORT (the 7-part
+        control message) releases them immediately.
+
+        ``update_status`` first, matching the base: a room already marked Failed
+        is skipped by the decode thread's compute-done handler, so a late
+        compute-done cannot re-add a tracker entry for an aborted request.
+        """
+        if not self.kv_mgr.lazy_alloc:
+            super().abort()
+            return
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.lazy_abort("Aborted by AbortReq.")
+
+    def _send_lazy_control(self, phase: bytes):
+        if not self._ensure_bootstrap_infos_or_fail():
+            return
+        for bootstrap_info in self.bootstrap_infos:
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            with lock:
+                sock.send_multipart(
+                    [
+                        str(self.bootstrap_room).encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.session_id.encode("ascii"),
+                        str(self.required_dst_info_num).encode("ascii"),
+                        phase,
+                        b"DUMMY" if bootstrap_info["is_dummy"] else b"REAL",
+                    ]
+                )
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
@@ -3382,12 +3976,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
     ):
         self.draft_dst_kv_indices = draft_dst_kv_indices
         self.draft_window_start = draft_window_start
-        if self.bootstrap_infos is None:
-            self.kv_mgr.record_failure(
-                self.bootstrap_room,
-                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
-            )
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        if not self._ensure_bootstrap_infos_or_fail():
             return
 
         self.chunk_staging_infos = []
@@ -3446,12 +4035,31 @@ class MooncakeKVReceiver(CommonKVReceiver):
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
+        elif status == KVPoll.Bootstrapping and self.kv_mgr.lazy_alloc:
+            if (
+                self.lazy_claim_time is not None
+                and time.time() - self.lazy_claim_time >= self.kv_mgr.waiting_timeout
+            ):
+                # Not just a local failure: prefill still holds the claim and
+                # would go on to compute this request, then keep its stashed KV
+                # until its own indices timeout, for a request nobody wants.
+                self.lazy_abort("Timed out waiting for lazy compute-done")
         elif status == KVPoll.WaitingForInput:
             timeout_result = self._check_waiting_timeout()
             if timeout_result is not None:
                 return timeout_result
 
         return status
+
+    def clear(self) -> None:
+        """Release the receiver's per-room state, including the lazy compute-done tracker."""
+        super().clear()
+        if self.kv_mgr.lazy_alloc:
+            # Pop the compute-done tracker under the lazy lock: the decode
+            # thread mutates the same tracker (compute-done counting), and an
+            # interleaving could otherwise leave an orphan entry behind.
+            with self.kv_mgr.lazy_lock:
+                self.kv_mgr.lazy_compute_done_tracker.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
         if self.conclude_state is None:
@@ -3470,4 +4078,20 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
-    pass
+    async def _handle_route_get(self, request: web.Request):
+        resp = await super()._handle_route_get(request)
+        if resp.status != 200:
+            return resp
+        data = json.loads(resp.body)
+        # Annotate only the per-rank response (PrefillRankInfo, told apart by
+        # rank_ip). The aggregate response is unpacked with
+        # PrefillServerInfo(**data) on decode, so an extra key there would raise.
+        if "rank_ip" not in data:
+            return resp
+        # Advertise this prefill's lazy-alloc config so decode can reject a P/D
+        # mismatch at bootstrap instead of hanging the handshake. Read from the
+        # env here rather than carried in the register payload: the bootstrap
+        # server runs in the prefill's process, so it sees the same value, and
+        # this keeps the change out of the shared common/ code.
+        data["lazy_alloc"] = envs.SGLANG_DISAGGREGATION_DECODE_LAZY_ALLOC.get()
+        return web.json_response(data, status=200)
