@@ -235,6 +235,7 @@ class Fp8Config(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
+        quantized_layers: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
@@ -277,6 +278,11 @@ class Fp8Config(QuantizationConfig):
             elif weight_block_size != [1, 32]:
                 raise ValueError("MXFP8 requires weight_block_size=[1, 32].")
         self.weight_block_size = weight_block_size
+        # W4A4 Attention (NVFP4): per-layer overrides parsed from config.json
+        # "quantized_layers" (e.g. self_attn.q_b_proj / o_proj). Empty on the
+        # legacy FP8 path so behavior is unchanged for existing checkpoints.
+        self.quantized_layers = quantized_layers or {}
+        self._nvfp4_linear_config = None
 
     def get_name(self) -> str:
         return "mxfp8" if self.use_mxfp8 else "fp8"
@@ -295,7 +301,7 @@ class Fp8Config(QuantizationConfig):
         if self.use_mxfp8 and _mxfp8_to_block_fp8_required:
             return 94
 
-        return 100 if self.use_mxfp8 else 80
+        return 100 if (self.use_mxfp8 or self.quantized_layers) else 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -330,6 +336,7 @@ class Fp8Config(QuantizationConfig):
                     weight_block_size,
                 )
             weight_block_size = [1, 32]
+        quantized_layers = config.get("quantized_layers", {}) or {}
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
@@ -337,6 +344,7 @@ class Fp8Config(QuantizationConfig):
             weight_block_size=weight_block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+            quantized_layers=quantized_layers,
         )
 
     def get_quant_method(
@@ -347,6 +355,26 @@ class Fp8Config(QuantizationConfig):
         from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
+            # W4A4 Attention (NVFP4): the checkpoint keeps quant_method=fp8 at
+            # the top level, so q_b_proj/o_proj marked NVFP4 in "quantized_layers"
+            # must be dispatched to the ModelOpt FP4 linear method here.
+            layer_info = self.quantized_layers.get(prefix)
+            if (
+                isinstance(layer_info, dict)
+                and str(layer_info.get("quant_algo", "")).upper() == "NVFP4"
+            ):
+                from sglang.srt.layers.quantization.modelopt_quant import (
+                    ModelOptFp4Config,
+                    ModelOptFp4LinearMethod,
+                )
+
+                if self._nvfp4_linear_config is None:
+                    self._nvfp4_linear_config = ModelOptFp4Config(
+                        is_checkpoint_nvfp4_serialized=True,
+                        group_size=int(layer_info.get("group_size", 16)),
+                        exclude_modules=[],
+                    )
+                return ModelOptFp4LinearMethod(self._nvfp4_linear_config)
             if is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
@@ -421,6 +449,12 @@ class Fp8Config(QuantizationConfig):
         if self.ignored_layers:
             self.ignored_layers = list(
                 dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
+            )
+        # Remap NVFP4 per-layer keys (HF names) to SGLang module prefixes so
+        # get_quant_method can match them against the runtime layer prefix.
+        if self.quantized_layers:
+            self.quantized_layers = hf_to_sglang_mapper.apply_dict(
+                self.quantized_layers
             )
 
 
