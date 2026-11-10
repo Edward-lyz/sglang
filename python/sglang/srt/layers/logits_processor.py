@@ -57,6 +57,51 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 
+# Shared static output buffers for the FULL-mode aux-hidden concat under CUDA
+# graph capture. Without this, every captured decode graph keeps its own cat
+# output alive in the graph pool (~40 MB x num_graphs for Kimi-K3 DSpark).
+# Replays are stream-serial (one graph at a time, consumer copy runs between
+# two writes), so all graphs can safely share one buffer per (width, dtype,
+# device). A buffer captured by a graph must never be freed or shrunk --
+# growth allocates a new buffer and retains the old one forever.
+_AUX_HIDDEN_CAT_BUFFERS: Dict[Tuple[int, torch.dtype, torch.device], torch.Tensor] = {}
+_AUX_HIDDEN_CAT_RETIRED: List[torch.Tensor] = []
+_aux_hidden_cat_static_disabled: Optional[bool] = None
+
+
+def _cat_aux_hidden(tensors: List[torch.Tensor]) -> torch.Tensor:
+    """torch.cat(dim=-1) that reuses a shared static output buffer during CUDA
+    graph capture. Falls back to a plain cat outside capture, or when TBO runs
+    two concurrent micro-batches inside one graph (they would clobber the
+    shared buffer)."""
+    global _aux_hidden_cat_static_disabled
+    if not torch.cuda.is_current_stream_capturing():
+        return torch.cat(tensors, dim=-1)
+    if _aux_hidden_cat_static_disabled is None:
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.utils import is_tbo_enabled
+
+        _aux_hidden_cat_static_disabled = (
+            not envs.SGLANG_ENABLE_STATIC_AUX_HIDDEN_CAT_BUFFER.get()
+            or is_tbo_enabled()
+        )
+    if _aux_hidden_cat_static_disabled:
+        return torch.cat(tensors, dim=-1)
+    num_tokens = tensors[0].shape[0]
+    width = sum(t.shape[-1] for t in tensors)
+    key = (width, tensors[0].dtype, tensors[0].device)
+    buf = _AUX_HIDDEN_CAT_BUFFERS.get(key)
+    if buf is None or buf.shape[0] < num_tokens:
+        if buf is not None:
+            _AUX_HIDDEN_CAT_RETIRED.append(buf)
+        buf = torch.empty(
+            (num_tokens, width), dtype=tensors[0].dtype, device=tensors[0].device
+        )
+        _AUX_HIDDEN_CAT_BUFFERS[key] = buf
+    out = buf[:num_tokens]
+    torch.cat(tensors, dim=-1, out=out)
+    return out
+
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
@@ -643,7 +688,7 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
-                    aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+                    aux_hidden_states = _cat_aux_hidden(aux_hidden_states)
                     hidden_states_to_store = aux_hidden_states
                 else:
                     hidden_states_to_store = hidden_states
