@@ -38,6 +38,8 @@ RUN pip config set global.index-url http://mirrors.baidubce.com/pypi/simple/ && 
 
 # Install deepgemm cache
 RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/cache_kimi_k3_0807_aiak.tar.gz && tar -xzvf cache_kimi_k3_0807_aiak.tar.gz && rm cache_kimi_k3_0807_aiak.tar.gz
+# K3/K3.1 prefill increment (incl. DSA indexer mqa_logits); archive root is cache/
+RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/cache_kimi_k3_k31_1030_aiak.tgz && mkdir -p /root/.cache/deep_gemm && tar -xzf cache_kimi_k3_k31_1030_aiak.tgz -C /root/.cache/deep_gemm && rm cache_kimi_k3_k31_1030_aiak.tgz
 
 RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/sglang-prestop-pyspy-dump.sh
 
