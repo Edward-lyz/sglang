@@ -127,7 +127,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8DeepGemmInput,
+    Mxfp8SwizzledInput,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -1378,6 +1381,57 @@ class MQALayer(MqaAttentionBase):
         q_lora = self._compute_q_a(x, qkv_a=qkv_a)
         return q_lora, q_lora
 
+    def _tk_qnorm_cast_ok(self) -> bool:
+        """[fusion-opt] Gate of SGLANG_OPT_TK_QNORM_CAST: wq_b runs the block-FP8-as-MXFP8
+        DeepGEMM route, so it can take a prequantized Mxfp8DeepGemmInput."""
+        if not (_is_cuda and envs.SGLANG_OPT_TK_QNORM_CAST.get()):
+            return False
+        qm = self.wq_b.quant_method
+        n, k = self.wq_b.weight.shape[0], self.wq_b.weight.shape[-1]
+        if not (
+            getattr(qm, "mxfp8_dense_backend", None) == Mxfp8DenseGemmBackend.DEEP_GEMM
+            and (
+                getattr(qm, "use_mxfp8", False)
+                or (
+                    getattr(qm, "block_fp8_as_mxfp8", False)
+                    and getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
+                )
+            )
+            and n % 64 == 0
+            and k % 128 == 0
+        ):
+            return False
+        from sglang.kernels.ops.quantization.tile_kernels_quant import (
+            tk_qnorm_cast_enabled,
+        )
+
+        return tk_qnorm_cast_enabled()
+
+    def _q_norm_for_wq_b(self, q_lora: torch.Tensor):
+        """Returns (normed bf16 q_lora, wq_b input). With SGLANG_OPT_TK_QNORM_CAST the
+        TileKernels norm_forward_and_per_token_cast does q_norm and wq_b's per-32 ue8m0
+        cast in one pass; the bf16 rows still feed the indexer."""
+        if self._tk_qnorm_cast_ok():
+            from sglang.kernels.ops.quantization.tile_kernels_quant import (
+                rmsnorm_cast_mxfp8,
+            )
+
+            fused = rmsnorm_cast_mxfp8(
+                q_lora, self.q_norm.weight, self.q_norm.variance_epsilon
+            )
+            if fused is not None:
+                from sglang.srt.utils.community_opt import log_community_opt_once
+
+                log_community_opt_once(
+                    "fusion-opt tk_qnorm_cast",
+                    "q_norm + wq_b input cast via tile_kernels (layer=%d, tokens=%d)",
+                    self.layer_id,
+                    q_lora.shape[0],
+                )
+                normed, (q, sf) = fused
+                return normed, Mxfp8DeepGemmInput(q, sf)
+        q_lora = self.q_norm(q_lora)
+        return q_lora, q_lora
 
     def _compute_q_b(
         self,
@@ -1921,8 +1975,8 @@ class MQALayer(MqaAttentionBase):
                 )
                 q, _ = self._wq_b(q_for_wqb)
             else:
-                q_lora = self.q_norm(q_lora)
-                q, _ = self._wq_b(q_lora)
+                q_lora, q_for_wqb = self._q_norm_for_wq_b(q_lora)
+                q, _ = self._wq_b(q_for_wqb)
 
             kv = (
                 qkv_a[..., self.q_lora_rank :]
@@ -2035,12 +2089,12 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            q_lora = self.q_norm(q_lora)
+            q_lora, q_for_wqb = self._q_norm_for_wq_b(q_lora)
             if fused_o:
-                q, _ = self.wq_b(q_lora)
+                q, _ = self.wq_b(q_for_wqb)
                 q = q.view(-1, self.n_local_heads, self.head_dim)
             else:
-                q = self._compute_q_b(q_lora, positions, q_out)
+                q = self._compute_q_b(q_for_wqb, positions, q_out)
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).

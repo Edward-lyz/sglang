@@ -798,10 +798,26 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
         w8a8_mxfp8_matmul_deepgemm,
     )
 
-    assert input_scale is None
-    output_dtype = input.dtype
-
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+    if input_scale is not None:
+        # [fusion-opt] prequantized Mxfp8DeepGemmInput (e.g. SGLANG_OPT_TK_QNORM_CAST):
+        # already in DeepGEMM's per-32 packed-ue8m0 layout, so no FlashInfer fallback.
+        assert shape_supported and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0, (
+            f"prequantized MXFP8 input for an unsupported DeepGEMM GEMM {tuple(weight.shape)}"
+        )
+        output_shape = [*input.shape[:-1], weight.shape[0]]
+        output = w8a8_mxfp8_matmul_deepgemm(
+            input.view(-1, input.shape[-1]),
+            weight,
+            input_scale,
+            weight_scale,
+            output_dtype=torch.bfloat16,
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*output_shape)
+
+    output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16
 
     if not (shape_supported and dtype_supported):
@@ -823,13 +839,27 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
     input_2d = input.contiguous().view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d,
-        32,
-        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
+    quantized = None
+    if (
+        deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and envs.SGLANG_OPT_TK_PER_TOKEN_CAST.get()
+    ):
+        # [fusion-opt] TileKernels per_token_cast: same operand, same layout.
+        from sglang.kernels.ops.quantization.tile_kernels_quant import (
+            per_token_cast_mxfp8,
+        )
+
+        quantized = per_token_cast_mxfp8(input_2d)
+    if quantized is not None:
+        q_input, x_scale = quantized
+    else:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            32,
+            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
 
     # weight_scale format is set per-backend by _process_mxfp8_linear_weight_scale
     # (int32 packed TMA-aligned on Blackwell, float32 on Hopper); NOT uint8 — Triton form is routed to the fallback above.
