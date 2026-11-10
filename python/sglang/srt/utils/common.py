@@ -22,6 +22,7 @@ import builtins
 import ctypes
 import functools
 import gc
+import hashlib
 import importlib
 import inspect
 import io
@@ -2660,13 +2661,87 @@ def set_prometheus_multiproc_dir():
     logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
+def _make_cached_metrics_app(registry, fallback_app, cache_seconds: float):
+    """ASGI /metrics app whose rendered output is shared by all HTTP workers
+    for ``cache_seconds``.
+
+    Every worker renders the multiprocess registry itself (all workers' files,
+    ~3.5k samples here): 70-200 ms on the worker's event loop per scrape, and
+    the platform scrapers hit P about once a second. The rendered response is
+    kept as a file next to the metric files (the collector only reads
+    ``*.db``), so within the window any worker answers from it. Rendering runs
+    in a thread so the worker keeps serving requests meanwhile. Requests with
+    a query string (name filters) take ``fallback_app``.
+    """
+    from prometheus_client.exposition import _bake_output
+
+    cache_dir = os.environ["PROMETHEUS_MULTIPROC_DIR"]
+
+    def header(scope, name: bytes) -> str:
+        """All values of one request header, comma-joined."""
+        return ",".join(
+            value.decode("latin-1")
+            for key, value in scope.get("headers") or []
+            if key.lower() == name
+        )
+
+    def render(accept: str, accept_encoding: str, path: str):
+        """(status, headers, body) from the shared file if fresh, else render it."""
+        try:
+            if time.time() - os.stat(path).st_mtime < cache_seconds:
+                with open(path, "rb") as f:
+                    return pickle.load(f)
+        except (OSError, EOFError, pickle.UnpicklingError):
+            pass
+        result = _bake_output(registry, accept, accept_encoding, {}, False)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(result, f)
+        os.replace(tmp, path)
+        return result
+
+    async def cached_metrics_app(scope, receive, send):
+        """Serve /metrics from the shared render (same response as prometheus_app)."""
+        if scope.get("query_string"):
+            return await fallback_app(scope, receive, send)
+        accept = header(scope, b"accept")
+        accept_encoding = header(scope, b"accept-encoding")
+        # One cached file per output variant (Accept picks the format).
+        variant = hashlib.md5(
+            f"{accept}|{'gzip' in accept_encoding}".encode()
+        ).hexdigest()[:12]
+        status, headers, output = await asyncio.to_thread(
+            render,
+            accept,
+            accept_encoding,
+            os.path.join(cache_dir, f"metrics_cache_{variant}.pkl"),
+        )
+        payload = await receive()
+        if payload.get("type") == "http.request":
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": int(status.split(" ")[0]),
+                    "headers": [tuple(x.encode() for x in h) for h in headers],
+                }
+            )
+            await send({"type": "http.response.body", "body": output})
+
+    return cached_metrics_app
+
+
 def add_prometheus_middleware(app):
+    """Mount the multiprocess Prometheus registry at ``/metrics``."""
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
 
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
-    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+    metrics_app = make_asgi_app(registry=registry)
+    cache_seconds = envs.SGLANG_METRICS_CACHE_SECONDS.get()
+    if cache_seconds > 0:
+        metrics_app = _make_cached_metrics_app(registry, metrics_app, cache_seconds)
+    metrics_route = Mount("/metrics", metrics_app)
 
     # Workaround for 307 Redirect for /metrics
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")

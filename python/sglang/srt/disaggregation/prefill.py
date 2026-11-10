@@ -875,6 +875,9 @@ class SchedulerDisaggregationPrefillMixin:
         )
         self._fwd_thread.start()
 
+    # Grad mode is thread-local: the worker does not inherit the scheduler's
+    # no_grad, and the CP extend path calls model.model() past its no_grad.
+    @torch.no_grad()
     def _prefill_fwd_thread_main(self: Scheduler) -> None:
         """Worker thread: bind the CUDA device, then run each submitted forward.
 
@@ -951,6 +954,24 @@ class SchedulerDisaggregationPrefillMixin:
                 req.as_kv_ready_event = batch_copy.as_kv_ready_event
         return result, batch_copy
 
+    def _queue_ready_grammar_requests(self: Scheduler) -> None:
+        """Move requests whose grammar compiled into the bootstrap queue now.
+
+        Requests with a grammar (tool calls under strict tool parsing,
+        json_schema, ...) wait in the grammar queue first. get_next moves them
+        on only after this tick's pop_bootstrapped, so they then spend one extra
+        loop iteration (a whole forward) in the bootstrap queue as well. Doing
+        it here, right after ingest, lets a grammar that compiled within the
+        poll interval reach admission in the same tick. The ready check is a
+        collective; every rank holds the same grammar queue, so all call it.
+        """
+        if self.grammar_manager.has_waiting_grammars():
+            for req in self.grammar_manager.get_ready_grammar_requests():
+                self._add_request_to_queue(req)
+            # get_next would poll again (another busy-wait of up to the poll
+            # interval and another tick of the iteration-counted timeout).
+            self._grammar_polled_this_tick = True
+
     def _run_batch_on_fwd_thread(self: Scheduler, batch):
         """Zero-overlap (Step 1): submit then block immediately, so the worker
         and scheduler never run concurrently -- proves the forward is correct
@@ -990,6 +1011,7 @@ class SchedulerDisaggregationPrefillMixin:
             snap.spec_info = copy.copy(batch.spec_info)
         return snap
 
+    @torch.no_grad()
     def event_loop_overlap_disagg_prefill_threaded(self: Scheduler) -> None:
         """SGLANG_ENABLE_PREFILL_FWD_THREAD: run the forward on a worker thread.
 
@@ -1011,6 +1033,7 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+            self._queue_ready_grammar_requests()
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -1707,6 +1730,7 @@ class SchedulerDisaggregationPrefillMixin:
                 elif poll == KVPoll.Success:  # transfer done
                     if not isinstance(req.finished_reason, FINISH_ABORT):
                         req.finished_reason = FINISH_LENGTH(length=0)
+                    self._fire_pending_trace(req)
                     release_kv_cache(req, self.tree_cache)  # unlock the tree
                     # FIXME: clean up req's data in transfer engine
                     req.disagg_kv_sender.clear()

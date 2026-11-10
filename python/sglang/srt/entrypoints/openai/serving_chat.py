@@ -1,9 +1,14 @@
+"""OpenAI-compatible /v1/chat/completions serving."""
+
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
+import os
+import tempfile
 import time
 import uuid
 from collections import Counter, OrderedDict, defaultdict, deque
@@ -115,6 +120,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
+from sglang.srt.utils.parallel_tokenize import encode_prompt
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
@@ -265,6 +271,51 @@ def _extract_ordered_task_ids(
                         else None
                     )
     return task_ids
+
+
+# Digests of tool schemas that already passed check_schema. Agent clients
+# resend the same tool list with every request, and meta-validating it runs on
+# the tokenizer's event loop: ~5 ms for a typical list, 2.4 s for a 300-tool
+# one (big schemas take 0.6 s each).
+_VALID_TOOL_SCHEMAS: OrderedDict[str, None] = OrderedDict()
+_VALID_TOOL_SCHEMAS_MAX = 65536
+# The HTTP workers share what they validated through empty marker files, so a
+# schema is checked once per server rather than once per worker (16 workers
+# each paying the 2.4 s above). Validity depends only on the schema, so a
+# marker left by any process is safe to trust.
+_SHARED_SCHEMA_DIR = os.path.join(
+    tempfile.gettempdir(), f"sglang_valid_tool_schemas_{os.getppid()}"
+)
+_SHARED_SCHEMA_WRITES_MAX = 100000
+_shared_schema_writes = 0
+
+
+def _check_tool_schema(parameters) -> None:
+    """``Draft202012Validator.check_schema``, skipped for schemas seen valid before."""
+    global _shared_schema_writes
+    try:
+        # json keeps NaN/Infinity distinct from null (orjson writes them as null).
+        key = json.dumps(parameters, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        Draft202012Validator.check_schema(parameters)
+        return
+    digest = hashlib.blake2b(key.encode(), digest_size=16).hexdigest()
+    if digest in _VALID_TOOL_SCHEMAS:
+        _VALID_TOOL_SCHEMAS.move_to_end(digest)
+        return
+    marker = os.path.join(_SHARED_SCHEMA_DIR, digest)
+    if not os.path.exists(marker):
+        Draft202012Validator.check_schema(parameters)
+        if _shared_schema_writes < _SHARED_SCHEMA_WRITES_MAX:
+            _shared_schema_writes += 1
+            try:
+                os.makedirs(_SHARED_SCHEMA_DIR, mode=0o700, exist_ok=True)
+                open(marker, "a").close()
+            except OSError:
+                pass  # sharing is an optimization only
+    _VALID_TOOL_SCHEMAS[digest] = None
+    if len(_VALID_TOOL_SCHEMAS) > _VALID_TOOL_SCHEMAS_MAX:
+        _VALID_TOOL_SCHEMAS.popitem(last=False)
 
 
 def _reorder_task_results_by_content(
@@ -598,7 +649,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Token ids of a Python-encoder prompt, through the segment cache if on."""
         if self._segment_tokenize_cache is not None:
             return self._segment_tokenize_cache.encode(text)
-        return self.tokenizer_manager.tokenizer.encode(text)
+        return encode_prompt(self.tokenizer_manager.tokenizer, text)
 
     def _handle_last_assistant_message(
         self,
@@ -1329,7 +1380,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # request before it ever reaches grammar compilation.
                 if envs.SGLANG_ENABLE_TOOL_SCHEMA_ID_NORMALIZATION.get():
                     normalize_json_schema_ids(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                _check_tool_schema(tool.function.parameters)
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:
@@ -1712,11 +1763,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 message, strict=self.chat_encoding_spec not in ("kimi_k3", "dsv41")
             )
 
-        prompt_ids = self._encode_messages(
-            copy.deepcopy(messages),
-            request,
-            thinking_mode,
-            tools=tools,
+        # Only inkling / kimi_k3 encode here (others return None); skip the copy
+        # otherwise -- a deep copy of a long agent conversation costs ~10 ms.
+        prompt_ids = (
+            self._encode_messages(
+                copy.deepcopy(messages),
+                request,
+                thinking_mode,
+                tools=tools,
+            )
+            if self.chat_encoding_spec in ("inkling", "kimi_k3")
+            or type(self)._encode_messages is not OpenAIServingChat._encode_messages
+            else None
         )
 
         if prompt_ids is not None:
@@ -1734,8 +1792,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         modalities,
                     )
         elif self.chat_encoding_spec is not None:
-            # dsv4/dsv41/dsv32 encoding path
-            messages = copy.deepcopy(messages)
+            # dsv4/dsv41/dsv32 encoding path. `messages` is already this request's
+            # own copy (model_dump above) and nothing else holds it, so it is
+            # edited in place; a deep copy of a long agent conversation cost
+            # ~0.25 s here.
             is_dsv41 = self.chat_encoding_spec == "dsv41"
 
             if is_dsv41:

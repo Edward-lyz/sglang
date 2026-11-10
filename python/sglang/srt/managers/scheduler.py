@@ -185,6 +185,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TraceReq,
+    TraceTrigger,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -212,6 +214,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.trace_manager import TraceManager
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -766,6 +769,22 @@ class Scheduler(
         # Init LoRA overlap loader
         self.init_lora_overlap_loader()
 
+        # Init trace manager
+        self.trace_manager = TraceManager(
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
+            num_hidden_layers=self.model_config.num_hidden_layers,
+            dp_rank=0 if self.ps.dp_rank is None else self.ps.dp_rank,
+            dp_size=self.ps.dp_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tokenizer=self.tokenizer,
+            disaggregation_mode=get_disagg().disaggregation_mode,
+        )
+        self.trace_manager.on_online_trace_ready = self._stream_deferred_trace_output
+
         # Init the grammar backend for constrained generation
         self.init_grammar_manager()
 
@@ -909,7 +928,7 @@ class Scheduler(
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
                 port_args,
-                self.ps.dp_size,
+                max(self.ps.dp_size, get_parallel().fake_dp_size or 1),
                 dp_rank,
                 publish_interval=get_observability().load_snapshot_publish_interval,
             )
@@ -1825,6 +1844,7 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (TraceReq, self.trace_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (
@@ -2987,6 +3007,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
+            fire_pending_trace=self._fire_pending_trace,
             abort_request=self.abort_request,
         )
 
@@ -3345,7 +3366,9 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 dispatch_to_scheduler_time=recv_req.dispatch_to_scheduler_time,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                trace_config=recv_req.trace_config
             )
+            self.trace_manager.log_trace_request(req)
             req.tokenizer = self.tokenizer
             if recv_req.dispatch_to_scheduler_time is not None:
                 req.time_stats.dispatch_to_scheduler_time = max(
@@ -4458,11 +4481,20 @@ class Scheduler(
         running_batch: ScheduleBatch,
         cost_scheduler: Optional[PrefillCostScheduler] = None,
     ) -> PrefillAdmission:
-        # Check if the grammar is ready in the grammar queue
-        if self.grammar_manager.has_waiting_grammars():
+        """Start one prefill admission: grammar/queue bookkeeping, then the PrefillAdder."""
+        # Check if the grammar is ready in the grammar queue (the threaded
+        # disagg prefill loop may already have done so this tick).
+        if getattr(self, "_grammar_polled_this_tick", False):
+            self._grammar_polled_this_tick = False
+        elif self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
+
+        # Retired AS writes may have released held-back online traces; this
+        # bounds the wait for writes that never retire. Every event loop,
+        # including the PP ones that skip retire_ascache_writes, reaches here.
+        self.trace_manager.check_deferred_online_traces()
 
         if (
             self.enable_hierarchical_cache
@@ -6450,6 +6482,58 @@ class Scheduler(
                     )
                 else:
                     req.to_finish = FINISH_ABORT()
+
+    def trace_request(self, recv_req: TraceReq):
+        """Handle a trace request from the frontend.
+
+        The frontend only sends the rid. The TraceReq was already built at
+        Req init time from trace_config. We look up the Req and decide
+        whether to execute the trace immediately or defer to on_finish.
+        """
+        req = self._find_req_by_rid(recv_req.rid)
+        if req is None:
+            logger.warning(
+                f"trace_request: rid={recv_req.rid} not found in any queue; skipping"
+            )
+            return
+
+        cfg = req.trace_config
+        if cfg and not cfg.get('enable_trace'):
+            cfg.update({'enable_trace': True})
+        req.to_trace_req = req.build_trace_req()
+        trace_req = req.to_trace_req
+        if trace_req is None:
+            return
+        if trace_req.trigger != TraceTrigger.IMMEDIATE:
+            # Already stored in req.to_trace_req; _fire_pending_trace will pick it up
+            return
+        self._run_trace(trace_req, req)
+
+    def _fire_pending_trace(self, req: Req) -> None:
+        if req.to_trace_req is None:
+            return
+        trace_req = req.to_trace_req
+        if trace_req.trigger != TraceTrigger.IMMEDIATE:
+            self._run_trace(trace_req, req)
+
+    def _find_req_by_rid(self, rid: str) -> Optional[Req]:
+        """Find a request by its rid across all queues."""
+        reqs = list(self.running_batch.reqs) if self.running_batch else []
+        cur_batch = self.cur_batch_for_debug
+        if cur_batch is not None and cur_batch is not self.running_batch:
+            reqs = reqs + list(cur_batch.reqs)
+        reqs = reqs + list(self.waiting_queue)
+        for req in reqs:
+            if req.rid == rid:
+                return req
+        return None
+
+    def _run_trace(self, trace_req: TraceReq, req: Req):
+        self.trace_manager.run_trace(trace_req, req)
+
+    def _stream_deferred_trace_output(self, req: Req) -> None:
+        # Finish output held back until its online AS trace finalized.
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

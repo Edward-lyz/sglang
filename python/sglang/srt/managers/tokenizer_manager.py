@@ -177,6 +177,10 @@ from sglang.srt.utils.hf_transformers_utils import (
     resolve_image_processor_backend,
 )
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.parallel_tokenize import (
+    configure_tokenizer_parallelism,
+    parallel_tokenize_enabled,
+)
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.srt.utils.weight_versions import add_weight_versions_to_meta_info
@@ -531,6 +535,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.validate_total_tokens = True
 
     def init_tokenizer_and_processor(self):
+        """Build the tokenizer, the HF processor and the multimodal processor."""
         server_args = self.server_args
 
         # Initialize tokenizer and processor
@@ -557,13 +562,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 self.processor = _processor
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
-                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+                configure_tokenizer_parallelism()
         else:
             self.mm_processor = self.processor = None
 
             if get_serving().skip_tokenizer_init:
                 self.tokenizer = None
             else:
+                if parallel_tokenize_enabled():
+                    # Cap the Rayon pool before the tokenizer first uses it.
+                    configure_tokenizer_parallelism()
                 self.tokenizer = get_tokenizer(
                     get_serving().tokenizer_path,
                     tokenizer_mode=get_serving().tokenizer_mode,

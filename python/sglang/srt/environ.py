@@ -515,6 +515,10 @@ class Envs:
     SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+    # Seconds the rendered /metrics response is shared by all HTTP workers
+    # (each render reads every process's metric files: 70-200 ms on a
+    # tokenizer worker's event loop). 0 renders on every scrape.
+    SGLANG_METRICS_CACHE_SECONDS = EnvFloat(0.0)
     SGLANG_TRACE_LOGITS_E2E = EnvBool(False)
     SGLANG_TRACE_LOGITS_E2E_SYNC = EnvBool(False)
     SGLANG_TRACE_SAMPLER_E2E = EnvBool(False)
@@ -1771,6 +1775,16 @@ class Envs:
     # or malformed is encoded locally instead of rejected with 400. Applied
     # identically on prefill and decode. 0 restores the strict 400.
     SGLANG_EPD_LOCAL_FALLBACK = EnvBool(True)
+    # Chat prompts at least this many characters long are cut at newline
+    # boundaries and tokenized in parallel (Rayon), with ids identical to one
+    # encode() call (checked per tokenizer at first use). A 120k-char prompt
+    # drops from ~100 ms to ~30 ms. 0 disables. 64 pieces (vs 16) keep the
+    # Rayon threads busy on 2M-char agent prompts: 254 -> 193 ms each.
+    SGLANG_PARALLEL_TOKENIZE_MIN_CHARS = EnvInt(32768)
+    SGLANG_PARALLEL_TOKENIZE_CHUNKS = EnvInt(64)
+    # Rayon threads per tokenizer process for the parallel tokenize above
+    # (tokenizer workers x this should stay within the CPU quota).
+    SGLANG_PARALLEL_TOKENIZE_THREADS = EnvInt(8)
     # IB device for the Mooncake engine dedicated to encoder embedding transfer.
     # Set it to run the embedding pulls on their own device and to advertise that
     # engine's session id to the encoder pool; empty keeps EPD off mooncake.
