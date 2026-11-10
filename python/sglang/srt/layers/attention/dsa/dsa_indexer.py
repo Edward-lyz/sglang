@@ -1833,6 +1833,7 @@ class Indexer(MultiPlatformOp):
                 ke_offset=lengths_chunk,
                 batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
+                row_range=(start, end),
             )
             topk_result[start:end] = raw_topk_chunk
             start = end

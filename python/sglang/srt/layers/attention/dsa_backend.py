@@ -310,6 +310,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         ke_offset: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
+        row_range: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         if topk_indices_offset_override is not None:
             cu_topk_indices_offset = topk_indices_offset_override
@@ -343,6 +344,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             row_starts=ks,
             batch_idx_list=batch_idx_list,
             force_unfused_topk=self.force_unfused_topk,
+            row_range=row_range,
         )
 
 

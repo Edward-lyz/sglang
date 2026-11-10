@@ -84,6 +84,7 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        row_range: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
@@ -127,6 +128,27 @@ class DSATopKBackend(Enum):
             return _topk_transform_v2_paged_prefill(
                 logits, lengths, topk, attn_metadata
             )
+
+        # Multi-request PAGED prefill: rows of request b are contiguous and its
+        # scores start at column ks_b = sum(seq_lens[:b]); run v2 once per
+        # request on that column window with the request's page-table row.
+        # ``row_range`` locates a row-chunk of the logits (the indexer splits
+        # them under memory pressure) within the batch's rows.
+        if (
+            envs.SGLANG_DSA_PREFILL_TOPK_V2.get()
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and (batch_idx_list is None or row_range is not None)
+            and row_starts is not None
+            and 0 < topk <= 2048
+            and logits.dtype == torch.float32
+            and logits.stride(1) == 1
+            and logits.stride(0) % 4 == 0
+        ):
+            segments = _v2_prefill_segments(logits, attn_metadata, row_range)
+            if segments is not None:
+                return _topk_transform_v2_paged_prefill_multi(
+                    logits, lengths, topk, attn_metadata, segments
+                )
 
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
         # which is always present here: the fold only drops it for the decode case
@@ -344,6 +366,81 @@ def _topk_transform_v2_paged_prefill(
     topk_transform_512_v2(
         logits, lengths_i32, page_table, out, get_token_to_kv_pool().page_size, plan
     )
+    return out
+
+
+# Per-request v2 costs ~3 launches per request, so it only pays on long rows
+# (B200, topk 2048: [492K+1792, 0+1792] 2.36 -> 1.15 ms; 8 x fresh 2048
+# 0.08 -> 0.18 ms). Short or many-request batches stay on the legacy kernel.
+_V2_PREFILL_MAX_SEGMENTS = 8
+_V2_PREFILL_MIN_MAX_SEQ = 8192
+
+
+def _v2_prefill_segments(
+    logits: torch.Tensor, attn_metadata, row_range: Optional[Tuple[int, int]] = None
+):
+    """Host-side (row_start, row_end, col_start, col_len, batch) per request of
+    a multi-request PAGED prefill, in ``logits`` row coordinates, or None when
+    the batch does not qualify. ``logits`` holds batch rows ``row_range``
+    (default: all of them). Uses only CPU metadata, so no device sync."""
+    page_table = getattr(attn_metadata, "real_page_table", None)
+    seq_lens_cpu = getattr(attn_metadata, "indexer_seq_lens_cpu", None)
+    extend_lens = getattr(attn_metadata, "dsa_extend_seq_lens_list", None)
+    if page_table is None or seq_lens_cpu is None or extend_lens is None:
+        return None
+    bs = page_table.shape[0]
+    if (
+        page_table.dtype != torch.int32
+        or not 1 < bs <= _V2_PREFILL_MAX_SEGMENTS
+        or len(extend_lens) != bs
+        or seq_lens_cpu.shape[0] != bs
+        or int(seq_lens_cpu.max()) < _V2_PREFILL_MIN_MAX_SEQ
+    ):
+        return None
+    lo, hi = (0, sum(extend_lens)) if row_range is None else row_range
+    if hi - lo != logits.shape[0] or hi > sum(extend_lens):
+        return None
+    segments = []
+    row = col = 0
+    for b, (q, k) in enumerate(zip(extend_lens, seq_lens_cpu.tolist())):
+        r0, r1 = max(row, lo), min(row + q, hi)
+        if r0 < r1:
+            # The kernel loads scores 16 B at a time from the window start.
+            if col % 4 != 0 or col + k > logits.shape[1]:
+                return None
+            segments.append((r0 - lo, r1 - lo, col, k, b))
+        row += q
+        col += k
+    return segments
+
+
+def _topk_transform_v2_paged_prefill_multi(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    attn_metadata,
+    segments,
+) -> torch.Tensor:
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        plan_topk_v2,
+        topk_transform_512_v2,
+    )
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    page_size = get_token_to_kv_pool().page_size
+    lengths_i32 = lengths.to(torch.int32)
+    out = logits.new_full((logits.shape[0], topk), -1, dtype=torch.int32)
+    for r0, r1, c0, k, b in segments:
+        seg_lens = lengths_i32[r0:r1]
+        page_table = attn_metadata.real_page_table[b : b + 1].expand(r1 - r0, -1)
+        topk_transform_512_v2(
+            logits[r0:r1, c0 : c0 + k],
+            seg_lens,
+            page_table,
+            out[r0:r1],
+            page_size,
+            plan_topk_v2(seg_lens),
+        )
     return out
 
 
