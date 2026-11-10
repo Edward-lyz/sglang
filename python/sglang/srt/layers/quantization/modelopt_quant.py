@@ -154,7 +154,7 @@ def _is_k3_attn_fp8_target(prefix: str) -> bool:
 def _is_k3_moe_fp8_target(prefix: str) -> bool:
     """Match the explicitly FP8-serialized K3 MoE projection tensors."""
     if ".shared_experts." in prefix:
-        return prefix.rsplit(".", 1)[-1] in {"up_proj", "down_proj"}
+        return prefix.rsplit(".", 1)[-1] in {"gate_proj", "up_proj", "down_proj"}
     if ".routed_expert_" in prefix:
         return prefix.rsplit(".", 1)[-1] in {
             "routed_expert_up_proj",
@@ -164,7 +164,19 @@ def _is_k3_moe_fp8_target(prefix: str) -> bool:
 
 
 def _is_k3_named_fp8_target(prefix: str) -> bool:
-    return _is_k3_attn_fp8_target(prefix) or _is_k3_moe_fp8_target(prefix)
+    if _is_k3_attn_fp8_target(prefix) or _is_k3_moe_fp8_target(prefix):
+        return True
+    # K3 v3 additionally serializes layer-0 dense MLP in FP8.  The runtime
+    # uses a fused gate_up_proj module, so recognize that fused prefix as the
+    # two independently selected checkpoint targets.
+    if ".layers.0.mlp." in prefix and prefix.rsplit(".", 1)[-1] in {
+        "gate_up_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    }:
+        return True
+    return False
 
 
 def _sglang_fp4_gemm_fake(

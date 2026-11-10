@@ -267,10 +267,13 @@ def should_deepgemm_weight_requant_ue8m0(
         return False
     if output_dtype is not None and output_dtype != torch.bfloat16:
         return False
-    if weight_shape is not None and (
-        weight_shape[0] % 64 != 0 or weight_shape[1] % 128 != 0
-    ):
-        return False
+    # Only matrix weights have the N/K dimensions required by DeepGEMM.
+    # V4 block-FP8 post-processing also visits vector/scalar parameters.
+    if weight_shape is not None:
+        if len(weight_shape) < 2:
+            return False
+        if weight_shape[0] % 64 != 0 or weight_shape[1] % 128 != 0:
+            return False
     return True
 
 
