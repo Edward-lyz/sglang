@@ -103,8 +103,10 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
     # AttentionStore uses the unified cache adapter.
     if server_args.enable_asradix_cache:
-        from sglang.srt.mem_cache.asradix_cache import (
+        from sglang.srt.mem_cache.storage.asradix.cache import (
             create_attention_store_cache,
+        )
+        from sglang.srt.mem_cache.storage.asradix.plans import (
             resolve_attention_store_plan,
         )
 

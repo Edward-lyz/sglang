@@ -990,14 +990,24 @@ class Scheduler(
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
     def _init_attention_store(self, server_args):
-        """Construct one typed AS binding and attach it after TP consensus."""
+        """Construct one typed AS binding and attach it after topology consensus."""
         import os
 
         binding = None
         init_error = None
         cache_plan = None
+        local_manifest = None
         try:
-            from sglang.srt.mem_cache.asradix_cache import AttentionStoreInitContext
+            from sglang.srt.mem_cache.storage.asradix.topology import (
+                attention_store_endpoint_geometry,
+                attention_store_node_pp_range,
+            )
+            from sglang.srt.mem_cache.storage.asradix.schema import (
+                merge_endpoint_schemas,
+            )
+            from sglang.srt.mem_cache.storage.asradix.types import (
+                AttentionStoreInitContext,
+            )
 
             pod_name = os.getenv("POD_NAME")
             model_id = os.getenv("MODEL_ID")
@@ -1007,11 +1017,10 @@ class Scheduler(
                 )
             kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
             cache_plan = self.tree_cache.attention_store_plan
-            target_start = int(getattr(kv_cache, "start_layer", 0))
-            target_count = int(
-                getattr(kv_cache, "layer_num", self.model_config.num_hidden_layers)
+            layer_info = self.tp_worker.model_runner.layer_info
+            target_layer_ids = tuple(
+                range(int(layer_info.start_layer), int(layer_info.end_layer))
             )
-            target_layer_ids = tuple(range(target_start, target_start + target_count))
             draft_layer_ids = ()
             draft_kv_cache = None
             if self.draft_worker is not None and self.spec_algorithm.is_eagle():
@@ -1019,7 +1028,100 @@ class Scheduler(
                 draft_start = int(getattr(draft_kv_cache, "start_layer", 0))
                 draft_count = int(getattr(draft_kv_cache, "layer_num", draft_layers))
                 draft_layer_ids = tuple(range(draft_start, draft_start + draft_count))
-            binding = self.tree_cache.create_attention_store_binding(
+
+            from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+            if isinstance(kv_cache, HybridLinearKVPool):
+                page_layer_ids = tuple(kv_cache.full_attention_layer_id_mapping)
+                state_layer_ids = tuple(self.req_to_token_pool.mamba_map)
+            else:
+                draft_layer_offset = max(
+                    int(self.model_config.num_hidden_layers),
+                    int(
+                        self.model_config.num_attention_layers
+                        or self.model_config.num_hidden_layers
+                    ),
+                )
+                page_layer_ids = target_layer_ids + tuple(
+                    draft_layer_offset + layer_id for layer_id in draft_layer_ids
+                )
+                state_layer_ids = ()
+
+            local_manifest = (
+                page_layer_ids,
+                state_layer_ids,
+                dict(cache_plan.schema_factory(kv_cache)),
+            )
+        except Exception as exc:
+            init_error = exc
+
+        manifest_record = (
+            local_manifest,
+            (
+                None
+                if init_error is None
+                else f"{type(init_error).__name__}: {init_error}"
+            ),
+        )
+        try:
+            if self.ps.pp_size > 1:
+                manifest_records = self.pp_group.all_gather_object(manifest_record)
+            else:
+                manifest_records = [manifest_record]
+        except Exception as exc:
+            init_error = init_error or exc
+            manifest_records = []
+
+        manifest_errors = [
+            f"pp_rank={rank}: {error}"
+            for rank, (_, error) in enumerate(manifest_records)
+            if error is not None
+        ]
+        if init_error is None and manifest_errors:
+            init_error = RuntimeError(
+                "AttentionStore manifest preparation failed: "
+                + "; ".join(manifest_errors)
+            )
+
+        pp_manifests = [manifest for manifest, _ in manifest_records]
+
+        manifest_ready = self.tree_cache._as_topology_min(
+            1 if init_error is None else 0
+        )
+        if manifest_ready == 0 and init_error is None:
+            init_error = RuntimeError(
+                "AttentionStore manifest preparation failed on another cache-group rank"
+            )
+
+        def create_binding_from_manifests():
+            node_pp_start, node_pp_end = attention_store_node_pp_range(
+                self.ps.pp_size, server_args.nnodes, server_args.node_rank
+            )
+
+            pp_rank = 0 if self.ps.pp_rank is None else self.ps.pp_rank
+            local_pp_offset = pp_rank - node_pp_start
+            node_manifests = pp_manifests[node_pp_start:node_pp_end]
+            if not 0 <= local_pp_offset < len(node_manifests):
+                raise ValueError(
+                    "AttentionStore PP rank is outside its computed node role: "
+                    f"rank={pp_rank}, role=[{node_pp_start}, {node_pp_end})"
+                )
+
+            def endpoint_geometry(endpoint_index: int):
+                layer_lists = [manifest[endpoint_index] for manifest in node_manifests]
+                return attention_store_endpoint_geometry(
+                    layer_lists,
+                    local_pp_offset,
+                    self.ps.attn_tp_rank,
+                    self.ps.attn_tp_size,
+                )
+
+            page_shard_id, page_shard_num, page_layer_num = endpoint_geometry(0)
+            state_shard_id, state_shard_num, state_layer_num = endpoint_geometry(1)
+            endpoint_schema = merge_endpoint_schemas(
+                [manifest[2] for manifest in node_manifests]
+            )
+            return self.tree_cache.create_attention_store_binding(
                 AttentionStoreInitContext(
                     kv_cache=kv_cache,
                     req_to_token_pool=self.req_to_token_pool,
@@ -1027,31 +1129,41 @@ class Scheduler(
                     pod_name=pod_name,
                     model_version="v1",
                     page_size=self.page_size,
-                    # AS collectives use the attention-TP cache group, so the
-                    # SDK shard identity must use that group's local topology.
+                    # A namespace shard is one (node-local PP stage, attention-TP)
+                    # pair, so every stage writes its block exactly once.
                     tp_rank=self.ps.attn_tp_rank,
                     tp_size=self.ps.attn_tp_size,
-                    pp_rank=0 if self.ps.pp_rank is None else self.ps.pp_rank,
+                    pp_rank=pp_rank,
+                    pp_size=self.ps.pp_size,
+                    node_pp_start=node_pp_start,
+                    node_pp_end=node_pp_end,
                     dp_rank=self.ps.attn_dp_rank,
                     device_id=self.ps.gpu_id,
                     gpu_count=server_args.per_node_gpu_num,
                     target_layer_ids=target_layer_ids,
                     draft_kv_cache=draft_kv_cache,
                     draft_layer_ids=draft_layer_ids,
+                    page_layer_ids=page_layer_ids,
+                    page_shard_id=page_shard_id,
+                    page_shard_num=page_shard_num,
+                    page_layer_num=page_layer_num,
+                    state_layer_ids=state_layer_ids,
+                    state_shard_id=state_shard_id,
+                    state_shard_num=state_shard_num,
+                    state_layer_num=state_layer_num,
+                    endpoint_schema=endpoint_schema,
                 )
             )
-        except Exception as exc:
-            init_error = exc
 
-        # Enable AS only when every TP rank initialized successfully.
-        ready = torch.tensor(1 if binding is not None else 0, dtype=torch.int)
-        tp_group = getattr(self.tree_cache, "tp_group", None)
-        tp_world_size = getattr(self.tree_cache, "tp_world_size", 1)
-        if tp_world_size > 1:
-            torch.distributed.all_reduce(
-                ready, op=torch.distributed.ReduceOp.MIN, group=tp_group
-            )
-        if ready.item() == 0:
+        if init_error is None:
+            try:
+                binding = create_binding_from_manifests()
+            except Exception as exc:
+                init_error = exc
+
+        # Enable AS only when every TP/CP/PP cache rank initialized successfully.
+        ready = self.tree_cache._as_topology_min(1 if binding is not None else 0)
+        if ready == 0:
             if binding is not None:
                 try:
                     binding.cache_store.stop()

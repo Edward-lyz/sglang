@@ -5,32 +5,21 @@ from __future__ import annotations
 import logging
 import os
 import threading
-import time
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 import torch
 
-from .page_binding import (
-    _create_mha_page_endpoint,
-    _create_mla_page_endpoint,
-    _key_buffer,
-    _uniform_page_bytes,
-    _value_buffer,
-)
+from .page_binding import _create_mha_page_endpoint, _create_mla_page_endpoint
 from .schema import pad_component_major_pointers, pad_pointer_buffers
 from .state_layout import PackedStateLayout, StateTensorSpec
-from .topology import attention_store_kda_namespaces
 from .transport import (
     CheckpointedPageStore,
     _BufferPageIO,
-    _once,
     _PassiveStore,
+    _once,
     _sdk_pod_config,
     _standard_namespace,
-    cache_digest_enabled,
-    cache_digest_logger,
-    page_digest,
 )
 from .types import (
     AttentionStoreBinding,
@@ -48,7 +37,6 @@ class PackedStateSnapshot:
 
     tensor: torch.Tensor
     release: Callable[[], None]
-    ready_event: Optional[Any] = None
 
 
 class KDACheckpointStore:
@@ -72,47 +60,13 @@ class KDACheckpointStore:
         self._slot_group = slot_group
         self._pack_validator = binding.pack_validator
         self._unpack_hook = binding.unpack_hook
-        # Event waits must happen before acquiring this SDK mutex.
-        self._sdk_lock = threading.Lock()
+        self._lock = threading.Lock()
 
-    @staticmethod
-    def _wait_for_event(event, timeout: Optional[float], operation: str) -> None:
-        """Poll a device event with a deadline."""
-        if event is None:
-            return
-        query = getattr(event, "query", None)
-        if query is None:
-            raise RuntimeError(f"{operation} event does not support bounded polling")
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        while not query():
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"{operation} completion wait timed out")
-            time.sleep(0.001)
-
-    def wait_for_producer(self, producer_ready, timeout: Optional[float] = 1.0) -> None:
-        """Fence registered buffers before an SDK write."""
-        if producer_ready is None and self._device.type in ("cuda", "xpu"):
-            raise RuntimeError("KDA checkpoint write requires a producer event")
-        self._wait_for_event(producer_ready, timeout, "KDA checkpoint write")
-
-    def _acquire_sdk_lock(self, timeout: Optional[float], operation: str) -> None:
-        """Acquire the SDK mutex within the remaining operation deadline."""
-        started = time.monotonic()
-        if timeout is None:
-            acquired = self._sdk_lock.acquire()
-        elif timeout <= 0:
-            acquired = self._sdk_lock.acquire(blocking=False)
-        else:
-            acquired = self._sdk_lock.acquire(timeout=timeout)
-        if not acquired:
-            raise TimeoutError(f"{operation} SDK lock wait timed out")
-        waited_ms = (time.monotonic() - started) * 1000
-        if waited_ms >= 10:
-            logger.warning(
-                "KDA checkpoint SDK lock wait: operation=%s wait_ms=%.2f",
-                operation,
-                waited_ms,
-            )
+    def _synchronize_device(self) -> None:
+        if self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
+        elif self._device.type == "xpu":
+            torch.xpu.synchronize(self._device)
 
     def _slot(self, slot: Mapping[str, int] | int) -> tuple[dict[str, int], int]:
         slot_map = slot if isinstance(slot, Mapping) else {self._slot_group: int(slot)}
@@ -123,66 +77,11 @@ class KDACheckpointStore:
             )
         return dict(slot_map), int(slot_map[self._slot_group])
 
-    def _snapshot_digests(self, slot_id: int) -> Optional[list]:
-        """Hash one KDA state slot in HBM, first and last layer per component.
-
-        State buffers are ``[layer, slot, ...]``, so the slot has to be indexed
-        inside a layer row. Only the first and last component (temporal head,
-        conv tail) and the first and last layer are hashed: hashing every
-        component of every layer costs a D2H copy each and adds nothing when the
-        point is to compare a write against its read-back.
-        """
-        if not cache_digest_enabled():
-            return None
-        try:
-            tensors = getattr(self.layout, "tensors", ())
-            if not tensors:
-                return None
-            names = getattr(self.layout, "payload_fields", ())
-            components = [0] if len(tensors) == 1 else [0, len(tensors) - 1]
-            snapshot = []
-            for component in components:
-                tensor = tensors[component]
-                layer_num = int(tensor.shape[0])
-                layers = [0] if layer_num == 1 else [0, layer_num - 1]
-                name = names[component] if component < len(names) else str(component)
-                for layer in layers:
-                    snapshot.append((name, layer, page_digest(tensor[layer], slot_id)))
-            return snapshot
-        except Exception as exc:  # diagnostic only, never break the transfer
-            cache_digest_logger.warning("AS kda digest snapshot failed: %s", exc)
-            return None
-
-    @staticmethod
-    def _emit_digests(
-        action: str,
-        snapshot: Optional[list],
-        block_hash_id: int,
-        slot_id: int,
-        transferred: int,
-    ) -> None:
-        """Print a captured KDA state digest so read-back can be compared."""
-        if not snapshot:
-            return
-        cache_digest_logger.info(
-            "AS %s digest: family=kda_state slot=%d block_hash_id=%d "
-            "transferred=%s digests=%s",
-            action,
-            int(slot_id),
-            int(block_hash_id),
-            transferred,
-            snapshot,
-        )
-
     def match(self, block_hash_ids: Sequence[int], timeout: float = 1.0) -> int:
         """Return the matched KDA checkpoint prefix length."""
         from attentionstore_sdk.sdk import MatchRequest
 
-        self._acquire_sdk_lock(timeout, "match")
-        try:
-            return self._sdk.match(MatchRequest(block_hash_ids, timeout=timeout))
-        finally:
-            self._sdk_lock.release()
+        return self._sdk.match(MatchRequest(block_hash_ids, timeout=timeout))
 
     def write(
         self,
@@ -190,39 +89,30 @@ class KDACheckpointStore:
         slot: Mapping[str, int] | int,
         timeout: float = 1.0,
         params: Optional[dict] = None,
-        producer_ready=None,
     ) -> int:
         """Write one KDA checkpoint from a logical state slot."""
         from attentionstore_sdk.sdk import BlockBatch, BufferBindings, WriteRequest
 
         slot_map, slot_id = self._slot(slot)
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-        self.wait_for_producer(producer_ready, remaining)
-        if self._pack_validator is not None:
-            self._pack_validator([slot_map])
-        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-        request = WriteRequest(
-            blocks=BlockBatch(
-                [block_hash_id],
-                [slot_id],
-                layer_ids=self._layer_ids,
-            ),
-            buffers=BufferBindings(state=self._state_ptrs),
-            timeout=(
-                timeout if deadline is None else max(0.0, deadline - time.monotonic())
-            ),
-            params=params or {},
-        )
-        self._acquire_sdk_lock(remaining, "write")
-        # Snapshot before the SDK call: this is the state content the Agent gets.
-        snapshot = self._snapshot_digests(slot_id)
-        try:
-            written = self._sdk.write(request)
-        finally:
-            self._sdk_lock.release()
-        self._emit_digests("write", snapshot, block_hash_id, slot_id, written)
-        return written
+        with self._lock:
+            # Model updates can run on a model-owned stream. The SDK consumes
+            # the registered layer-buffer pointers directly, so fence those
+            # updates before queuing the native D2H transfer.
+            self._synchronize_device()
+            if self._pack_validator is not None:
+                self._pack_validator([slot_map])
+            return self._sdk.write(
+                WriteRequest(
+                    blocks=BlockBatch(
+                        [block_hash_id],
+                        [slot_id],
+                        layer_ids=self._layer_ids,
+                    ),
+                    buffers=BufferBindings(state=self._state_ptrs),
+                    timeout=timeout,
+                    params=params or {},
+                )
+            )
 
     def read(
         self,
@@ -235,33 +125,27 @@ class KDACheckpointStore:
         from attentionstore_sdk.sdk import BlockBatch, BufferBindings, ReadRequest
 
         slot_map, slot_id = self._slot(slot)
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        request = ReadRequest(
-            blocks=BlockBatch(
-                [block_hash_id],
-                [slot_id],
-                layer_ids=self._layer_ids,
-            ),
-            buffers=BufferBindings(state=self._state_ptrs),
-            timeout=(
-                timeout if deadline is None else max(0.0, deadline - time.monotonic())
-            ),
-            remote_addrs=remote_addrs or (),
-        )
-        self._acquire_sdk_lock(
-            None if deadline is None else max(0.0, deadline - time.monotonic()),
-            "read",
-        )
-        try:
-            count = self._sdk.read(request)
+        with self._lock:
+            count = self._sdk.read(
+                ReadRequest(
+                    blocks=BlockBatch(
+                        [block_hash_id],
+                        [slot_id],
+                        layer_ids=self._layer_ids,
+                    ),
+                    buffers=BufferBindings(state=self._state_ptrs),
+                    timeout=timeout,
+                    remote_addrs=remote_addrs or (),
+                )
+            )
             if count and self._unpack_hook is not None:
-                self._unpack_hook([slot_map])
-        finally:
-            self._sdk_lock.release()
-        self._emit_digests(
-            "read", self._snapshot_digests(slot_id), block_hash_id, slot_id, count
-        )
-        return count
+                try:
+                    self._unpack_hook([slot_map])
+                finally:
+                    # Fence ReplaySSM cursor resets before another model stream
+                    # consumes the state restored by native H2D copies.
+                    self._synchronize_device()
+            return count
 
     def stop(self) -> None:
         """Stop the underlying checkpoint SDK client."""
@@ -451,60 +335,6 @@ def _split_kda_namespace_chunks(total_chunks: int) -> tuple[int, int]:
     return total_chunks - checkpoint_chunks, checkpoint_chunks
 
 
-def describe_kda_local_endpoint_bytes(
-    kv_cache,
-    req_to_token_pool,
-    page_size: int,
-    *,
-    page_active: bool,
-    state_active: bool,
-) -> tuple[int, int]:
-    """Return local per-layer byte sizes before any SDK registration."""
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    if not isinstance(kv_cache, HybridLinearKVPool):
-        raise ValueError("KDA endpoint sizing requires HybridLinearKVPool")
-
-    page_bytes_per_layer = 0
-    if page_active:
-        pool = kv_cache.full_kv_pool
-        local_layer_ids = tuple(range(int(pool.layer_num)))
-        if not local_layer_ids:
-            raise ValueError("active KDA page endpoint has no local layers")
-        key_buffers = [_key_buffer(pool, layer_id) for layer_id in local_layer_ids]
-        key_bytes = _uniform_page_bytes(
-            key_buffers,
-            [pool] * len(key_buffers),
-            page_size,
-            "KDA page K",
-        )
-        if kv_cache.use_mla:
-            page_bytes_per_layer = key_bytes
-        else:
-            value_buffers = [
-                _value_buffer(pool, layer_id) for layer_id in local_layer_ids
-            ]
-            value_bytes = _uniform_page_bytes(
-                value_buffers,
-                [pool] * len(value_buffers),
-                page_size,
-                "KDA page V",
-            )
-            page_bytes_per_layer = key_bytes + value_bytes
-
-    state_bytes_per_layer = 0
-    if state_active:
-        checkpoint_pool = getattr(req_to_token_pool, "mamba_ckpt_pool", None)
-        state_binding = (
-            make_kda_checkpoint_layout(checkpoint_pool)
-            if checkpoint_pool is not None
-            else make_kda_active_state_layout(kv_cache.mamba_pool)
-        )
-        state_bytes_per_layer = state_binding.bytes_per_layer
-
-    return page_bytes_per_layer, state_bytes_per_layer
-
-
 def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
     """Create independent KDA page and recurrent-checkpoint stores."""
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -516,9 +346,8 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
     if not page_active and not state_active:
         raise ValueError("KDA AttentionStore node role has no page or state layers")
 
-    page_namespace, checkpoint_namespace = attention_store_kda_namespaces(
-        ctx.namespace_base, ctx.node_pp_start
-    )
+    page_namespace = _standard_namespace(ctx, "kda-page", ctx.page_shard_num)
+    checkpoint_namespace = _standard_namespace(ctx, "kda-state", ctx.state_shard_num)
     if page_active and state_active:
         page_chunks, checkpoint_chunks = _split_kda_namespace_chunks(ctx.gpu_count)
     elif page_active:
@@ -540,12 +369,10 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
             pool=ctx.kv_cache.full_kv_pool,
             namespace=page_namespace,
             gpu_count=page_chunks,
-            registration_endpoint_name="kda-page",
         )
     else:
         page_endpoint = AttentionStoreEndpointBinding(
             name="mla" if ctx.kv_cache.use_mla else "mha",
-            registration_name="kda-page",
             role=AttentionStoreEndpointRole.PAGE,
             store=_PassiveStore(),
             namespace=page_namespace,
@@ -557,7 +384,7 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
     checkpoint_store = None
     try:
         if ctx.state_shard_id >= 0:
-            from attentionstore_sdk.sdk import AttentionStoreSDK, KDAConfig
+            from attentionstore_sdk.sdk import AttentionStoreSDK, KDAConfig, PodConfig
 
             checkpoint_pool = getattr(ctx.req_to_token_pool, "mamba_ckpt_pool", None)
             checkpoint_binding = (
@@ -567,32 +394,35 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
             )
             if checkpoint_binding.layer_num != len(ctx.state_layer_ids):
                 raise ValueError("KDA state manifest and local buffer counts differ")
-            is_kda_single_shard = "kda-state" in ctx.endpoint_registrations
-            state_layer_ids = (
-                tuple(ctx.state_layer_ids)
-                if is_kda_single_shard
-                else tuple(range(ctx.state_layer_num))
+            checkpoint_binding = _KDACheckpointBinding(
+                layer_num=ctx.state_layer_num,
+                temporal_bytes=checkpoint_binding.temporal_bytes,
+                conv_bytes=checkpoint_binding.conv_bytes,
+                state_ptrs=pad_component_major_pointers(
+                    checkpoint_binding.state_ptrs,
+                    checkpoint_binding.layer_num,
+                    ctx.state_layer_num,
+                ),
+                tensors=checkpoint_binding.tensors,
+                payload_fields=checkpoint_binding.payload_fields,
+                device=checkpoint_binding.device,
+                pack_validator=checkpoint_binding.pack_validator,
+                unpack_hook=checkpoint_binding.unpack_hook,
             )
-            state_layer_num = len(state_layer_ids)
-            # The request carries this client's compact layer IDs and must
-            # carry exactly this client's component-major pointers.  Padding
-            # with the last pointer would alias another PP client's layer and
-            # also make the SDK's layer/pointer count inconsistent.
             checkpoint_sdk = AttentionStoreSDK(
-                _sdk_pod_config(
-                    ctx,
-                    checkpoint_namespace,
-                    endpoint_name="kda-state",
+                PodConfig(
+                    namespace=checkpoint_namespace,
+                    pod_name=ctx.pod_name,
+                    model_version=ctx.model_version,
+                    device_id=ctx.device_id,
+                    dp_id=ctx.dp_rank,
                     gpu_count=checkpoint_chunks,
                 ),
                 KDAConfig(
-                    # The Agent namespace is shared by all PP clients on the
-                    # node.  Register its complete layer geometry, while the
-                    # checkpoint store retains only this client's pointers.
-                    layer_num=ctx.state_layer_num if is_kda_single_shard else state_layer_num,
-                    shard_id=0 if is_kda_single_shard else ctx.state_shard_id,
-                    shard_num=1 if is_kda_single_shard else ctx.state_shard_num,
-                    block_token_size=ctx.block_size,
+                    layer_num=ctx.state_layer_num,
+                    shard_id=ctx.state_shard_id,
+                    shard_num=ctx.state_shard_num,
+                    block_token_size=ctx.page_size,
                     temporal_bytes=checkpoint_binding.temporal_bytes,
                     conv_bytes=checkpoint_binding.conv_bytes,
                 ),
@@ -602,12 +432,10 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
                 checkpoint_sdk,
                 checkpoint_binding,
                 slot_group="checkpoint",
-                layer_ids=state_layer_ids,
+                layer_ids=range(ctx.state_layer_num),
             )
             checkpoint_layout_id = "kda-state"
-            checkpoint_bytes = (
-                checkpoint_binding.bytes_per_layer * ctx.state_layer_num
-            )
+            checkpoint_bytes = checkpoint_binding.bytes_per_layer * ctx.state_layer_num
             checkpoint_fields = checkpoint_binding.payload_fields
         else:
             checkpoint_store = _PassiveStore()
@@ -617,18 +445,10 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
     except Exception:
         page_endpoint.store.stop()
         raise
-    cache_store = CheckpointedPageStore(
-        page_endpoint.store,
-        checkpoint_store,
-        page_match_is_joint=(
-            "kda-page" in ctx.endpoint_registrations
-            and "kda-state" in ctx.endpoint_registrations
-        ),
-    )
+    cache_store = CheckpointedPageStore(page_endpoint.store, checkpoint_store)
     try:
         checkpoint_endpoint = AttentionStoreEndpointBinding(
             name="checkpoint",
-            registration_name="kda-state",
             role=AttentionStoreEndpointRole.CHECKPOINT,
             store=checkpoint_store,
             namespace=checkpoint_namespace,
@@ -640,7 +460,6 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
             plan_name="KDA",
             cache_store=cache_store,
             endpoints=(page_endpoint, checkpoint_endpoint),
-            endpoint_registrations=ctx.endpoint_registrations,
         )
     except Exception:
         cache_store.stop()
@@ -812,13 +631,10 @@ class SPACheckpointStore:
         # The second row matches the SDK's SPA read offset.
         self.staging = self._allocate_staging(2)
         self._lock = threading.Lock()
-        self._read_lock = threading.Lock()
-        self._read_ready_event = None
         self._snapshot_condition = threading.Condition()
         self._available_write_snapshots = [
             self._allocate_staging(1) for _ in range(write_snapshot_capacity)
         ]
-        self._pending_write_snapshots = []
         self._stopped = False
 
     def _allocate_staging(self, capacity: int) -> torch.Tensor:
@@ -831,45 +647,17 @@ class SPACheckpointStore:
     def _layout_view(self, staging: torch.Tensor) -> torch.Tensor:
         return staging[:, : self.layout.bytes_per_block]
 
-    def _record_stream_event(self):
-        device = self.layout.device
-        if device.type not in ("cuda", "xpu"):
-            return None
-        device_module = torch.get_device_module(device)
-        event = device_module.Event()
-        event.record(device_module.current_stream(device))
-        return event
-
-    @staticmethod
-    def _acquire_lock(lock, timeout: Optional[float], operation: str) -> None:
-        if timeout is None:
-            acquired = lock.acquire()
-        elif timeout <= 0:
-            acquired = lock.acquire(blocking=False)
-        else:
-            acquired = lock.acquire(timeout=timeout)
-        if not acquired:
-            raise TimeoutError(f"{operation} lock wait timed out")
-
-    def _reap_write_snapshots_locked(self) -> None:
-        pending = []
-        for tensor, event in self._pending_write_snapshots:
-            query = getattr(event, "query", None)
-            if query is not None and query():
-                self._available_write_snapshots.append(tensor)
-            else:
-                pending.append((tensor, event))
-        self._pending_write_snapshots = pending
+    def _synchronize_device(self) -> None:
+        if self.layout.device.type == "cuda":
+            torch.cuda.synchronize(self.layout.device)
+        elif self.layout.device.type == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.synchronize(self.layout.device)
 
     def match(self, block_hash_ids: Sequence[int], timeout: float = 1.0) -> int:
         """Return the matched SPA checkpoint prefix length."""
         from attentionstore_sdk.sdk import MatchRequest
 
-        self._acquire_lock(self._lock, timeout, "SPA match")
-        try:
-            return self._sdk.match(MatchRequest(block_hash_ids, timeout=timeout))
-        finally:
-            self._lock.release()
+        return self._sdk.match(MatchRequest(block_hash_ids, timeout=timeout))
 
     def write(
         self,
@@ -879,7 +667,7 @@ class SPACheckpointStore:
         params: Optional[dict] = None,
     ) -> int:
         """Snapshot and write one SPA checkpoint."""
-        snapshot = self.snapshot(slots, timeout=timeout)
+        snapshot = self.snapshot(slots)
         try:
             return self.write_snapshot(
                 block_hash_id,
@@ -890,43 +678,30 @@ class SPACheckpointStore:
         finally:
             snapshot.release()
 
-    def snapshot(
-        self, slots: Mapping[str, int], timeout: float = 1.0
-    ) -> PackedStateSnapshot:
+    def snapshot(self, slots: Mapping[str, int]) -> PackedStateSnapshot:
         """Pack state into an exclusively leased checkpoint snapshot."""
-        deadline = time.monotonic() + max(0.0, timeout)
         with self._snapshot_condition:
-            while True:
+            if self._stopped:
+                raise RuntimeError("SPA checkpoint store is already stopped")
+            while not self._available_write_snapshots:
                 if self._stopped:
                     raise RuntimeError("SPA checkpoint store is already stopped")
-                self._reap_write_snapshots_locked()
-                if self._available_write_snapshots:
-                    tensor = self._available_write_snapshots.pop()
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("SPA snapshot lease wait timed out")
-                self._snapshot_condition.wait(timeout=min(remaining, 0.01))
-
-        ready_event = None
+                self._snapshot_condition.wait()
+            tensor = self._available_write_snapshots.pop()
 
         def return_snapshot() -> None:
             with self._snapshot_condition:
-                query = getattr(ready_event, "query", None)
-                if ready_event is not None and (query is None or not query()):
-                    self._pending_write_snapshots.append((tensor, ready_event))
-                else:
-                    self._available_write_snapshots.append(tensor)
-                    self._snapshot_condition.notify()
+                self._available_write_snapshots.append(tensor)
+                self._snapshot_condition.notify()
 
         release = _once(return_snapshot)
         try:
+            self._synchronize_device()
             tensor.zero_()
             self.layout.pack([slots], self._layout_view(tensor))
-            ready_event = self._record_stream_event()
-            return PackedStateSnapshot(tensor, release, ready_event)
+            self._synchronize_device()
+            return PackedStateSnapshot(tensor=tensor, release=release)
         except Exception:
-            ready_event = self._record_stream_event()
             release()
             raise
 
@@ -948,28 +723,19 @@ class SPACheckpointStore:
             raise ValueError(
                 f"invalid SPA checkpoint snapshot shape: {tuple(snapshot.tensor.shape)}"
             )
-        deadline = time.monotonic() + max(0.0, timeout)
-        KDACheckpointStore._wait_for_event(
-            snapshot.ready_event,
-            max(deadline - time.monotonic(), 0.0),
-            "SPA checkpoint write",
-        )
-        remaining = max(deadline - time.monotonic(), 0.0)
-        self._acquire_lock(self._lock, remaining, "SPA write")
-        try:
+        with self._lock:
+            self._synchronize_device()
             return self._sdk.write(
                 WriteRequest(
                     blocks=BlockBatch(hash_ids=[block_hash_id], data_ids=[0]),
                     buffers=BufferBindings(
                         swa=(snapshot.tensor.data_ptr(),), swa_ids=(0,)
                     ),
-                    timeout=max(deadline - time.monotonic(), 0.0),
+                    timeout=timeout,
                     params=params or {},
                     swa_block_step=1,
                 )
             )
-        finally:
-            self._lock.release()
 
     def read(
         self,
@@ -985,38 +751,22 @@ class SPACheckpointStore:
             ReadRequest,
         )
 
-        deadline = time.monotonic() + max(0.0, timeout)
-        self._acquire_lock(self._read_lock, timeout, "SPA read staging")
-        try:
-            KDACheckpointStore._wait_for_event(
-                self._read_ready_event,
-                max(deadline - time.monotonic(), 0.0),
-                "SPA checkpoint read staging",
-            )
-            remaining = max(deadline - time.monotonic(), 0.0)
-            self._acquire_lock(self._lock, remaining, "SPA read")
-            try:
-                count = self._sdk.read(
-                    ReadRequest(
-                        blocks=BlockBatch(hash_ids=[block_hash_id], data_ids=[0]),
-                        buffers=BufferBindings(
-                            swa=(self.staging.data_ptr(),), swa_ids=(0,)
-                        ),
-                        timeout=max(deadline - time.monotonic(), 0.0),
-                        remote_addrs=remote_addrs or (),
-                        swa_block_step=1,
-                    )
+        with self._lock:
+            count = self._sdk.read(
+                ReadRequest(
+                    blocks=BlockBatch(hash_ids=[block_hash_id], data_ids=[0]),
+                    buffers=BufferBindings(
+                        swa=(self.staging.data_ptr(),), swa_ids=(0,)
+                    ),
+                    timeout=timeout,
+                    remote_addrs=remote_addrs or (),
+                    swa_block_step=1,
                 )
-            finally:
-                self._lock.release()
+            )
             if count == 1:
-                try:
-                    self.layout.unpack([slots], self._layout_view(self.staging[1:2]))
-                finally:
-                    self._read_ready_event = self._record_stream_event()
+                self.layout.unpack([slots], self._layout_view(self.staging[1:2]))
+                self._synchronize_device()
             return count
-        finally:
-            self._read_lock.release()
 
     def stop(self) -> None:
         """Wake snapshot waiters and stop the underlying SDK client."""
