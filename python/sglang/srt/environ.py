@@ -533,6 +533,19 @@ class Envs:
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
+    # Gather the speculative draft KV head slice into registered GPU staging
+    # memory before the RDMA, collapsing one descriptor per token into one per
+    # contiguous destination run (see disaggregation/common/draft_kv_gather.py).
+    SGLANG_ENABLE_DISAGG_DRAFT_GATHER = EnvBool(True)
+    SGLANG_DISAGG_DRAFT_GATHER_BUFFERS = EnvInt(8)
+    # Cap on the CTAs the gather kernel launches (0 = one per block, uncapped).
+    # It runs on its own stream, concurrently with the forward, so the grid is the
+    # only SM throttle available: one CTA occupies one SM. Measured on B200 for a
+    # 24k-token chunk (2 entries, 128B slice): uncapped 6144 CTAs = 10.9 us,
+    # 148 = 18.5 us, 64 = 41.5 us, 32 = 81 us, 8 = 311 us. The extra latency lands
+    # on the transfer thread only, against the ~10 ms this path saves per call, so
+    # the default trades it for a peak footprint of ~1/5 of the GPU.
+    SGLANG_DISAGG_DRAFT_GATHER_MAX_CTAS = EnvInt(32)
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)

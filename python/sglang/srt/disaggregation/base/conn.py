@@ -120,6 +120,13 @@ class BaseKVManager(ABC):
         """Register prefill server info to the bootstrap server."""
         ...
 
+    def set_draft_kv_entry_tensors(self, entry_tensors: list) -> None:
+        """Receive the speculative draft KV pool tensors registered for transfer.
+
+        Only backends that can gather a head slice on the GPU before the transfer
+        use these; the default is to ignore them and address the pool directly.
+        """
+
 
 class BaseKVSender(ABC):
     @abstractmethod

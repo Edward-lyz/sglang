@@ -304,6 +304,13 @@ class PrefillBootstrapQueue:
                     kv_pool.v_buffer,
                     kv_pool.page_size,
                 )
+        if draft_kv_head_num:
+            # The draft pool is head-sharded on the decode side, so its transfer
+            # needs a GPU gather to stay descriptor-efficient; hand over the pool
+            # tensors in the same order their pointers were registered above.
+            kv_manager.set_draft_kv_entry_tensors(
+                self.draft_token_to_kv_pool._pd_registerable_tensors()
+            )
         return kv_manager
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:

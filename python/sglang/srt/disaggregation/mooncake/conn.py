@@ -68,6 +68,7 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import is_cuda
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,13 @@ class MooncakeKVManager(CommonKVManager):
         self.allow_last_chunk_without_aux = (
             envs.SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK.get()
         )
+        # Speculative draft KV gather staging. These stay unset until
+        # set_draft_kv_entry_tensors() is called with the draft pool this rank
+        # registered for transfer (last PP stage only, prefill side only).
+        self._draft_kv_entry_tensors: Optional[list] = None
+        self._draft_kv_entry_ptrs_gpu = None
+        self._draft_gather_max_ctas = 0
+        self._draft_gather_pool = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -369,6 +377,51 @@ class MooncakeKVManager(CommonKVManager):
             "v_buffers": v_buffers,
             "page_size": page_size,
         }
+
+    def set_draft_kv_entry_tensors(self, entry_tensors: list) -> None:
+        """Hand over the draft KV pool tensors this rank registered for transfer.
+
+        Enables the gather-staging path in ``send_kvcache_dcp_draft``: the head
+        slice one decode rank wants is strided in the token-major draft pool, so
+        without a gather every token needs its own RDMA descriptor. ``entry_tensors``
+        must be in registration order (``kv_data_ptrs[num_mla_kv_entries:]``);
+        the geometry is re-validated against the registered pointers per transfer.
+        """
+        # CUDA-only: the gather is a Triton kernel writing a torch cuda buffer, so
+        # the Ascend/NPU subclass keeps addressing the pool directly.
+        if (
+            self.disaggregation_mode != DisaggregationMode.PREFILL
+            or not entry_tensors
+            or not envs.SGLANG_ENABLE_DISAGG_DRAFT_GATHER.get()
+            or not is_cuda()
+        ):
+            return
+
+        from sglang.srt.disaggregation.common.draft_kv_gather import (
+            DraftKVGatherPool,
+            build_entry_ptr_tensor,
+        )
+        from sglang.srt.disaggregation.common.staging_handler import (
+            _get_custom_mem_pool,
+        )
+
+        custom_mem_pool, _ = _get_custom_mem_pool(f"cuda:{self.kv_args.gpu_id}")
+        self._draft_kv_entry_tensors = entry_tensors
+        self._draft_kv_entry_ptrs_gpu = build_entry_ptr_tensor(
+            entry_tensors=entry_tensors, gpu_id=self.kv_args.gpu_id
+        )
+        self._draft_gather_max_ctas = envs.SGLANG_DISAGG_DRAFT_GATHER_MAX_CTAS.get()
+        self._draft_gather_pool = DraftKVGatherPool(
+            gpu_id=self.kv_args.gpu_id,
+            num_slots=max(1, envs.SGLANG_DISAGG_DRAFT_GATHER_BUFFERS.get()),
+            register=lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            deregister=lambda ptr: self.engine.batch_deregister([ptr]),
+            custom_mem_pool=custom_mem_pool,
+        )
+        logger.info(
+            f"PD draft KV gather staging enabled for {len(entry_tensors)} draft "
+            f"entries on gpu {self.kv_args.gpu_id}"
+        )
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -954,6 +1007,90 @@ class MooncakeKVManager(CommonKVManager):
             np.concatenate([addrs[2] for addrs in per_layer]),
         )
 
+    def _send_draft_slice_via_gather(
+        self,
+        mooncake_session_id: str,
+        *,
+        src_token_indices: npt.NDArray[np.int64],
+        dst_token_indices: npt.NDArray[np.int64],
+        draft_dst_kv_ptrs: list[int],
+        draft_src_kv_ptrs: list[int],
+        src_head_start: int,
+        num_heads_to_send: int,
+        src_token_item_len: int,
+        src_head_slice_offset: int,
+        dst_token_item_len: int,
+        dst_head_slice_offset: int,
+        heads_bytes_per_token: int,
+    ) -> Optional[int]:
+        """Gather the draft head slice into staging, then send it in one batch.
+
+        Returns the transfer status, or ``None`` when this configuration can't use
+        the gather (the caller then falls back to per-token descriptors).
+        """
+        from sglang.srt.disaggregation.common import draft_kv_gather
+
+        if dst_head_slice_offset != 0 or heads_bytes_per_token != dst_token_item_len:
+            logger.info_once(
+                "PD DCP draft gather disabled: destination slot is not fully "
+                f"covered (dst_off={dst_head_slice_offset} "
+                f"slice={heads_bytes_per_token} dst_item={dst_token_item_len})"
+            )
+            return None
+
+        layout = draft_kv_gather.build_draft_gather_layout(
+            entry_tensors=self._draft_kv_entry_tensors,
+            entry_ptrs=draft_src_kv_ptrs,
+            head_start=src_head_start,
+            num_heads=num_heads_to_send,
+            src_token_item_len=src_token_item_len,
+            src_head_slice_offset=src_head_slice_offset,
+            heads_bytes_per_token=heads_bytes_per_token,
+        )
+        if layout is None:
+            return None
+
+        entry_tensors = self._draft_kv_entry_tensors
+        if len(draft_dst_kv_ptrs) != len(entry_tensors):
+            # Staging is sized and laid out per LOCAL entry; a peer that split the
+            # MLA/draft boundary differently would read past the gathered region.
+            logger.info_once(
+                "PD DCP draft gather disabled: peer has "
+                f"{len(draft_dst_kv_ptrs)} draft entries, this rank has "
+                f"{len(entry_tensors)}"
+            )
+            return None
+        required_bytes = draft_kv_gather.staging_bytes_needed(
+            layout=layout,
+            num_entries=len(entry_tensors),
+            num_tokens=src_token_indices.size,
+        )
+        logger.info_once(
+            "PD DCP draft transfer gathers the head slice into staging: "
+            f"slice={heads_bytes_per_token} src_item={src_token_item_len} "
+            f"entries={len(entry_tensors)} staging={required_bytes} B"
+        )
+        with self._draft_gather_pool.borrow(required_bytes) as staging_buffer:
+            draft_kv_gather.gather_token_slices(
+                entry_ptrs_gpu=self._draft_kv_entry_ptrs_gpu,
+                layout=layout,
+                src_token_indices=src_token_indices,
+                staging_buffer=staging_buffer,
+                gpu_id=self.kv_args.gpu_id,
+                max_ctas=self._draft_gather_max_ctas,
+            )
+            src_addrs, dst_addrs, lengths = draft_kv_gather.build_gathered_descriptors(
+                staging_ptr=staging_buffer.get_ptr(),
+                dst_entry_ptrs=draft_dst_kv_ptrs,
+                dst_token_indices=dst_token_indices,
+                layout=layout,
+                dst_token_item_len=dst_token_item_len,
+                dst_head_slice_offset=dst_head_slice_offset,
+            )
+            return self._transfer_data_arrays(
+                mooncake_session_id, src_addrs, dst_addrs, lengths
+            )
+
     def send_kvcache_dcp_draft(
         self,
         mooncake_session_id: str,
@@ -1077,6 +1214,28 @@ class MooncakeKVManager(CommonKVManager):
                 f"(src_item={src_token_item_len} dst_item={dst_token_item_len})"
             )
         else:
+            # A head slice is strided in the token-major source pool, so descriptors
+            # can only coalesce once the slice has been made contiguous. Gathering
+            # into staging first turns ~one descriptor per token into ~one per
+            # destination page; without it, building the list holds the GIL long
+            # enough to stall this rank's scheduler (and the PP ring behind it).
+            if self._draft_gather_pool is not None:
+                status = self._send_draft_slice_via_gather(
+                    mooncake_session_id,
+                    src_token_indices=plan.src_token_indices,
+                    dst_token_indices=plan.dst_token_indices,
+                    draft_dst_kv_ptrs=draft_dst_kv_ptrs,
+                    draft_src_kv_ptrs=draft_src_kv_ptrs,
+                    src_head_start=src_head_start,
+                    num_heads_to_send=num_heads_to_send,
+                    src_token_item_len=src_token_item_len,
+                    src_head_slice_offset=src_head_slice_offset,
+                    dst_token_item_len=dst_token_item_len,
+                    dst_head_slice_offset=dst_head_slice_offset,
+                    heads_bytes_per_token=heads_bytes_per_token,
+                )
+                if status is not None:
+                    return status
             src_token_offsets = (
                 plan.src_token_indices * src_token_item_len + src_head_slice_offset
             )
