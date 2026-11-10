@@ -252,6 +252,15 @@ class Envs:
     # layer are never opened, and owned shards only materialize owned tensors.
     SGLANG_ENABLE_PP_WEIGHT_FILTER = EnvBool(False)
 
+    # Attention backends
+    # Under `--attention-backend tokenspeed_mla --kv-cache-dtype fp8_e4m3`,
+    # replace the `tokenspeed_mla.tokenspeed_mla_decode` decode call with the
+    # FlashMLA dense FP8 kernel (sm100::flash_fwd_splitkv_mla_qkv_fp8_dense_kernel,
+    # exposed as flash_mla.flash_mla_dense_fp8_with_kvcache). Equivalent output;
+    # only the regular decode sub-case (q_len==1, no DCP, page_size==64) is
+    # routed to FlashMLA, everything else stays on tokenspeed.
+    SGLANG_ENABLE_TOKENSPEED_MLA_DECODE_BALANCED = EnvBool(False)
+
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)

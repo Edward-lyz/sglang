@@ -29,6 +29,7 @@ the partial log-sum-exp needed by the cross-rank merge.
 """
 
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -57,6 +58,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
 
 if is_flashinfer_available():
@@ -461,6 +463,144 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 )
             )
 
+    def _flashmla_metadata_for_step(self, flash_mla, seq_lens, s_q, h_q):
+        """``get_mla_metadata`` for the current decode step, computed once and
+        shared by every MLA attention layer in the step.
+
+        The split schedule only depends on ``seq_lens`` (identical for all MLA
+        layers in one forward) plus ``s_q`` / ``h_q`` (fixed), so recomputing it
+        per layer is pure redundancy. Cache ``(tile_scheduler_metadata,
+        num_splits)`` on the per-forward decode-metadata object -- a fresh
+        ``TRTLLMMLADecodeMetadata`` each eager step, and a stable per-bs object
+        under CUDA graph. Under CUDA graph this Python cache is consulted only
+        during capture, so the captured graph keeps a single get_mla_metadata
+        kernel: its ``num_sm_parts`` shape is a hardware constant, and that one
+        kernel re-reads the persistent ``seq_lens`` buffer on replay (verified
+        bitwise-identical to eager in test_dense_fp8_cudagraph.py). If no
+        metadata object is available, fall back to a per-call compute.
+        """
+        md = getattr(self, "forward_decode_metadata", None)
+        key = (s_q, h_q)
+        cached = getattr(md, "_fm_meta_cache", None) if md is not None else None
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+        meta, num_splits = flash_mla.get_mla_metadata(
+            seq_lens,
+            s_q * h_q,  # num_q_tokens_per_head_k
+            1,
+            h_q,
+            is_fp8_kvcache=True,
+            topk=None,
+            is_fp8_query=True,
+        )
+        if md is not None:
+            md._fm_meta_cache = (key, meta, num_splits)
+        return meta, num_splits
+
+    def _run_decode_kernel_flashmla_dense(
+        self,
+        *,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        layer: RadixAttention,
+        softmax_scale: float,
+        output_scale: float,
+        return_lse: bool,
+    ):
+        """Decode / target-verify path via FlashMLA's dense FP8 kernel.
+
+        Handles s_q==1 (regular decode, non-causal) and s_q>1 (target verify,
+        intra-window causal). Returns the same contract as
+        ``tokenspeed_mla_decode`` -- ``out`` (or ``(out, lse)`` when
+        ``return_lse``) -- or ``None`` to fall back.
+
+        Layout parity: the tokenspeed FP8 KV cache stores each token as
+        ``[kv_lora_rank(512) fp8 | qk_rope(64) fp8]`` == 576 bytes, and the
+        absorbed MLA query is the same 576-wide FP8 layout, which is exactly
+        what the FlashMLA dense kernel expects.
+        """
+        try:
+            import flash_mla
+        except ImportError:
+            return None
+
+        h_q = layer.tp_q_head_num
+        # query is [b, s_q, h_q, kv_lora_rank + qk_rope] fp8, which is exactly
+        # FlashMLA's expected q layout (s_q==1 regular decode, s_q>1 target
+        # verify). No reshape/copy needed.
+        s_q = int(query.shape[1])
+
+        # One-time activation log per distinct q_len, so the serving log confirms
+        # the FlashMLA-dense op is actually replacing tokenspeed_mla_decode
+        # (s_q==1 regular decode, s_q>1 target-verify).
+        _seen = self.__dict__.setdefault("_fm_logged_sq", set())
+        if s_q not in _seen:
+            _seen.add(s_q)
+            logger.info(
+                "[FlashMLA-dense-fp8] ACTIVE: tokenspeed_mla_decode -> "
+                "flash_mla_dense_fp8_with_kvcache (s_q=%d, causal=%s, h_q=%d, "
+                "page_size=%d, kv_lora_rank=%d)",
+                s_q, s_q > 1, h_q, self.page_size, self.kv_lora_rank,
+            )
+            # Opt-in process-independent activation marker (logger output from a
+            # scheduler subprocess is not reliably merged into the launcher log).
+            # Only writes when SGLANG_FLASHMLA_DENSE_MARKER points at a file.
+            _marker = os.environ.get("SGLANG_FLASHMLA_DENSE_MARKER")
+            if _marker:
+                try:
+                    with open(_marker, "a") as _f:
+                        _f.write(
+                            f"pid={os.getpid()} s_q={s_q} causal={s_q > 1} "
+                            f"h_q={h_q} page_size={self.page_size}\n"
+                        )
+                except Exception:
+                    pass
+
+        # Normalise the paged FP8 KV cache to FlashMLA's expected 4D layout
+        # [num_blocks, page_size, num_heads_k=1, 576]. The trtllm decode path
+        # hands us [num_blocks, num_heads_k=1, page_size, 576] (head axis at
+        # dim 1, see trtllm_mla_backend: k_cache.view(-1, page, dim).unsqueeze(1)),
+        # so drop that head axis and re-insert it at dim 2. Because num_heads_k
+        # is 1 the underlying [num_blocks, page_size, 576] buffer is untouched
+        # (squeeze/unsqueeze of size-1 dims stay views -- no copy).
+        if kv_cache.dim() == 4:
+            # [num_blocks, 1, page_size, 576] -> [num_blocks, page_size, 1, 576]
+            kv4d = kv_cache.squeeze(1).unsqueeze(2)
+        elif kv_cache.dim() == 3:
+            # [num_blocks, page_size, 576] -> [num_blocks, page_size, 1, 576]
+            kv4d = kv_cache.unsqueeze(2)
+        else:
+            kv4d = kv_cache
+
+        # Split schedule for this decode step. Computed once per forward and
+        # reused by every MLA layer (see _flashmla_metadata_for_step); seq_lens
+        # is identical across layers within a step.
+        meta, num_splits = self._flashmla_metadata_for_step(
+            flash_mla, seq_lens, s_q, h_q
+        )
+        out, lse = flash_mla.flash_mla_dense_fp8_with_kvcache(
+            query,
+            kv4d,
+            block_tables,
+            seq_lens,
+            self.kv_lora_rank,  # head_dim_v
+            meta,
+            num_splits,
+            softmax_scale=softmax_scale,
+            causal=(s_q > 1),  # target-verify: query row j attends [0, seqlen_k - s_q + 1 + j)
+        )
+        # FlashMLA out: [b, s_q, h_q, kv_lora_rank] bf16 -> tokenspeed raw_out
+        # [tokens == b*s_q, h_q, v]. flatten(0,1) is a view (contiguous), no copy.
+        out = out.flatten(0, 1)
+        if output_scale != 1.0:
+            out = out * output_scale
+        if return_lse:
+            # FlashMLA lse: [b, h_q, s_q] -> [tokens == b*s_q, h_q]
+            return out, lse.transpose(1, 2).reshape(-1, h_q)
+        return out
+
     def _run_decode_kernel(
         self,
         query: torch.Tensor,
@@ -484,6 +624,40 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+
+        # Env-gated equivalent replacement: route decode and target-verify to the
+        # FlashMLA dense FP8 kernel. Only the cases FlashMLA dense covers 1:1 are
+        # routed; everything else stays on tokenspeed_mla_decode.
+        #   * no decode-context-parallel (cp_world == 1, causal_seqs is None)
+        #   * page_size == 64 (FlashMLA requires page_block_size % 64 == 0)
+        #   * query is dense [b, s_q, h_q, head_dim] with a uniform per-request
+        #     q_len. s_q==1 (regular decode, non-causal) is always safe; s_q>1
+        #     (target-verify, intra-window causal) is only routed when
+        #     forward_extend marked it uniform+non-DCP (self._fm_route_ok).
+        #     Ragged verify / draft-extend keep a padded q_len and stay on
+        #     tokenspeed.
+        if (
+            envs.SGLANG_ENABLE_TOKENSPEED_MLA_DECODE_BALANCED.get()
+            and cp_world == 1
+            and causal_seqs is None
+            and self.page_size == 64
+            and query.dim() == 4
+            and query.shape[0] == seq_lens_i32.shape[0]
+            and (query.shape[1] == 1 or getattr(self, "_fm_route_ok", False))
+        ):
+            out = self._run_decode_kernel_flashmla_dense(
+                query=query,
+                kv_cache=kv_cache,
+                block_tables=block_tables,
+                seq_lens=seq_lens_i32,
+                layer=layer,
+                softmax_scale=softmax_scale,
+                output_scale=output_scale,
+                return_lse=return_lse,
+            )
+            if out is not None:
+                return out
+
         return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
@@ -501,6 +675,51 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             cp_world=cp_world,
             cp_rank=cp_rank,
         )
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = False,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        # Mark FlashMLA-dense eligibility for the (multi-token) decode kernel used
+        # inside super().forward_extend -> _run_decode_kernel. Only *uniform*,
+        # non-DCP target-verify has a dense [bs, draft_token_num, h_q, d] query
+        # that maps 1:1 to FlashMLA's causal kernel. Ragged verify (ragged_verify_
+        # layout set) and draft-extend keep a padded/varying q_len that FlashMLA
+        # dense cannot express, so they must stay on tokenspeed_mla_decode.
+        """
+        spec = getattr(forward_batch, "spec_info", None)
+        self._fm_route_ok = bool(
+            forward_batch.forward_mode.is_target_verify()
+            and getattr(spec, "ragged_verify_layout", None) is None
+            and not get_parallel().dcp_enabled
+        )
+        try:
+            return super().forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                cos_sin_cache,
+                is_neox,
+                llama_4_scaling,
+            )
+        finally:
+            self._fm_route_ok = False
 
     def forward_decode(
         self,
