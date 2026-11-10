@@ -483,6 +483,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=self.ps.tp_rank,
             tp_sync=self._tp_sync,
             available_memory_gb=available_memory_gb,
+            inline_rng=get_spec().speculative_dspark_fuse_inline_rng,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence

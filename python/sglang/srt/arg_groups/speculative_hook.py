@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
@@ -727,6 +728,20 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "--speculative-dspark-sps-table-path feeds the ragged-verify budget "
             "scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; it "
             "will be a no-op."
+        )
+
+    # Inline-RNG sampling fusion: the user knob is the env var
+    # SGLANG_FUSE_DSPARK_INLINE_RNG, but it is read lazily in the
+    # scheduler/worker process, which under DP / mp-spawn does not inherit it.
+    # Resolve it here, in the launcher, so the decision is pickled onto the
+    # record and published to every worker via
+    # ``get_spec().speculative_dspark_fuse_inline_rng``. Only fill it when unset
+    # so an explicit (e.g. programmatic) value still wins; default stays off.
+    if cfg.speculative_dspark_fuse_inline_rng is None:
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            speculative_dspark_fuse_inline_rng=envs.SGLANG_FUSE_DSPARK_INLINE_RNG.get(),
         )
 
 

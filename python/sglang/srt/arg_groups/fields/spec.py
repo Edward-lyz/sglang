@@ -108,6 +108,18 @@ class Spec(msgspec.Struct):
         "it into extra real verification at the same step time. Off by default; when "
         "off the schedule is byte-for-byte unchanged.",
     ] = False
+    # DSPARK only. Propagation channel for the inline-RNG sampling fusion whose
+    # user knob is the env var SGLANG_FUSE_DSPARK_INLINE_RNG. That env var is read
+    # lazily in the scheduler/worker process, which under DP / mp-spawn does not
+    # inherit it; this field carries the launcher-resolved decision onto the
+    # record so it is pickled to and published for every worker (read via
+    # ``get_spec().speculative_dspark_fuse_inline_rng``). ``None`` means unresolved:
+    # ``_handle_dspark`` fills it from the env var during launcher-side resolution.
+    # No CLI surface by design -- the env var stays the single user knob.
+    speculative_dspark_fuse_inline_rng: A[
+        Optional[bool],
+        Arg(no_cli=True),
+    ] = None
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

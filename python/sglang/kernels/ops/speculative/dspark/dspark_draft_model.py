@@ -22,7 +22,10 @@ class SampleStepTokens:
         step_logits: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
-        exp_noise: torch.Tensor,
+        exp_noise: Optional[torch.Tensor] = None,
+        rng_counter: Optional[torch.Tensor] = None,
+        rng_step: int = 0,
+        rng_num_steps: int = 1,
     ) -> torch.Tensor:
         if step_logits.is_cuda:
             return cls.triton(
@@ -30,12 +33,18 @@ class SampleStepTokens:
                 temperatures=temperatures,
                 greedy_mask=greedy_mask,
                 exp_noise=exp_noise,
+                rng_counter=rng_counter,
+                rng_step=rng_step,
+                rng_num_steps=rng_num_steps,
             )
         return cls.torch(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
             exp_noise=exp_noise,
+            rng_counter=rng_counter,
+            rng_step=rng_step,
+            rng_num_steps=rng_num_steps,
         )
 
     @classmethod
@@ -45,13 +54,19 @@ class SampleStepTokens:
         step_logits: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
-        exp_noise: torch.Tensor,
+        exp_noise: Optional[torch.Tensor] = None,
+        rng_counter: Optional[torch.Tensor] = None,
+        rng_step: int = 0,
+        rng_num_steps: int = 1,
     ) -> torch.Tensor:
         return sample_step_tokens(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
             exp_noise=exp_noise,
+            rng_counter=rng_counter,
+            rng_step=rng_step,
+            rng_num_steps=rng_num_steps,
         )
 
     @classmethod
@@ -61,14 +76,43 @@ class SampleStepTokens:
         step_logits: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
-        exp_noise: torch.Tensor,
+        exp_noise: Optional[torch.Tensor] = None,
+        rng_counter: Optional[torch.Tensor] = None,
+        rng_step: int = 0,
+        rng_num_steps: int = 1,
     ) -> torch.Tensor:
         return sample_step_tokens_triton(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
             exp_noise=exp_noise,
+            rng_counter=rng_counter,
+            rng_step=rng_step,
+            rng_num_steps=rng_num_steps,
         )
+
+
+def _inline_exp_noise_torch(
+    *,
+    shape: torch.Size,
+    device: torch.device,
+    rng_counter: torch.Tensor,
+    rng_step: int,
+    rng_num_steps: int,
+) -> torch.Tensor:
+    """CPU/eager reference for the inline philox noise: Exp(1) drawn as
+    ``-log(u)``, u ~ Uniform(0,1). Distribution-equivalent to the Triton path
+    (both draw iid Exp(1)); the seed folds the per-step index exactly as the
+    kernel does, but values are not bit-identical because torch and Triton use
+    different philox layouts. Only used off CUDA / in the kernel's torch
+    fallback -- the graph path never touches this.
+    """
+    base = int(rng_counter.reshape(-1)[0].item())
+    seed = (base * int(rng_num_steps) + int(rng_step)) & 0xFFFFFFFF
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    u = torch.rand(shape, generator=gen, device=device, dtype=torch.float32)
+    return -torch.log(u.clamp_min(torch.finfo(torch.float32).tiny))
 
 
 def sample_step_tokens(
@@ -76,9 +120,25 @@ def sample_step_tokens(
     step_logits: torch.Tensor,
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
-    exp_noise: torch.Tensor,
+    exp_noise: Optional[torch.Tensor] = None,
+    rng_counter: Optional[torch.Tensor] = None,
+    rng_step: int = 0,
+    rng_num_steps: int = 1,
 ) -> torch.Tensor:
     probs = torch.softmax(step_logits.float() / temperatures[:, None], dim=-1)
+    if rng_counter is not None:
+        # Inline RNG: ignore exp_noise entirely and draw the Exp(1) noise here.
+        exp_noise = _inline_exp_noise_torch(
+            shape=step_logits.shape,
+            device=step_logits.device,
+            rng_counter=rng_counter,
+            rng_step=rng_step,
+            rng_num_steps=rng_num_steps,
+        )
+    else:
+        assert exp_noise is not None, (
+            "sample_step_tokens needs exp_noise unless rng_counter is set"
+        )
     noise = torch.where(greedy_mask[:, None], 1.0, exp_noise)
     return probs.div_(noise).argmax(dim=-1)
 
@@ -89,13 +149,17 @@ def _online_partial_kernel(
     temperatures_ptr,
     greedy_mask_ptr,
     exp_noise_ptr,
+    rng_seed_ptr,
     tile_max_ptr,
     partial_key_ptr,
     partial_idx_ptr,
     V,
     stride_row,
     n_tiles,
+    rng_step,
+    rng_num_steps,
     BLOCK_V: tl.constexpr,
+    INLINE_RNG: tl.constexpr,
 ):
     row = tl.program_id(0)
     tile = tl.program_id(1)
@@ -108,7 +172,20 @@ def _online_partial_kernel(
     s = logits / temperature
     tile_max = tl.max(s, axis=0)
     greedy = tl.load(greedy_mask_ptr + row) != 0
-    noise = tl.load(exp_noise_ptr + row * V + offs, mask=mask, other=1.0)
+    if INLINE_RNG:
+        # Inline Gumbel noise: draw uniforms with philox and map u -> -log(u),
+        # i.e. Exp(1) -- the exact noise exponential_() precomputes. fp32
+        # throughout, matching the precomputed buffer's dtype. The seed is read
+        # live from a device counter (graph-safe: the host bumps it each decode
+        # step, so replays redraw), and folds in the per-block step index so the
+        # gamma draft steps -- all baked into one captured graph -- draw
+        # independently. The offset row * V + offs keys noise per (row, vocab).
+        base = tl.load(rng_seed_ptr)
+        seed = (base * rng_num_steps + rng_step).to(tl.uint32)
+        u = tl.rand(seed, row * V + offs)
+        noise = -tl.log(u)
+    else:
+        noise = tl.load(exp_noise_ptr + row * V + offs, mask=mask, other=1.0)
     denom = tl.where(greedy, 1.0, noise)
     key = tl.exp(s - tile_max) / denom
     key = tl.where(mask, key, -1.0)
@@ -155,7 +232,10 @@ def sample_step_tokens_triton(
     step_logits: torch.Tensor,
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
-    exp_noise: torch.Tensor,
+    exp_noise: Optional[torch.Tensor] = None,
+    rng_counter: Optional[torch.Tensor] = None,
+    rng_step: int = 0,
+    rng_num_steps: int = 1,
 ) -> torch.Tensor:
     bs, V = step_logits.shape
     device = step_logits.device
@@ -163,7 +243,22 @@ def sample_step_tokens_triton(
     stride_row = step_logits.stride(0)
     temperatures = temperatures.to(torch.float32).contiguous()
     greedy_mask = greedy_mask.to(torch.int32).contiguous()
-    exp_noise = exp_noise.to(torch.float32).contiguous()
+
+    inline_rng = rng_counter is not None
+    if inline_rng:
+        # Graph-safe seed: a device counter the host bumps each decode step, so
+        # replays redraw. No [bs, V] noise buffer, no exponential_() launch, and
+        # no read of exp_noise -- its pointer below is dead (the load is behind a
+        # constexpr-False branch) and only kept so the launch signature matches.
+        rng_seed = rng_counter
+        exp_noise_arg = rng_counter
+    else:
+        assert exp_noise is not None, (
+            "sample_step_tokens_triton needs exp_noise unless rng_counter is set"
+        )
+        exp_noise_arg = exp_noise.to(torch.float32).contiguous()
+        # Dead pointer for the (constexpr-False) inline branch; never loaded.
+        rng_seed = greedy_mask
 
     n_tiles = triton.cdiv(V, _BLOCK_V)
     block_tiles = triton.next_power_of_2(n_tiles)
@@ -180,14 +275,18 @@ def sample_step_tokens_triton(
         step_logits,
         temperatures,
         greedy_mask,
-        exp_noise,
+        exp_noise_arg,
+        rng_seed,
         tile_max,
         partial_key,
         partial_idx,
         V,
         stride_row,
         n_tiles,
+        int(rng_step),
+        int(rng_num_steps),
         BLOCK_V=_BLOCK_V,
+        INLINE_RNG=inline_rng,
     )
     _online_combine_kernel[row_grid](
         tile_max,

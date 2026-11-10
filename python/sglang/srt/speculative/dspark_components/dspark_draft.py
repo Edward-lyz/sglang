@@ -19,7 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
@@ -172,6 +172,13 @@ def sample_draft_block(
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
     fast_sampling = envs.SGLANG_DSPARK_FAST_SAMPLING.get()
+    # Fuse the exp-noise RNG into the sampling kernel (user knob:
+    # SGLANG_FUSE_DSPARK_INLINE_RNG). Read the launcher-resolved value from the
+    # published spec config rather than the env var directly: under DP / mp-spawn
+    # the worker's os.environ may lack it. Eager fallback path, so no graph-safe
+    # counter plumbing is needed -- a fresh per-call seed suffices.
+    inline_rng = fast_sampling and bool(get_spec().speculative_dspark_fuse_inline_rng)
+    num_steps = base_logits.shape[1]
 
     if sampling_info is None:
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
@@ -193,18 +200,39 @@ def sample_draft_block(
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
             if fast_sampling:
-                exp_noise = torch.empty(
-                    step_logits.shape, dtype=torch.float32, device=step_logits.device
-                ).exponential_(1)
-                return tp_sync.sync(
-                    SpecTpSyncSite.DSPARK_DRAFT_SAMPLE,
-                    SampleStepTokens.execute(
+                if inline_rng:
+                    # Draw the Exp(1) noise inside the sampling kernel (philox)
+                    # instead of a separate exponential_() over a fresh
+                    # [bs, vocab] buffer. Eager (no capture), so a fresh random
+                    # counter per call is enough; step_idx keys the steps apart.
+                    rng_counter = torch.randint(
+                        0,
+                        2**31 - 1,
+                        (1,),
+                        dtype=torch.int64,
+                        device=step_logits.device,
+                    )
+                    sampled = SampleStepTokens.execute(
+                        step_logits=step_logits,
+                        temperatures=temperatures,
+                        greedy_mask=greedy_mask,
+                        rng_counter=rng_counter,
+                        rng_step=step_idx,
+                        rng_num_steps=num_steps,
+                    )
+                else:
+                    exp_noise = torch.empty(
+                        step_logits.shape,
+                        dtype=torch.float32,
+                        device=step_logits.device,
+                    ).exponential_(1)
+                    sampled = SampleStepTokens.execute(
                         step_logits=step_logits,
                         temperatures=temperatures,
                         greedy_mask=greedy_mask,
                         exp_noise=exp_noise,
-                    ),
-                )
+                    )
+                return tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT_SAMPLE, sampled)
             else:
                 probs = torch.softmax(
                     step_logits.float() / temperatures[:, None], dim=-1

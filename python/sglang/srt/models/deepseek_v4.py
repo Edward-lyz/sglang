@@ -209,7 +209,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
-from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
@@ -1493,15 +1492,14 @@ class MQALayer(MqaAttentionBase):
 
         if self.indexer is not None:
             with torch.cuda.stream(stream_indexer):
-                with operations_nvtx_range("attn.indexer"):
-                    self.indexer(
-                        x=x,
-                        q_lora=q_lora,
-                        forward_batch=forward_batch,
-                        attn_backend=attn_backend,
-                        enable_multi_stream=True,
-                        q_lora_ready=q_lora_ready,
-                    )
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                    enable_multi_stream=True,
+                    q_lora_ready=q_lora_ready,
+                )
 
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
@@ -1673,13 +1671,12 @@ class MQALayer(MqaAttentionBase):
 
         # Indexer + compressor: serial on current.
         if self.indexer is not None:
-            with operations_nvtx_range("attn.indexer"):
-                self.indexer(
-                    x=x,
-                    q_lora=q_lora,
-                    forward_batch=forward_batch,
-                    attn_backend=attn_backend,
-                )
+            self.indexer(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+            )
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
                 x,
@@ -1795,14 +1792,13 @@ class MQALayer(MqaAttentionBase):
             current_stream.wait_stream(stream_compressor)
             if stream_indexer_compressor is not None:
                 current_stream.wait_stream(stream_indexer_compressor)
-            with operations_nvtx_range("attn.indexer"):
-                self.indexer(
-                    x=x,
-                    q_lora=q_lora,
-                    forward_batch=forward_batch,
-                    attn_backend=attn_backend,
-                    skip_compressor=True,
-                )
+            self.indexer(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+                skip_compressor=True,
+            )
         elif self.compressor is not None:
             current_stream.wait_stream(stream_compressor)
 
