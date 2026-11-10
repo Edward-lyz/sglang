@@ -32,6 +32,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.chunk_cost_model import ChunkCostModel
+from sglang.srt.managers.chunk_flops_estimator import (
+    aggregate_stage_flops,
+    estimate_stage_flops_per_token,
+    resolve_llm_config,
+)
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import PlannedAdmission
@@ -1664,6 +1670,11 @@ class SchedulerPPMixin:
         """
         seq_lens: List[int] = []
         latencies: List[float] = []
+        # Per-token FLOPs constants walked on every PP stage (all-gathered
+        # below). All stages are kept: the microbatch cost is max over stages
+        # and which one binds depends on (history, chunk), e.g. K3 partitions
+        # layers 7/6/5 and spreads MLA layers unevenly across them.
+        stage_flops_buckets = None
 
         if self.pp_group.is_first_rank:
             model_runner = self.tp_worker.model_runner
@@ -1831,11 +1842,124 @@ class SchedulerPPMixin:
             self.pp_group.broadcast_object_list(data_to_sync, src=0)
             seq_lens, latencies = data_to_sync
 
+        # The weight walk is local, but the gather below must NOT be gated on
+        # the env flag: it is per-container, and a pod whose yaml disagrees
+        # would leave its ranks out of the collective and hang startup with no
+        # diagnostic. Always gather (flag, buckets) and let PP0's flag decide.
+        local_enabled = envs.SGLANG_DYNAMIC_CHUNKING_COST_MODEL.get()
+        local_buckets = None
+        if local_enabled:
+            try:
+                local_buckets = estimate_stage_flops_per_token(
+                    self.tp_worker.model_runner.model,
+                    self.model_config.hf_config,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[PP Dynamic Chunk] Weight-walk FLOPs estimation failed: "
+                    f"{e}. Falling back to the quadratic predictor."
+                )
+        use_cost_model = local_enabled
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            gathered = [None] * torch.distributed.get_world_size(
+                self.pp_group.cpu_group
+            )
+            torch.distributed.all_gather_object(
+                gathered, (local_enabled, local_buckets), group=self.pp_group.cpu_group
+            )
+            flags = [g[0] for g in gathered]
+            use_cost_model = flags[0]
+            if any(f != use_cost_model for f in flags):
+                logger.warning(
+                    "[PP Dynamic Chunk] SGLANG_DYNAMIC_CHUNKING_COST_MODEL "
+                    "disagrees across PP ranks (%s); following PP0 (%s). Fix "
+                    "the launch config so every pod sets the same value.",
+                    flags,
+                    use_cost_model,
+                )
+            buckets = [g[1] for g in gathered]
+            missing = [i for i, b in enumerate(buckets) if not b]
+            if use_cost_model and missing:
+                # Dropping a stage would silently stop enforcing its
+                # constraint, which is exactly how a straggler appears.
+                logger.warning(
+                    "[PP Dynamic Chunk] Weight walk produced no FLOPs on PP "
+                    "ranks %s; disabling the cost model rather than modelling "
+                    "%d of %d stages. Falling back to the quadratic predictor.",
+                    missing,
+                    len(buckets) - len(missing),
+                    len(buckets),
+                )
+                use_cost_model = False
+            # Keep every stage's buckets; the cost model evaluates all of them
+            # because the binding stage moves with the operating point. The
+            # gathered list is identical on every rank, so schedulers stay in
+            # lockstep.
+            stage_flops_buckets = buckets if use_cost_model else None
+        elif use_cost_model:
+            stage_flops_buckets = [local_buckets] if local_buckets else None
+
         # Quadratic model: f(l) = al^2 + bl + c
         self.length_predictor = ChunkSizePredictor()
         self.length_predictor.fit(seq_lens, latencies)
         self.length_predictor.set_target_latency(self.chunked_prefill_size)
         self.length_predictor.is_ready = True
+
+        # Per-stage compute cost model (batch-composition-aware budgets).
+        # Coefficients come from the walked per-token FLOPs plus the config's
+        # per-layer attention constants -- no fitting, no hardware calibration.
+        self.chunk_cost_model = None
+        if use_cost_model:
+            # Multimodal configs (K3) nest the LLM fields in text_config.
+            hf_cfg = resolve_llm_config(self.model_config.hf_config)
+            num_heads = getattr(hf_cfg, "num_attention_heads", 0)
+            try:
+                if not stage_flops_buckets:
+                    raise ValueError(
+                        "weight-walk FLOPs unavailable on every PP stage"
+                    )
+                # MHA core per (q, kv) pair plus the kv_b_proj re-expansion of
+                # the whole latent prefix, both only on full-attention (MLA)
+                # layers -- counted per layer here, scaled by each stage's own
+                # MLA layer count (from its kv_b_proj weights) in the model.
+                # Heads are counted per attention-TP rank, because the walked
+                # GEMM FLOPs they are weighed against are this rank's shard.
+                qk_nope = getattr(hf_cfg, "qk_nope_head_dim", 0) or 0
+                qk_rope = getattr(hf_cfg, "qk_rope_head_dim", 0) or 0
+                v_head = getattr(hf_cfg, "v_head_dim", 0) or 0
+                kv_lora = getattr(hf_cfg, "kv_lora_rank", 0) or 0
+                local_heads = num_heads // max(self.ps.attn_tp_size, 1)
+                if not (
+                    kv_lora > 0 and qk_nope > 0 and v_head > 0 and local_heads > 0
+                ):
+                    # Fail loudly rather than silently zeroing the k_a/k_e
+                    # terms: a model without them degenerates to the static
+                    # token budget while pretending to price history.
+                    raise ValueError(
+                        "cost model needs MLA head dims (qk_nope/qk_rope/"
+                        f"v_head/kv_lora/local_heads={qk_nope}/{qk_rope}/"
+                        f"{v_head}/{kv_lora}/{local_heads})"
+                    )
+                stages = aggregate_stage_flops(stage_flops_buckets)
+                cost_model = ChunkCostModel()
+                cost_model.init_analytic(
+                    flops=stages["flops"],
+                    mla_layers=stages["mla_layers"],
+                    attn_flops_per_pair_per_layer=(
+                        2.0 * local_heads * ((qk_nope + qk_rope) + v_head)
+                    ),
+                    reexpand_flops_per_layer=(
+                        2.0 * local_heads * kv_lora * (qk_nope + v_head)
+                    ),
+                )
+                cost_model.set_target_cost(self.chunked_prefill_size)
+                cost_model.is_ready = True
+                self.chunk_cost_model = cost_model
+            except Exception as e:
+                logger.warning(
+                    f"[PP Dynamic Chunk] Cost model init failed: {e}. "
+                    "Falling back to the quadratic predictor."
+                )
         logger.info(
             f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predictor ready (quadratic). "
             f"Target latency: {self.length_predictor.target_latency:.2f}ms"

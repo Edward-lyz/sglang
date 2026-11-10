@@ -43,6 +43,7 @@ from typing import (
     Union,
 )
 
+import numpy as np
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
@@ -512,6 +513,13 @@ class PlannedAdmission:
 
 
 class PrefillAdder:
+    # How far a whole request may overshoot the remaining cost budget before it
+    # is chunked instead. Admitting it whole keeps the batch full and avoids a
+    # sliver chunk that would repay the prefix re-expansion a second time; the
+    # overshoot is absorbed by the next batch, whose budget_state() sees a
+    # non-positive remainder.
+    COST_OVERSHOOT_TOL = 1.05
+
     def __init__(
         self,
         page_size: int,
@@ -529,6 +537,9 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        cost_model=None,
+        rem_cost: Optional["np.ndarray"] = None,
+        cost_chunk_cap: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -537,6 +548,17 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        # Optional compute-based budget (see ChunkCostModel). When set, each
+        # admitted request is charged its predicted per-PP-stage cost (which
+        # depends on its cached-history length), so batches are bounded by
+        # predicted compute instead of raw token count.
+        self.cost_model = cost_model
+        self.rem_cost = rem_cost if cost_model is not None else None
+        # Per-request chunk cap in cost-model mode: budgets admit more
+        # requests, they must never inflate a single chunk beyond the
+        # validated base chunk size (long chunks hit untested kernel paths,
+        # e.g. KDA's >16K triton fallback).
+        self.cost_chunk_cap = cost_chunk_cap
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -551,6 +573,11 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        # Whether this batch already carries a partial (chunked) request,
+        # either resumed from the previous batch or created here. At most one
+        # is allowed, and it is the only reason the cost model defers a
+        # request that would otherwise fit.
+        self.batch_has_partial_req = False
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_host_hit_tokens = 0
@@ -800,6 +827,62 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _req_cost(self, prefix_len: int, extend_len: int):
+        """Per-PP-stage cost this request would add to the batch, or None when
+        the cost model is off. Page-aligned to match what
+        ``_update_prefill_budget`` actually charges to the token budgets."""
+        if self.cost_model is None:
+            return None
+        return self.cost_model.req_cost(
+            prefix_len, self.ceil_paged_tokens(extend_len)
+        )
+
+    def _cost_chunk_limit(self, prefix_len: int) -> int:
+        """Largest page-aligned chunk that fits every stage's remaining budget,
+        capped at the validated base chunk size, with one page of forced
+        progress so a chunked request can never stall."""
+        x = self.cost_model.solve_x(prefix_len, self.rem_cost)
+        # solve_x(0, target) is base_chunk_size exactly in theory, but the
+        # quadratic root lands a few ULPs below it; truncating there would cost
+        # a whole page on every fresh chunk relative to the static token budget.
+        x = int(x * (1.0 + 1e-9) + 1e-6)
+        if self.cost_chunk_cap is not None:
+            x = min(x, self.cost_chunk_cap)
+        return max(x // self.page_size * self.page_size, self.page_size)
+
+    def _cost_admit(self, prefix_len: int, extend_len: int, can_defer: bool):
+        """Cost-model verdict for a request that is not yet in this batch.
+
+        Returns ("whole", None), ("chunk", limit) or ("defer", None).
+
+        Three rules, in order:
+        1. Admit whole if it fits, tolerating a small overshoot: leaving a
+           sliver chunk behind costs more (see rule 3) than briefly exceeding
+           the budget, which the next batch absorbs via budget_state().
+        2. Defer only when the batch already holds a partial request. SGLang
+           allows one per batch; anything stricter (e.g. "the batch is
+           non-empty") leaves the tail of every batch idle.
+        3. Prefer deferring over carving a sliver: every extra chunk repays
+           the whole prefix re-expansion (k_e * L), so splitting is only worth
+           it when the budget it fills exceeds that repayment.
+        """
+        full_cost = self._req_cost(prefix_len, extend_len)
+        over_cap = (
+            self.cost_chunk_cap is not None and extend_len > self.cost_chunk_cap
+        )
+        if not over_cap and np.all(
+            full_cost <= self.rem_cost * self.COST_OVERSHOOT_TOL
+        ):
+            return "whole", None
+        if can_defer:
+            if self.batch_has_partial_req:
+                return "defer", None
+            if self.cost_model.reexpand_cost(prefix_len) >= float(
+                np.min(self.rem_cost)
+            ):
+                return "defer", None
+        return "chunk", self._cost_chunk_limit(prefix_len)
+
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
@@ -820,6 +903,8 @@ class PrefillAdder:
         else:
             if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
+            if self.rem_cost is not None and np.any(self.rem_cost <= 0):
+                return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
 
@@ -831,6 +916,7 @@ class PrefillAdder:
         retracted_stain: bool,
         host_hit_len: int,
         mamba_gap_reserve: int = 0,
+        cost=None,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -862,6 +948,8 @@ class PrefillAdder:
             self.rem_dllm_tokens -= extend_input_len
         elif self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= extend_input_len
+        if self.rem_cost is not None and cost is not None:
+            self.rem_cost -= cost
 
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
@@ -977,6 +1065,18 @@ class PrefillAdder:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
+        if self.cost_model is not None and self.rem_cost is not None:
+            # A resumed chunked request must make progress, so there is no
+            # defer option here: take the largest chunk that fits.
+            cost_tokens = self._cost_chunk_limit(len(req.prefix_indices))
+            _rem_tokens = min(_rem_tokens, cost_tokens)
+            logger.debug(
+                "[ChunkCostModel-Admit] resumed L=%d rem=%s cost_tokens=%d",
+                len(req.prefix_indices),
+                self.rem_cost,
+                cost_tokens,
+            )
+
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
         if self.prefill_delayer_single_pass is not None:
@@ -1008,6 +1108,9 @@ class PrefillAdder:
             truncated = end < len(req.full_untruncated_fill_ids)
         req.set_extend_range(prefix_len, prefix_len + new_len)
         self.can_run_list.append(req)
+        # Still partial after this chunk: it stays this batch's one chunked
+        # request, so no waiting request may be chunked as well.
+        self.batch_has_partial_req = truncated
         self._update_prefill_budget(
             0,
             req.extend_range.length,
@@ -1019,6 +1122,7 @@ class PrefillAdder:
             req.retracted_stain,
             host_hit_len=0,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            cost=self._req_cost(len(req.prefix_indices), req.extend_range.length),
         )
 
         # Return if chunked prefill not finished
@@ -1178,6 +1282,31 @@ class PrefillAdder:
         ):
             return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
+        # The cost budget applies to ignore_eos traffic too (benchmarks/warmup
+        # take this path when the radix cache is off); otherwise oversized
+        # whole-request chunks bypass the budget and reach untested long-chunk
+        # kernel paths.
+        cost_chunk_limit = None
+        if self.cost_model is not None and self.rem_cost is not None:
+            verdict, cost_chunk_limit = self._cost_admit(
+                len(req.prefix_indices),
+                cand_extend_input_len,
+                can_defer=len(self.can_run_list) != 0,
+            )
+            logger.debug(
+                "[ChunkCostModel-Admit] ignore_eos L=%d x=%d verdict=%s "
+                "limit=%s rem=%s",
+                len(req.prefix_indices),
+                cand_extend_input_len,
+                verdict,
+                cost_chunk_limit,
+                self.rem_cost,
+            )
+            if verdict == "defer":
+                return self._sync_attention_store_read_abort(
+                    req, AddReqResult.OTHER
+                )
+
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
                 return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
@@ -1186,6 +1315,9 @@ class PrefillAdder:
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+        ) and (
+            cost_chunk_limit is None
+            or cand_extend_input_len <= cost_chunk_limit
         ):
             # Non-chunked prefill — the whole sequence is committed this iter.
             req.set_extend_range(
@@ -1199,13 +1331,22 @@ class PrefillAdder:
                 req.retracted_stain,
                 host_hit_len=0,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                cost=self._req_cost(
+                    len(req.prefix_indices), req.extend_range.length
+                ),
             )
         else:
-            if self.rem_chunk_tokens <= 0:
+            if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
                 return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = (
+                self.rem_chunk_tokens
+                if self.rem_chunk_tokens is not None
+                else cost_chunk_limit
+            )
+            if cost_chunk_limit is not None:
+                trunc_len = min(trunc_len, cost_chunk_limit)
 
             assert len(req.prefix_indices) == 0
             req.set_extend_range(
@@ -1213,6 +1354,7 @@ class PrefillAdder:
             )
             self.can_run_list.append(req)
             self.new_chunked_req = req
+            self.batch_has_partial_req = True
             self._update_prefill_budget(
                 0,
                 trunc_len,
@@ -1220,6 +1362,7 @@ class PrefillAdder:
                 req.retracted_stain,
                 host_hit_len=0,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                cost=self._req_cost(len(req.prefix_indices), trunc_len),
             )
 
         return self._sync_attention_store_read_abort(req, self.budget_state())
@@ -1434,6 +1577,42 @@ class PrefillAdder:
                 # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
+            if (
+                planned_admission is None
+                and self.cost_model is not None
+                and self.rem_cost is not None
+            ):
+                # Compute budget: charge this request for its cached history
+                # (k_e/k_a terms), which the token budget cannot see. A 4K
+                # extend on a 124K prefix costs several times more than its
+                # token count suggests. An authoritative admission replays
+                # PP0's range and is not re-gated here; it is still charged
+                # below so the remaining budget stays in sync.
+                verdict, cost_limit = self._cost_admit(
+                    len(req.prefix_indices),
+                    input_tokens,
+                    can_defer=len(self.can_run_list) != 0,
+                )
+                logger.debug(
+                    "[ChunkCostModel-Admit] L=%d x=%d verdict=%s limit=%s "
+                    "rem=%s cap=%s",
+                    len(req.prefix_indices),
+                    input_tokens,
+                    verdict,
+                    cost_limit,
+                    self.rem_cost,
+                    self.cost_chunk_cap,
+                )
+                if verdict == "defer":
+                    return AddReqResult.OTHER
+                if verdict == "chunk":
+                    # Route through the existing truncation branch below.
+                    chunk_tokens_limit = (
+                        min(chunk_tokens_limit, cost_limit)
+                        if chunk_tokens_limit is not None
+                        else cost_limit
+                    )
+
             if planned_admission is not None:
                 if self.dllm_config is not None:
                     available_chunk_tokens = self.rem_dllm_tokens
@@ -1469,6 +1648,9 @@ class PrefillAdder:
                     req.retracted_stain,
                     req.host_hit_length,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    cost=self._req_cost(
+                        prefix_len, authoritative_end - authoritative_start
+                    ),
                 )
             elif self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
@@ -1481,6 +1663,12 @@ class PrefillAdder:
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
+                if self.cost_model is not None:
+                    logger.debug(
+                        "[ChunkCostModel-Admit] whole x=%d limit=%s",
+                        input_tokens,
+                        chunk_tokens_limit,
+                    )
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1498,6 +1686,7 @@ class PrefillAdder:
                     req.retracted_stain,
                     req.host_hit_length,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    cost=self._req_cost(prefix_len, input_tokens),
                 )
             else:
                 # Make sure at least one page is available
@@ -1531,6 +1720,7 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
+                self.batch_has_partial_req = True
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
@@ -1540,6 +1730,7 @@ class PrefillAdder:
                     req.retracted_stain,
                     host_hit_len=req.host_hit_length,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    cost=self._req_cost(prefix_len, trunc_len),
                 )
 
         return self.budget_state()

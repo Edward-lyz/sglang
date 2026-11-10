@@ -462,6 +462,12 @@ class Envs:
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    # Per-PP-stage compute cost model for dynamic chunking: price each request
+    # as cost_s(L, x) = k_g*x + k_e*(L+x) + k_a*x*(L+0.5x) on every stage and
+    # form prefill batches against a compute budget instead of a token budget.
+    # Coefficients are pure FLOPs counts derived at startup from a walk of the
+    # loaded weights plus the model config, so no configuration is needed.
+    SGLANG_DYNAMIC_CHUNKING_COST_MODEL = EnvBool(False)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)

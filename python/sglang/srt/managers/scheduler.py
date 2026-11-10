@@ -1601,6 +1601,7 @@ class Scheduler(
         )
 
         # Init the dynamic chunking predictor for PP
+        self.chunk_cost_model = None
         self.enable_dynamic_chunking = (
             self.server_args.enable_dynamic_chunking and self.ps.pp_size > 1
         )
@@ -3891,7 +3892,21 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
+        cost_model = self.chunk_cost_model
+        use_cost_model = (
+            self.enable_dynamic_chunking
+            and cost_model is not None
+            and cost_model.is_ready
+        )
+        rem_cost = None
+        if use_cost_model:
+            # Cost-model mode: the compute budget is the binding constraint;
+            # the token budget stays as a memory/workspace guard (the A2A
+            # workspace is validated against max_prefill_tokens).
+            chunked_prefill_size = self.max_prefill_tokens
+            # Copied: PrefillAdder decrements it in place per admission.
+            rem_cost = cost_model.target_cost.copy()
+        elif self.chunked_req is not None and self.enable_dynamic_chunking:
             history_len = len(self.chunked_req.prefix_indices)
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
@@ -3914,6 +3929,9 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            cost_model=cost_model if use_cost_model else None,
+            rem_cost=rem_cost,
+            cost_chunk_cap=self.chunked_prefill_size if use_cost_model else None,
         )
 
         skip_waiting_admission = False
