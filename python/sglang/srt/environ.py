@@ -262,6 +262,14 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Log an MD5 digest of every AttentionStore page/state buffer at write and
+    # read time, so a cache read can be matched byte-for-byte against the write
+    # that produced it. Costs a D2H copy plus a hash per page — diagnostic only.
+    SGLANG_LOG_AS_CACHE_DIGEST = EnvBool(False)
+    # Log whether the producer event fenced before an AttentionStore write/read
+    # actually had anything in flight, plus per-page freshness/ownership right
+    # before the SDK gather. Diagnostic only, off by default.
+    SGLANG_LOG_AS_BARRIER_DEBUG = EnvBool(False)
 
     # IPC
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
@@ -560,6 +568,16 @@ class Envs:
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    # Inline local $ref pointers against the $defs/definitions of each tool's
+    # `parameters` schema at request time, so downstream prompt rendering and
+    # constrained decoding get a self-contained tree. Off by default; opt in
+    # per deployment.
+    SGLANG_ENABLE_TOOL_SCHEMA_REF_EXPANSION = EnvBool(False)
+    # Move the fragment out of every `$id` in a tool's `parameters` schema, so
+    # draft-07 identifiers such as `{"$id": "#user"}` stay admissible instead of
+    # being rejected outright by the 2020-12 metaschema. Set False to restore the
+    # legacy behavior, which answers such a request with HTTP 400.
+    SGLANG_ENABLE_TOOL_SCHEMA_ID_NORMALIZATION = EnvBool(True)
 
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
@@ -1138,6 +1156,11 @@ class Envs:
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+    # Stream Kimi K3 tool-call arguments as deltas while the call is still being
+    # generated. Set False to fall back to the legacy behavior, which surfaces
+    # each call once, fully formed, in a single chunk carrying both the name and
+    # the complete arguments.
+    SGLANG_ENABLE_KIMI_K3_TOOL_ARGUMENT_STREAMING = EnvBool(True)
 
     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)

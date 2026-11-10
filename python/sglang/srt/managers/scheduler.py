@@ -1543,6 +1543,15 @@ class Scheduler(
 
         self.tree_cache.ref_as_binding(binding)
         self.ascli = binding.cache_store
+        # Hand the model's forward_stream to the AS write coordinator so its
+        # producer fence records on the stream the MLA/KDA KV writes actually run
+        # on. The hybrid pool's allocator does not carry forward_stream, so
+        # without this the fence records on the (idle) default stream.
+        _as_coord = getattr(self.tree_cache, "_as_coordinator", None)
+        if _as_coord is not None:
+            _as_coord.forward_stream = getattr(
+                getattr(self.tp_worker, "model_runner", None), "forward_stream", None
+            )
         if self.ps.attn_tp_rank == 0:
             logger.info(
                 "AttentionStore initialized: cache_plan=%s namespace=%s "
@@ -5164,6 +5173,8 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "log_as_cache_digest",
+                "log_as_barrier_debug",
             ]
         )
 
@@ -5229,6 +5240,23 @@ class Scheduler(
                 )
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
+            # The AS cache digest is a diagnostic log switch, not a server arg:
+            # apply it on this rank and keep it out of the override. The control
+            # request walks every PP rank, so all of them flip together.
+            if "log_as_cache_digest" in server_args_dict:
+                from sglang.srt.mem_cache.storage.asradix.transport import (
+                    set_cache_digest_enabled,
+                )
+
+                set_cache_digest_enabled(bool(remaining.pop("log_as_cache_digest")))
+            if "log_as_barrier_debug" in server_args_dict:
+                from sglang.srt.mem_cache.storage.asradix.transport import (
+                    set_barrier_debug_enabled,
+                )
+
+                set_barrier_debug_enabled(
+                    bool(remaining.pop("log_as_barrier_debug"))
+                )
             if remaining:
                 get_context().override(source="update_server_args", **remaining)
             logger.info(f"Config updated via context override: {remaining}")

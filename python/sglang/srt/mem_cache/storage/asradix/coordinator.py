@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 
-from .transport import _once
+from .transport import _once, barrier_debug_enabled, cache_digest_logger
 from .types import AttentionStoreWriteContext, AttentionStoreWriteOwner
 
 logger = logging.getLogger(__name__)
@@ -217,16 +217,53 @@ class AttentionStoreCoordinator:
         # writes whose concrete task is created below the cache integration
         # layer. It is never read by the writer thread.
         self._owner_hint: Optional[AttentionStoreWriteOwner] = None
+        # Injected by Scheduler._init_attention_store: the model's forward_stream,
+        # i.e. the stream the MLA/KDA KV writes actually run on. The hybrid pool's
+        # allocator does not carry forward_stream, so the coordinator holds it
+        # directly for the producer fence.
+        self.forward_stream: Any = None
+
+    def _producer_stream(self, cache):
+        """Stream the forward pass used to fill the KV pages.
+
+        The model forward (and the KV writes) run on ``model_runner.forward_stream``;
+        the page/checkpoint writers read those pages on their own stream, so the
+        completion fence has to target that forward stream. Prefer the explicitly
+        injected ``forward_stream`` (set by the scheduler) and fall back to the
+        allocator's copy if present.
+        """
+        if self.forward_stream is not None:
+            return self.forward_stream
+        allocator = getattr(cache, "token_to_kv_pool_allocator", None)
+        return getattr(allocator, "forward_stream", None)
 
     @staticmethod
-    def record_device_event(device: Any):
-        """Record completion of the current producer stream."""
+    def record_device_event(device: Any, stream: Any = None):
+        """Record completion of the producer stream that filled the pages.
+
+        ``stream`` should be the forward stream that produced the KV data (see
+        ``_producer_stream``); when omitted we fall back to the current stream.
+        """
         device = torch.device(device)
         if device.type not in ("cuda", "xpu"):
             return None
         device_module = torch.get_device_module(device)
-        event = device_module.Event()
-        event.record(device_module.current_stream(device))
+        # This may be called from the writer thread (do_write), whose current
+        # device can differ from the KV pool's; pin it so the event and the
+        # producer stream are created on the same device.
+        with device_module.device(device):
+            if stream is None:
+                stream = device_module.current_stream(device)
+            event = device_module.Event()
+            event.record(stream)
+        if barrier_debug_enabled():
+            # If query() is already true right here, this event was recorded
+            # against a stream that had nothing in flight -- it fences nothing.
+            cache_digest_logger.info(
+                "AS record_device_event: stream=%s already_done=%s",
+                stream.cuda_stream if hasattr(stream, "cuda_stream") else stream,
+                event.query(),
+            )
         return event
 
     def prepare_page_ids(self, cache, slot_ids: torch.Tensor) -> _PreparedPageIds:

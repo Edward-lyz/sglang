@@ -584,8 +584,18 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 self.enqueue_dummy(cache, req.rid)
                 return
             checkpoint_slot = self.prepare_checkpoint_slot(mamba_data.value)
-            page_ids = self.prepare_page_ids(cache, snapshot[:cache_len])
-            producer_ready = self.record_device_event(cache.device)
+            # WAR fix: gather from the tree's canonical, ref-protected slots
+            # (match.device_indices), NOT the pre-commit request snapshot.
+            # super().cache_finished_req (run between capture and this enqueue)
+            # frees the duplicate prefix slots kv_indices[cache_protected_len:
+            # prefix_len] that live in `snapshot`; a later forward reuses and
+            # overwrites them before the async writer's gather runs, so gathering
+            # from `snapshot` reads corrupted (reused) KV. inc_lock_ref(node)
+            # below protects device_indices, so page_ids must come from there.
+            page_ids = self.prepare_page_ids(cache, match.device_indices)
+            # Producer fence is recorded in do_write right before the gather; an
+            # enqueue-time event is too early to cover a still-draining write.
+            producer_ready = None
 
             def release_staging() -> None:
                 page_ids.release()
@@ -635,13 +645,19 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
         started = time.perf_counter()
         try:
             page_ids = task.page_ids.materialize()
+            # Record the producer fence here (writer thread, right before the
+            # gather) capturing the producer stream's current tail, so a late
+            # page write not covered by an enqueue-time event is still fenced.
+            producer_ready = self.record_device_event(
+                cache.device, self._producer_stream(cache)
+            )
             written = cache.ascli.write(
                 task.block_hash_ids,
                 page_ids,
                 {"checkpoint": task.checkpoint_slot.materialize()},
                 timeout=1.0,
                 params=task.params,
-                producer_ready=task.producer_ready,
+                producer_ready=producer_ready,
             )
             cache._log_as_result(
                 "write",

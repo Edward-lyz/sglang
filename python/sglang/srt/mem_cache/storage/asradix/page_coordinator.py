@@ -44,6 +44,7 @@ class _PageWriteTask:
     block_hash_ids: Sequence[int]
     data_id_list: Any
     write_params: Any
+    producer_ready: Any = None
     release_after_write: Callable[[], None] = _noop_release
     release: Callable[[], None] = _noop_release
     owner: Optional[AttentionStoreWriteOwner] = None
@@ -419,11 +420,18 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             if endpoint is None:
                 return 0
             data_ids = task.data_id_list.materialize()
+            # Record the producer fence here (writer thread, right before the
+            # gather) so it captures the producer stream's current tail; a late
+            # page write not covered by an enqueue-time event is still fenced.
+            producer_ready = self.record_device_event(
+                cache.device, self._producer_stream(cache)
+            )
             written = endpoint.store.write(
                 task.block_hash_ids,
                 data_ids,
                 timeout=1.0,
                 params=task.write_params,
+                producer_ready=producer_ready,
             )
             cache._log_as_result(
                 "write",
@@ -497,6 +505,10 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
                 block_hash_ids=hashes,
                 data_id_list=data_ids,
                 write_params=getattr(req, "as_kv_cache_params", None) or {},
+                # Producer fence is recorded in do_write, on the writer thread
+                # right before the gather -- an enqueue-time event misses page
+                # writes that are still draining, so recording here is too early.
+                producer_ready=None,
                 release_after_write=data_ids.release,
             )
             task.release = _acquire_node_release(cache, node)
