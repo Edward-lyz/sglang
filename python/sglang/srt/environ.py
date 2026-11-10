@@ -465,6 +465,10 @@ class Envs:
     # kernels + 4 collectives. Up to 4 rows per SM per call; larger calls use
     # the multi-kernel path.
     SGLANG_K31_INDEXER_DCP_FUSED_TOPK = EnvBool(False)
+    # K3.1 DSA target-verify metadata: N programs per expanded row walk only the
+    # live column blocks instead of one program per block of the full context
+    # width (0 = original grid). Decode-only path (target verify).
+    SGLANG_K31_DSA_VERIFY_META_ROW_PROGS = EnvInt(0)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)

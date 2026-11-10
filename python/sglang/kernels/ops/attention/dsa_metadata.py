@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 
 @triton.jit(
     do_not_specialize=[
@@ -240,6 +242,7 @@ def _fused_dsa_target_verify_metadata_kernel(
     BLOCK_BS: tl.constexpr,
     BLOCK_EXPANDED: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    ROW_PROGS: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
     expanded_size: tl.constexpr = bs * next_n
@@ -282,6 +285,49 @@ def _fused_dsa_target_verify_metadata_kernel(
                 base_seq + next_n,
                 mask=mask_e,
             )
+        return
+
+    if ROW_PROGS > 0:
+        # Strided variant (SGLANG_K31_DSA_VERIFY_META_ROW_PROGS): ROW_PROGS
+        # programs per expanded row walk only the row's live column blocks.
+        # The default grid has one program per (row, column block) of the full
+        # page-table width (context_len), i.e. ~1.5M mostly-idle programs per
+        # verify step at a 1M context.
+        page_pid = pid - 1
+        out_row = page_pid // ROW_PROGS
+        lane = page_pid - out_row * ROW_PROGS
+        req_row = out_row // next_n
+        req_idx = tl.load(req_pool_indices + req_row * req_pool_indices_stride)
+        kv_len = tl.load(seq_lens + req_row * seq_lens_stride).to(tl.int32) + next_n
+        kv_len = tl.minimum(kv_len, max_seqlen_k)
+        for col_block in range(lane, tl.cdiv(kv_len, BLOCK_N), ROW_PROGS):
+            offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+            mask = offs_n < max_seqlen_k
+            vals = tl.load(
+                req_to_token
+                + req_idx * req_to_token_stride_0
+                + offs_n * req_to_token_stride_1,
+                mask=mask,
+                other=0,
+            ).to(tl.int32)
+            if HAS_PAGE_TABLE_1:
+                tl.store(
+                    page_table_1
+                    + out_row * page_table_stride_0
+                    + offs_n * page_table_stride_1,
+                    vals,
+                    mask=mask,
+                )
+            if HAS_REAL_PAGE_TABLE:
+                real_mask = mask & ((offs_n % real_page_size) == 0)
+                real_cols = offs_n // real_page_size
+                tl.store(
+                    real_page_table
+                    + out_row * real_page_table_stride_0
+                    + real_cols * real_page_table_stride_1,
+                    vals // real_page_size,
+                    mask=real_mask,
+                )
         return
 
     num_col_blocks = tl.cdiv(max_seqlen_k, BLOCK_N)
@@ -400,9 +446,14 @@ def fused_dsa_target_verify_metadata(
     expanded_size = bs * next_n
     block_bs = triton.next_power_of_2(bs)
     block_expanded = triton.next_power_of_2(expanded_size)
-    block_n = 128
-    num_col_blocks = triton.cdiv(max_seqlen_k, block_n)
-    grid = (1 + expanded_size * num_col_blocks,)
+    row_progs = envs.SGLANG_K31_DSA_VERIFY_META_ROW_PROGS.get()
+    if row_progs > 0:
+        block_n = 1024
+        grid = (1 + expanded_size * row_progs,)
+    else:
+        block_n = 128
+        num_col_blocks = triton.cdiv(max_seqlen_k, block_n)
+        grid = (1 + expanded_size * num_col_blocks,)
 
     _fused_dsa_target_verify_metadata_kernel[grid](
         seq_lens,
@@ -437,6 +488,7 @@ def fused_dsa_target_verify_metadata(
         BLOCK_BS=block_bs,
         BLOCK_EXPANDED=block_expanded,
         BLOCK_N=block_n,
+        ROW_PROGS=row_progs,
     )
 
 
