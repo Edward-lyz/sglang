@@ -301,6 +301,52 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
+# Large free-form SamplingParams fields (tool schemas etc.) are logged by length
+# only: structural_tag alone reaches hundreds of KB per request in production,
+# and formatting it on every request costs milliseconds on the scheduler thread.
+_SAMPLING_PARAMS_LOG_FIELDS = (
+    "max_new_tokens",
+    "min_new_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "n",
+    "ignore_eos",
+    "stream_interval",
+    "sampling_seed",
+    "thinking_budget",
+)
+_SAMPLING_PARAMS_LOG_SIZED_FIELDS = (
+    "json_schema",
+    "regex",
+    "ebnf",
+    "structural_tag",
+    "stop_strs",
+    "stop_token_ids",
+    "stop_regex_strs",
+    "logit_bias",
+    "custom_params",
+    "thinking_prompt_token_ids",
+)
+
+
+def _sampling_params_log_summary(sampling_params) -> str:
+    """Compact SamplingParams description for the per-request INFO log."""
+    parts = [
+        f"{name}={getattr(sampling_params, name, None)}"
+        for name in _SAMPLING_PARAMS_LOG_FIELDS
+    ]
+    for name in _SAMPLING_PARAMS_LOG_SIZED_FIELDS:
+        value = getattr(sampling_params, name, None)
+        if value:
+            parts.append(f"len({name})={len(value)}")
+    return "SamplingParams(" + ", ".join(parts) + ")"
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -2689,8 +2735,14 @@ class Scheduler(
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
-            logger.info(f"A new req {req.rid} has been insert into queue. "
-                        f"Prompt len: {len(req.origin_input_ids)}. Sampling params: {req.sampling_params}.")
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "A new req %s has been insert into queue. Prompt len: %d. "
+                    "Sampling params: %s.",
+                    req.rid,
+                    len(req.origin_input_ids),
+                    _sampling_params_log_summary(req.sampling_params),
+                )
 
     def handle_batch_generate_request(
         self,

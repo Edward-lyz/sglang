@@ -69,8 +69,12 @@ class FakeKVSender(BaseKVSender):
         kv_indices: list[int],
         aux_index: Optional[int] = None,
     ):
+        # Lazy %-formatting: kv_indices holds one entry per page (or token), so
+        # an f-string would format the whole array even with DEBUG off.
         logger.debug(
-            f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}"
+            "FakeKVSender init with kv_indices: %s, aux_index: %s",
+            kv_indices,
+            aux_index,
         )
         pass
 
@@ -82,7 +86,9 @@ class FakeKVSender(BaseKVSender):
     ):
         self.has_sent = True
         logger.debug(
-            f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
+            "FakeKVSender send with kv_indices: %s, state_indices: %s",
+            kv_indices,
+            state_indices,
         )
 
     def failure_exception(self):
@@ -129,8 +135,14 @@ class FakeKVReceiver(BaseKVReceiver):
         decode_prefix_len: Optional[int] = None,
     ):
         self.has_sent_metadata = True
+        # Called on the decode scheduler thread for every admitted request. At
+        # ctx60k the page indices (960 entries, below numpy's 1000-element
+        # summarization threshold) cost ~2 ms to format even with DEBUG off.
         logger.debug(
-            f"FakeKVReceiver send_metadata with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}"
+            "FakeKVReceiver send_metadata with kv_indices: %s, aux_index: %s, state_indices: %s",
+            kv_indices,
+            aux_index,
+            state_indices,
         )
 
     def failure_exception(self):
