@@ -15,6 +15,7 @@ Supported attention types:
 
 import atexit
 import concurrent.futures
+import hashlib
 import logging
 import os
 import time
@@ -174,6 +175,16 @@ class AsRadixCache(RadixCache):
         else:
             self.tp_world_size = 1
 
+        leader = os.environ.get("AS_MOVER_WRITE_TP_LEADER")
+        self._as_write_tp_leader = None if leader is None else int(leader)
+        if self._as_write_tp_leader is not None and not (
+            0 <= self._as_write_tp_leader < self.tp_world_size
+        ):
+            raise ValueError("AS_MOVER_WRITE_TP_LEADER must name a cache TP rank")
+        self._as_write_replica_checked = False
+        self._as_write_replica_agreed = False
+        self._as_write_replica_rank = None
+
         # Async write
         self._as_write_queue: List[Tuple[concurrent.futures.Future, _AsWriteTask]] = []
         self._write_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
@@ -243,6 +254,23 @@ class AsRadixCache(RadixCache):
     def ref_ascli(self, ascli):
         """Inject AttentionStore SDK client reference."""
         self.ascli = ascli
+        if self._as_write_tp_leader is not None:
+            rank = torch.distributed.get_rank(group=self.tp_group)
+            if not (
+                type(ascli).__name__ == "MoverAttentionStoreSDK"
+                and self.attention_type == "DSA"
+                and self.tp_world_size == 8
+                and ascli.gpu_count == 8
+                and ascli.dp_id == 0
+                and ascli.shard_id == 0
+                and ascli.shard_num == 1
+                and ascli.device_id == rank
+            ):
+                raise ValueError(
+                    "AS_MOVER_WRITE_TP_LEADER requires TP8, DP1, replicated DSA "
+                    "with one AS shard and matching local GPU ranks"
+                )
+            self._as_write_replica_rank = rank
         logger.info("AttentionStore SDK client injected into AsRadixCache")
 
     def init_buffer_ptrs(
@@ -2129,6 +2157,72 @@ class AsRadixCache(RadixCache):
             logger.warning(f"AS write failed: {e}")
             return 0
 
+    def _check_as_write_replicas(self, snapshot, aligned_tokens, block_hashes):
+        """Validate real replicas once, in the scheduler's ordered TP context.
+
+        Every rank retains its normal node lock and FIFO entry. A mismatched
+        payload or a local sampling error disables this optimization everywhere.
+        """
+        if self._as_write_tp_leader is None or self._as_write_replica_checked:
+            return
+        try:
+            page_rows = snapshot[:aligned_tokens:self.page_size] // self.page_size
+            count = page_rows.numel()
+            positions = sorted({0, count // 2, count - 1})
+            select = torch.tensor(positions, dtype=torch.int64, device=page_rows.device)
+            sampled = page_rows.index_select(0, select).to(dtype=torch.int64)
+            digest = hashlib.sha256()
+            for layer_id in self.layer_ids:
+                key, value, value_paged = self._get_layer_kv_tensors(layer_id)
+                for plane, buffer, page_indexed in (
+                    (0, key, False), (1, value, value_paged)
+                ):
+                    if buffer is None:
+                        continue
+                    row_bytes = buffer[0].numel() * buffer.element_size()
+                    page_bytes = row_bytes if page_indexed else row_bytes * self.page_size
+                    pages = buffer.view(torch.uint8).reshape(-1, page_bytes)
+                    payload = pages.index_select(0, sampled).cpu().numpy().tobytes()
+                    digest.update(f"{layer_id}:{plane}:{page_bytes}:".encode())
+                    digest.update(payload)
+            local = {
+                "status": "ok",
+                "payload": digest.hexdigest(),
+                "request": hashlib.sha256(
+                    repr(tuple(map(int, block_hashes.hash_ids))).encode()
+                ).hexdigest(),
+                "sample_pages": len(positions),
+                "layers": len(self.layer_ids),
+            }
+        except Exception as error:
+            local = {"status": "error", "error": str(error)[:256]}
+        records = [None] * self.tp_world_size
+        torch.distributed.all_gather_object(records, local, group=self.tp_group)
+        agreed = all(record["status"] == "ok" for record in records)
+        if agreed:
+            signatures = {
+                (record["payload"], record["request"], record["sample_pages"], record["layers"])
+                for record in records
+            }
+            agreed = len(signatures) == 1
+        self._as_write_replica_checked = True
+        self._as_write_replica_agreed = agreed
+        logger.info(
+            "AS replica writer check: leader=%d agreed=%d records=%s",
+            self._as_write_tp_leader, agreed, records,
+        )
+
+    def _submit_as_write_task(self, task):
+        """Keep normal per-rank lock ownership and TP FIFO completion semantics."""
+        if (
+            self._as_write_replica_agreed
+            and self._as_write_replica_rank != self._as_write_tp_leader
+        ):
+            future = concurrent.futures.Future()
+            future.set_result(0)
+            return future
+        return self._write_executor.submit(self._do_as_write, task)
+
     def _write_kv_on_finish(self, req, snapshot: Optional[torch.Tensor] = None):
         """Submit KV write task to async executor after request completion.
 
@@ -2169,6 +2263,8 @@ class AsRadixCache(RadixCache):
                     self._enqueue_dummy_write()
                 return
             aligned_tokens = num_pages * self.page_size
+
+            self._check_as_write_replicas(snapshot, aligned_tokens, req.as_block_hashs)
 
             # Get KV indices for this request (token-level pool slot indices)
             kv_indices = snapshot[:aligned_tokens]
@@ -2215,7 +2311,7 @@ class AsRadixCache(RadixCache):
             self.inc_lock_ref(last_node)
 
             # Submit to executor and track
-            future = self._write_executor.submit(self._do_as_write, task)
+            future = self._submit_as_write_task(task)
             self._as_write_queue.append((future, task))
 
             logger.debug(

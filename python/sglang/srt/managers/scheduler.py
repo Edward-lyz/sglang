@@ -3474,6 +3474,8 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
+        # 中文说明：统计本轮准入过程中，因“已完成的 AS 写”被提前回收而多出来的可驱逐 token 数，仅用于日志
+        as_admission_reclaimed_tokens = 0
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
@@ -3510,6 +3512,22 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            if self.enable_asradix_cache and res == AddReqResult.CONTINUE:
+                # AS restores can take long enough for previous-batch
+                # writes to finish. Reclaim their locks before the next
+                # request reads the dynamic available/evictable budget.
+                # The existing TP MIN/FIFO protocol only releases tasks
+                # completed on every rank; accepted requests stay locked.
+                # 中文说明：AS 恢复耗时较长，期间上一批的 AS 写可能已经完成。
+                # 每成功准入一个请求，就回收一次已完成的写并释放其锁，让后续请求
+                # 看到的可用/可驱逐预算更准确。只会释放所有 rank 都写完的任务，
+                # 已准入请求的锁不受影响。
+                evictable_before = self.tree_cache.evictable_size()
+                self.tree_cache.check_ascache_events()
+                as_admission_reclaimed_tokens += max(
+                    0, self.tree_cache.evictable_size() - evictable_before
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -3549,6 +3567,12 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None, running_batch
+
+        if as_admission_reclaimed_tokens:
+            logger.info(
+                "AS admission reclaimed: requests=%d, tokens=%d",
+                len(can_run_list), as_admission_reclaimed_tokens,
+            )
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
@@ -4391,6 +4415,21 @@ class Scheduler(
             )
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+
+    def evict_evictable_cache(self) -> bool:
+        """Evict unprotected GPU pages while retaining the Host AS cache."""
+        # 中文：只回收所有TP rank都已完成的异步写，未完成写的页锁仍然有效。
+        # 新版flush控制由SchedulerFlushWrapper负责；该回调不恢复旧的控制循环。
+        for attempt in range(5):
+            if self.enable_asradix_cache:
+                self.tree_cache.check_ascache_events()
+            evict_size = self.tree_cache.evictable_size()
+            if evict_size > 0:
+                self.tree_cache.evict(EvictParams(num_tokens=evict_size))
+            if attempt < 4:
+                time.sleep(0.1)
+        logger.info("Device cache cleared.")
+        return True
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
