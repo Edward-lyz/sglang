@@ -308,6 +308,22 @@ class KDAKernelDispatcher:
         )
 
 
+def _dense_verify_cu_seqlens(
+    seq_len: int, draft_token_num: int, device: torch.device
+) -> torch.Tensor:
+    # Non-compact target-verify is a dense [bs, draft_token_num] grid: every
+    # request contributes exactly draft_token_num tokens. Under static mode the
+    # token buffer is bucket-padded (seq_len rounds bs up to a graph tier) while
+    # forward_metadata.query_start_loc still describes only the real requests,
+    # so it must not be used here — the fused CuTe kernel needs cu_seqlens
+    # covering the full padded buffer (T % N == 0). Padding rows land in ghost
+    # cache slots and are discarded downstream, matching the non-fused
+    # fallback's `batch_size = seq_len // draft_token_num`.
+    return torch.arange(
+        0, seq_len + draft_token_num, draft_token_num, device=device, dtype=torch.int32
+    )
+
+
 def kda_extend_initial_state_and_track(
     *,
     prefix_lens: torch.Tensor,
@@ -904,6 +920,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return self._run_dspark_cutedsl_mtp(
                 layer=layer,
                 mixed_qkv=mixed_qkv,
+                cu_seqlens=(
+                    self._verify_cu_seqlens(
+                        forward_batch,
+                        mixed_qkv.shape[0],
+                        draft_token_num,
+                        mixed_qkv.device,
+                    )
+                    if envs.SGLANG_K3_VERIFY_METADATA_HOIST.get()
+                    else None
+                ),
                 a=a,
                 b=b,
                 conv_states=conv_states,
@@ -1019,6 +1045,36 @@ class KDAAttnBackend(MambaAttnBackendBase):
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
         return core_attn_out
 
+    def _verify_cu_seqlens(
+        self,
+        forward_batch: ForwardBatch,
+        seq_len: int,
+        draft_token_num: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Dense verify cu_seqlens, built once per forward and shared by every
+        KDA layer (it only depends on the padded token count). The slot pins
+        the forward_batch it was built for, so a CUDA graph records the arange
+        once and each replay refreshes it before the first KDA layer reads it.
+        Capture never reuses a tensor built eagerly (the warmup passes run on
+        the same forward_batch), since the graph would then read memory it
+        does not own."""
+        key = (
+            id(forward_batch),
+            seq_len,
+            draft_token_num,
+            torch.cuda.is_current_stream_capturing(),
+        )
+        cached = getattr(self, "_verify_cu_seqlens_slot", None)
+        if cached is None or cached[0] is not forward_batch or cached[1] != key:
+            cached = (
+                forward_batch,
+                key,
+                _dense_verify_cu_seqlens(seq_len, draft_token_num, device),
+            )
+            self._verify_cu_seqlens_slot = cached
+        return cached[2]
+
     def _can_run_dspark_cutedsl_mtp(
         self,
         *,
@@ -1123,6 +1179,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
@@ -1130,21 +1187,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len = mixed_qkv.shape[0]
         h = layer.num_v_heads
-        # Non-compact target-verify is a dense [bs, draft_token_num] grid: every
-        # request contributes exactly draft_token_num tokens. Under static mode
-        # the token buffer is bucket-padded (seq_len rounds bs up to a graph
-        # tier) while forward_metadata.query_start_loc still describes only the
-        # real requests, so it must not be used here — the fused CuTe kernel
-        # needs cu_seqlens covering the full padded buffer (T % N == 0). Padding
-        # rows land in ghost cache slots and are discarded downstream, matching
-        # the non-fused fallback's `batch_size = seq_len // draft_token_num`.
-        cu_seqlens = torch.arange(
-            0,
-            seq_len + draft_token_num,
-            draft_token_num,
-            device=mixed_qkv.device,
-            dtype=torch.int32,
-        )
+        if cu_seqlens is None:
+            cu_seqlens = _dense_verify_cu_seqlens(
+                seq_len, draft_token_num, mixed_qkv.device
+            )
         x_q, x_k, x_v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         x_q = x_q.reshape(1, seq_len, h, layer.head_q_dim)
         x_k = x_k.reshape(1, seq_len, h, layer.head_k_dim)

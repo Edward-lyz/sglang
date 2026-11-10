@@ -416,6 +416,10 @@ class Envs:
     SGLANG_K3_DSPARK_MHA_CELL_SIZE = EnvInt(None)
     SGLANG_K3_ONLY_LANGUAGE = EnvBool(False)
     SGLANG_K3_DEL_MLA_KVB_DCP = EnvBool(False)
+    # K3 decode switches cherry-picked from base (each default off).
+    # DSPARK target-verify: build the dense KDA cu_seqlens / MLA q_indptr
+    # arange once per forward and share it across layers. Same values.
+    SGLANG_K3_VERIFY_METADATA_HOIST = EnvBool(False)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)

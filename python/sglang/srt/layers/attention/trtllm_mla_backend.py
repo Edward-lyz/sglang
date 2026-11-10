@@ -757,11 +757,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.global_seq_lens_k = (
                     self.forward_decode_metadata.seq_lens_k
                 )
-            elif forward_batch.forward_mode.is_decode_or_idle():
-                # One int32 conversion per step; forward_decode reads it back
-                # so the per-layer .to(int32) in _run_decode_kernel stays a
-                # no-op (24 elementwise copies/step otherwise).
-                self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -1238,6 +1233,40 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return output
 
+    def _dense_verify_q_indptr(
+        self,
+        forward_batch: ForwardBatch,
+        bs: int,
+        draft_token_num: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Dense [bs, draft_token_num] verify q_indptr, built once per forward
+        and shared by every MLA layer. The slot pins the forward_batch it was
+        built for, so a CUDA graph records the arange once; the capture flag in
+        the key keeps capture from reusing a tensor built by an eager warmup
+        pass on the same forward_batch."""
+        key = (
+            id(forward_batch),
+            bs,
+            draft_token_num,
+            torch.cuda.is_current_stream_capturing(),
+        )
+        cached = getattr(self, "_dense_verify_q_indptr_slot", None)
+        if cached is None or cached[0] is not forward_batch or cached[1] != key:
+            cached = (
+                forward_batch,
+                key,
+                torch.arange(
+                    0,
+                    (bs + 1) * draft_token_num,
+                    draft_token_num,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            )
+            self._dense_verify_q_indptr_slot = cached
+        return cached[2]
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1456,13 +1485,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     layer.v_head_dim,
                 )
                 lse = lse.view(bs * draft_token_num, layer.tp_q_head_num)
-                dense_q_indptr = torch.arange(
-                    0,
-                    (bs + 1) * draft_token_num,
-                    draft_token_num,
-                    dtype=torch.int32,
-                    device=q.device,
-                )
+                if envs.SGLANG_K3_VERIFY_METADATA_HOIST.get():
+                    dense_q_indptr = self._dense_verify_q_indptr(
+                        forward_batch, bs, draft_token_num, q.device
+                    )
+                else:
+                    dense_q_indptr = torch.arange(
+                        0,
+                        (bs + 1) * draft_token_num,
+                        draft_token_num,
+                        dtype=torch.int32,
+                        device=q.device,
+                    )
                 fixup_zero_kv_rows(
                     output,
                     lse,
