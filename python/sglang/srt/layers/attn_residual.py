@@ -115,7 +115,11 @@ def _score_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """One CTA per (token, row): scan H, output one scalar score."""
-    pid_t = tl.program_id(0)
+    # int64: bank is [T, NB, H], so the row offset pid_t * stride_bm reaches
+    # 2**31 elements at T = 2**31 / (NB * H) (37448 tokens for K3's NB=8,
+    # H=7168). program_id is int32, so a plain multiply wraps negative and the
+    # loads below read out of bounds.
+    pid_t = tl.program_id(0).to(tl.int64)
     j = tl.program_id(1)
     if j > NVB:
         return
@@ -159,7 +163,7 @@ def _combine_kernel(
     Softmax is redundantly computed by each H-chunk CTA (≤16 elements, trivial).
     This gives full H-parallelism: 7 CTAs for H=7168/1024.
     """
-    pid_t = tl.program_id(0)
+    pid_t = tl.program_id(0).to(tl.int64)  # int64: see _score_kernel
     pid_h = tl.program_id(1)
     h0 = pid_h * BLOCK_H
 
@@ -203,6 +207,12 @@ def _mix_fused(
 ) -> torch.Tensor:
     """Triton score + combine pair: returns the pre-norm mixture."""
     T, H = prefix_sum.shape
+    # Both kernels address the bank by program_id(0), which is unmasked, so a
+    # shorter bank would be read out of bounds instead of failing here.
+    assert bank.shape[0] == T, (
+        f"attn-res bank rows {bank.shape[0]} != prefix rows {T}; "
+        "the caller must align the bank to its token shard"
+    )
     cw = get_cw(score_proj, score_norm)
     n_h_blocks = H // _BLOCK_H
 

@@ -86,6 +86,33 @@ class TestAggregateStream(CustomTestCase):
         ref = aggregate_stream_torch(prefix, bank, 5, self.proj, self.norm)
         torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=4e-2)
 
+    def test_row_offset_beyond_int32(self):
+        """T past 2**31 / (NB * H) rows: the bank row offset must not wrap.
+
+        With NB=8 and H=7168 the offset crosses int32 at 37448 tokens, which a
+        48K chunked prefill reaches. Only the tail rows are checked against the
+        reference: rows are independent, and materializing [T, nvb+1, H] for all
+        of them would not fit.
+        """
+        num_bank_slots, T = 8, 40960
+        needed = (T * num_bank_slots * _H + 2 * T * _H) * 2
+        free, _ = torch.cuda.mem_get_info()
+        if free < needed + (1 << 30):
+            raise unittest.SkipTest(
+                f"needs ~{needed / (1 << 30):.1f} GiB of free GPU memory"
+            )
+        self.assertGreater(T * num_bank_slots * _H, 2**31, "T is below the wrap point")
+
+        nvb = 5
+        prefix, bank = _make_inputs(T, seed=9, num_bank_slots=num_bank_slots)
+        out = _mix_fused(prefix, bank, nvb, self.proj, self.norm)
+        ref = aggregate_stream_torch(
+            prefix[-64:], bank[-64:], nvb, self.proj, self.norm
+        )
+        torch.testing.assert_close(
+            out[-64:].float(), ref.float(), rtol=2e-2, atol=4e-2
+        )
+
     def test_nvb0_passthrough(self):
         prefix, bank = _make_inputs(3, seed=2)
         out = aggregate_stream(prefix, bank, 0, self.proj, self.norm)
