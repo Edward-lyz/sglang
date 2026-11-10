@@ -802,20 +802,22 @@ class MooncakeKVManager(CommonKVManager):
         num_kv_tokens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: List[int],
-        mla_entry_count: Optional[int] = None,
+        src_mla_entry_count: int,
+        dst_mla_entry_count: int,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         # Restrict to the leading MLA (main) entries; the head-sharded draft
         # tail is transferred separately via send_kvcache_dcp_draft, since it is
         # DCP-replicated (whole token set at every rank) and head-sliced.
-        src_kv_ptrs_all = self.kv_args.kv_data_ptrs
-        src_layer_ids = self.kv_args.kv_layer_ids
-        if mla_entry_count is not None:
-            src_kv_ptrs_all = src_kv_ptrs_all[:mla_entry_count]
-            dst_kv_ptrs = dst_kv_ptrs[:mla_entry_count]
-            dcp_token_item_lens = dcp_token_item_lens[:mla_entry_count]
-            src_layer_ids = src_layer_ids[:mla_entry_count] if src_layer_ids else []
+        # The boundary differs per side: a PP prefill stage registers only the
+        # MLA entries of its own layers while the decode peer registers all of
+        # them, so the two prefixes are paired by model layer id below.
+        src_kv_ptrs_all = self.kv_args.kv_data_ptrs[:src_mla_entry_count]
+        src_layer_ids = self.kv_args.kv_layer_ids[:src_mla_entry_count]
+        dcp_token_item_lens = dcp_token_item_lens[:src_mla_entry_count]
+        dst_kv_ptrs = dst_kv_ptrs[:dst_mla_entry_count]
+        dst_layer_ids = dst_layer_ids[:dst_mla_entry_count]
         physical_page_size = self.kv_args.page_size
         plan = build_dcp_token_transfer_plan(
             prefill_kv_indices,
@@ -904,7 +906,8 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         *,
-        mla_entry_count: int,
+        src_mla_entry_count: int,
+        dst_mla_entry_count: int,
         dst_attn_tp_size: int,
         dst_tp_rank: int,
         draft_total_kv_heads: int,
@@ -921,12 +924,15 @@ class MooncakeKVManager(CommonKVManager):
         send the WHOLE token set (no dcp stride) and, because the draft KV is
         head-sharded, slice heads M-to-N exactly like ``send_kvcache_slice``.
 
-        ``mla_entry_count`` is the count of leading MLA entries; the draft
-        entries are ``kv_data_ptrs[mla_entry_count:]`` (layout
+        The MLA/draft boundary is per-side: a PP prefill stage registers only
+        the MLA entries of its own layers while the decode peer registers the
+        whole model's. So the draft entries are
+        ``kv_data_ptrs[src_mla_entry_count:]`` on this side and
+        ``dst_kv_ptrs[dst_mla_entry_count:]`` on the peer (layout
         ``[draft_K..., draft_V...]``, matching the main pool's K-then-V split).
         """
-        draft_src_kv_ptrs = self.kv_args.kv_data_ptrs[mla_entry_count:]
-        draft_dst_kv_ptrs = dst_kv_ptrs[mla_entry_count:]
+        draft_src_kv_ptrs = self.kv_args.kv_data_ptrs[src_mla_entry_count:]
+        draft_dst_kv_ptrs = dst_kv_ptrs[dst_mla_entry_count:]
         if not draft_src_kv_ptrs:
             return 0
 
@@ -948,7 +954,7 @@ class MooncakeKVManager(CommonKVManager):
         # granular), so reduce to a per-token stride before computing addresses;
         # otherwise every token index is inflated by page_size and the RDMA
         # addresses land outside the registered memory region.
-        src_page_item_len = self.kv_args.kv_item_lens[mla_entry_count]
+        src_page_item_len = self.kv_args.kv_item_lens[src_mla_entry_count]
         src_token_item_len = src_page_item_len // physical_page_size
         # Head geometry: draft KV is head-sharded by attn_tp_size on each side.
         dst_heads_per_rank = max(1, draft_total_kv_heads // dst_attn_tp_size)
@@ -1742,10 +1748,16 @@ class MooncakeKVManager(CommonKVManager):
                             # Split entries at the MLA/draft boundary: the MLA
                             # prefix takes DCP token relayout; the head-sharded
                             # draft tail (DCP-replicated) takes a head-slice
-                            # whole-token transfer.
-                            mla_entry_count = (
-                                target_rank_registration_info.dst_num_mla_kv_entries
+                            # whole-token transfer. The boundary is per-side: a
+                            # PP prefill stage only owns its own layers' MLA
+                            # entries while the decode peer owns all of them.
+                            src_mla_entry_count = (
+                                self.kv_args.num_mla_kv_entries
                                 or len(self.kv_args.kv_item_lens)
+                            )
+                            dst_mla_entry_count = (
+                                target_rank_registration_info.dst_num_mla_kv_entries
+                                or len(target_rank_registration_info.dst_kv_ptrs)
                             )
                             ret = self.send_kvcache_dcp(
                                 req.mooncake_session_id,
@@ -1762,9 +1774,10 @@ class MooncakeKVManager(CommonKVManager):
                                 dst_layer_ids=(
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
-                                mla_entry_count=mla_entry_count,
+                                src_mla_entry_count=src_mla_entry_count,
+                                dst_mla_entry_count=dst_mla_entry_count,
                             )
-                            if ret == 0 and mla_entry_count < len(
+                            if ret == 0 and src_mla_entry_count < len(
                                 self.kv_args.kv_item_lens
                             ):
                                 draft_total_kv_heads = (
@@ -1775,7 +1788,8 @@ class MooncakeKVManager(CommonKVManager):
                                     kv_chunk.prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
                                     chunked_dst_kv_indice,
-                                    mla_entry_count=mla_entry_count,
+                                    src_mla_entry_count=src_mla_entry_count,
+                                    dst_mla_entry_count=dst_mla_entry_count,
                                     dst_attn_tp_size=(
                                         target_rank_registration_info.dst_attn_tp_size
                                     ),
@@ -2037,19 +2051,33 @@ class MooncakeKVManager(CommonKVManager):
                         else:
                             dst_page_item_lens = [
                                 decode_kv_args.dst_kv_item_len
-                            ] * len(self.kv_args.kv_item_lens)
+                            ] * len(decode_kv_args.dst_kv_ptrs)
                         # Boundary before the head-sharded draft tail: validate
                         # only the MLA prefix for exact geometry match.
-                        num_mla_kv_entries = self._resolve_num_mla_kv_entries(
-                            decode_kv_args.dst_num_mla_kv_entries
+                        src_num_mla_kv_entries, dst_num_mla_kv_entries = (
+                            self._resolve_mla_entry_boundaries(
+                                decode_kv_args.dst_num_mla_kv_entries
+                            )
                         )
                         # Persist the reconciled boundary for the transfer
                         # dispatch to split MLA vs draft entries.
-                        decode_kv_args.dst_num_mla_kv_entries = num_mla_kv_entries
+                        decode_kv_args.dst_num_mla_kv_entries = dst_num_mla_kv_entries
+                        # A PP prefill stage registers only its own layers, so
+                        # pair the decode entries by model layer id before
+                        # comparing geometry.
+                        paired_dst_page_item_lens = [
+                            dst_page_item_lens[j]
+                            for j in resolve_dcp_dst_entry_indices(
+                                self.kv_args.kv_layer_ids,
+                                decode_kv_args.dst_kv_layer_ids,
+                                len(self.kv_args.kv_item_lens),
+                                len(dst_page_item_lens),
+                            )
+                        ]
                         decode_kv_args.dcp_token_item_lens = (
                             self.prepare_dcp_token_item_lens(
-                                dst_page_item_lens,
-                                num_mla_kv_entries=num_mla_kv_entries,
+                                paired_dst_page_item_lens,
+                                num_mla_kv_entries=src_num_mla_kv_entries,
                             )
                         )
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args

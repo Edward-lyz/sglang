@@ -53,6 +53,8 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_transfer_draft_kv_layer_ids,
+    get_transfer_kv_layer_ids,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -428,6 +430,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
         )
+        kv_layer_ids = get_transfer_kv_layer_ids(
+            self.token_to_kv_pool, len(kv_data_ptrs)
+        )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
             if self.scheduler.enable_hisparse
@@ -443,6 +448,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
+            kv_layer_ids = []
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         # Boundary before the draft pool's entries are appended below.
         kv_args.num_mla_kv_entries = len(kv_data_ptrs)
@@ -452,6 +458,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            kv_layer_ids += get_transfer_draft_kv_layer_ids(len(draft_kv_data_ptrs))
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
@@ -463,12 +470,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
-        )
+        kv_args.kv_layer_ids = kv_layer_ids if len(kv_layer_ids) == len(kv_data_ptrs) else []
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size

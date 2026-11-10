@@ -782,6 +782,11 @@ class Envs:
     SGLANG_ENABLE_K3_MOE_WEIGHT_SHARD = EnvBool(False)
     # Layer selection: "all", comma-separated ids, or inclusive ranges.
     SGLANG_K3_MOE_WEIGHT_SHARD_LAYERS = EnvStr("all")
+    # Debug-only: instantiate only the first N Kimi-K3 routed experts per MoE
+    # layer and load the matching expert prefix. 0/unset keeps the full
+    # checkpoint. This preserves all transformer layers, so DSpark layer capture
+    # still observes the configured target layer ids.
+    SGLANG_KIMI_K3_KEEP_NUM_EXPERTS = EnvInt(0)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

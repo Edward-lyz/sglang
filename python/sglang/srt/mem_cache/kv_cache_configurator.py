@@ -1781,6 +1781,9 @@ class KVCacheConfigurator:
         assert config is not None
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        # Prefill nodes never run speculative verify, so they don't need
+        # the intermediate_ssm_state_cache buffer.
+        is_prefill_node = server_args.disaggregation_mode == "prefill"
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
@@ -1800,6 +1803,20 @@ class KVCacheConfigurator:
             if replayssm_active
             else 0
         )
+
+        kda_layers = config.mamba2_cache_params.layers
+        local_kda_layers = [
+            i for i in kda_layers
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+        num_kda_layers = len(kda_layers)
+        num_local_kda_layers = len(local_kda_layers)
+        mamba_cache_per_req = config.mamba2_cache_params.mamba_cache_per_req
+        local_mamba_cache_per_req = (
+            mamba_cache_per_req * num_local_kda_layers // num_kda_layers
+            if num_kda_layers > 0
+            else 0
+        )
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
@@ -1813,15 +1830,16 @@ class KVCacheConfigurator:
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
-            # (no intermediate_ssm allocated).
-            if has_spec_dec and not replayssm_active:
+            # (no intermediate_ssm allocated). Also skipped for prefill nodes
+            # which never run speculative verify.
+            if has_spec_dec and not replayssm_active and not is_prefill_node:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     server_args.max_running_requests // self.ps.attn_dp_size,
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
+                    local_mamba_cache_per_req
                     * (capped_reqs + 1)
                     * server_args.speculative_num_draft_tokens
                 )
@@ -1837,10 +1855,11 @@ class KVCacheConfigurator:
                 // self.ps.attn_dp_size,
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
-            # pool's padding slot). Skipped under replayssm.
-            if has_spec_dec and not replayssm_active:
+            # pool's padding slot). Skipped under replayssm. Also skipped for
+            # prefill nodes which never run speculative verify.
+            if has_spec_dec and not replayssm_active and not is_prefill_node:
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
+                    local_mamba_cache_per_req
                     * (server_args.max_mamba_cache_size + 1)
                     * server_args.speculative_num_draft_tokens
                 )
@@ -1848,7 +1867,7 @@ class KVCacheConfigurator:
         else:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
-            per_req = config.mamba2_cache_params.mamba_cache_per_req
+            per_req = local_mamba_cache_per_req
 
             # Solve jointly for max_mamba_cache_size (K), including the pool's
             # +1 padding slot on both buffers (see memory_pool.py):
@@ -1860,7 +1879,7 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if has_spec_dec and not replayssm_active:
+            if has_spec_dec and not replayssm_active and not is_prefill_node:
                 ratio = self._calculate_mamba_ratio()
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
@@ -1897,7 +1916,8 @@ class KVCacheConfigurator:
                 f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
                 f"Computed max_mamba_cache_size={server_args.max_mamba_cache_size} "
                 f"(total_rest_memory={total_rest_memory:.2f} GB, "
-                f"mamba_cache_per_req={config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f} MB). "
+                f"local_mamba_cache_per_req={local_mamba_cache_per_req / (1 << 20):.2f} MB, "
+                f"local_kda_layers={num_local_kda_layers}/{num_kda_layers}). "
                 f"Try: (1) reduce --max-running-requests, "
                 f"(2) increase --mem-fraction-static, "
                 f"(3) reduce --speculative-num-draft-tokens, or "
@@ -1907,9 +1927,10 @@ class KVCacheConfigurator:
         # +1: the pool's padding slot is allocated alongside the request slots.
         # ReplaySSM ring rides on every slot too (replayssm_ring_per_req is 0 when
         # the ring is not allocated).
+        # Use local_mamba_cache_per_req for actual memory: pool only stores PP-local layers.
         mamba_state_memory = (
             (server_args.max_mamba_cache_size + 1)
-            * (config.mamba2_cache_params.mamba_cache_per_req + replayssm_ring_per_req)
+            * (local_mamba_cache_per_req + replayssm_ring_per_req)
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory

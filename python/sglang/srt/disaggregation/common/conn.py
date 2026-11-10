@@ -287,6 +287,12 @@ class CommonKVManager(BaseKVManager):
         *,
         num_mla_kv_entries: Optional[int] = None,
     ) -> List[int]:
+        """Per-token byte strides for a DCP relayout, indexed in local entry order.
+
+        ``dst_page_item_lens`` must already be paired into this side's entry
+        order (see ``resolve_dcp_dst_entry_indices``), since a PP prefill stage
+        registers only the entries of its own layers.
+        """
         page_size = self.kv_args.page_size
         src_token_lens = [
             item_len // page_size for item_len in self.kv_args.kv_item_lens
@@ -307,27 +313,28 @@ class CommonKVManager(BaseKVManager):
             )
         return src_token_lens
 
-    def _resolve_num_mla_kv_entries(self, dst_num_mla_kv_entries: int) -> int:
-        """Reconcile the MLA/draft entry boundary between this (prefill) side and
-        the decode peer.
+    def _resolve_mla_entry_boundaries(
+        self, dst_num_mla_kv_entries: int
+    ) -> Tuple[int, int]:
+        """Resolve the MLA/draft entry boundary on each side of a PD DCP transfer.
 
-        Both sides append the draft pool's entries after the main MLA entries, so
-        the MLA prefix count must match. Prefer this side's own boundary
-        (``kv_args.num_mla_kv_entries``); fall back to the decode-provided value
-        for older peers, and finally to the full length (no draft split)."""
-        src_boundary = self.kv_args.num_mla_kv_entries
-        if src_boundary and dst_num_mla_kv_entries:
-            if src_boundary != dst_num_mla_kv_entries:
-                raise RuntimeError(
-                    "PD DCP MLA/draft entry boundary mismatch: "
-                    f"prefill={src_boundary}, decode={dst_num_mla_kv_entries}"
-                )
-            return src_boundary
-        if src_boundary:
-            return src_boundary
-        if dst_num_mla_kv_entries:
-            return dst_num_mla_kv_entries
-        return len(self.kv_args.kv_item_lens)
+        Both sides append the draft pool's entries after the main MLA entries,
+        but the counts are per-side: a PP prefill stage registers only the MLA
+        entries of its own layers while the decode peer registers the whole
+        model's. So the two boundaries are resolved independently and the entries
+        are paired by model layer id, not by position."""
+        src_boundary = self.kv_args.num_mla_kv_entries or len(
+            self.kv_args.kv_item_lens
+        )
+        # Older decode peers do not report their boundary. Without PP both sides
+        # register the same entry layout, so the local boundary describes them too.
+        dst_boundary = dst_num_mla_kv_entries or src_boundary
+        if src_boundary > dst_boundary:
+            raise RuntimeError(
+                "PD DCP prefill registered more MLA KV entries than the decode "
+                f"peer: prefill={src_boundary}, decode={dst_boundary}"
+            )
+        return src_boundary, dst_boundary
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
