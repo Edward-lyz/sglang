@@ -350,7 +350,7 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
                 load_info["hashes"],
                 page_ids,
                 state_slots,
-                timeout=1.0,
+                timeout=5.0,
                 remote_addrs=load_info.get("remote_addrs") or None,
             )
         except Exception as exc:
@@ -785,7 +785,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                     load_info["hashes"],
                     page_ids,
                     {"checkpoint": state_id},
-                    timeout=1.0,
+                    timeout=5.0,
                     remote_addrs=load_info.get("remote_addrs") or None,
                 )
             except Exception as exc:

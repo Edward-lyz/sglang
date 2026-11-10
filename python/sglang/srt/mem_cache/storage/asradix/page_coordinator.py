@@ -272,7 +272,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             read_count = cache.ascli.read(
                 block_hash_ids,
                 data_ids,
-                timeout=1.0,
+                timeout=5.0,
                 remote_addrs=(remote_addr,) if remote_addr else (),
                 logical_start=start_block,
             )
