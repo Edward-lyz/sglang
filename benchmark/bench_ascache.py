@@ -1,10 +1,10 @@
 """通过两波请求压测内存 cache 命中场景下的 prefill 吞吐。
 
 每个目标命中率都执行以下流程：先分别清理 GPU cache 和所有节点的内存
-cache；再发送按 page 对齐的短 prompt 填充内存 cache；随后只清 GPU cache；
-最后发送对应的完整 prompt 并统计这一波的性能。填充波与测量波严格复用请求
-编号、prompt 前缀、到达时间表以及 DP rank，确保测到的是内存 cache 命中，
-而不是测量前遗留的 GPU cache 命中。
+cache；再发送按 AttentionStore 落盘块对齐的短 prompt 填充内存 cache；随后
+只清 GPU cache；最后发送对应的完整 prompt 并统计这一波的性能。填充波与
+测量波严格复用请求编号、prompt 前缀、到达时间表以及 DP rank，确保测到的
+是内存 cache 命中，而不是测量前遗留的 GPU cache 命中。
 
 Usage
 -----
@@ -17,6 +17,17 @@ QPS mode（显式指定泊松到达率，建议传多个 QPS 找饱和点）:
     python3 benchmark/bench_ascache.py --host 127.0.0.1 --port 30000 \\
         --total-len 1024 --qps 10 --duration 60 \\
         --target-hit-rates "0.0,0.5,0.9"
+
+Fill alignment
+--------------
+The cache-fill wave is the only writer of the memory cache, and the engine
+only commits a prefix whose length is a multiple of the AttentionStore block
+size (``AS_BLOCK_SIZE``, 256 tokens as of luno-5080; the page-only MHA/MLA/DSA
+plans write their aligned prefix, the hybrid KDA plan drops the whole write).
+The fill length is therefore quantised on that block size, not on the prefix
+cache ``page_size`` (64), or 20000 tokens at a 0.9 target would fill
+17984 = 70*256 + 64 tokens and write nothing at all. The block size is read
+from the server (``--fill-block-size`` overrides it).
 
 For non-zero cache-hit targets, the server must be started with
 --enable-cache-report to get accurate cached_tokens from
@@ -71,6 +82,42 @@ def get_model_from_server(base_url: str) -> str:
     return resp.json()["data"][0]["id"]
 
 
+# AttentionStore (AS) 落盘块粒度：python/sglang/srt/mem_cache/storage/asradix/types.py
+# 里的 AS_BLOCK_SIZE。AS 侧写路径要求被缓存的 prefix 长度是该值的整数倍
+# （见 KDACacheCoordinator.enqueue 的 cache_len % attention_store_block_size 检查），
+# 否则整笔写被丢弃。它与 prefix cache 的 page_size 已经解耦，不能假设相等。
+DEFAULT_AS_BLOCK_SIZE = 256
+
+
+def get_as_block_size(
+    base_url: str, page_size: int, force_as_cache: bool = None
+) -> int:
+    """返回 cache 填充波必须对齐的粒度。
+
+    优先用服务端上报的 attention_store_block_size（老版本服务端没有这个字段，
+    则看它是否开了 enable_asradix_cache 并用编译期常量兜底）；查询不到服务端
+    信息时用调用方的显式覆盖，最后退回 page_size。
+    """
+    info = None
+    try:
+        resp = requests.get(f"{base_url}/get_server_info", timeout=10)
+        resp.raise_for_status()
+        info = resp.json()
+    except Exception:
+        info = None
+
+    as_on = None
+    if isinstance(info, dict):
+        for key in ("attention_store_block_size", "as_block_size"):
+            value = info.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+        as_on = info.get("enable_asradix_cache")
+    if as_on is None:
+        as_on = force_as_cache
+    return DEFAULT_AS_BLOCK_SIZE if as_on else page_size
+
+
 def get_page_size(base_url: str) -> int:
     """从服务端读取 prefix cache 的 page size，查询失败时返回 1。"""
     try:
@@ -108,20 +155,43 @@ def flush_cache(base_url: str):
         raise RuntimeError(f"flush_cache returned HTTP {resp.status_code}: {resp.text}")
 
 
-def clear_memory_cache(base_url: str):
-    """通过统一接口清理该实例所有节点 8080 服务中的内存 cache。"""
-    resp = requests.post(
-        f"{base_url}/clear_all_cache",
-        params={"memory_only": "true"},
-        timeout=5 * 60,
-    )
-    # 接口以 207 表示部分节点失败，而 requests.raise_for_status() 会把所有
-    # 2xx（包括 207）视为成功；这里必须严格要求 200，避免带着残留 cache
-    # 继续压测并得到虚高的命中率。
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"memory cache clear returned HTTP {resp.status_code}: {resp.text}"
+def clear_memory_cache(base_url: str, max_rounds: int = 8, delay_s: float = 2.0):
+    """通过统一接口清理该实例所有节点的内存 cache，直到回读确实为空。
+
+    ``/clear_all_cache`` 内部的 ``/op/evictBlocks?clearCacheWithExpireAt=true``
+    是带 expire 的惰性回收，一次调用常常只回收一部分（实测 1560->780、
+    40->20），此时接口返回 207。带着残留继续压测会把命中率算虚（残留的
+    prompt 前缀会被后续请求命中），所以这里必须重试到回读全 0 才返回。
+    """
+    last_status = None
+    last_body = ""
+    for round_index in range(1, max_rounds + 1):
+        resp = requests.post(
+            f"{base_url}/clear_all_cache",
+            params={"memory_only": "true"},
+            timeout=5 * 60,
         )
+        last_status = resp.status_code
+        last_body = resp.text
+        if resp.status_code == 200:
+            return
+        # 接口以 207 表示部分节点/部分 namespace 未清空（raise_for_status 会把
+        # 207 当成功），必须严格要求 200。
+        if resp.status_code != 207:
+            raise RuntimeError(
+                f"memory cache clear returned HTTP {resp.status_code}: {resp.text}"
+            )
+        if round_index == 1 or round_index % 2 == 0:
+            print(
+                f"  memory cache still not empty (round {round_index}/"
+                f"{max_rounds}), waiting {delay_s:.0f}s ..."
+            )
+        if round_index < max_rounds:
+            time.sleep(delay_s)
+    raise RuntimeError(
+        f"memory cache clear returned HTTP {last_status} after {max_rounds} "
+        f"rounds; the store never became empty: {last_body}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +524,7 @@ async def run_one_hit_rate(
     dp_size: int = 1,
     qps: float = None,
     duration: float = 60.0,
+    fill_block_size: int = None,
 ) -> dict:
     """针对一个目标命中率执行一次完整、彼此隔离的 cache 压测。
 
@@ -462,13 +533,28 @@ async def run_one_hit_rate(
     吞吐结果。
     """
     total_chunks = total_len // page_size
-    hit_chunks = sample_hit_chunks(total_chunks, target_hit_rate, rng)
+    # 填充波的长度必须落在 AS 的落盘块边界上：AS 写路径只在
+    # cache_len % attention_store_block_size == 0 时提交，而填充波唯一的写
+    # 触发点就是它自己的 prompt 长度。按 page_size 对齐会得到 64 的倍数
+    # （例如 20000 token 目标 0.9 -> 17984 = 70*256 + 64），AS 写被整体丢弃，
+    # 命中率随之塌掉。这里改成按 AS block 量化目标命中率。
+    fill_block = (
+        fill_block_size if fill_block_size and fill_block_size > 0 else page_size
+    )
+    fill_blocks = total_len // fill_block
+    hit_chunks = sample_hit_chunks(fill_blocks, target_hit_rate, rng)
     if target_hit_rate >= 1.0:
         warmup_len = total_len
     elif target_hit_rate <= 0.0:
         warmup_len = 0
     else:
-        warmup_len = hit_chunks * page_size
+        warmup_len = hit_chunks * fill_block
+    # Reported hit per request in page units (logging only): the matched prefix
+    # is what the fill wave actually committed (fill_block aligned) and cannot
+    # exceed the store's own match cap on the measured prompt.
+    expected_hit_pages = (
+        min(warmup_len, fill_blocks * fill_block) // page_size
+    )
 
     # 两层 cache 分开清理：内存层必须走 clear_all_cache 的 memory_only
     # 模式，确保接口会遍历该实例的所有节点，而非只清理入口所在节点。
@@ -485,7 +571,8 @@ async def run_one_hit_rate(
 
     print(
         f"  Cache-fill wave: prompt_len={warmup_len}, hit_chunks={hit_chunks}/"
-        f"{total_chunks}, target_hit_rate={target_hit_rate:.4f}"
+        f"{total_chunks}, fill_block={fill_block}, "
+        f"target_hit_rate={target_hit_rate:.4f}"
     )
 
     semaphore = asyncio.Semaphore(max_concurrency)
@@ -636,6 +723,7 @@ async def run_one_hit_rate(
         return {
             "mode": "qps",
             "target_hit_rate": target_hit_rate,
+            "fill_block_size": fill_block,
             "cache_fill_len": warmup_len,
             "cache_fill_requests": len(warmup_results),
             "cache_fill_successful": warmup_success,
@@ -733,7 +821,7 @@ async def run_one_hit_rate(
     bench_start = time.perf_counter()
 
     for round_idx in range(num_rounds):
-        batch_prompts, expected_hit_chunks = build_batch(
+        batch_prompts, _ = build_batch(
             vocab_size=vocab_size,
             total_len=total_len,
             page_size=page_size,
@@ -776,7 +864,7 @@ async def run_one_hit_rate(
                 "prompt_tokens": r_prompt,
                 "cached_tokens": r_cached,
                 "hit_rate": r_hit_rate,
-                "expected_hit_chunks_mean": float(np.mean(expected_hit_chunks)),
+                "expected_hit_chunks_mean": float(expected_hit_pages),
                 "actual_hit_chunks_dist": hit_chunks_dist,
                 "elapsed_s": round_elapsed,
                 "num_successful": len(successful),
@@ -794,7 +882,7 @@ async def run_one_hit_rate(
 
         # Tag each result with its expected hit_chunks
         for i, r in enumerate(results):
-            r["expected_hit_chunks"] = expected_hit_chunks[i]
+            r["expected_hit_chunks"] = expected_hit_pages
         all_results.extend(results)
 
     bench_elapsed = time.perf_counter() - bench_start
@@ -840,6 +928,7 @@ async def run_one_hit_rate(
     return {
         "mode": "batch",
         "target_hit_rate": target_hit_rate,
+        "fill_block_size": fill_block,
         "cache_fill_len": warmup_len,
         "cache_fill_requests": len(warmup_results),
         "cache_fill_successful": warmup_success,
@@ -979,11 +1068,33 @@ async def main(args):
     if page_size <= 0:
         page_size = page_size if page_size > 0 else 1
 
+    # 填充波必须落在 AttentionStore 的 block 边界上（见 run_one_hit_rate 里的说明）。
+    # 服务端 page_size 只决定 radix cache 的 page 粒度，AS block 与之解耦。
+    fill_block_size = args.fill_block_size
+    if fill_block_size <= 0:
+        fill_block_size = get_as_block_size(
+            base_url, page_size, args.enable_asradix_cache
+        )
+    if fill_block_size < page_size:
+        fill_block_size = page_size
+    if fill_block_size % page_size:
+        raise ValueError(
+            f"--fill-block-size={fill_block_size} must be a multiple of "
+            f"page_size={page_size}."
+        )
+    print(f"  cache-fill block size = {fill_block_size}")
+
     total_chunks = args.total_len // page_size
     if total_chunks == 0:
         raise ValueError(
             f"total_len={args.total_len} is smaller than page_size={page_size}. "
             "Increase --total-len or decrease --page-size."
+        )
+    if args.total_len // fill_block_size == 0:
+        raise ValueError(
+            f"total_len={args.total_len} is smaller than the AttentionStore "
+            f"block size={fill_block_size}. Increase --total-len or pass "
+            "--fill-block-size to shrink it."
         )
 
     target_hit_rates = [float(x.strip()) for x in args.target_hit_rates.split(",")]
@@ -997,6 +1108,7 @@ async def main(args):
     if qps_list is not None:
         print(
             f"\nConfig [QPS mode]: total_len={args.total_len}, page_size={page_size}, "
+            f"fill_block_size={fill_block_size}, "
             f"total_chunks={total_chunks}, output_len={args.output_len}, "
             f"qps={qps_list}, duration={args.duration}s, "
             f"max_concurrency={args.max_concurrency}, "
@@ -1005,6 +1117,7 @@ async def main(args):
     else:
         print(
             f"\nConfig [Batch mode]: total_len={args.total_len}, page_size={page_size}, "
+            f"fill_block_size={fill_block_size}, "
             f"total_chunks={total_chunks}, output_len={args.output_len}, "
             f"num_rounds={args.num_rounds}, batch_size={args.batch_size}, "
             f"max_concurrency={args.max_concurrency}, "
@@ -1039,6 +1152,7 @@ async def main(args):
                     dp_size=dp_size,
                     qps=qps,
                     duration=args.duration,
+                    fill_block_size=fill_block_size,
                 )
                 all_stats.append(stats)
                 if "error" not in stats:
@@ -1074,6 +1188,7 @@ async def main(args):
                 dp_size=dp_size,
                 qps=None,
                 duration=args.duration,
+                fill_block_size=fill_block_size,
             )
             all_stats.append(stats)
             if "error" not in stats:
@@ -1144,6 +1259,24 @@ if __name__ == "__main__":
         default=64,
         help="Prefix-cache chunk size (page granularity). "
         "Defaults to server page_size from /get_server_info.",
+    )
+    parser.add_argument(
+        "--enable-asradix-cache",
+        action="store_true",
+        default=None,
+        help="Server runs with --enable-asradix-cache. Auto-detected from "
+        "/get_server_info when omitted.",
+    )
+    parser.add_argument(
+        "--fill-block-size",
+        type=int,
+        default=0,
+        help="Token granularity the cache-fill wave must be aligned to (0 = "
+        "auto). AttentionStore only commits a prefix whose length is a "
+        "multiple of AS_BLOCK_SIZE (256), so filling at page_size granularity "
+        "silently writes nothing. Auto: the server's "
+        "attention_store_block_size, else 256 when asradix cache is on, else "
+        "page_size.",
     )
     parser.add_argument(
         "--output-len",
