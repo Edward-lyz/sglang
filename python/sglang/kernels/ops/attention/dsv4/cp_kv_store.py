@@ -25,35 +25,67 @@ def _scatter_kv_rows_kernel(
     dst_ptr,  # int32 view of the SWA cache [num_pages, PB / 4]
     swa_loc_ptr,  # [T] dst slot per global token (< 0: no write)
     src_row_ptr,  # [T] int64 flat staging row (rank * P + local row) per global token
+    total,  # T
     rank_len,  # P: rows per rank in the staging layout
     npages_per_rank,
     page_words,  # PB / 4
+    cp_size,
+    INTERLEAVE: tl.constexpr,  # src row = (t % cp) * P + t // cp, src_row_ptr unused
     PAGE_SIZE: tl.constexpr,
     DATA_WORDS: tl.constexpr,  # data bytes per token / 4 (V4: 144, V4.1: 128)
     SCALE_WORDS: tl.constexpr,  # scale bytes per token / 4 (V4: 2, V4.1: 4)
     DATA_P2: tl.constexpr,
     SCALE_P2: tl.constexpr,
+    BLOCK_T: tl.constexpr,  # tokens per program
 ):
-    t = tl.program_id(0)
-    dst = tl.load(swa_loc_ptr + t).to(tl.int64)
-    if dst < 0:
-        return
-    m = tl.load(src_row_ptr + t).to(tl.int64)
+    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    tm = t < total
+    dst = tl.load(swa_loc_ptr + t, mask=tm, other=-1).to(tl.int64)
+    ok = tm & (dst >= 0)
+    if INTERLEAVE:
+        m = (t % cp_size).to(tl.int64) * rank_len + t // cp_size
+    else:
+        m = tl.load(src_row_ptr + t, mask=tm, other=0).to(tl.int64)
     r = m // rank_len
     j = m % rank_len
-    s_page = r * npages_per_rank + j // PAGE_SIZE
+    s_base = (r * npages_per_rank + j // PAGE_SIZE) * page_words
     s_slot = j % PAGE_SIZE
-    d_page = dst // PAGE_SIZE
-    d_slot = dst % PAGE_SIZE
+    dst_c = tl.where(ok, dst, 0)
+    d_base = (dst_c // PAGE_SIZE) * page_words
+    d_slot = dst_c % PAGE_SIZE
     w = tl.arange(0, DATA_P2)
-    wm = w < DATA_WORDS
-    v = tl.load(src_ptr + s_page * page_words + s_slot * DATA_WORDS + w, mask=wm)
-    tl.store(dst_ptr + d_page * page_words + d_slot * DATA_WORDS + w, v, mask=wm)
+    wm = ok[:, None] & (w[None, :] < DATA_WORDS)
+    v = tl.load(src_ptr + (s_base + s_slot * DATA_WORDS)[:, None] + w[None, :], mask=wm)
+    tl.store(dst_ptr + (d_base + d_slot * DATA_WORDS)[:, None] + w[None, :], v, mask=wm)
     sw = tl.arange(0, SCALE_P2)
-    sm = sw < SCALE_WORDS
+    sm = ok[:, None] & (sw[None, :] < SCALE_WORDS)
     scale_base = PAGE_SIZE * DATA_WORDS
-    sv = tl.load(src_ptr + s_page * page_words + scale_base + s_slot * SCALE_WORDS + sw, mask=sm)
-    tl.store(dst_ptr + d_page * page_words + scale_base + d_slot * SCALE_WORDS + sw, sv, mask=sm)
+    sv = tl.load(
+        src_ptr + (s_base + scale_base + s_slot * SCALE_WORDS)[:, None] + sw[None, :],
+        mask=sm,
+    )
+    tl.store(
+        dst_ptr + (d_base + scale_base + d_slot * SCALE_WORDS)[:, None] + sw[None, :],
+        sv,
+        mask=sm,
+    )
+
+
+_SCATTER_BLOCK_T = 8
+
+
+_ARANGE_CACHE = {}
+
+
+def _arange_i32(n: int, dev) -> torch.Tensor:
+    # read-only staging slots 0..n-1, shared by every layer of a forward
+    key = (n, dev)
+    t = _ARANGE_CACHE.get(key)
+    if t is None:
+        if len(_ARANGE_CACHE) > 64:
+            _ARANGE_CACHE.clear()
+        t = _ARANGE_CACHE[key] = torch.arange(n, dtype=torch.int32, device=dev)
+    return t
 
 
 def cp_store_swa_kv_local_first(
@@ -86,7 +118,7 @@ def cp_store_swa_kv_local_first(
 
     # 1. local rows -> staging pages (same kernel as the cache store)
     staging = torch.empty((npages, page_bytes), dtype=torch.uint8, device=dev)
-    stage_loc = torch.arange(local_len, dtype=torch.int32, device=dev)
+    stage_loc = _arange_i32(local_len, dev)
     fused_k_norm_rope_flashmla(
         kv=kv_local[:local_len],
         kv_weight=kv_weight,
@@ -103,24 +135,28 @@ def cp_store_swa_kv_local_first(
     attn_cp_all_gather_into_tensor(gathered, staging)
 
     # 3. global token t -> flat staging row; same map as the interleave gather
-    if meta.gather_index is not None:
+    # (interleave map computed in the kernel: no index tensors / launches per layer)
+    interleave = meta.gather_index is None
+    src_row = swa_loc  # placeholder pointer when INTERLEAVE
+    if not interleave:
         src_row = meta.gather_index[:total].to(torch.int64)
-    else:
-        t = torch.arange(total, device=dev, dtype=torch.int64)
-        src_row = (t % cp_size) * rank_len + t // cp_size
     loc = swa_loc[:total]
-    _scatter_kv_rows_kernel[(total,)](
+    _scatter_kv_rows_kernel[(triton.cdiv(total, _SCATTER_BLOCK_T),)](
         gathered.view(torch.int32),
         kvcache.view(torch.int32),
         loc,
         src_row,
+        total,
         rank_len,
         npages,
         page_bytes // 4,
+        cp_size,
+        INTERLEAVE=interleave,
         PAGE_SIZE=page_size,
         DATA_WORDS=layout.data_bytes // 4,
         SCALE_WORDS=layout.scale_bytes // 4,
         DATA_P2=triton.next_power_of_2(layout.data_bytes // 4),
         SCALE_P2=max(2, triton.next_power_of_2(layout.scale_bytes // 4)),
-        num_warps=1,
+        BLOCK_T=_SCATTER_BLOCK_T,
+        num_warps=4,
     )

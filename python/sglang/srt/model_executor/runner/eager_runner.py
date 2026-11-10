@@ -82,6 +82,86 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _cp_last_token_rows(hidden_states, forward_batch):
+    """[fusion-opt] SGLANG_FUSE_CP_LAST_TOKEN_GATHER: when the logits only read each
+    request's last prompt token (prefill, no input logprobs, no FULL hidden capture),
+    CP-gather just those bs rows instead of the whole [T, hidden] (and the interleave
+    reorder). Interleave CP keeps global token t on rank t % cp, local row t // cp; each
+    rank contributes its owned rows, the gather is a plain copy -> bitwise the rows the
+    stock gather + last-token prune yields. Returns rows in batch order (same tuple
+    shape as cp_gather_after_forward), or None when the batch does not qualify."""
+    from sglang.srt.environ import envs
+
+    forward_batch.cp_last_rows_pruned = False
+    if not envs.SGLANG_FUSE_CP_LAST_TOKEN_GATHER.get():
+        return None
+    from sglang.srt.layers.cp.base import get_cp_strategy
+    from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+    from sglang.srt.layers.dp_attention import attn_cp_all_gather_into_tensor
+    from sglang.srt.runtime_context import get_parallel
+
+    meta = getattr(forward_batch, "attn_cp_metadata", None)
+    mode = forward_batch.forward_mode
+    lens_cpu = forward_batch.extend_seq_lens_cpu
+    if (
+        meta is None
+        or meta.gather_index is not None
+        or not isinstance(get_cp_strategy(), InterleaveCPStrategy)
+        or not mode.is_extend()
+        or mode.is_target_verify()
+        or mode.is_draft_extend_v2()
+        or (
+            # FULL capture only reads the full rows when the DSpark aux does not take
+            # the F2b tail path (which replaces output.hidden_states with the aux)
+            forward_batch.capture_hidden_mode.is_full()
+            and getattr(forward_batch, "dspark_aux_tail_global_idx", None) is None
+        )
+        or forward_batch.extend_seq_lens is None
+        or not lens_cpu
+        or min(lens_cpu) <= 0
+        or sum(lens_cpu) != int(meta.total_seq_lens)
+    ):
+        return None
+    if forward_batch.return_logprob and any(
+        e - st > 0
+        for e, st in zip(lens_cpu, forward_batch.extend_logprob_start_lens_cpu)
+    ):
+        return None  # input logprobs need every row
+
+    parallel = get_parallel()
+    cp, rank = parallel.attn_cp_size, parallel.attn_cp_rank
+    last = torch.cumsum(forward_batch.extend_seq_lens.to(torch.int64), dim=0) - 1
+    owner = last % cp
+    bs = last.shape[0]
+
+    def pick(x):
+        """CP-gather the last-token row of each request from its owner rank."""
+        if x is None:
+            return None
+        local = x[(last // cp).clamp(max=max(x.shape[0] - 1, 0))]
+        local = torch.where((owner == rank).view(-1, *[1] * (x.dim() - 1)), local, 0)
+        gathered = local.new_empty((cp * bs, *x.shape[1:]))
+        attn_cp_all_gather_into_tensor(gathered, local.contiguous())
+        return gathered[owner * bs + torch.arange(bs, device=x.device)]
+
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "fusion-opt cp_last_token_gather",
+        "CP-gather only the last-token rows (bs=%d, total=%d, cp=%d)",
+        bs,
+        int(meta.total_seq_lens),
+        cp,
+    )
+    forward_batch.cp_last_rows_pruned = True
+    if isinstance(hidden_states, tuple):
+        out = tuple(pick(item) for item in hidden_states)
+        if len(out) == 2 and out[1] is None:
+            return out[0]
+        return out
+    return pick(hidden_states)
+
+
 def _cp_embed_reduce_scatter(embed, input_ids, forward_batch):
     """[fusion-opt] SGLANG_FUSE_CP_EMBED_REDUCE_SCATTER: this rank's interleave-CP shard of
     the vocab-parallel embedding via one reduce-scatter of rank-major ids, instead of an
@@ -562,7 +642,11 @@ class EagerRunner(BaseRunner):
             and len(hidden_states) == 2
         ):
             hidden_states = (hidden_states[0], None)
-        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
+        pruned = _cp_last_token_rows(hidden_states, forward_batch)
+        if pruned is not None:
+            hidden_states = pruned
+        else:
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
         aux_row_to_token = None
         dspark_commit_mask = None

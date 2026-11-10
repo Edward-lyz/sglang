@@ -485,7 +485,16 @@ def late_layer_tail_layout(
         floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
     # One H2D copy for the three length vectors; launch count does not grow with bs.
-    lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_FUSE_TAIL_META_NO_SYNC.get():
+        # [fusion-opt] pinned + non_blocking: a pageable torch.tensor(..., device=cuda)
+        # copy synchronises the stream, i.e. waits for the previous forward to finish
+        lens = torch.tensor(
+            [extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], pin_memory=True
+        ).to(device, non_blocking=True)
+    else:
+        lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
     extend_lens, tail_lens, seq_lens = lens[0], lens[1], lens[2]
     total = sum(tail_lens_cpu)
     req = torch.repeat_interleave(

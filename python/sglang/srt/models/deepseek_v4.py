@@ -1466,7 +1466,12 @@ class MQALayer(MqaAttentionBase):
         extend into the paged V4 / V4.1 fp8 SWA cache (no tail layout / request window)."""
         if not envs.SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST.get():
             return False
-        if attn_backend.forward_metadata.late_layer_tail is not None:
+        if (
+            attn_backend.forward_metadata.late_layer_tail is not None
+            and not envs.SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST_TAIL.get()
+        ):
+            # tail rows: the tail CP metadata carries a gather_index, which the
+            # scatter kernel takes as its row map (SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST_TAIL)
             return False
         pool = get_token_to_kv_pool()
         ok = (
@@ -2094,11 +2099,25 @@ class MQALayer(MqaAttentionBase):
                     # the gather yields logical counts under skip-all-gather (fake
                     # DP). Gathering tail.positions the same way keeps them aligned
                     # for both real DP (physical) and fake DP (logical).
-                    global_positions = cp_materialize_global_token_order(
-                        tail.positions,
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
+                    # [fusion-opt] SGLANG_FUSE_TAIL_POS_GATHER_ONCE: the gathered tail
+                    # positions are the same for every tail layer of this forward;
+                    # gather them once and reuse (an all-gather + reorder per layer).
+                    tail_meta = attn_backend.forward_metadata
+                    cached = getattr(tail_meta, "_fo_tail_global_positions", None)
+                    if (
+                        cached is not None
+                        and cached[0] is tail
+                        and envs.SGLANG_FUSE_TAIL_POS_GATHER_ONCE.get()
+                    ):
+                        global_positions = cached[1]
+                    else:
+                        global_positions = cp_materialize_global_token_order(
+                            tail.positions,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
+                        if envs.SGLANG_FUSE_TAIL_POS_GATHER_ONCE.get():
+                            tail_meta._fo_tail_global_positions = (tail, global_positions)
                 else:
                     global_positions = forward_batch.positions[: kv.shape[0]]
                 get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
@@ -2300,6 +2319,7 @@ class MQALayer(MqaAttentionBase):
             and (
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_target_verify()
+                or attn_backend.fused_o_tail_extend(forward_batch)
             )
             and kernel_num_heads == self.n_local_heads
             and not is_unified_kv_triton()

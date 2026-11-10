@@ -297,6 +297,9 @@ class LogitsMetadata:
     top_logprobs_nums: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
+    # [fusion-opt] SGLANG_FUSE_CP_LAST_TOKEN_GATHER: the prefill-CP boundary already
+    # handed over only each request's last-token row ([bs, hidden], batch order).
+    cp_last_rows_pruned: bool = False
 
     # logits and logprobs post processing
     temperature: torch.Tensor = None
@@ -384,6 +387,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            cp_last_rows_pruned=getattr(forward_batch, "cp_last_rows_pruned", False),
         )
 
     def compute_dp_attention_metadata(self):
@@ -665,8 +669,13 @@ class LogitsProcessor(nn.Module):
                 def _prune(t):
                     return None if t is None else t[safe_index]
 
-            pruned_states = _prune(hidden_states)
-            pruned_states_before_norm = _prune(hidden_states_before_norm)
+            if logits_metadata.cp_last_rows_pruned:
+                # [fusion-opt] rows are already the last tokens, in batch order
+                pruned_states = hidden_states
+                pruned_states_before_norm = hidden_states_before_norm
+            else:
+                pruned_states = _prune(hidden_states)
+                pruned_states_before_norm = _prune(hidden_states_before_norm)
             if aux_hidden_states is not None:
                 aux_pruned_states = (
                     _prune(aux_hidden_states)
