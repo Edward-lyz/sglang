@@ -64,27 +64,40 @@ def transform_index_page_table_decode_kernel(
     tl.store(result_ptr + offset, -1, mask=~mask)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "page_table_stride_0",
+        "page_table_stride_1",
+        "topk_indices_stride_0",
+        "topk_indices_stride_1",
+        "result_stride_0",
+        "result_stride_1",
+    ],
+    do_not_specialize_on_alignment=[
+        "page_table_ptr",
+        "topk_indices_ptr",
+        "cu_seqlens_q_ptr",
+        "result_ptr",
+    ],
+)
 def transform_index_page_table_prefill_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,
     cu_seqlens_q_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
-    # Runtime (not constexpr): page_table is a per-batch [bs, max_seqlen_k] gather, so
-    # stride(0) == max_seqlen_k changes almost every batch. As a constexpr it forced a
-    # fresh Triton JIT compile (~90 ms on the scheduler thread) per new width; as a
-    # runtime int it only specializes on ==1 / %16, i.e. a bounded set of variants.
     page_table_stride_0,
-    page_table_stride_1: tl.constexpr,
-    topk_indices_stride_0: tl.constexpr,
-    topk_indices_stride_1: tl.constexpr,
-    result_stride_0: tl.constexpr,
-    result_stride_1: tl.constexpr,
+    page_table_stride_1,
+    topk_indices_stride_0,
+    topk_indices_stride_1,
+    result_stride_0,
+    result_stride_1,
     PAGE_TABLE_IS_EXPANDED: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
 ):
+    # 中文：stride 随请求长度变化，不能为每个长度加载一个 CUDA module。
+    # threaded prefill 中模块加载可能与另一线程的 collective/event 操作互等。
     request_id = tl.program_id(0)
     query_offsets = tl.program_id(1) * BLOCK_Q + tl.arange(0, BLOCK_Q)
     topk_offsets = tl.program_id(2) * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -124,6 +137,36 @@ def transform_index_page_table_prefill_kernel(
         loaded_kv_indices,
         mask=mask,
     )
+
+
+def warmup_transform_index_page_table_prefill(device) -> None:
+    """Load all prefill tile/layout variants before concurrent AS and forward."""
+    pointer = torch.empty(1, dtype=torch.int32, device=device)
+    # 中文：只编译并加载，不执行 kernel；指针不需要承载真实页表。
+    # stride 不再专门化，指针对齐也不产生新变体，故只需覆盖这六种组合。
+    for expanded in (False, True):
+        for block_q in (1, 2, 4):
+            kernel = transform_index_page_table_prefill_kernel.warmup(
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                17,
+                1,
+                2048,
+                1,
+                2048,
+                1,
+                PAGE_TABLE_IS_EXPANDED=expanded,
+                TOPK=2048,
+                BLOCK_Q=block_q,
+                BLOCK_TOPK=256,
+                num_warps=4,
+                grid=(1, 1, 8),
+            )
+            if hasattr(kernel, "result"):
+                kernel = kernel.result()
+            kernel._init_handles()
 
 
 def transform_index_page_table_decode_fast(

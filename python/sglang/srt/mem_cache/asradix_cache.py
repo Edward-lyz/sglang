@@ -21,11 +21,25 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.mem_cache import as_probe as _asp
+from sglang.srt.mem_cache.as_load_kernels import (
+    _BLOCK_BYTES,
+    _DESCRIPTOR_COLUMNS,
+    _METADATA_COLUMNS,
+    AsLoadSegment,
+    build_as_load_descriptors,
+    make_as_load_segment,
+    make_inplace_allgather_pair,
+    pack_as_load_segments,
+    select_as_load_vector_bytes,
+    unpack_as_load_segments,
+    warmup_as_load_kernels,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -39,19 +53,6 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
     TreeNode,
-)
-from sglang.srt.mem_cache.as_load_kernels import (
-    AsLoadSegment,
-    _BLOCK_BYTES,
-    _DESCRIPTOR_COLUMNS,
-    _METADATA_COLUMNS,
-    build_as_load_descriptors,
-    make_inplace_allgather_pair,
-    make_as_load_segment,
-    pack_as_load_segments,
-    select_as_load_vector_bytes,
-    unpack_as_load_segments,
-    warmup_as_load_kernels,
 )
 
 logger = logging.getLogger(__name__)
@@ -268,6 +269,12 @@ class AsRadixCache(RadixCache):
             os.environ.get("AS_MOVER_DEFER_LOAD_WAIT", "0") == "1"
         )
 
+        # Optional serialized-device fallback for deployments that cannot
+        # safely overlap restore kernels with a persistent forward. The audited
+        # overlap recipe leaves this off and uses the scoped MegaMoE SM budget.
+        self._as_gpu_gate = os.environ.get("SGLANG_PF_AS_GPU_GATE", "0") == "1"
+        self._as_restore_tp = None
+
         # Allgather mode: packed (default/fallback), auto (in-place when pages
         # are contiguous + pynccl available), inplace (force, fall back to packed).
         self._as_allgather_mode = os.environ.get(
@@ -400,27 +407,31 @@ class AsRadixCache(RadixCache):
         return latent, indexer
 
     def _warmup_as_load_kernels(self) -> None:
-        """Pre-compile pack/unpack Triton kernels at init so the first AS load
-        does not pay JIT compilation inside the shared-memory timeout window.
+        """Compile and load pack/unpack before the forward thread starts.
 
         Triton caches per-constexpr binary (VECTOR_BYTES, BLOCK_ROWS,
-        BLOCK_BYTES, world_size); shapes/pointers don't matter. ``.warmup()``
-        only compiles, so dummy tensors suffice. VECTOR_BYTES is per-request, so
-        pre-compile all widths.
+        BLOCK_BYTES, world_size) and pointer alignment. Cover every vector width
+        and both alignments of a seven-int64 metadata row without launching a
+        kernel against the dummy metadata.
         """
+        threaded = os.environ.get("SGLANG_ENABLE_PREFILL_FWD_THREAD", "0") == "1"
         try:
             attn_tp = _get_as_load_group()
             world = attn_tp.world_size
         except Exception as e:
+            if threaded:
+                raise RuntimeError(
+                    "Threaded AS restore requires its load group before kernel warmup"
+                ) from e
             logger.warning(
                 f"AS load kernel warmup skipped: attn TP group unavailable ({e})"
             )
             return
 
         device = self.device
-        # One descriptor block -> non-empty grid; contents irrelevant since
-        # .warmup() does not launch. torch.zeros is aligned for every VECTOR_BYTES.
-        metadata = torch.zeros(1, _METADATA_COLUMNS, dtype=torch.int64, device=device)
+        # 中文：每行 7 * 8 = 56 字节。运行时 metadata slab 的切片会同时出现
+        # 16 字节对齐和仅 8 字节对齐，启动时两类都必须完成模块加载。
+        metadata_slab = torch.zeros(2, _METADATA_COLUMNS, dtype=torch.int64, device=device)
         descriptors = torch.zeros(
             1, _DESCRIPTOR_COLUMNS, dtype=torch.int64, device=device
         )
@@ -433,23 +444,29 @@ class AsRadixCache(RadixCache):
         try:
             warmed = []
             for vb in (8, 4, 2, 1):
-                warmup_as_load_kernels(
-                    metadata,
-                    descriptors,
-                    local,
-                    gathered,
-                    packed_rank_bytes=scratch,
-                    world_size=world,
-                    vector_bytes=vb,
-                )
+                for metadata in (metadata_slab[:1], metadata_slab[1:]):
+                    warmup_as_load_kernels(
+                        metadata,
+                        descriptors,
+                        local,
+                        gathered,
+                        packed_rank_bytes=scratch,
+                        world_size=world,
+                        vector_bytes=vb,
+                    )
                 warmed.append(vb)
             logger.info(
-                f"AS load kernels warmed up: world_size={world}, "
+                f"AS load kernel modules ready: world_size={world}, "
                 f"vector_bytes={warmed}, device=cuda:{torch.cuda.current_device()}"
             )
         except Exception as e:
-            # Warmup is an optimization only; the runtime path still compiles
-            # lazily on first use, so never fail init over it.
+            if threaded:
+                # 中文：并发恢复不能把加载失败推迟到首个 packed 请求中重试。
+                # 此时尚未启动 forward worker，直接终止启动并保留原始异常。
+                raise RuntimeError(
+                    "Threaded AS restore requires pack/unpack CUDA modules ready "
+                    "at startup"
+                ) from e
             logger.warning(f"AS load kernel warmup failed (will lazy-compile): {e}")
 
     def _extract_buffer_ptrs(self, kv_cache, layer_ids: List[int]):
@@ -632,10 +649,6 @@ class AsRadixCache(RadixCache):
         self, req, is_insert: bool = True, *, kv_len_to_handle: int
     ):
         """Cache finished request, then report to AS."""
-        all_tokenids_len = len(req.origin_input_ids) + len(req.output_ids)
-        snapshot = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :all_tokenids_len
-        ].clone()
         # Standard radix tree insert
         super().cache_finished_req(
             req, is_insert, kv_len_to_handle=kv_len_to_handle
@@ -653,7 +666,10 @@ class AsRadixCache(RadixCache):
 
         # Write KV to AS
         if self._is_prefill_role() and self.ascli is not None:
-            self._write_kv_on_finish(req, snapshot)
+            if is_insert:
+                self._write_kv_on_finish(req, kv_len_to_handle=kv_len_to_handle)
+            elif self.tp_world_size > 1:
+                self._enqueue_dummy_write()
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Evict with AS index reporting."""
@@ -710,6 +726,54 @@ class AsRadixCache(RadixCache):
 
     # ===== HiCache-compatible hooks =====
 
+    def initialize_threaded_restore(self, reserved_streams=None):
+        """Give admission its own NCCL state before the forward thread starts."""
+        if self._as_restore_tp is not None:
+            return
+        from sglang.srt.distributed.device_communicators.pynccl import (
+            PyNcclCommunicator,
+        )
+        group = _get_as_load_group()
+        if group.world_size <= 1:
+            return
+        if torch.distributed.get_process_group_ranks(
+            self.tp_group
+        ) != torch.distributed.get_process_group_ranks(group.cpu_group):
+            raise RuntimeError("AS restore and attention rank order differ")
+        communicator = PyNcclCommunicator(group.cpu_group, device=group.device)
+        if not communicator.available:
+            raise RuntimeError("Threaded AS restore needs a private NCCL communicator")
+        # 中文：0.5.17 PyNccl使用调用线程的当前流，不再提供旧cp_*接口。
+        # _allgather_loaded_kv的新版分支在专用load_stream上下文发起collective。
+        self._as_restore_tp = SimpleNamespace(pynccl_comm=communicator)
+        # torch.cuda.Stream draws from a finite pool. Reserve distinct handles
+        # before the worker starts, including the streams allocated by admission.
+        streams = dict(reserved_streams or {})
+        used = {stream.cuda_stream for stream in streams.values()}
+        for name, attribute, priority in (
+            ("as_load", "_as_load_stream", 1),
+            ("as_unpack", "_as_unpack_stream", 1),
+            ("as_page_copy", "_as_page_id_copy_stream", 0),
+        ):
+            stream = self._allocate_distinct_restore_stream(used, priority)
+            setattr(self, attribute, stream)
+            streams[name] = stream
+            used.add(stream.cuda_stream)
+        logger.info(
+            "Threaded AS streams: %s CUDA_DEVICE_MAX_CONNECTIONS=%s",
+            {name: stream.cuda_stream for name, stream in streams.items()},
+            os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS"),
+        )
+        logger.info("Threaded AS restore: private NCCL communicator initialized")
+
+    @staticmethod
+    def _allocate_distinct_restore_stream(used, priority):
+        for _ in range(64):
+            stream = torch.cuda.Stream(priority=priority)
+            if stream.cuda_stream not in used:
+                return stream
+        raise RuntimeError("No distinct CUDA stream available for AS restore")
+
     @contextmanager
     def batch_as_load_handoffs(self):
         """Defer KV-consumer fences while admission only manipulates page IDs.
@@ -732,6 +796,10 @@ class AsRadixCache(RadixCache):
                 self.flush_as_load_handoffs()
             finally:
                 self._as_load_handoff_events = None
+
+    def finalize_as_load_batch(self):
+        """Fence every restored KV payload after metadata preparation."""
+        return self.flush_as_load_handoffs()
 
     def flush_as_load_handoffs(self, *, wait_for_kv=True):
         """Commit loads, and optionally fence the compute stream for KV reads."""
@@ -1020,6 +1088,11 @@ class AsRadixCache(RadixCache):
     def ready_to_load_host_cache(self) -> int:
         """AS loads are synchronous, so return 0 (no async consumer to track)."""
         return 0
+
+    def has_pending_as_writes(self) -> bool:
+        """判断是否仍有受 FIFO 完成协议保护的异步写。"""
+        # Only the scheduler mutates the FIFO. Writers merely complete futures.
+        return bool(self._as_write_queue)
 
     def check_ascache_events(self):
         """Check for completed AS load/write tasks and clean up.
@@ -1695,14 +1768,16 @@ class AsRadixCache(RadixCache):
         """Dedicated NCCL stream so load allgather runs concurrently with the
         SDK's scatter streams (true read/allgather overlap)."""
         if self._as_load_stream is None:
-            self._as_load_stream = torch.cuda.Stream()
+            # Low priority: the prefill forward must preempt the restore's
+            # allgather/unpack kernels when both compete for SMs and bandwidth.
+            self._as_load_stream = torch.cuda.Stream(priority=1)
         return self._as_load_stream
 
     def _get_as_unpack_stream(self) -> torch.cuda.Stream:
         """Dedicated stream for Triton unpack of the gathered scratch, so it
         overlaps the next batch's NCCL allgather on the load stream."""
         if self._as_unpack_stream is None:
-            self._as_unpack_stream = torch.cuda.Stream()
+            self._as_unpack_stream = torch.cuda.Stream(priority=1)
         return self._as_unpack_stream
 
     def _get_as_page_id_copy_stream(self) -> torch.cuda.Stream:
@@ -1820,6 +1895,7 @@ class AsRadixCache(RadixCache):
                 warmup_plan.local_nbytes,
                 world,
                 warmup_plan.vector_bytes,
+                allow_module_load=self._as_restore_tp is None,
             )
         return metadata
 
@@ -2256,12 +2332,17 @@ class AsRadixCache(RadixCache):
         shard_indices = alloc_indices[: n_shard * self.page_size]
         shard_page_rows = page_rows[:n_shard]
 
-        pynccl_comm = attn_tp.pynccl_comm
+        restore_tp = self._as_restore_tp or attn_tp
+        pynccl_comm = restore_tp.pynccl_comm
         pynccl_available = bool(
             pynccl_comm is not None and getattr(pynccl_comm, "available", False)
         )
         load_stream = self._get_as_load_stream()
         load_stream.wait_event(indices_ready_event)
+        if self._as_gpu_gate:
+            fwd_ev = getattr(self, "_pf_forward_done_event", None)
+            if fwd_ev is not None:
+                load_stream.wait_event(fwd_ev)
         unpack_stream = self._get_as_unpack_stream()
         first_page = None
         pages_contiguous = False
@@ -2294,6 +2375,93 @@ class AsRadixCache(RadixCache):
             packed_metadata = self._prepare_packed_as_load_plans(
                 plans, world, alloc_indices.device, load_stream
             )
+
+        # Submit the replicated tail before the sharded layer groups.
+        # Keep the current mover SDK handle ownership and padded-row bounds.
+        load_stream_ptr = load_stream.cuda_stream
+        # Remainder (replicated on every rank, no allgather).
+        if n_remainder > 0 and not failed:
+            _materialize_data_id_list()
+            _t_remainder = time.perf_counter()
+            rh = None
+            tail_wait_started = False
+            tail_stream_ordered = False
+            tail_scatter_started = False
+            try:
+                tail_args = dict(
+                    tokens=as_block_hashs,
+                    start_transfer_block_index=start_block + n_shard,
+                    k_dest_ptrs=self.k_buffer_ptrs,
+                    v_dest_ptrs=self.v_buffer_ptrs,
+                    data_id_list=data_id_list[n_shard:real_n_blocks],
+                    # 中文：mover 的 timeout 覆盖排队、Agent 读取和 peermem
+                    # 搬运；尾部与主分片共用读预算，不能沿用旧 Agent 的 1 秒。
+                    timeout=self._as_shard_fetch_timeout,
+                    remote_addrs=remote_addrs_arg,
+                )
+                if world > 1 and chunk > 0:
+                    # Keep the replicated tail off the host admission critical
+                    # path, using the shard pipeline's refcounted SDK protocol.
+                    # 中文说明：多卡下尾部（remainder）各 rank 都要完整读取。原来用
+                    # read_submit + read_wait 同步等待，会卡住主机准入线程；这里改成与分片
+                    # 流水线相同的 fetch -> acquire -> scatter -> 在 load_stream 上等待 的
+                    # 引用计数协议，host 不再阻塞，只由 load_stream 排队等待数据到位。
+                    tail_offsets = self.ascli.read_fetch(**tail_args)
+                    self.ascli.read_acquire(tail_offsets, 1)
+                    tail_scatter_started = True
+                    rh = self.ascli.read_scatter(
+                        tail_offsets, layer_ids=self.layer_ids, refcounted=True
+                    )
+                    tail_wait_started = True
+                    rem_rd = self.ascli.read_stream_wait(rh, load_stream_ptr)
+                    tail_stream_ordered = True
+                    # SDK stream_wait maps native failures (including an
+                    # unproven completion) to a zero prefix. Quarantine on any
+                    # incomplete result rather than inferring DMA quiescence.
+                    # 中文：读取不完整时不能推断 DMA 已停止，宁可隔离这批句柄、不复用。
+                    if rem_rd != n_remainder:
+                        scatter_handles_quiescent = False
+                    self.ascli.read_release_on_stream(rh, load_stream_ptr)
+                    # The request readiness event must cover BOTH packed
+                    # unpacks and tail scatters, including deferred load cleanup.
+                    # 中文：请求的“就绪事件”必须同时覆盖分片 unpack 和尾部 scatter，
+                    # 否则后续延迟清理可能在尾部数据还没写完时就释放页。
+                    if last_unpack_event is not None:
+                        load_stream.wait_event(last_unpack_event)
+                    tail_ready = torch.cuda.Event()
+                    tail_ready.record(load_stream)
+                    last_unpack_event = tail_ready
+                else:
+                    # 中文：单卡或没有分片时保持原来的同步读取路径
+                    rh = self.ascli.read_submit(
+                        layer_ids=self.layer_ids, **tail_args
+                    )
+                    rem_rd = self.ascli.read_wait(rh)
+            except Exception as e:
+                logger.warning(f"AS remainder read failed: {e}")
+                if tail_scatter_started:
+                    # Submission can fail before returning its scatter handle.
+                    # 中文：提交阶段失败时可能拿不到 scatter 句柄，无法确认 DMA 是否已停，按不安全处理
+                    scatter_handles_quiescent = False
+                if world > 1 and chunk > 0 and rh is not None:
+                    try:
+                        if not tail_wait_started:
+                            # 中文：尚未开始等待：同步等待完成并释放句柄，-2 表示无法证明已停止
+                            cleanup_ret = self.ascli.read_sync_wait(rh)
+                            if cleanup_ret == -2:
+                                scatter_handles_quiescent = False
+                            self.ascli.read_release(rh)
+                        elif not tail_stream_ordered:
+                            # A failed stream wait may already have consumed the
+                            # handle. Retain allocation/SHM rather than reuse it.
+                            # 中文：stream 等待失败时句柄可能已被消费，保留分配和共享内存，不再复用
+                            scatter_handles_quiescent = False
+                    except Exception:
+                        scatter_handles_quiescent = False
+                rem_rd = -1
+            if rem_rd != n_remainder:
+                failed = True
+            _diag["remainder"] += (time.perf_counter() - _t_remainder) * 1000
 
         # One gRPC for the whole sharded read; replayed per layer batch below.
         # Timeout must cover all batches' scatter + allgather, else the agent's
@@ -2527,7 +2695,7 @@ class AsRadixCache(RadixCache):
                             ):
                                 load_stream.wait_event(unpack_slot_events[slot])
                             _nc, _unpack, unpack_done = self._allgather_loaded_kv(
-                                attn_tp,
+                                restore_tp,
                                 world,
                                 plan,
                                 stream=load_stream,
@@ -2594,99 +2762,17 @@ class AsRadixCache(RadixCache):
                     last_unpack_event.record(unpack_stream)
                 self._as_scratch_ready_event = last_unpack_event
 
-        # Remainder (replicated on every rank, no allgather).
-        if n_remainder > 0 and not failed:
-            _materialize_data_id_list()
-            _t_remainder = time.perf_counter()
-            rh = None
-            tail_wait_started = False
-            tail_stream_ordered = False
-            tail_scatter_started = False
-            try:
-                tail_args = dict(
-                    tokens=as_block_hashs,
-                    start_transfer_block_index=start_block + n_shard,
-                    k_dest_ptrs=self.k_buffer_ptrs,
-                    v_dest_ptrs=self.v_buffer_ptrs,
-                    data_id_list=data_id_list[n_shard:real_n_blocks],
-                    timeout=1,
-                    remote_addrs=remote_addrs_arg,
-                )
-                if world > 1 and chunk > 0:
-                    # Keep the replicated tail off the host admission critical
-                    # path, using the shard pipeline's refcounted SDK protocol.
-                    # 中文说明：多卡下尾部（remainder）各 rank 都要完整读取。原来用
-                    # read_submit + read_wait 同步等待，会卡住主机准入线程；这里改成与分片
-                    # 流水线相同的 fetch -> acquire -> scatter -> 在 load_stream 上等待 的
-                    # 引用计数协议，host 不再阻塞，只由 load_stream 排队等待数据到位。
-                    tail_offsets = self.ascli.read_fetch(**tail_args)
-                    self.ascli.read_acquire(tail_offsets, 1)
-                    tail_scatter_started = True
-                    rh = self.ascli.read_scatter(
-                        tail_offsets, layer_ids=self.layer_ids, refcounted=True
-                    )
-                    tail_wait_started = True
-                    rem_rd = self.ascli.read_stream_wait(rh, load_stream_ptr)
-                    tail_stream_ordered = True
-                    # SDK stream_wait maps native failures (including an
-                    # unproven completion) to a zero prefix. Quarantine on any
-                    # incomplete result rather than inferring DMA quiescence.
-                    # 中文：读取不完整时不能推断 DMA 已停止，宁可隔离这批句柄、不复用。
-                    if rem_rd != n_remainder:
-                        scatter_handles_quiescent = False
-                    self.ascli.read_release_on_stream(rh, load_stream_ptr)
-                    # The request readiness event must cover BOTH packed
-                    # unpacks and tail scatters, including deferred load cleanup.
-                    # 中文：请求的“就绪事件”必须同时覆盖分片 unpack 和尾部 scatter，
-                    # 否则后续延迟清理可能在尾部数据还没写完时就释放页。
-                    if last_unpack_event is not None:
-                        load_stream.wait_event(last_unpack_event)
-                    tail_ready = torch.cuda.Event()
-                    tail_ready.record(load_stream)
-                    last_unpack_event = tail_ready
-                else:
-                    # 中文：单卡或没有分片时保持原来的同步读取路径
-                    rh = self.ascli.read_submit(
-                        layer_ids=self.layer_ids, **tail_args
-                    )
-                    rem_rd = self.ascli.read_wait(rh)
-            except Exception as e:
-                logger.warning(f"AS remainder read failed: {e}")
-                if tail_scatter_started:
-                    # Submission can fail before returning its scatter handle.
-                    # 中文：提交阶段失败时可能拿不到 scatter 句柄，无法确认 DMA 是否已停，按不安全处理
-                    scatter_handles_quiescent = False
-                if world > 1 and chunk > 0 and rh is not None:
-                    try:
-                        if not tail_wait_started:
-                            # 中文：尚未开始等待：同步等待完成并释放句柄，-2 表示无法证明已停止
-                            cleanup_ret = self.ascli.read_sync_wait(rh)
-                            if cleanup_ret == -2:
-                                scatter_handles_quiescent = False
-                            self.ascli.read_release(rh)
-                        elif not tail_stream_ordered:
-                            # A failed stream wait may already have consumed the
-                            # handle. Retain allocation/SHM rather than reuse it.
-                            # 中文：stream 等待失败时句柄可能已被消费，保留分配和共享内存，不再复用
-                            scatter_handles_quiescent = False
-                    except Exception:
-                        scatter_handles_quiescent = False
-                rem_rd = -1
-            if rem_rd != n_remainder:
-                failed = True
-            _diag["remainder"] += (time.perf_counter() - _t_remainder) * 1000
-
         # Make the default/compute stream wait for all allgathers before it
         # consumes the loaded KV, without host-blocking here.
         ready_event = None
         if world > 1 and chunk > 0:
-            _t_handoff = time.perf_counter()
             if preflight_state == 1 and last_unpack_event is not None:
                 ready_event = last_unpack_event
             else:
                 ready_event = torch.cuda.Event()
                 ready_event.record(load_stream)
-            self._handoff_as_load(ready_event)  # 中文：批量准入作用域内只登记，不立刻阻塞计算流
+            _t_handoff = time.perf_counter()
+            self._handoff_as_load(ready_event)
             _diag["handoff"] += (time.perf_counter() - _t_handoff) * 1000
 
         # Single all-or-nothing barrier across ranks.
@@ -2983,7 +3069,7 @@ class AsRadixCache(RadixCache):
             return future
         return self._write_executor.submit(self._do_as_write, task)
 
-    def _write_kv_on_finish(self, req, snapshot: Optional[torch.Tensor] = None):
+    def _write_kv_on_finish(self, req, *, kv_len_to_handle: int):
         """Submit KV write task to async executor after request completion.
 
         Key points:
@@ -3010,12 +3096,13 @@ class AsRadixCache(RadixCache):
             return
 
         try:
-            kv_committed_len = len(req.origin_input_ids) + len(req.output_ids)
-            token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+            # 中文：取消/部分 prefill 时，只有 kv_len_to_handle 以内的 KV 已提交。
+            # 请求的完整 prompt 长度不能代表已分配、已计算的物理页范围。
+            token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
 
             # TODO(@duanbing02): input_ids + output_ids 是 page_size 整倍数时写入会越界，暂时只写 input
             num_pages = min(
-                len(token_ids) // self.page_size,
+                max(0, len(token_ids) - int(self.is_eagle)) // self.page_size,
                 len(req.origin_input_ids) // self.page_size,
             )
             if num_pages <= 0:
@@ -3023,14 +3110,6 @@ class AsRadixCache(RadixCache):
                     self._enqueue_dummy_write()
                 return
             aligned_tokens = num_pages * self.page_size
-
-            self._check_as_write_replicas(snapshot, aligned_tokens, req.as_block_hashs)
-
-            # Get KV indices for this request (token-level pool slot indices)
-            kv_indices = snapshot[:aligned_tokens]
-
-            # Convert to page-boundary indices: one index per block for AS SDK
-            data_id_list = (kv_indices[:: self.page_size] // self.page_size).tolist()
 
             # Get write_params from request's AS parameters (passed from upstream)
             # Default to empty dict if None – SDK requires a python/numpy/pytorch object
@@ -3041,17 +3120,28 @@ class AsRadixCache(RadixCache):
             match_result = super().match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
-                        token_ids, req.extra_key, is_bigram=self.is_eagle
+                        # bigram 的 N 个逻辑 KV 位置需要 N+1 个原始 token。
+                        token_ids[: aligned_tokens + int(self.is_eagle)],
+                        req.extra_key,
+                        is_bigram=self.is_eagle,
                     ).page_aligned(self.page_size),
                 )
             )
             last_node = match_result.last_device_node
 
-            if last_node is None:
+            if last_node is None or len(match_result.device_indices) < aligned_tokens:
                 logger.warning("AS write: no matching node found, skipping")
                 if self.tp_world_size > 1:
                     self._enqueue_dummy_write()
                 return
+
+            # 中文：radix 插入会释放重复前缀的旧页。必须使用插入后的规范页索引，
+            # 不能写插入前 req_to_token 的快照；锁住该节点即可保活整个写入前缀。
+            kv_indices = match_result.device_indices[:aligned_tokens]
+            self._check_as_write_replicas(
+                kv_indices, aligned_tokens, req.as_block_hashs
+            )
+            data_id_list = (kv_indices[:: self.page_size] // self.page_size).tolist()
 
             # Create write task
             task = _AsWriteTask(

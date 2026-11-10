@@ -238,6 +238,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -3968,6 +3969,10 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        *,
+        prep_done_event=None,
+        extend_input_len_per_req: Optional[List[int]] = None,
+        extend_logprob_start_len_per_req: Optional[List[int]] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
@@ -4003,7 +4008,10 @@ class Scheduler(
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    if prep_done_event is None:
+                        self.forward_stream.wait_stream(self.schedule_stream)
+                    else:
+                        self.forward_stream.wait_event(prep_done_event)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
@@ -4133,12 +4141,18 @@ class Scheduler(
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
             if batch.return_logprob:
-                batch_result.extend_input_len_per_req = [
-                    req.extend_range.length if req.extend_range is not None else 0
-                    for req in batch.reqs
-                ]
+                batch_result.extend_input_len_per_req = (
+                    extend_input_len_per_req
+                    if extend_input_len_per_req is not None
+                    else [
+                        req.extend_range.length if req.extend_range is not None else 0
+                        for req in batch.reqs
+                    ]
+                )
                 batch_result.extend_logprob_start_len_per_req = (
-                    batch.extend_logprob_start_lens
+                    extend_logprob_start_len_per_req
+                    if extend_logprob_start_len_per_req is not None
+                    else batch.extend_logprob_start_lens
                 )
             else:
                 batch_result.extend_input_len_per_req = None
@@ -4149,7 +4163,10 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    if prep_done_event is None:
+                        self.forward_stream.wait_stream(self.schedule_stream)
+                    else:
+                        self.forward_stream.wait_event(prep_done_event)
                     resolve_forward_inputs(batch, self.future_map)
                     pooler_output = self.tp_worker.forward_batch_embedding(batch)
                     ret = EmbeddingBatchResult(
@@ -4371,6 +4388,9 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
+            # 中文：threaded prefill使用有界worker队列，result_queue为空
+            # 不能证明前向已结束；flush必须同时检查该实际所有权。
+            and not getattr(self, "_pf_forward_inflight", False)
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
@@ -4528,14 +4548,21 @@ class Scheduler(
         """Evict unprotected GPU pages while retaining the Host AS cache."""
         # 中文：只回收所有TP rank都已完成的异步写，未完成写的页锁仍然有效。
         # 新版flush控制由SchedulerFlushWrapper负责；该回调不恢复旧的控制循环。
-        for attempt in range(5):
+        for attempt in range(300):
             if self.enable_asradix_cache:
                 self.tree_cache.check_ascache_events()
             evict_size = self.tree_cache.evictable_size()
             if evict_size > 0:
                 self.tree_cache.evict(EvictParams(num_tokens=evict_size))
-            if attempt < 4:
-                time.sleep(0.1)
+            pending_writes = (
+                self.enable_asradix_cache and self.tree_cache.has_pending_as_writes()
+            )
+            if attempt >= 4 and not pending_writes:
+                break
+            if attempt == 299:
+                logger.warning("Device cache eviction timed out waiting for AS writes")
+                return False
+            time.sleep(0.1)
         logger.info("Device cache cleared.")
         return True
 
@@ -5240,7 +5267,10 @@ def dispatch_event_loop(scheduler: Scheduler):
         if server_args.pp_size > 1:
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:
-            scheduler.event_loop_overlap_disagg_prefill()
+            if os.environ.get("SGLANG_ENABLE_PREFILL_FWD_THREAD", "0") == "1":
+                scheduler.event_loop_overlap_disagg_prefill_threaded()
+            else:
+                scheduler.event_loop_overlap_disagg_prefill()
         else:
             scheduler.event_loop_normal_disagg_prefill()
     elif disaggregation_mode == DisaggregationMode.DECODE:

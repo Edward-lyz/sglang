@@ -381,14 +381,13 @@ def warmup_as_load_kernels(
     packed_rank_bytes: int,
     world_size: int,
     vector_bytes: int,
+    *,
+    allow_module_load: bool = True,
 ) -> None:
-    """Pre-compile pack/unpack kernels to avoid JIT overhead at inference time."""
-    cache_key = (metadata.device.type, metadata.device.index, world_size, vector_bytes)
+    """Compile and load the exact pack/unpack variants before concurrent use."""
     with _WARMUP_LOCK:
-        if cache_key in _WARMED_KERNELS:
-            return
         pack_grid = (descriptors.shape[0],)
-        _pack_as_load_segments_kernel.warmup(
+        pack_kernel = _pack_as_load_segments_kernel.warmup(
             metadata,
             descriptors,
             local,
@@ -400,7 +399,7 @@ def warmup_as_load_kernels(
             grid=pack_grid,
         )
         unpack_grid = (descriptors.shape[0], world_size)
-        _unpack_as_load_segments_kernel.warmup(
+        unpack_kernel = _unpack_as_load_segments_kernel.warmup(
             metadata,
             descriptors,
             gathered,
@@ -413,4 +412,32 @@ def warmup_as_load_kernels(
             num_stages=2,
             grid=unpack_grid,
         )
+
+        # 中文：.warmup() 只编译，CUDA module/function 仍可能尚未加载。
+        # 同步编译结果也覆盖 Triton 的异步编译模式；这里不执行 kernel，
+        # 所以启动阶段的全零 metadata 不会被当成真实 KV 指针解引用。
+        kernels = tuple(
+            kernel.result() if hasattr(kernel, "result") else kernel
+            for kernel in (pack_kernel, unpack_kernel)
+        )
+        # 中文：metadata 的奇数行切片只有 8 字节对齐，可能对应另一份二进制。
+        # 用实际编译产物的 hash 区分专门化，不能仅按 world/vector_bytes 判定已就绪。
+        cache_key = (
+            metadata.device.type,
+            metadata.device.index,
+            *(kernel.hash for kernel in kernels),
+        )
+        if cache_key in _WARMED_KERNELS:
+            return
+        if not allow_module_load:
+            # 中文：forward 已在途时禁止补做模块加载；交给现有 AS 失败归约
+            # 和请求回退处理，避免 cuModuleLoadData 再次把整个 TP 组卡死。
+            raise RuntimeError(
+                "AS pack/unpack variant was not preloaded before threaded forward "
+                f"(world_size={world_size}, vector_bytes={vector_bytes})"
+            )
+        for kernel in kernels:
+            # 已核对配套 Triton：_init_handles 只加载模块和取得函数句柄，不发射 kernel。
+            kernel._init_handles()
+        # 只有两份模块都加载成功，才允许后续请求跳过初始化。
         _WARMED_KERNELS.add(cache_key)

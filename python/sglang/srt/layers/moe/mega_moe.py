@@ -309,16 +309,19 @@ def _run_mega_routed(
         device=hidden_states.device,
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
-    deep_gemm.fp8_fp4_mega_moe(
-        y,
-        moe.experts.mega_l1_weights,
-        moe.experts.mega_l2_weights,
-        buf,
-        recipe=(1, 1, 32),
-        activation="swiglu",
-        activation_clamp=swiglu_limit,
-        fast_math=True,
-    )
+    from sglang.srt.mem_cache.as_moe_budget import as_moe_sm_scope
+
+    with as_moe_sm_scope():
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=swiglu_limit,
+            fast_math=True,
+        )
     y = y[:num_tokens]
 
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk and not defer_tail_scaling:

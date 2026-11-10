@@ -453,7 +453,10 @@ class SamplingBatchInfo:
 
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
-        self.update_penalties()
+        # Threaded prefill snapshots sampling before admission filters the live
+        # batch. run_batch may copy that independent snapshot once more.
+        if self.penalizer_orchestrator is not None:
+            self.update_penalties()
         return dataclasses.replace(self, penalizer_orchestrator=None)
 
 

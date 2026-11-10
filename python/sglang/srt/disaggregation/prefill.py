@@ -19,10 +19,15 @@ Life cycle of a request in the prefill server
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
+import queue
+import threading
+import time
 from array import array
 from collections import deque
+from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
@@ -490,6 +495,7 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
+        *, deferred_finalize: Optional[List] = None,
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
 
@@ -499,7 +505,10 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.resolve_waiting_queue_bootstrap()
 
-        self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
+        self.process_prefill_chunk(
+            last_batch=last_batch, running_batch=running_batch,
+            deferred_finalize=deferred_finalize,
+        )
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
@@ -580,6 +589,12 @@ class SchedulerDisaggregationPrefillMixin:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
+                # Publish completion of the submitted forward so the next
+                # batch's AS restore can keep its device work off this forward
+                # while its host-side submit already runs ahead.
+                _pf_fwd_done = self.device_module.Event()
+                _pf_fwd_done.record(self.forward_stream)
+                self.tree_cache._pf_forward_done_event = _pf_fwd_done
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -600,6 +615,237 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+    # ===== forward worker thread (threaded overlap) =====
+
+    def _ensure_prefill_fwd_thread(self: Scheduler) -> None:
+        """Start the forward worker thread on demand.
+
+        Gated by SGLANG_ENABLE_PREFILL_FWD_THREAD; when it is off the base loop
+        runs unchanged and no thread is created.
+        """
+        if getattr(self, "_fwd_thread", None) is not None:
+            return
+        # 中文：沿用新版run_event_loop建立的schedule_stream和WAR上下文。
+        for _ in range(64):
+            if self.schedule_stream.cuda_stream != self.forward_stream.cuda_stream:
+                break
+            self.schedule_stream = self.device_module.Stream()
+        else:
+            raise RuntimeError(
+                "Threaded prefill requires distinct schedule and forward streams"
+            )
+        if (
+            not self.enable_asradix_cache
+            or self.tree_cache.attention_type != "DSA"
+            or getattr(self, "enable_unified_memory", False)
+            or getattr(self, "enable_hisparse", False)
+        ):
+            raise RuntimeError(
+                "Threaded AS prefill requires ordinary paged DSA cache ownership"
+            )
+        if self.enable_asradix_cache:
+            from sglang.kernels.ops.attention.dsa.transform_index import (
+                warmup_transform_index_page_table_prefill,
+            )
+
+            # 中文：先加载随 chunk/尾批形状切换的 DSA 页表 kernel，再开启 worker。
+            # 只做 .warmup() 不会加载 CUDA module，必须完成 _init_handles()。
+            warmup_transform_index_page_table_prefill(f"cuda:{self.gpu_id}")
+            logger.info("DSA prefill transform modules ready")
+            # 在 worker 启动前准备独立 restore communicator 和互不复用的 CUDA stream，
+            # 避免调度线程与 forward 线程无意共享流，导致恢复与前向重新串行。
+            self.tree_cache.initialize_threaded_restore(
+                reserved_streams={
+                    "forward": self.forward_stream,
+                    "schedule": self.schedule_stream,
+                    "result_copy": self.copy_stream,
+                }
+            )
+        self._fwd_in_q = queue.Queue(maxsize=1)
+        self._fwd_out_q = queue.Queue(maxsize=1)
+        self._fwd_submission_done = threading.Event()
+        self._fwd_submission_done.set()
+        self._pf_forward_inflight = False
+        self._fwd_thread = threading.Thread(
+            target=self._prefill_fwd_thread_main, name="prefill_fwd", daemon=True
+        )
+        self._fwd_thread.start()
+        logger.info("[PF_ENV] gpu=%s threaded=on", getattr(self, "gpu_id", "?"))
+
+    @torch.no_grad()
+    def _prefill_fwd_thread_main(self: Scheduler) -> None:
+        """Run prefill forwards off the scheduler thread.
+
+        A prefill forward only *enqueues* device work; the KV allocator, the
+        radix tree and req_to_token are mutated on the scheduler thread only,
+        so the two threads never write the same state.
+        """
+        device_module = getattr(self, "device_module", None)
+        if device_module is not None and hasattr(device_module, "set_device"):
+            device_module.set_device(self.gpu_id)
+        while True:
+            item = self._fwd_in_q.get()
+            if item is None:  # shutdown sentinel
+                return
+            batch, prep_done, input_lens, logprob_lens = item
+            try:
+                with self.device_module.StreamContext(self.forward_stream):
+                    # prep_done 同时覆盖本批元数据和缓存就绪依赖；worker 只提交前向，
+                    # KV 分配、radix 锁与 req_to_token 修改仍由调度线程独占。
+                    self.forward_stream.wait_event(prep_done)
+                    result = self.run_batch(
+                        batch,
+                        prep_done_event=prep_done,
+                        extend_input_len_per_req=input_lens,
+                        extend_logprob_start_len_per_req=logprob_lens,
+                    )
+                    done = self.device_module.Event()
+                    done.record(self.forward_stream)
+                    self.tree_cache._pf_forward_done_event = done
+                batch_copy = batch.copy()
+                # ScheduleBatch.copy() intentionally omits forward-only fields.
+                # EAGLE result processing still needs the worker's draft output.
+                batch_copy.spec_info = batch.spec_info
+                self._fwd_out_q.put((result, batch_copy, None))
+            except BaseException as exc:  # relay to the scheduler thread
+                self._fwd_out_q.put((None, None, exc))
+            finally:
+                # 中文：这里只交接 CPU 的 CUDA 提交阶段，不等待 GPU 执行完成。
+                # 新 shape 的算子可能隐式同步 context，不能与下一批 AS NCCL
+                # 提交交错；否则一个 rank 的初始化会等另一个尚未提交的通信。
+                self._fwd_submission_done.set()
+
+    def _fwd_submit(self: Scheduler, batch) -> None:
+        prep_done = self.device_module.Event()
+        prep_done.record(self.schedule_stream)
+        input_lens = (
+            [req.extend_range.length for req in batch.reqs]
+            if batch.return_logprob
+            else None
+        )
+        logprob_lens = (
+            list(batch.extend_logprob_start_lens)
+            if batch.return_logprob
+            else None
+        )
+        self._pf_forward_inflight = True
+        self._fwd_submission_done.clear()
+        self._fwd_in_q.put((batch, prep_done, input_lens, logprob_lens))
+
+    def _fwd_collect(self: Scheduler):
+        result, batch_copy, exc = self._fwd_out_q.get()
+        if exc is not None:
+            raise exc
+        self._pf_forward_inflight = False
+        return result, batch_copy
+
+    @torch.no_grad()
+    def event_loop_overlap_disagg_prefill_threaded(self: Scheduler) -> None:
+        """启动有界 forward worker，并在独立调度流中执行 prefill 重叠循环。"""
+        # The shared idle/flush predicate expects this even though the threaded
+        # path owns its result through the bounded worker queue instead.
+        self.result_queue = deque()
+        self._ensure_prefill_fwd_thread()
+        with self.device_module.StreamContext(self.schedule_stream):
+            self._event_loop_overlap_disagg_prefill_threaded_impl()
+
+    def _snapshot_batch_for_forward(self: Scheduler, batch):
+        """Keep admission's batch filtering separate from the worker's inputs."""
+        # 下一轮准入会过滤/修改 batch、sampling 和 spec；worker 必须使用提交时快照。
+        # req 对象继续共享以保持请求身份，列表和可变前向状态各自复制。
+        snap = copy.copy(batch)
+        snap.reqs = batch.reqs[:]
+        if batch.sampling_info is not None:
+            snap.sampling_info = batch.sampling_info.copy_for_forward()
+        if batch.spec_info is not None:
+            snap.spec_info = copy.copy(batch.spec_info)
+        return snap
+
+    @torch.no_grad()
+    def _event_loop_overlap_disagg_prefill_threaded_impl(self: Scheduler) -> None:
+        """Overlap loop with the forward launched on a worker thread.
+
+        Admission starts after the worker has enqueued the previous forward.
+        AS restore can overlap that forward's GPU execution. Sampling, deferred
+        KV publication and scheduler CUDA cleanup finish before the next worker
+        submission, keeping shape-dependent initialization out of that overlap.
+        """
+        inflight = None
+
+        while True:
+            if inflight is not None:
+                # 中文：前向已入队后才允许主线程操作 CUDA。AS load 与前向的
+                # GPU 执行仍重叠，避免的是两线程同时进行首次算子初始化/提交。
+                self._fwd_submission_done.wait()
+            self.iter_start_time = time.perf_counter()
+            self.metrics_reporter.iter_start_time = self.iter_start_time
+            recv_reqs = self.request_receiver.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+            self.waiting_queue.extend(
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            )
+
+            # Admission (prefix match, AS load-back submit, page allocation)
+            # overlaps the previous forward. Carry the computed chunk's prefix
+            # into admission now, but publish its KV only after completion.
+            # 可以提前复用 chunk 的页索引，但 KV 数据必须在上一批完成后才对外发布。
+            # deferred_finalize 保存这次发布义务，异常或部分 chunk 也不能重复发布。
+            deferred_finalize = []
+            plan = self.get_next_disagg_prefill_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch,
+                deferred_finalize=deferred_finalize,
+            )
+            self.running_batch = plan.running_batch
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                plan.batch_to_run, chunked_req=self.chunked_req
+            )
+            self.cur_batch_for_debug = batch
+
+            prev_result = None
+            prev_copy = None
+            if inflight is not None:
+                prev_result, prev_copy = self._fwd_collect()
+
+            if prev_result is not None:
+                # 中文：保持0.5.17显式batch采样和WAR交接，不能使用旧cur_batch隐式状态。
+                self._apply_war_barrier()
+                self.launch_batch_sample_if_needed(prev_result, prev_copy)
+
+                # Delayed sampling records copy_done, so it must run before
+                # this fence and before deferred code can repoint/free KV.
+                if getattr(prev_result, "copy_done", None) is not None:
+                    prev_result.copy_done.synchronize()
+
+            for finalize in deferred_finalize:
+                finalize()
+
+            if prev_result is not None:
+                self.process_batch_result(prev_copy, prev_result)
+            elif (
+                batch is None
+                and inflight is None
+                and not self.disagg_prefill_inflight_queue
+                and not self.waiting_queue
+            ):
+                # Only truly idle: a pending KV transfer still protects pages
+                # and would look like a leak to check_memory().
+                self.on_idle()
+
+            self.process_disagg_prefill_inflight_queue()
+            self.last_batch = batch
+            # 中文：页释放、缓存写入计划和 P/D 完成处理也会访问 CUDA。
+            # 在它们完成后才交给 worker，主线程下一轮先等待提交阶段交接。
+            if batch:
+                if self.enable_staging:
+                    self.maybe_prefetch_staging_for_batch(batch)
+                snap = self._snapshot_batch_for_forward(batch)
+                self._fwd_submit(snap)
+            else:
+                snap = None
+            inflight = snap
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -652,10 +898,12 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
+        completed_req_ids = set()
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
             if req.inflight_middle_chunks <= 0:
+                completed_req_ids.add(req.rid)
                 req.time_stats.set_prefill_finished_time()
 
                 # Test hook: exercise the release/requeue retry path.
@@ -776,7 +1024,7 @@ class SchedulerDisaggregationPrefillMixin:
         stream_reqs = [
             req
             for req in batch.reqs
-            if req.inflight_middle_chunks <= 0 and req.finished_reason is None
+            if req.rid in completed_req_ids and req.finished_reason is None
         ]
         for req in stream_reqs:
             req.finished_reason = FINISH_LENGTH(length=0)
@@ -1021,11 +1269,22 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         last_batch: Optional[ScheduleBatch],
         running_batch: ScheduleBatch,
+        *, deferred_finalize: Optional[List] = None,
     ) -> None:
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
-            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            if deferred_finalize is None:
+                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            else:
+                chunk_end = req.extend_range.end
+                deferred_finalize.append(
+                    partial(self._finalize_prefill_chunk, req, chunk_end)
+                )
+                # 中文：下一批只借用已分配的页索引；上一批完成后才把KV发布进树。
+                req.prefix_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :chunk_end
+                ].to(dtype=torch.int64, copy=True)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
@@ -1084,6 +1343,15 @@ class SchedulerDisaggregationPrefillMixin:
             ev.record(self.forward_stream)
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+
+    def _finalize_prefill_chunk(self: Scheduler, req: Req, chunk_end: int) -> None:
+        """Publish the completed chunk using the new explicit extend range."""
+        live_range = req.extend_range
+        try:
+            req.extend_range = live_range._replace(end=chunk_end)
+            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+        finally:
+            req.extend_range = live_range
 
     def send_kv_chunk(
         self: Scheduler,
