@@ -1944,6 +1944,30 @@ class Scheduler(
         Other algorithms either carry draft hidden states or have unaudited
         draft KV ownership, hence the exact ``is_dspark()`` match rather than a
         negated ``carries_draft_hidden_states()``.
+
+        No per-request admission check is left. return_logprob is served: the
+        topology never depends on it, and PP0 is at once the aux owner, the only
+        holder of the detokenizer socket and the only rank that consumes a real
+        logits_output, so no extra communication is needed. return_sampling_mask
+        is not rejected either, but it is not served under pp_size > 1: its two
+        fields ride the logprob tensor dict, which _pp_prepare_tensor_dict gates
+        on batch.return_logprob, so a mask-only batch silently returns a null
+        mask. That gap is independent of this switch (it reproduces without PD)
+        and is left as is -- see
+        docs/design/pp-pd-early-last-chunk-return-logprob.md section 2.4.
+
+        Should an admission check ever be needed again, it has to be a pure
+        function of the request so that all PP ranks reach the same verdict on
+        their own copy: the output ring topology is a static per-round decision,
+        and a rank that admitted a request its peers aborted would disagree on
+        whether to exchange outputs. See
+        docs/design/pp-prefill-last-chunk-early-send.md sections 5.3 and 6.3.
+
+        If aux ownership ever moves off PP0
+        (SGLANG_PP_PD_PREFILL_LAST_RANK_AUX), PP0 loses the real logits_output
+        and return_logprob has to be rejected again, or its payload sent back
+        over the same last-rank -> PP0 channel. See
+        docs/design/pp-pd-early-last-chunk-return-logprob.md.
         """
         if self.transfer_backend != TransferBackend.MOONCAKE:
             raise ValueError(
@@ -3276,8 +3300,6 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            if self._pp_pd_reject_unsupported_request(req):
-                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -3296,40 +3318,6 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
-
-    def _pp_pd_reject_unsupported_request(self, req: Req) -> bool:
-        """Abort requests the early-last-chunk path cannot serve. Returns True if aborted.
-
-        Per-request downgrade is impossible: the PP output ring topology is a
-        static per-round decision, so a single unsupported request in a batch
-        would make ranks disagree on whether to exchange outputs. See
-        docs/design/pp-prefill-last-chunk-early-send.md sections 5.3 and 6.3.
-
-        Constrained decoding is not listed: the prefill-side FSM has accepted no
-        generated token when the last chunk is sampled, and only the aux owner
-        advances it, so the ranks cannot diverge. See
-        docs/design/pp-prefill-last-chunk-early-send-phase2.md section 4.
-        """
-        if not self._pp_pd_early_last_chunk_enabled or req.finished():
-            return False
-
-        if req.return_logprob:
-            unsupported = "return_logprob"
-        elif req.return_sampling_mask:
-            unsupported = "return_sampling_mask"
-        else:
-            return False
-
-        error_msg = (
-            f"{unsupported} is not supported while "
-            "SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK is enabled. Drop the parameter "
-            f"or disable the env var. {req.rid=}"
-        )
-        logger.error(error_msg)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-        self.output_streamer.stream_output([req], req.return_logprob)
-        return True
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""

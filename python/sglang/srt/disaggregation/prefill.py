@@ -826,13 +826,30 @@ class SchedulerDisaggregationPrefillMixin:
         draft_input = result.next_draft_input
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
-        self.batch_result_processor.move_logprobs_to_cpu(
-            batch=batch,
-            logits_output=logits_output,
-        )
+        # Every "may I touch the logprob / sampling-mask payload here" check below
+        # guards on logits_output itself, the very object it is about to
+        # dereference. It is None on a rank that consumed no real output row (the
+        # early-last-chunk path on non-PP0, or _pp_can_skip_output_comm, which can
+        # fire on PP0 too) and on a batch whose payload never went on the ring
+        # (_pp_prepare_tensor_dict gates it on batch.return_logprob). PP0 owns the
+        # aux row and is the only rank holding the detokenizer socket, so it is
+        # also the only rank that has to do this bookkeeping; skipping it
+        # elsewhere loses nothing. Do not derive the answer from something else --
+        # _pp_pd_owns_aux contradicts it on PP0 under _pp_can_skip_output_comm,
+        # which is how phase 2 broke. See
+        # docs/design/pp-pd-early-last-chunk-return-logprob.md section 4.1.
+        if logits_output is not None:
+            self.batch_result_processor.move_logprobs_to_cpu(
+                batch=batch,
+                logits_output=logits_output,
+            )
 
         def advance_logprob_pt(i: int, req: Req) -> None:
             nonlocal logprob_pt
+            # req.return_logprob implies batch.return_logprob, and run_batch fills
+            # these two lists for exactly that batch, so they are None here only
+            # when this rank holds no real output row -- the logits_output is None
+            # case above.
             if not req.return_logprob or extend_input_len_per_req is None:
                 return
             extend_logprob_start_len = extend_logprob_start_len_per_req[i]
@@ -879,7 +896,7 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     req.hidden_states_tensor = None
                     req.output_dsa_topk_indices = None
-                if req.return_logprob:
+                if req.return_logprob and logits_output is not None:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
@@ -894,7 +911,15 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                if req.return_sampling_mask:
+                # A mask-only batch (batch.return_logprob False) puts nothing on
+                # the ring, so under pp_size > 1 the mask is computed on the last
+                # rank and dropped here, and the request gets a null mask instead
+                # of an error. That is a plain pp_size > 1 gap, unrelated to the
+                # early-last-chunk switch -- see
+                # docs/design/pp-pd-early-last-chunk-return-logprob.md section
+                # 2.4. Without the guard, a placeholder rank would instead
+                # AttributeError on the None logits_output.
+                if req.return_sampling_mask and logits_output is not None:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
@@ -956,7 +981,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
 
-                if req.return_logprob:
+                if req.return_logprob and logits_output is not None:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                     extend_input_len = extend_input_len_per_req[i]
                     if extend_logprob_start_len < extend_input_len:
@@ -1301,7 +1326,10 @@ class SchedulerDisaggregationPrefillMixin:
         Only non-PP0 ranks reach the body (see `_pp_pd_early_send_final_kv`): with
         PP0 owning the aux row they no longer need the sampled token for the last
         chunk, so the KV/state can leave from the next iteration's CPU phase
-        instead of waiting a full PP round for the output ring to come back.
+        instead of waiting a full PP round for the output ring to come back. They
+        do not do the logprob bookkeeping either -- their output row is a
+        placeholder, and PP0 owns the logprobs for the same reason it owns the aux
+        row. See docs/design/pp-pd-early-last-chunk-return-logprob.md.
         """
         if not self._pp_pd_early_send_final_kv or not batch.forward_mode.is_extend():
             return
@@ -1432,7 +1460,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         send_aux only applies to the last chunk: False means this rank is not the
         aux owner, so the metadata buffer is neither written nor transferred.
-        Used by the PP+PD early-last-chunk path where PP0 owns the aux row.
+        Used by the PP+PD early-last-chunk path where PP0 owns the aux row. The
+        aux row's logprob columns follow the same rule -- only the aux owner runs
+        add_logprob_return_values, so only it has anything to write here.
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
