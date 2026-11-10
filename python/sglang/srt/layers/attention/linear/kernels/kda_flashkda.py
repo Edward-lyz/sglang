@@ -9,14 +9,25 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 
 
 def _load_flash_kda():
-    """Import the optional ``flash_kda`` CUTLASS module."""
+    """Return the ``flash_kda`` fwd/get_workspace_size module.
+
+    With ``SGLANG_OPT_FLASH_KDA_CUTE`` enabled, use the vendored CuTe DSL
+    drop-in (no external dependency); otherwise import the external MoonshotAI
+    ``flash_kda`` CUTLASS package.
+    """
+    if envs.SGLANG_OPT_FLASH_KDA_CUTE.get():
+        from sglang.kernels.ops.attention.linear import flash_kda_cute
+
+        return flash_kda_cute
     try:
         import flash_kda
     except ImportError as e:
         raise ImportError(
             "The 'flashkda' KDA prefill backend requires the flash_kda module, "
             "which is not installed. Install it from source:\n"
-            "    pip install git+https://github.com/MoonshotAI/FlashKDA.git"
+            "    pip install git+https://github.com/MoonshotAI/FlashKDA.git\n"
+            "or enable the in-tree CuTe DSL drop-in with "
+            "SGLANG_OPT_FLASH_KDA_CUTE=1 (Blackwell SM100+)."
         ) from e
     return flash_kda
 

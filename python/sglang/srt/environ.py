@@ -1161,6 +1161,14 @@ class Envs:
     SGLANG_FLASHKDA_MIN_SEQ_LEN = EnvInt(64)
     SGLANG_FLASHKDA_MAX_SEQ_LEN = EnvInt(2048)
 
+    # Replace the external MoonshotAI ``flash_kda`` CUTLASS package with the
+    # vendored CuTe DSL drop-in (sglang.kernels.ops.attention.linear.
+    # flash_kda_cute) in the FlashKDAKernel prefill backend. On = no external
+    # dependency, kernel runs on the in-tree CuTe forward (Blackwell SM100+);
+    # off = import the external ``flash_kda`` as before. Does not change the
+    # Triton fallback gating in FlashKDAKernel.
+    SGLANG_OPT_FLASH_KDA_CUTE = EnvBool(False)
+
     # KDA extend/prefill output tail: fuse the non-contiguous layout copy
     # (forced by FusedRMSNormGated's x.reshape(-1, D) on core_attn_out, which
     # aliases the transposed conv-output buffer) together with the gated
