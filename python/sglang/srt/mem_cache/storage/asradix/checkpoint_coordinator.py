@@ -70,6 +70,7 @@ class _KDAWriteTask:
     page_ids: Any
     checkpoint_slot: Any
     params: dict
+    producer_ready: Any = None
     request: Any = None
     write_key: Optional[tuple[int, int]] = None
     release_after_write: Callable[[], None] = _noop_release
@@ -539,6 +540,8 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
     ) -> None:
         """Build and submit a KDA page-and-checkpoint write."""
         task = None
+        checkpoint_slot = None
+        page_ids = None
         cache_len = 0
         try:
             if not isinstance(token_ids, array) or token_ids.typecode != "q":
@@ -581,16 +584,23 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 return
             checkpoint_slot = self.prepare_checkpoint_slot(mamba_data.value)
             page_ids = self.prepare_page_ids(cache, snapshot[:cache_len])
+            producer_ready = self.record_device_event(cache.device)
+
+            def release_staging() -> None:
+                page_ids.release()
+                checkpoint_slot.release()
+
             task = _KDAWriteTask(
                 rid=req.rid,
                 node=node,
                 block_hash_ids=hashes,
                 page_ids=page_ids,
                 checkpoint_slot=checkpoint_slot,
+                producer_ready=producer_ready,
                 params=getattr(req, "as_kv_cache_params", None) or {},
                 request=req,
                 write_key=write_key,
-                release_after_write=page_ids.release,
+                release_after_write=release_staging,
             )
             task.release = _acquire_node_release(cache, node)
             mamba_data.metadata[_KDA_PENDING_HASH] = endpoint_hash
@@ -606,6 +616,11 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
         except Exception as exc:
             if task is not None:
                 self._discard_unsubmitted(cache, task)
+            else:
+                if page_ids is not None:
+                    page_ids.release()
+                if checkpoint_slot is not None:
+                    checkpoint_slot.release()
             cache._log_as_failure(
                 "write",
                 rid=req.rid,
@@ -625,6 +640,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 {"checkpoint": task.checkpoint_slot.materialize()},
                 timeout=1.0,
                 params=task.params,
+                producer_ready=task.producer_ready,
             )
             cache._log_as_result(
                 "write",
@@ -752,10 +768,15 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             )
             cache._as_min(0)
             return None
-        checkpoint_slot = checkpoint_allocation.value
         keep_transaction = False
         try:
-            state_id = int(checkpoint_slot.item())
+            host_ids = checkpoint_allocation.host_value
+            if host_ids is None or len(host_ids) != 1:
+                raise RuntimeError(
+                    "AttentionStore KDA load-back requires a host-side checkpoint "
+                    "slot ID; refusing to scalarize the scheduler GPU tensor"
+                )
+            state_id = int(host_ids[0])
             if cache._as_min(1) == 0:
                 return None
             read_error = None

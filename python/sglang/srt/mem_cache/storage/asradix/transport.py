@@ -289,16 +289,21 @@ class CheckpointedPageStore:
         checkpoint_slot: Mapping[str, int] | int,
         timeout: float = 1.0,
         params: Optional[dict] = None,
+        producer_ready=None,
     ) -> int:
         """Write pages and their terminal checkpoint as one unit."""
         if not block_hash_ids:
             return 0
+        wait_for_producer = getattr(self.checkpoint_store, "wait_for_producer", None)
+        if wait_for_producer is not None:
+            wait_for_producer(producer_ready, timeout=timeout)
         self.page_store.write(block_hash_ids, page_ids, timeout=timeout, params=params)
         checkpoint_result = self.checkpoint_store.write(
             int(block_hash_ids[-1]),
             checkpoint_slot,
             timeout=timeout,
             params=params,
+            producer_ready=producer_ready,
         )
         return len(block_hash_ids) if checkpoint_result == 1 else -1
 

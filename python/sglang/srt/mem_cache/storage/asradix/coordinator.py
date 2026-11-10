@@ -6,6 +6,7 @@ import concurrent.futures
 import hashlib
 import logging
 import struct
+import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional, Sequence, Tuple
@@ -70,6 +71,50 @@ def _materialize_page_ids(page_meta: torch.Tensor, page_size: int) -> tuple[int,
     return tuple(int(page_base) // page_size for page_base, _ in page_meta)
 
 
+_COPY_EVENT_TIMEOUT_S = 1.0
+_quarantined_copies: list = []
+_quarantine_lock = threading.Lock()
+
+
+def _event_completed(event) -> bool:
+    query = getattr(event, "query", None)
+    if query is None:
+        return False
+    try:
+        return bool(query())
+    except Exception:
+        return False
+
+
+def _wait_copy_event(event, timeout: float, operation: str) -> None:
+    query = getattr(event, "query", None)
+    if query is None:
+        raise RuntimeError(f"{operation} event does not support bounded polling")
+    deadline = time.monotonic() + max(0.0, timeout)
+    while not query():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{operation} copy completion wait timed out")
+        time.sleep(0.001)
+
+
+def _quarantine_copy(prepared, operation: str) -> None:
+    with _quarantine_lock:
+        if prepared.quarantined:
+            return
+        prepared.quarantined = True
+        _quarantined_copies.append(prepared)
+    logger.warning("%s copy is incomplete; retaining its buffers", operation)
+
+
+def _reap_quarantined_copies() -> None:
+    with _quarantine_lock:
+        _quarantined_copies[:] = [
+            entry
+            for entry in _quarantined_copies
+            if not _event_completed(entry.ready_event)
+        ]
+
+
 @dataclass
 class _PreparedPageIds:
     page_size: int
@@ -77,45 +122,49 @@ class _PreparedPageIds:
     ready_event: Any = None
     source_ready_event: Any = None
     source_metadata: Optional[torch.Tensor] = None
+    quarantined: bool = False
 
     def materialize(self) -> tuple[int, ...]:
-        """Wait for an asynchronous copy and return validated page IDs."""
         if self.ready_event is not None:
-            self.ready_event.synchronize()
+            try:
+                _wait_copy_event(self.ready_event, _COPY_EVENT_TIMEOUT_S, "AS page-id")
+            except Exception:
+                _quarantine_copy(self, "AS page-id")
+                raise
         return _materialize_page_ids(self.metadata, self.page_size)
 
     def release(self) -> None:
-        """Wait until asynchronous metadata users are quiescent."""
-        if self.ready_event is not None:
-            self.ready_event.synchronize()
+        """Retain buffers while the page-ID copy is incomplete."""
+        if self.ready_event is not None and not _event_completed(self.ready_event):
+            _quarantine_copy(self, "AS page-id")
 
 
 @dataclass
 class _PreparedSlot:
-    """A recurrent-state slot index staged for reading off the scheduler thread.
-
-    `.item()` on a device tensor drains the calling thread's stream, and the
-    PP disaggregated prefill loop enqueues this write *before* it posts the
-    iteration's proxy sends and recvs.  A blocking read here therefore couples
-    AS write latency into the pipeline: this rank waits for its own GPU queue,
-    whose NCCL work waits on peers that are in turn waiting for the sends this
-    rank has not posted yet.  Stage the copy instead and resolve it on the
-    writer thread, exactly as `_PreparedPageIds` does for page metadata.
-    """
 
     host: Any = None
     ready_event: Any = None
     source: Optional[torch.Tensor] = None
     value: Optional[int] = None
+    quarantined: bool = False
 
     def materialize(self) -> int:
-        """Wait for the staged copy and return the slot index."""
         if self.value is None:
             if self.ready_event is not None:
-                self.ready_event.synchronize()
+                try:
+                    _wait_copy_event(
+                        self.ready_event, _COPY_EVENT_TIMEOUT_S, "AS checkpoint-slot"
+                    )
+                except Exception:
+                    _quarantine_copy(self, "AS checkpoint-slot")
+                    raise
             self.value = int(self.host.item())
         return self.value
 
+    def release(self) -> None:
+        """Retain buffers while the slot copy is incomplete."""
+        if self.ready_event is not None and not _event_completed(self.ready_event):
+            _quarantine_copy(self, "AS checkpoint-slot")
 
 
 def _request_block_hash_ids(
@@ -169,8 +218,20 @@ class AttentionStoreCoordinator:
         # layer. It is never read by the writer thread.
         self._owner_hint: Optional[AttentionStoreWriteOwner] = None
 
+    @staticmethod
+    def record_device_event(device: Any):
+        """Record completion of the current producer stream."""
+        device = torch.device(device)
+        if device.type not in ("cuda", "xpu"):
+            return None
+        device_module = torch.get_device_module(device)
+        event = device_module.Event()
+        event.record(device_module.current_stream(device))
+        return event
+
     def prepare_page_ids(self, cache, slot_ids: torch.Tensor) -> _PreparedPageIds:
         """Stage validated page metadata without blocking the scheduler."""
+        _reap_quarantined_copies()
         metadata = _page_id_metadata(slot_ids, cache.page_size)
         if metadata.device.type != "cuda" or not metadata.numel():
             return _PreparedPageIds(cache.page_size, metadata.cpu())
@@ -200,6 +261,7 @@ class AttentionStoreCoordinator:
 
     def prepare_checkpoint_slot(self, slot: Any) -> _PreparedSlot:
         """Stage a recurrent-state slot index without blocking the scheduler."""
+        _reap_quarantined_copies()
         if not isinstance(slot, torch.Tensor):
             return _PreparedSlot(value=int(slot))
         if slot.device.type != "cuda" or slot.numel() != 1:
@@ -574,6 +636,7 @@ class AttentionStoreCoordinator:
         prevents the current batch from releasing a node while its proxy or
         result lifecycle is still in flight.
         """
+        _reap_quarantined_copies()
         is_pp = getattr(cache, "pp_world_size", getattr(cache, "pp_size", 1)) > 1
         if is_pp:
             if maintenance_round is None:

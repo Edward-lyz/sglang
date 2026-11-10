@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import torch
 
@@ -44,6 +45,7 @@ class PackedStateSnapshot:
 
     tensor: torch.Tensor
     release: Callable[[], None]
+    ready_event: Optional[Any] = None
 
 
 class KDACheckpointStore:
@@ -67,13 +69,47 @@ class KDACheckpointStore:
         self._slot_group = slot_group
         self._pack_validator = binding.pack_validator
         self._unpack_hook = binding.unpack_hook
-        self._lock = threading.Lock()
+        # Event waits must happen before acquiring this SDK mutex.
+        self._sdk_lock = threading.Lock()
 
-    def _synchronize_device(self) -> None:
-        if self._device.type == "cuda":
-            torch.cuda.synchronize(self._device)
-        elif self._device.type == "xpu":
-            torch.xpu.synchronize(self._device)
+    @staticmethod
+    def _wait_for_event(event, timeout: Optional[float], operation: str) -> None:
+        """Poll a device event with a deadline."""
+        if event is None:
+            return
+        query = getattr(event, "query", None)
+        if query is None:
+            raise RuntimeError(f"{operation} event does not support bounded polling")
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while not query():
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"{operation} completion wait timed out")
+            time.sleep(0.001)
+
+    def wait_for_producer(self, producer_ready, timeout: Optional[float] = 1.0) -> None:
+        """Fence registered buffers before an SDK write."""
+        if producer_ready is None and self._device.type in ("cuda", "xpu"):
+            raise RuntimeError("KDA checkpoint write requires a producer event")
+        self._wait_for_event(producer_ready, timeout, "KDA checkpoint write")
+
+    def _acquire_sdk_lock(self, timeout: Optional[float], operation: str) -> None:
+        """Acquire the SDK mutex within the remaining operation deadline."""
+        started = time.monotonic()
+        if timeout is None:
+            acquired = self._sdk_lock.acquire()
+        elif timeout <= 0:
+            acquired = self._sdk_lock.acquire(blocking=False)
+        else:
+            acquired = self._sdk_lock.acquire(timeout=timeout)
+        if not acquired:
+            raise TimeoutError(f"{operation} SDK lock wait timed out")
+        waited_ms = (time.monotonic() - started) * 1000
+        if waited_ms >= 10:
+            logger.warning(
+                "KDA checkpoint SDK lock wait: operation=%s wait_ms=%.2f",
+                operation,
+                waited_ms,
+            )
 
     def _slot(self, slot: Mapping[str, int] | int) -> tuple[dict[str, int], int]:
         slot_map = slot if isinstance(slot, Mapping) else {self._slot_group: int(slot)}
@@ -88,7 +124,11 @@ class KDACheckpointStore:
         """Return the matched KDA checkpoint prefix length."""
         from attentionstore_sdk.sdk import MatchRequest
 
-        return self._sdk.match(MatchRequest(block_hash_ids, timeout=timeout))
+        self._acquire_sdk_lock(timeout, "match")
+        try:
+            return self._sdk.match(MatchRequest(block_hash_ids, timeout=timeout))
+        finally:
+            self._sdk_lock.release()
 
     def write(
         self,
@@ -96,30 +136,35 @@ class KDACheckpointStore:
         slot: Mapping[str, int] | int,
         timeout: float = 1.0,
         params: Optional[dict] = None,
+        producer_ready=None,
     ) -> int:
         """Write one KDA checkpoint from a logical state slot."""
         from attentionstore_sdk.sdk import BlockBatch, BufferBindings, WriteRequest
 
         slot_map, slot_id = self._slot(slot)
-        with self._lock:
-            # Model updates can run on a model-owned stream. The SDK consumes
-            # the registered layer-buffer pointers directly, so fence those
-            # updates before queuing the native D2H transfer.
-            self._synchronize_device()
-            if self._pack_validator is not None:
-                self._pack_validator([slot_map])
-            return self._sdk.write(
-                WriteRequest(
-                    blocks=BlockBatch(
-                        [block_hash_id],
-                        [slot_id],
-                        layer_ids=self._layer_ids,
-                    ),
-                    buffers=BufferBindings(state=self._state_ptrs),
-                    timeout=timeout,
-                    params=params or {},
-                )
-            )
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        self.wait_for_producer(producer_ready, remaining)
+        if self._pack_validator is not None:
+            self._pack_validator([slot_map])
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        request = WriteRequest(
+            blocks=BlockBatch(
+                [block_hash_id],
+                [slot_id],
+                layer_ids=self._layer_ids,
+            ),
+            buffers=BufferBindings(state=self._state_ptrs),
+            timeout=(
+                timeout if deadline is None else max(0.0, deadline - time.monotonic())
+            ),
+            params=params or {},
+        )
+        self._acquire_sdk_lock(remaining, "write")
+        try:
+            return self._sdk.write(request)
+        finally:
+            self._sdk_lock.release()
 
     def read(
         self,
@@ -132,27 +177,30 @@ class KDACheckpointStore:
         from attentionstore_sdk.sdk import BlockBatch, BufferBindings, ReadRequest
 
         slot_map, slot_id = self._slot(slot)
-        with self._lock:
-            count = self._sdk.read(
-                ReadRequest(
-                    blocks=BlockBatch(
-                        [block_hash_id],
-                        [slot_id],
-                        layer_ids=self._layer_ids,
-                    ),
-                    buffers=BufferBindings(state=self._state_ptrs),
-                    timeout=timeout,
-                    remote_addrs=remote_addrs or (),
-                )
-            )
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        request = ReadRequest(
+            blocks=BlockBatch(
+                [block_hash_id],
+                [slot_id],
+                layer_ids=self._layer_ids,
+            ),
+            buffers=BufferBindings(state=self._state_ptrs),
+            timeout=(
+                timeout if deadline is None else max(0.0, deadline - time.monotonic())
+            ),
+            remote_addrs=remote_addrs or (),
+        )
+        self._acquire_sdk_lock(
+            None if deadline is None else max(0.0, deadline - time.monotonic()),
+            "read",
+        )
+        try:
+            count = self._sdk.read(request)
             if count and self._unpack_hook is not None:
-                try:
-                    self._unpack_hook([slot_map])
-                finally:
-                    # Fence ReplaySSM cursor resets before another model stream
-                    # consumes the state restored by native H2D copies.
-                    self._synchronize_device()
-            return count
+                self._unpack_hook([slot_map])
+        finally:
+            self._sdk_lock.release()
+        return count
 
     def stop(self) -> None:
         """Stop the underlying checkpoint SDK client."""
@@ -702,10 +750,13 @@ class SPACheckpointStore:
         # The second row matches the SDK's SPA read offset.
         self.staging = self._allocate_staging(2)
         self._lock = threading.Lock()
+        self._read_lock = threading.Lock()
+        self._read_ready_event = None
         self._snapshot_condition = threading.Condition()
         self._available_write_snapshots = [
             self._allocate_staging(1) for _ in range(write_snapshot_capacity)
         ]
+        self._pending_write_snapshots = []
         self._stopped = False
 
     def _allocate_staging(self, capacity: int) -> torch.Tensor:
@@ -718,17 +769,45 @@ class SPACheckpointStore:
     def _layout_view(self, staging: torch.Tensor) -> torch.Tensor:
         return staging[:, : self.layout.bytes_per_block]
 
-    def _synchronize_device(self) -> None:
-        if self.layout.device.type == "cuda":
-            torch.cuda.synchronize(self.layout.device)
-        elif self.layout.device.type == "xpu" and hasattr(torch, "xpu"):
-            torch.xpu.synchronize(self.layout.device)
+    def _record_stream_event(self):
+        device = self.layout.device
+        if device.type not in ("cuda", "xpu"):
+            return None
+        device_module = torch.get_device_module(device)
+        event = device_module.Event()
+        event.record(device_module.current_stream(device))
+        return event
+
+    @staticmethod
+    def _acquire_lock(lock, timeout: Optional[float], operation: str) -> None:
+        if timeout is None:
+            acquired = lock.acquire()
+        elif timeout <= 0:
+            acquired = lock.acquire(blocking=False)
+        else:
+            acquired = lock.acquire(timeout=timeout)
+        if not acquired:
+            raise TimeoutError(f"{operation} lock wait timed out")
+
+    def _reap_write_snapshots_locked(self) -> None:
+        pending = []
+        for tensor, event in self._pending_write_snapshots:
+            query = getattr(event, "query", None)
+            if query is not None and query():
+                self._available_write_snapshots.append(tensor)
+            else:
+                pending.append((tensor, event))
+        self._pending_write_snapshots = pending
 
     def match(self, block_hash_ids: Sequence[int], timeout: float = 1.0) -> int:
         """Return the matched SPA checkpoint prefix length."""
         from attentionstore_sdk.sdk import MatchRequest
 
-        return self._sdk.match(MatchRequest(block_hash_ids, timeout=timeout))
+        self._acquire_lock(self._lock, timeout, "SPA match")
+        try:
+            return self._sdk.match(MatchRequest(block_hash_ids, timeout=timeout))
+        finally:
+            self._lock.release()
 
     def write(
         self,
@@ -738,7 +817,7 @@ class SPACheckpointStore:
         params: Optional[dict] = None,
     ) -> int:
         """Snapshot and write one SPA checkpoint."""
-        snapshot = self.snapshot(slots)
+        snapshot = self.snapshot(slots, timeout=timeout)
         try:
             return self.write_snapshot(
                 block_hash_id,
@@ -749,30 +828,43 @@ class SPACheckpointStore:
         finally:
             snapshot.release()
 
-    def snapshot(self, slots: Mapping[str, int]) -> PackedStateSnapshot:
+    def snapshot(
+        self, slots: Mapping[str, int], timeout: float = 1.0
+    ) -> PackedStateSnapshot:
         """Pack state into an exclusively leased checkpoint snapshot."""
+        deadline = time.monotonic() + max(0.0, timeout)
         with self._snapshot_condition:
-            if self._stopped:
-                raise RuntimeError("SPA checkpoint store is already stopped")
-            while not self._available_write_snapshots:
+            while True:
                 if self._stopped:
                     raise RuntimeError("SPA checkpoint store is already stopped")
-                self._snapshot_condition.wait()
-            tensor = self._available_write_snapshots.pop()
+                self._reap_write_snapshots_locked()
+                if self._available_write_snapshots:
+                    tensor = self._available_write_snapshots.pop()
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("SPA snapshot lease wait timed out")
+                self._snapshot_condition.wait(timeout=min(remaining, 0.01))
+
+        ready_event = None
 
         def return_snapshot() -> None:
             with self._snapshot_condition:
-                self._available_write_snapshots.append(tensor)
-                self._snapshot_condition.notify()
+                query = getattr(ready_event, "query", None)
+                if ready_event is not None and (query is None or not query()):
+                    self._pending_write_snapshots.append((tensor, ready_event))
+                else:
+                    self._available_write_snapshots.append(tensor)
+                    self._snapshot_condition.notify()
 
         release = _once(return_snapshot)
         try:
-            self._synchronize_device()
             tensor.zero_()
             self.layout.pack([slots], self._layout_view(tensor))
-            self._synchronize_device()
-            return PackedStateSnapshot(tensor=tensor, release=release)
+            ready_event = self._record_stream_event()
+            return PackedStateSnapshot(tensor, release, ready_event)
         except Exception:
+            ready_event = self._record_stream_event()
             release()
             raise
 
@@ -794,19 +886,28 @@ class SPACheckpointStore:
             raise ValueError(
                 f"invalid SPA checkpoint snapshot shape: {tuple(snapshot.tensor.shape)}"
             )
-        with self._lock:
-            self._synchronize_device()
+        deadline = time.monotonic() + max(0.0, timeout)
+        KDACheckpointStore._wait_for_event(
+            snapshot.ready_event,
+            max(deadline - time.monotonic(), 0.0),
+            "SPA checkpoint write",
+        )
+        remaining = max(deadline - time.monotonic(), 0.0)
+        self._acquire_lock(self._lock, remaining, "SPA write")
+        try:
             return self._sdk.write(
                 WriteRequest(
                     blocks=BlockBatch(hash_ids=[block_hash_id], data_ids=[0]),
                     buffers=BufferBindings(
                         swa=(snapshot.tensor.data_ptr(),), swa_ids=(0,)
                     ),
-                    timeout=timeout,
+                    timeout=max(deadline - time.monotonic(), 0.0),
                     params=params or {},
                     swa_block_step=1,
                 )
             )
+        finally:
+            self._lock.release()
 
     def read(
         self,
@@ -822,22 +923,38 @@ class SPACheckpointStore:
             ReadRequest,
         )
 
-        with self._lock:
-            count = self._sdk.read(
-                ReadRequest(
-                    blocks=BlockBatch(hash_ids=[block_hash_id], data_ids=[0]),
-                    buffers=BufferBindings(
-                        swa=(self.staging.data_ptr(),), swa_ids=(0,)
-                    ),
-                    timeout=timeout,
-                    remote_addrs=remote_addrs or (),
-                    swa_block_step=1,
-                )
+        deadline = time.monotonic() + max(0.0, timeout)
+        self._acquire_lock(self._read_lock, timeout, "SPA read staging")
+        try:
+            KDACheckpointStore._wait_for_event(
+                self._read_ready_event,
+                max(deadline - time.monotonic(), 0.0),
+                "SPA checkpoint read staging",
             )
+            remaining = max(deadline - time.monotonic(), 0.0)
+            self._acquire_lock(self._lock, remaining, "SPA read")
+            try:
+                count = self._sdk.read(
+                    ReadRequest(
+                        blocks=BlockBatch(hash_ids=[block_hash_id], data_ids=[0]),
+                        buffers=BufferBindings(
+                            swa=(self.staging.data_ptr(),), swa_ids=(0,)
+                        ),
+                        timeout=max(deadline - time.monotonic(), 0.0),
+                        remote_addrs=remote_addrs or (),
+                        swa_block_step=1,
+                    )
+                )
+            finally:
+                self._lock.release()
             if count == 1:
-                self.layout.unpack([slots], self._layout_view(self.staging[1:2]))
-                self._synchronize_device()
+                try:
+                    self.layout.unpack([slots], self._layout_view(self.staging[1:2]))
+                finally:
+                    self._read_ready_event = self._record_stream_event()
             return count
+        finally:
+            self._read_lock.release()
 
     def stop(self) -> None:
         """Wake snapshot waiters and stop the underlying SDK client."""

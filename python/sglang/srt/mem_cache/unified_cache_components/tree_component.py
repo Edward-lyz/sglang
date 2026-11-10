@@ -85,20 +85,39 @@ class PrepareLoadBackResult:
 
 @dataclasses.dataclass(frozen=True)
 class ComponentDeviceValueAllocator:
-    """Device allocation hooks for a component value."""
+    """Device allocation hooks with optional host-side IDs."""
 
     alloc: Callable[[int], Optional[torch.Tensor]]
     free: Callable[[torch.Tensor], Any]
     evict: Optional[Callable[[int], Any]] = None
     available: Optional[Callable[[], int]] = None
     eviction_margin: int = 0
+    alloc_with_metadata: Optional[
+        Callable[[int], tuple[Optional[torch.Tensor], Optional[tuple[int, ...]]]]
+    ] = None
+    free_with_metadata: Optional[Callable[[torch.Tensor, Sequence[int]], Any]] = None
 
-    def reserve(self, count: int) -> torch.Tensor:
+    def release(
+        self, value: torch.Tensor, host_value: Optional[Sequence[int]] = None
+    ) -> Any:
+        if host_value is not None and self.free_with_metadata is not None:
+            return self.free_with_metadata(value, host_value)
+        return self.free(value)
+
+    def reserve_with_metadata(
+        self, count: int
+    ) -> tuple[torch.Tensor, Optional[tuple[int, ...]]]:
         if count <= 0:
             raise ValueError(
                 f"Component allocation count must be positive, got {count}"
             )
-        value = self.alloc(count)
+
+        def allocate():
+            if self.alloc_with_metadata is not None:
+                return self.alloc_with_metadata(count)
+            return self.alloc(count), None
+
+        value, host_value = allocate()
         if value is None and self.evict is not None:
             evict_count = count
             if self.available is not None:
@@ -107,15 +126,29 @@ class ComponentDeviceValueAllocator:
                 if shortfall > 0:
                     evict_count = shortfall + self.eviction_margin
             self.evict(evict_count)
-            value = self.alloc(count)
+            value, host_value = allocate()
         if value is None:
             raise RuntimeError(f"Cannot allocate {count} component device value(s)")
         if len(value) != count:
-            self.free(value)
+            metadata = (
+                host_value
+                if host_value is not None and len(host_value) == len(value)
+                else None
+            )
+            self.release(value, metadata)
             raise RuntimeError(
                 f"Allocated {len(value)} of {count} component device value(s)"
             )
-        return value
+        if host_value is not None and len(host_value) != count:
+            self.free(value)
+            raise RuntimeError(
+                f"Allocated {len(host_value)} of {count} host component value ID(s)"
+            )
+        return value, host_value
+
+    def reserve(self, count: int) -> torch.Tensor:
+        """Reserve a component value, discarding optional host metadata."""
+        return self.reserve_with_metadata(count)[0]
 
 
 class ComponentValueAllocation:
@@ -126,9 +159,11 @@ class ComponentValueAllocation:
         component_type: ComponentType,
         value: torch.Tensor,
         allocator: ComponentDeviceValueAllocator,
+        host_value: Optional[tuple[int, ...]] = None,
     ):
         self.component_type = component_type
         self.value = value
+        self.host_value = host_value
         self._allocator = allocator
         self._consumed = 0
         self._closed = False
@@ -152,7 +187,10 @@ class ComponentValueAllocation:
             return
         self._closed = True
         if self._consumed < len(self.value):
-            self._allocator.free(self.value[self._consumed :])
+            host_value = (
+                None if self.host_value is None else self.host_value[self._consumed :]
+            )
+            self._allocator.release(self.value[self._consumed :], host_value)
 
 
 class ComponentValueTransaction:
@@ -183,10 +221,12 @@ class ComponentValueTransaction:
             raise RuntimeError(
                 f"{type(component).__name__} does not expose a device value allocator"
             )
+        value, host_value = allocator.reserve_with_metadata(count)
         allocation = ComponentValueAllocation(
             component_type,
-            allocator.reserve(count),
+            value,
             allocator,
+            host_value=host_value,
         )
         self._allocations.append(allocation)
         return allocation
@@ -250,7 +290,6 @@ class UnifiedInsertResult(InsertResult):
 
 
 class CacheTransferPhase(str, Enum):
-
     BACKUP_HOST = "backup_host"  # D→H
     LOAD_BACK = "load_back"  # H→D
     BACKUP_STORAGE = "backup_storage"  # H→Storage
@@ -258,7 +297,6 @@ class CacheTransferPhase(str, Enum):
 
 
 class LRURefreshPhase(str, Enum):
-
     WALKDOWN = "walkdown"  # touching a node while walking through the tree
     MATCH_END = "match_end"  # end of a successful prefix match
     INSERT_END = "insert_end"  # after a new/updated leaf is committed

@@ -52,10 +52,12 @@ class MambaComponent(TreeComponent):
         return ComponentDeviceValueAllocator(
             alloc=pool.alloc,
             free=pool.free,
+            alloc_with_metadata=getattr(pool, "alloc_with_host", None),
+            free_with_metadata=getattr(pool, "free_with_host", None),
             evict=lambda count: self.cache.evict(
                 EvictParams(num_tokens=0, mamba_num=count)
             ),
-            available=pool.available_size,
+            available=getattr(pool, "schedulable_available_size", pool.available_size),
         )
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
