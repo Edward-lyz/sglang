@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     build_dcp_replicated_token_transfer_plan,
     build_dcp_token_transfer_plan,
+    contiguous_run_starts_and_counts,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -634,6 +635,30 @@ class MooncakeKVManager(CommonKVManager):
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
 
+    def _transfer_data_arrays(
+        self,
+        mooncake_session_id,
+        src_addrs: npt.NDArray[np.int64],
+        dst_addrs: npt.NDArray[np.int64],
+        lengths: npt.NDArray[np.int64],
+    ):
+        """Same contract as :meth:`_transfer_data`, for callers that already hold
+        the addresses as NumPy arrays.
+
+        Avoids building one Python tuple per block only for ``zip(*blocks)`` to
+        take them apart again -- that round trip dominates when the block count
+        is token-granular (DCP relayout).
+        """
+        if src_addrs.size == 0:
+            return 0
+
+        return self.engine.batch_transfer_sync(
+            mooncake_session_id,
+            src_addrs.tolist(),
+            dst_addrs.tolist(),
+            lengths.tolist(),
+        )
+
     def _send_kvcache_generic(
         self,
         mooncake_session_id: str,
@@ -847,7 +872,10 @@ class MooncakeKVManager(CommonKVManager):
                 dst_kv_ptrs,
             )
         layers_current_pp_stage = len(src_kv_ptrs)
-        src_groups, dst_groups = group_concurrent_contiguous(
+        # Run-length form, not materialised groups: a DCP relayout strides the
+        # source by dcp_size, so every run is a single token and the per-group
+        # Python lists would be as long as the token count -- per layer.
+        src_starts, dst_starts, run_counts = contiguous_run_starts_and_counts(
             plan.src_token_indices,
             plan.dst_token_indices,
         )
@@ -861,22 +889,21 @@ class MooncakeKVManager(CommonKVManager):
             for layer_id in range(layers_current_pp_stage)
         ]
 
-        def set_transfer_blocks(
+        def layer_addrs(
             src_ptr: int, dst_ptr: int, token_item_len: int
-        ) -> List[Tuple[int, int, int]]:
-            return [
-                (
-                    src_ptr + int(src_group[0]) * token_item_len,
-                    dst_ptr + int(dst_group[0]) * token_item_len,
-                    len(src_group) * token_item_len,
-                )
-                for src_group, dst_group in zip(src_groups, dst_groups)
-            ]
+        ) -> Tuple[
+            npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]
+        ]:
+            return (
+                src_ptr + src_starts * token_item_len,
+                dst_ptr + dst_starts * token_item_len,
+                run_counts * token_item_len,
+            )
 
         def process_layer(src_ptr: int, dst_ptr: int, token_item_len: int) -> int:
-            return self._transfer_data(
+            return self._transfer_data_arrays(
                 mooncake_session_id,
-                set_transfer_blocks(src_ptr, dst_ptr, token_item_len),
+                *layer_addrs(src_ptr, dst_ptr, token_item_len),
             )
 
         if self.enable_custom_mem_pool:
@@ -892,12 +919,15 @@ class MooncakeKVManager(CommonKVManager):
                     return status
             return 0
 
-        transfer_blocks = []
-        for src_ptr, dst_ptr, token_item_len in layers_params:
-            transfer_blocks.extend(
-                set_transfer_blocks(src_ptr, dst_ptr, token_item_len)
-            )
-        return self._transfer_data(mooncake_session_id, transfer_blocks)
+        per_layer = [layer_addrs(*params) for params in layers_params]
+        if not per_layer:
+            return 0
+        return self._transfer_data_arrays(
+            mooncake_session_id,
+            np.concatenate([addrs[0] for addrs in per_layer]),
+            np.concatenate([addrs[1] for addrs in per_layer]),
+            np.concatenate([addrs[2] for addrs in per_layer]),
+        )
 
     def send_kvcache_dcp_draft(
         self,

@@ -130,6 +130,40 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
+def contiguous_run_starts_and_counts(
+    src_indices: npt.NDArray[np.int64],
+    dst_indices: npt.NDArray[np.int64],
+) -> Tuple[
+    npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]
+]:
+    """Run-length form of :func:`group_concurrent_contiguous`.
+
+    Returns ``(src_starts, dst_starts, counts)``: the first src index, the first
+    dst index and the length of every maximal run in which both sides advance by
+    one. Equivalent to taking ``g[0]`` and ``len(g)`` of each group the grouping
+    helper returns, but keeps everything in NumPy instead of materialising one
+    Python list per run -- under a DCP relayout the source side is strided by
+    ``dcp_size``, so every run has length 1 and the group lists would be as long
+    as the token count.
+    """
+    if src_indices.size == 0 or dst_indices.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return empty, empty.copy(), empty.copy()
+
+    if src_indices.size != dst_indices.size:
+        raise ValueError(
+            "contiguous_run_starts_and_counts requires equal-length src/dst "
+            f"index arrays, got {src_indices.size} and {dst_indices.size}"
+        )
+
+    src = np.asarray(src_indices, dtype=np.int64)
+    dst = np.asarray(dst_indices, dtype=np.int64)
+    brk = np.where((np.diff(src) != 1) | (np.diff(dst) != 1))[0] + 1
+    starts = np.concatenate((np.zeros(1, dtype=np.int64), brk))
+    bounds = np.concatenate((starts, np.array([src.size], dtype=np.int64)))
+    return src[starts], dst[starts], np.diff(bounds)
+
+
 @dataclasses.dataclass(frozen=True)
 class DCPTokenTransferPlan:
     src_token_indices: npt.NDArray[np.int64]
