@@ -470,6 +470,16 @@ class Envs:
     # admitted only when every PP rank acknowledged it. Kill-switch: set to 0 to
     # restore the byte-identical two-pass (pre-consensus + consensus ring) path.
     SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS = EnvBool(False)
+    # PP + PD prefill: answer the client as soon as this rank's own prefill is
+    # done, instead of waiting for the all-PP-ranks release consensus (whose
+    # second lap runs against the pipeline direction, one microbatch slot per
+    # hop). The terminal FINISH_LENGTH(length=0) response carries no token the
+    # client needs, and the paired decode judges KV transfer success/failure
+    # from its own in-band notification, so the consensus only has to gate the
+    # dequeue (KV page + req slot release), not the HTTP answer. Takes effect on
+    # PP0 only -- no other rank holds a detokenizer socket. Kill-switch: set to
+    # 0 to restore the byte-identical release-time answer.
+    SGLANG_PP_PD_PREFILL_EARLY_STREAM_OUTPUT = EnvBool(False)
     # Cap on the tokens whose KV one transfer chunk ships, i.e. one synchronous
     # RDMA batch. Only requests whose cached prefix exceeds this ever split:
     # chunked prefill already bounds every other send to chunked_prefill_size,

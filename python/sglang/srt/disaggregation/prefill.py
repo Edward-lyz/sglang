@@ -1128,10 +1128,11 @@ class SchedulerDisaggregationPrefillMixin:
                         req.time_stats.prefill_kv_transfer_finish_time
                         - req.time_stats.prefill_transfer_queue_entry_time
                     )
-                    self.metrics_collector.observe_time_to_first_token(
-                        req.time_stats.prefill_kv_transfer_finish_time
-                        - req.time_stats.prefill_bootstrap_queue_entry_time
-                    )
+                    if not envs.SGLANG_PP_PD_PREFILL_EARLY_STREAM_OUTPUT:
+                        self.metrics_collector.observe_time_to_first_token(
+                            req.time_stats.prefill_kv_transfer_finish_time
+                            - req.time_stats.prefill_bootstrap_queue_entry_time
+                        )
             elif poll == KVPoll.Failed:
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
@@ -1145,13 +1146,49 @@ class SchedulerDisaggregationPrefillMixin:
                 # A failed transfer can finish before the next early-send
                 # flush. Its forward fence was checked above on every shard.
                 self._pp_drop_pending_final_kv(req)
-            req.time_stats.set_completion_time()
-            if self.enable_metrics and not isinstance(
-                req.finished_reason, FINISH_ABORT
-            ):
-                self.metrics_collector.observe_request_first_token_forward_time(
-                    req.time_stats.get_request_first_token_forward_time()
-                )
+
+        stream_reqs = []
+        if self._pp_pd_prefill_early_stream_output:
+            # The release consensus gates the dequeue (KV pages + req slot), not
+            # the client's answer, so a released request was already answered on
+            # an earlier round -- with one exception, which is why done_reqs is
+            # still scanned here: a request the consensus failed while it was
+            # parked on bootstrap never became eligible for an early answer, and
+            # this abort is the only answer it will ever get.
+            stream_reqs = [
+                req
+                for req in undone_reqs
+                if not req.finished_output and not req.pending_bootstrap
+            ] + [req for req in done_reqs if not req.finished_output]
+
+            # Nothing is due for an already-answered request except this
+            # timestamp: the kv-transfer metric below falls back to it whenever
+            # the backend reports no transfer latency (mooncake never does), and
+            # the early value would collapse the reported latency to one round.
+            for req in done_reqs:
+                if req.finished_output:
+                    req.time_stats.set_completion_time()
+
+            for req in stream_reqs:
+                if not isinstance(req.finished_reason, FINISH_ABORT):
+                    req.finished_reason = FINISH_LENGTH(length=0)
+                req.time_stats.set_completion_time()
+                if self.enable_metrics and not isinstance(
+                    req.finished_reason, FINISH_ABORT
+                ):
+                    self.metrics_collector.observe_request_first_token_forward_time(
+                        req.time_stats.get_request_first_token_forward_time()
+                    )
+        else:
+            for req in done_reqs:
+                req.time_stats.set_completion_time()
+                if self.enable_metrics and not isinstance(
+                    req.finished_reason, FINISH_ABORT
+                ):
+                    self.metrics_collector.observe_request_first_token_forward_time(
+                        req.time_stats.get_request_first_token_forward_time()
+                    )
+            stream_reqs = done_reqs
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -1173,8 +1210,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         # Stream requests which have finished transfer
         self.output_streamer.stream_output(
-            done_reqs,
-            any(req.return_logprob for req in done_reqs),
+            stream_reqs,
+            any(req.return_logprob for req in stream_reqs),
             None,
         )
         for req in done_reqs:

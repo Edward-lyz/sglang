@@ -1781,6 +1781,9 @@ class Scheduler(
         # reports) instead of over the pipeline consensus relay, so PP0's poll()
         # already means "globally ready".
         self._pp_pd_sideband_bootstrap = False
+        # Whether this rank answers the client before the release consensus
+        # lands. PP0 only, since it is the only rank with a detokenizer socket.
+        self._pp_pd_prefill_early_stream_output = False
         self.disagg_prefill_pending_final_kv: List[PendingFinalKV] = []
 
         self.disaggregation_mode = DisaggregationMode(
@@ -1922,6 +1925,17 @@ class Scheduler(
             )
             if self._pp_pd_sideband_bootstrap:
                 self._validate_pp_pd_sideband_bootstrap()
+
+            self._pp_pd_prefill_early_stream_output = (
+                envs.SGLANG_PP_PD_PREFILL_EARLY_STREAM_OUTPUT.get()
+                and self.ps.pp_size > 1
+                and self.pp_group.is_first_rank
+            )
+            if self._pp_pd_prefill_early_stream_output:
+                logger.info(
+                    "PP+PD prefill early stream output enabled: "
+                    f"pp_rank={self.pp_group.rank_in_group}."
+                )
 
         # Init mm receiver for EPD disaggregation mode
         if (
