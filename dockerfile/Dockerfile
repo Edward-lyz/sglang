@@ -9,8 +9,8 @@ FROM iregistry.baidu-int.com/lyz/lmsysorg/sglang:dev-dsv41
 # 和 kimi-k3 交付镜像相比，这里刻意少了一步：tokenspeed_mla 的精确除法 patch。
 # 那个包只在 aiak-inference-sglang 基础镜像里，社区镜像里没有，patch 会直接失败。
 #
-# deep_gemm 预编译缓存见文件末尾。kimi-k3 那份是按 K3 编的，对 DSv4.1 无效，
-# 这里换成 bzz2 prefill pod 上汇总出来的 DSv4.1-Flash 版本。
+# deep_gemm 处理见文件末尾：megamoe 要求固定 dev@1ff3932f 的 wheel，并配套一份用同一
+# 版本烤出来的 DSv4.1-Flash JIT 预编译缓存（kimi-k3 那份按 K3 编的，对 DSv4.1 无效）。
 ## ===========================================================================================
 
 
@@ -63,15 +63,41 @@ RUN set -eux; \
 
 RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/msit_llm-8.3.2-py3-none-any.whl onnx --no-deps
 
+# deep_gemm 库固定成经 DSv4.1-Flash 验证过的构建（dev@1ff3932f，含 SF-alignment 修复，
+# 治 CUDA graph capture 期 mega_moe.cuh:379 num_bytes%16 崩溃）。base 镜像自带的 deep_gemm
+# 不保证是这个版本，而下面那份 JIT 缓存正是用这个版本在 bzz2 pod 上烤出来的，二者必须对齐，
+# 所以这里显式卸掉旧的（含无 pip 元数据的裸目录）再装 BOS 上 pin 好的 wheel
+# （torch 2.13.0+cu130 → torch2.13.0/ 路径；社区那条是 torch2.9.1，ABI 对不上不能复用）。
+# 刷新方式：重编 deep_gemm 后打 wheel 传 BOS，替换下面 URL，并同步刷新那份 JIT 缓存包。
+RUN set -eux; \
+    pip uninstall -y deep_gemm 2>/dev/null || true; \
+    for sp in $(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib']); print(sysconfig.get_paths()['platlib'])"); do \
+        rm -rf "$sp/deep_gemm"; \
+    done; \
+    pip install --no-deps --no-cache-dir \
+        https://cce-ai-datasets.bj.bcebos.com/hac_test/vllm/DeepGemm/develop/torch2.13.0/deep_gemm-0.1.8+1ff3932f-cp312-cp312-linux_x86_64.whl; \
+    python3 -c "import importlib.metadata as m; v=m.version('deep_gemm'); print('[deep_gemm] installed', v); assert v == '0.1.8+1ff3932f', v"
+
+# FlashMLA 07a1089：带 fused_norm_rope_attn_rope_cast（mega-attn fused-o），读引擎的 V4 584B / V4.1 池。
+# base 镜像的 sgl_kernel.flash_mla 没有这个算子、也没有顶层 flash_mla 包，缺它时
+# SGLANG_OPT_FLASHMLA_FUSED_ATTN_O 会每层静默失效（日志刷 "stays unfused"）。
+# 顶层 flash_mla 只被 fused-o 路径(fused_o_attn.py)使用，不改普通 attention(走 sgl_kernel.flash_mla)。
+# 仅适配 py3.12 + torch2.13 + cu130 + sm100/sm103；换 torch/CUDA 必须重编（文件名不体现这点）。
+# 校验只读 dist-info 版本，不 import CUDA 扩展：构建环境无 GPU 驱动(libcuda.so.1)，import 会失败。
+RUN pip install --no-deps --no-cache-dir \
+        https://cce-ai-datasets.bj.bcebos.com/hac_test/vllm/FlashMLA/develop/flash_mla-1.0.0+07a1089.sm100a.sm103a-cp312-cp312-linux_x86_64.whl && \
+    python3 -c "import importlib.metadata as m; v=m.version('flash_mla'); print('[flash_mla] installed', v); assert v.startswith('1.0.0+07a1089'), v"
+
 # DSv4.1-Flash 的 JIT 预编译缓存：DeepGEMM cubin、Triton kernel、sgl-kernel JIT、tilelang。
-# 内容取自 bzz2 上跑过一轮 prefill 的 dsv41-flash pod 的 /root/.cache 与 /root/.tilelang，
-# 包内顶层就是 root/，所以解到 / 即落回原路径，省掉容器启动时的 kernel 编译。
-# 包里的 pip HTTP 缓存有 122MB 且运行时用不到，解包时排除，避免镜像白涨 120MB。
+# 内容取自跑最终 megamoe+DSpark 配置的 dsv41-flash PD pod(deep_gemm dev@1ff3932f,与上面 pin 的 wheel 同源):
+# prefill(tp4 cp4 fake-dp2) + decode(dp8) 两侧 /root/.cache + /root/.tilelang 的并集,1028 在 bzz2 PD pod 上重烤。
+# 换了 deep_gemm 就必须同步重烤这份(源码变→JIT cache key 变),两者要成对更新。
+# 包内顶层就是 root/,所以解到 / 即落回原路径,省掉容器启动时的 kernel 编译;打包时已排除 pip HTTP 缓存。
 #
-# 刷新方式：在 pod 上重新跑一轮 prefill，把 /root/.cache + /root/.tilelang 打包上传 BOS，
-# 再替换下面的 URL。包内路径约定不能变，第一步的测试会挡住路径不对的包。
+# 刷新方式:在装了新 wheel 的 PD pod 上跑最终配置(prefill+decode),各自打包 /root/.cache + /root/.tilelang
+# 取并集上传 BOS,再替换下面的 URL。包内路径约定不能变,末尾 test 会挡住路径不对的包。
 RUN wget -q -O /tmp/dsv41-flash-cache.tar.gz \
-        https://aihc-ai-datasets-bj.bj.bcebos.com/hac-aiacc/deepseek/deep_gemm_deepseekv41_flash_bzz2_cache_0918.tar.gz && \
+        https://cce-ai-datasets.bj.bcebos.com/hac_test/vllm/DeepGemm/develop/torch2.13.0/deep_gemm_deepseekv41_flash_pd_cache_1028.tar.gz && \
     tar -xzf /tmp/dsv41-flash-cache.tar.gz -C / --exclude='root/.cache/pip' && \
     rm -f /tmp/dsv41-flash-cache.tar.gz && \
     test -d /root/.cache/sglang/deep_gemm/cache && test -d /root/.tilelang/cache
