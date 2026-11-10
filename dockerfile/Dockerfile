@@ -1,4 +1,4 @@
-FROM iregistry.baidu-int.com/hac_test/aiak-inference-sglang:v0.5.15.post1-cu130-flashinfer-0.6.14
+FROM iregistry.baidu-int.com/hac-aiacc/aiak-inference-sglang:kimi-k3
 
 ## ===========================================================================================
 # 这个是base是在社区这个commit v0.5.8 基础上打的镜像，作了如下修改：
@@ -29,11 +29,7 @@ EOF
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
 # 新增copy单测用例：scripts/ci/ci_tests.json
-RUN cd /tmp/aiak_sglang && find . -name "*.py" -exec cp --parents {} /sgl-workspace/sglang \; && \
-    cp scripts/ci/ci_tests.json scripts/ci/run_ci.py /sgl-workspace/sglang/scripts/ci/ && \
-    cp -R python/sglang/jit_kernel /sgl-workspace/sglang/python/sglang && \
-    git log -1 --format="%H %s %an %ad" > /sgl-workspace/sglang/aiak-last-commit && \
-    rm -rf /tmp/aiak_sglang
+RUN rm -rf /sgl-workspace/sglang/python && cp -r /tmp/aiak_sglang/python /sgl-workspace/sglang/python && rm -r /tmp/aiak_sglang
 
 # RUN pip install --upgrade tokenspeed-mla --break-system-packages --proxy http://agent.baidu.com:8891
 
@@ -41,7 +37,7 @@ RUN pip config set global.index-url http://mirrors.baidubce.com/pypi/simple/ && 
     pip config set global.trusted-host mirrors.baidubce.com
 
 # Install deepgemm cache
-RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/cache_k26_0601.tar.gz && tar -xzvf cache_k26_0601.tar.gz && rm cache_k26_0601.tar.gz
+RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/cache_k3_0728_2.tar.gz && tar -xzvf cache_k3_0728_2.tar.gz && rm cache_k3_0728_2.tar.gz
 
 RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/sglang-prestop-pyspy-dump.sh
 
