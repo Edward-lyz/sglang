@@ -146,7 +146,10 @@ class DSATopKBackend(Enum):
         # scores start at column ks_b = sum(seq_lens[:b]); run v2 once per
         # request on that column window with the request's page-table row.
         # ``row_range`` locates a row-chunk of the logits (the indexer splits
-        # them under memory pressure) within the batch's rows.
+        # them under memory pressure) within the batch's rows. Batches with more
+        # than _V2_PREFILL_MAX_SEGMENTS requests send only their long requests to
+        # v2 and the rest to the legacy kernel (sgl-kernel only), so a long
+        # request never goes through the [rows, max_seq_len] page_table_1 gather.
         if (
             envs.SGLANG_DSA_PREFILL_TOPK_V2.get()
             and topk_transform_method == TopkTransformMethod.PAGED
@@ -157,10 +160,12 @@ class DSATopKBackend(Enum):
             and logits.stride(1) == 1
             and logits.stride(0) % 4 == 0
         ):
-            segments = _v2_prefill_segments(logits, attn_metadata, row_range)
+            segments = _v2_prefill_segments(
+                logits, attn_metadata, row_range, allow_mixed=self.is_sgl_kernel()
+            )
             if segments is not None:
                 return _topk_transform_v2_paged_prefill_multi(
-                    logits, lengths, topk, attn_metadata, segments
+                    logits, lengths, topk, attn_metadata, segments, row_starts
                 )
 
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
@@ -388,18 +393,25 @@ def _topk_transform_v2_paged_prefill(
 
 # Per-request v2 costs ~3 launches per request, so it only pays on long rows
 # (B200, topk 2048: [492K+1792, 0+1792] 2.36 -> 1.15 ms; 8 x fresh 2048
-# 0.08 -> 0.18 ms). Short or many-request batches stay on the legacy kernel.
+# 0.08 -> 0.18 ms). Short batches stay on the legacy kernel; batches with more
+# than _V2_PREFILL_MAX_SEGMENTS requests send only requests of at least
+# _V2_PREFILL_MIN_MAX_SEQ tokens to v2.
 _V2_PREFILL_MAX_SEGMENTS = 8
 _V2_PREFILL_MIN_MAX_SEQ = 8192
 
 
 def _v2_prefill_segments(
-    logits: torch.Tensor, attn_metadata, row_range: Optional[Tuple[int, int]] = None
+    logits: torch.Tensor,
+    attn_metadata,
+    row_range: Optional[Tuple[int, int]] = None,
+    allow_mixed: bool = False,
 ):
-    """Host-side (row_start, row_end, col_start, col_len, batch) per request of
-    a multi-request PAGED prefill, in ``logits`` row coordinates, or None when
-    the batch does not qualify. ``logits`` holds batch rows ``row_range``
-    (default: all of them). Uses only CPU metadata, so no device sync."""
+    """Host-side (row_start, row_end, col_start, col_len, batch, req_row_start,
+    extend_len, use_v2) per request of a multi-request PAGED prefill, in
+    ``logits`` row coordinates, or None when the batch does not qualify.
+    ``logits`` holds batch rows ``row_range`` (default: all of them). Segments
+    with use_v2=False go to the legacy kernel; that split is only produced when
+    ``allow_mixed``. Uses only CPU metadata, so no device sync."""
     page_table = getattr(attn_metadata, "real_page_table", None)
     seq_lens_cpu = getattr(attn_metadata, "indexer_seq_lens_cpu", None)
     extend_lens = getattr(attn_metadata, "dsa_extend_seq_lens_list", None)
@@ -408,11 +420,14 @@ def _v2_prefill_segments(
     bs = page_table.shape[0]
     if (
         page_table.dtype != torch.int32
-        or not 1 < bs <= _V2_PREFILL_MAX_SEGMENTS
+        or bs <= 1
         or len(extend_lens) != bs
         or seq_lens_cpu.shape[0] != bs
         or int(seq_lens_cpu.max()) < _V2_PREFILL_MIN_MAX_SEQ
     ):
+        return None
+    mixed = bs > _V2_PREFILL_MAX_SEGMENTS
+    if mixed and not allow_mixed:
         return None
     lo, hi = (0, sum(extend_lens)) if row_range is None else row_range
     if hi - lo != logits.shape[0] or hi > sum(extend_lens):
@@ -422,12 +437,18 @@ def _v2_prefill_segments(
     for b, (q, k) in enumerate(zip(extend_lens, seq_lens_cpu.tolist())):
         r0, r1 = max(row, lo), min(row + q, hi)
         if r0 < r1:
-            # The kernel loads scores 16 B at a time from the window start.
-            if col % 4 != 0 or col + k > logits.shape[1]:
+            if col + k > logits.shape[1]:
                 return None
-            segments.append((r0 - lo, r1 - lo, col, k, b))
+            use_v2 = not mixed or k >= _V2_PREFILL_MIN_MAX_SEQ
+            segments.append((r0 - lo, r1 - lo, col, k, b, r0 - row, q, use_v2))
         row += q
         col += k
+    # A window that does not start on a 16 B boundary is read from the aligned
+    # column below it through the page_size=1 table.
+    if any(s[7] and s[2] % 4 != 0 for s in segments) and (
+        getattr(attn_metadata, "page_table_1", None) is None
+    ):
+        return None
     return segments
 
 
@@ -437,6 +458,7 @@ def _topk_transform_v2_paged_prefill_multi(
     topk: int,
     attn_metadata,
     segments,
+    row_starts: torch.Tensor,
 ) -> torch.Tensor:
     from sglang.kernels.ops.attention.dsv4.topk import (
         plan_topk_v2,
@@ -447,18 +469,102 @@ def _topk_transform_v2_paged_prefill_multi(
     page_size = get_token_to_kv_pool().page_size
     lengths_i32 = lengths.to(torch.int32)
     out = logits.new_full((logits.shape[0], topk), -1, dtype=torch.int32)
-    for r0, r1, c0, k, b in segments:
-        seg_lens = lengths_i32[r0:r1]
-        page_table = attn_metadata.real_page_table[b : b + 1].expand(r1 - r0, -1)
-        topk_transform_512_v2(
-            logits[r0:r1, c0 : c0 + k],
-            seg_lens,
-            page_table,
-            out[r0:r1],
-            page_size,
-            plan_topk_v2(seg_lens),
+    legacy_run = []
+    for seg in segments:
+        r0, r1, c0, k, b, req_row, q, use_v2 = seg
+        if not use_v2:
+            legacy_run.append(seg)
+            continue
+        _legacy_paged_prefill_rows(
+            logits, lengths_i32, topk, attn_metadata, legacy_run, row_starts, out
         )
+        legacy_run = []
+        pad = c0 % 4
+        if pad == 0:
+            seg_lens = lengths_i32[r0:r1]
+            page_table = attn_metadata.real_page_table[b : b + 1].expand(r1 - r0, -1)
+            topk_transform_512_v2(
+                logits[r0:r1, c0 : c0 + k],
+                seg_lens,
+                page_table,
+                out[r0:r1],
+                page_size,
+                plan_topk_v2(seg_lens),
+            )
+            continue
+        # The window starts off a 16 B boundary: read it from column c0 - pad
+        # with the pad columns at -inf (they hold the previous request's K,
+        # which these rows never use) and lengths + pad, and map positions
+        # through this request's page_size=1 row shifted right by pad.
+        # Row j of the request has length k - q + j + 1; rows of length
+        # <= topk take the kernel's trivial path, which never reads scores
+        # and must see the unshifted table, so they are launched apart.
+        n_trivial = min(max(topk - (k - q) - req_row, 0), r1 - r0)
+        rm = r0 + n_trivial
+        if n_trivial > 0:
+            seg_lens = lengths_i32[r0:rm]
+            topk_transform_512_v2(
+                logits[r0:rm, c0 - pad : c0 - pad + k],
+                seg_lens,
+                attn_metadata.real_page_table[b : b + 1].expand(n_trivial, -1),
+                out[r0:rm],
+                page_size,
+                plan_topk_v2(seg_lens),
+            )
+        if rm < r1:
+            window = logits[rm:r1, c0 - pad : c0 + k]
+            window[:, :pad] = float("-inf")
+            page_table_1 = attn_metadata.page_table_1
+            shifted_row = torch.cat(
+                [page_table_1.new_full((pad,), -1), page_table_1[b, :k]]
+            )
+            seg_lens = lengths_i32[rm:r1] + pad
+            topk_transform_512_v2(
+                window,
+                seg_lens,
+                shifted_row[None].expand(r1 - rm, -1),
+                out[rm:r1],
+                1,
+                plan_topk_v2(seg_lens),
+            )
+    _legacy_paged_prefill_rows(
+        logits, lengths_i32, topk, attn_metadata, legacy_run, row_starts, out
+    )
     return out
+
+
+def _legacy_paged_prefill_rows(
+    logits: torch.Tensor,
+    lengths_i32: torch.Tensor,
+    topk: int,
+    attn_metadata,
+    run,
+    row_starts: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """sgl-kernel top-k over a run of row-adjacent short segments. Each row's
+    page_size=1 table is cut to the run's longest request, so the per-row copy
+    stays [rows, < _V2_PREFILL_MIN_MAX_SEQ] instead of [rows, max_seq_len]."""
+    if not run:
+        return
+    from sgl_kernel import fast_topk_transform_fused
+
+    r0, r1 = run[0][0], run[-1][1]
+    width = max(seg[3] for seg in run)
+    page_table_1 = attn_metadata.page_table_1[:, :width]
+    page_table = torch.cat(
+        [page_table_1[seg[4] : seg[4] + 1].expand(seg[1] - seg[0], -1) for seg in run]
+    )
+    out[r0:r1] = fast_topk_transform_fused(
+        score=logits[r0:r1],
+        lengths=lengths_i32[r0:r1],
+        page_table_size_1=page_table,
+        cu_seqlens_q=torch.arange(
+            r1 - r0 + 1, dtype=torch.int32, device=logits.device
+        ),
+        topk=topk,
+        row_starts=row_starts[r0:r1],
+    )
 
 
 def _build_flashinfer_paged_args(
