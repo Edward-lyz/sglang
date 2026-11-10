@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
+from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -211,6 +213,27 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     # graphs key their wrappers by token tier (_verify_graph_key).
     supports_ragged_verify_graph: bool = True
 
+    def quantize_prefill_mla_kv_cache(
+        self,
+        kv_a: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize only the persistent MLA cache payload for eager prefill."""
+        if (
+            not self.enable_kimi_k3_prefill_fp8_cache
+            or self.token_to_kv_pool.dtype != torch.float8_e4m3fn
+        ):
+            return kv_a, k_pe
+
+        return (
+            fp8_quantize(kv_a, scale_inv=1.0, enable_pdl=is_arch_support_pdl()),
+            fp8_quantize(
+                k_pe.squeeze(1),
+                scale_inv=1.0,
+                enable_pdl=is_arch_support_pdl(),
+            ).unsqueeze(1),
+        )
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -228,11 +251,18 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        server_args = get_server_args()
+        model_arches = model_runner.model_config.hf_config.architectures or ()
+        self.enable_kimi_k3_prefill_fp8_cache = (
+            "KimiK3ForConditionalGeneration" in model_arches
+            and server_args.disaggregation_mode == "prefill"
+            and server_args.kv_cache_dtype == "fp8_e4m3"
+        )
         self.enable_chunk_kv = (
             not skip_prefill
-            and get_server_args().disaggregation_mode != "decode"
-            and not get_server_args().disable_chunked_prefix_cache
-            and not get_server_args().flashinfer_mla_disable_ragged
+            and server_args.disaggregation_mode != "decode"
+            and not server_args.disable_chunked_prefix_cache
+            and not server_args.flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
 
