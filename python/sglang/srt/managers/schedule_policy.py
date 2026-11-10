@@ -954,11 +954,11 @@ class PrefillAdder:
     def _sync_attention_store_read_abort(
         self, req: Req, result: AddReqResult
     ) -> AddReqResult:
-        """Synchronize one request's AS read outcome across PP stages.
+        """Synchronize one request's AS read outcome within its PP stage.
 
         Every request considered by ``add_one_req`` must reach this helper
-        exactly once, including local admission early returns, so the PP
-        collective cannot be left unmatched by another rank.
+        exactly once, including local admission early returns, so attention
+        lanes enter the stage-local collective in the same order.
         """
         sync_read_abort = getattr(
             type(self.tree_cache), "sync_attention_store_read_abort", None

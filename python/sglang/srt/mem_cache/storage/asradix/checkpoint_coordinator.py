@@ -134,7 +134,7 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
             return
         task = context.prepared_write
         if task is None:
-            self.enqueue_dummy(cache)
+            self.enqueue_dummy(cache, context.req.rid)
             return
 
         try:
@@ -162,7 +162,7 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
                 requested=task.requested_blocks,
                 error=exc,
             )
-            self.enqueue_dummy(cache)
+            self.enqueue_dummy(cache, context.req.rid)
 
     def state_slots(self, cache, req_pool_idx: int, swa_page_id: int) -> dict[str, int]:
         """Return the logical SPA checkpoint slots for a request."""
@@ -466,13 +466,13 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
             )
             return -1
 
-    def enqueue_dummy(self, cache) -> None:
+    def enqueue_dummy(self, cache, rid: str) -> None:
         """Queue a no-op SPA task to preserve TP retirement ordering."""
         if cache.as_world_size <= 1:
             return
         self.submit_completed(
             _SPAWriteTask(
-                rid="-",
+                rid=rid,
                 page_endpoint=None,
                 checkpoint_store=None,
                 block_hash_ids=(),
@@ -556,7 +556,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 or mamba_data.value is None
                 or len(snapshot) < cache_len
             ):
-                self.enqueue_dummy(cache)
+                self.enqueue_dummy(cache, req.rid)
                 return
 
             page_count = cache_len // cache.page_size
@@ -570,11 +570,11 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             if mamba_data.metadata.get(_KDA_PENDING_HASH) is not None or (
                 endpoint_hash == mamba_data.metadata.get(_KDA_PUBLISHED_HASH)
             ):
-                self.enqueue_dummy(cache)
+                self.enqueue_dummy(cache, req.rid)
                 return
             write_key = (cache_len, endpoint_hash)
             if getattr(req, "_as_kda_last_submitted_write", None) == write_key:
-                self.enqueue_dummy(cache)
+                self.enqueue_dummy(cache, req.rid)
                 return
             checkpoint_slot = int(mamba_data.value.item())
             page_ids = self.prepare_page_ids(cache, snapshot[:cache_len])
@@ -609,7 +609,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 requested=cache_len // cache.page_size,
                 error=exc,
             )
-            self.enqueue_dummy(cache)
+            self.enqueue_dummy(cache, req.rid)
 
     def do_write(self, cache, task: _KDAWriteTask) -> int:
         """Write KDA pages and recurrent state through the composite store."""
@@ -863,13 +863,13 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             ] = int(load_info["hashes"][-1])
         return tree_indices, match.last_device_node
 
-    def enqueue_dummy(self, cache) -> None:
+    def enqueue_dummy(self, cache, rid: str) -> None:
         """Queue a no-op KDA task to preserve TP retirement ordering."""
         if cache.as_world_size <= 1:
             return
         self.submit_completed(
             _KDAWriteTask(
-                rid="-",
+                rid=rid,
                 node=cache.root_node,
                 block_hash_ids=(),
                 page_ids=(),

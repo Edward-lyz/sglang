@@ -157,13 +157,17 @@ class AttentionStoreIntegrationMixin:
         return int(tensor.item())
 
     def sync_attention_store_read_abort(self, req) -> bool:
-        """Return whether this stage failed to read the request from cache.
+        """Return the stage-wide AttentionStore read-abort decision.
 
         PP stages do not call request admission in lockstep, so this path must
-        not issue a PP collective. Cross-stage cache matching is synchronized
-        earlier, while a stage-local read failure aborts that stage's request.
+        not issue a PP collective.
         """
-        return bool(getattr(req, "_as_cache_read_abort_reason", None))
+        abort = torch.tensor(
+            int(bool(getattr(req, "_as_cache_read_abort_reason", None))),
+            dtype=torch.int64,
+        )
+        self._all_reduce_attn_groups(abort, torch.distributed.ReduceOp.MAX)
+        return bool(abort.item())
 
     def _tp_min(self, value: int) -> int:
         """Reduce a write-retirement value across local attention shards."""
@@ -455,9 +459,9 @@ class AttentionStoreIntegrationMixin:
                 coordinator.abort_local_commit(self, context)
             raise
 
-    def check_ascache_events(self) -> None:
+    def check_ascache_events(self, checkpoint_seq: Optional[int] = None) -> None:
         """Retire completed AttentionStore writes."""
-        self.attention_store_coordinator.check_events(self)
+        self.attention_store_coordinator.check_events(self, checkpoint_seq)
 
     def drain_attention_store_writes(self) -> None:
         """Wait for all pending AttentionStore writes."""

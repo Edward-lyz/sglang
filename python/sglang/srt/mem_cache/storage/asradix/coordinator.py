@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import logging
+import struct
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Tuple
 
@@ -111,6 +114,7 @@ def _request_block_hash_ids(
 class _PendingWrite:
     future: concurrent.futures.Future
     task: Any
+    logical_id: bytes
 
 
 class AttentionStoreCoordinator:
@@ -119,10 +123,11 @@ class AttentionStoreCoordinator:
     Subclasses capture stable request inputs and implement type-specific I/O.
     The base class owns submission ordering and the two resource horizons:
     staging is released when the writer returns, while cache-node retention is
-    released only after the task is retired across the TP completion frontier.
+    released only after the task crosses the ordered retirement checkpoint.
     """
 
     write_thread_name = "as_writer"
+    pp_retirement_wait_timeout_s = 30.0
 
     def __init__(self) -> None:
         """Initialize an idle asynchronous write coordinator."""
@@ -254,11 +259,14 @@ class AttentionStoreCoordinator:
     def submit_write(self, cache, task) -> None:
         """Submit a write task to the ordered background executor."""
         try:
+            logical_id = self._task_logical_id(task)
             future = self._ensure_executor().submit(self._run_write, cache, task)
         except Exception:
             self._discard_unsubmitted(cache, task)
             raise
-        self._pending_writes.append(_PendingWrite(future=future, task=task))
+        self._pending_writes.append(
+            _PendingWrite(future=future, task=task, logical_id=logical_id)
+        )
 
     def submit_completed(self, task, result: int = 0) -> None:
         """Queue an already completed task for ordered retirement."""
@@ -266,7 +274,13 @@ class AttentionStoreCoordinator:
             raise RuntimeError("AttentionStore coordinator is already closed")
         future = concurrent.futures.Future()
         future.set_result(result)
-        self._pending_writes.append(_PendingWrite(future=future, task=task))
+        self._pending_writes.append(
+            _PendingWrite(
+                future=future,
+                task=task,
+                logical_id=self._task_logical_id(task),
+            )
+        )
 
     def _resolve_result(
         self, cache, pending: _PendingWrite, timeout: Optional[float]
@@ -312,13 +326,145 @@ class AttentionStoreCoordinator:
                 "retained resource",
             )
             first_error = first_error or release_error
-        if first_error is not None:
-            raise RuntimeError(
-                "AttentionStore write retirement failed"
-            ) from first_error
+        retirement_succeeded = first_error is None
+        if synchronize:
+            retirement_succeeded = bool(cache._tp_min(int(retirement_succeeded)))
+        if not retirement_succeeded:
+            error = RuntimeError("AttentionStore write retirement failed")
+            if first_error is not None:
+                raise error from first_error
+            raise error
 
-    def check_events(self, cache) -> None:
-        """Retire the completed write prefix shared by local attention ranks."""
+    @staticmethod
+    def _task_logical_id(task) -> bytes:
+        """Return a compact, rank-stable identity for one pending write.
+
+        The queue is compared across attention shards, so this identity must
+        contain logical write inputs but not rank-local resources such as page
+        IDs, node addresses, or checkpoint pool slots.  In particular, the
+        request ID alone is insufficient for chunked writes: two writes for
+        one request can have different prefixes.
+
+        A digest keeps the pending-queue fingerprint bounded even for long
+        prefixes.  ``write_key`` is currently used by KDA and adds the cache
+        length/terminal-hash identity that is not otherwise guaranteed by the
+        task type and request ID.
+        """
+        task_kind = f"{type(task).__module__}.{type(task).__qualname__}".encode(
+            "utf-8", "surrogatepass"
+        )
+        rid = str(task.rid).encode("utf-8", "surrogatepass")
+        block_hash_ids = tuple(
+            int(block_hash_id) for block_hash_id in task.block_hash_ids
+        )
+
+        identity = hashlib.sha256()
+        identity.update(b"as-task-logical-id-v2\0")
+        for field in (task_kind, rid):
+            identity.update(struct.pack(">Q", len(field)))
+            identity.update(field)
+        identity.update(struct.pack(">Q", int(task.requested_blocks)))
+        identity.update(struct.pack(">Q", len(block_hash_ids)))
+        for block_hash_id in block_hash_ids:
+            identity.update(struct.pack(">Q", block_hash_id))
+
+        # KDA's write_key is a logical (cache length, terminal hash) pair.
+        # Do not include checkpoint_slot: it is a rank-local Mamba pool slot.
+        write_key = getattr(task, "write_key", None)
+        if write_key is None:
+            identity.update(b"\x00")
+        else:
+            identity.update(b"\x01")
+            identity.update(struct.pack(">Q", len(write_key)))
+            for value in write_key:
+                identity.update(struct.pack(">Q", int(value)))
+
+        return identity.digest()
+
+    def _pending_queue_state(self) -> tuple[int, int, int]:
+        digest = hashlib.sha256()
+        digest.update(struct.pack(">Q", len(self._pending_writes)))
+        for pending in self._pending_writes:
+            digest.update(struct.pack(">Q", len(pending.logical_id)))
+            digest.update(pending.logical_id)
+
+        raw_digest = digest.digest()
+        int64_mask = (1 << 63) - 1
+        return (
+            len(self._pending_writes),
+            int.from_bytes(raw_digest[:8], "big") & int64_mask,
+            int.from_bytes(raw_digest[8:16], "big") & int64_mask,
+        )
+
+    def _synchronized_pending_state(self, cache) -> int:
+        count, digest_a, digest_b = self._pending_queue_state()
+        bounds = torch.tensor(
+            [count, -count, digest_a, -digest_a, digest_b, -digest_b],
+            dtype=torch.int64,
+        )
+        cache._all_reduce_attn_groups(bounds, torch.distributed.ReduceOp.MIN)
+        minimum, negative_maximum = map(int, bounds[:2].tolist())
+        digest_bounds = list(map(int, bounds[2:].tolist()))
+        if minimum != -negative_maximum:
+            raise RuntimeError(
+                "AttentionStore write queue length mismatch within attention stage"
+            )
+        if any(
+            minimum_digest != -negative_maximum_digest
+            for minimum_digest, negative_maximum_digest in zip(
+                digest_bounds[::2], digest_bounds[1::2]
+            )
+        ):
+            raise RuntimeError(
+                "AttentionStore write queue identity or order mismatch within "
+                "attention stage"
+            )
+        return minimum
+
+    def _wait_for_pending_writes(
+        self, cache, pending_writes: Sequence[_PendingWrite]
+    ) -> None:
+        deadline = time.monotonic() + self.pp_retirement_wait_timeout_s
+        timed_out_pending = None
+        for pending in pending_writes:
+            try:
+                pending.future.result(timeout=max(0.0, deadline - time.monotonic()))
+            except concurrent.futures.TimeoutError as exc:
+                if pending.future.done():
+                    continue
+                cache._log_as_failure(
+                    "write",
+                    rid=pending.task.rid,
+                    requested=pending.task.requested_blocks,
+                    error=exc,
+                )
+                timed_out_pending = pending
+                break
+            except Exception:
+                pass
+        stage_settled = bool(cache._tp_min(int(timed_out_pending is None)))
+        if not stage_settled:
+            rid = (
+                timed_out_pending.task.rid
+                if timed_out_pending is not None
+                else "<peer attention shard>"
+            )
+            raise RuntimeError(
+                "AttentionStore PP write retirement timed out before resource "
+                f"release: rid={rid} timeout_s={self.pp_retirement_wait_timeout_s}"
+            )
+
+    def check_events(self, cache, checkpoint_seq: Optional[int] = None) -> None:
+        """Retire writes at the scheduler's fixed cache checkpoint."""
+        is_pp = getattr(cache, "pp_world_size", getattr(cache, "pp_size", 1)) > 1
+        if is_pp:
+            if checkpoint_seq is None:
+                raise RuntimeError(
+                    "missing PP scheduler step for AttentionStore retirement"
+                )
+            self._drain(cache, synchronize=True, bounded_wait=True)
+            return
+
         if not self._pending_writes:
             return
         completed = 0
@@ -333,52 +479,56 @@ class AttentionStoreCoordinator:
         del self._pending_writes[:completed]
         self._retire(cache, pending_writes, timeout=1.0)
 
-    def drain(self, cache, *, synchronize: bool = True) -> None:
-        """Wait for and retire every pending write."""
-        pending_writes = self._pending_writes
-        self._pending_writes = []
-        if not pending_writes:
+    def _drain(self, cache, *, synchronize: bool, bounded_wait: bool = False) -> None:
+        if not self._pending_writes and not synchronize:
             return
-        common_count = (
-            cache._tp_min(len(pending_writes)) if synchronize else len(pending_writes)
-        )
-        extra_writes = pending_writes[common_count:]
-        pending_writes = pending_writes[:common_count]
-        # A timed-out writer is still allowed to touch its page buffers.  A
-        # reset or shutdown therefore waits for quiescence before releasing
-        # retained radix nodes.
+        if synchronize:
+            if not self._synchronized_pending_state(cache):
+                return
+        pending_writes = tuple(self._pending_writes)
+        if bounded_wait:
+            self._wait_for_pending_writes(cache, pending_writes)
+        self._pending_writes = []
         self._retire(
             cache,
             pending_writes,
-            timeout=None,
+            timeout=0.0 if bounded_wait else None,
             synchronize=synchronize,
         )
-        for pending in extra_writes:
-            self._resolve_result(cache, pending, timeout=None)
-            try:
-                self.finish(cache, pending.task, -1)
-            finally:
-                self._release_task_resource(
-                    cache,
-                    pending.task,
-                    pending.task.release,
-                    "retained resource",
-                )
+
+    def drain(self, cache, *, synchronize: bool = True) -> None:
+        """Wait for and retire every pending write."""
+        is_pp = getattr(cache, "pp_world_size", getattr(cache, "pp_size", 1)) > 1
+        self._drain(
+            cache,
+            synchronize=synchronize,
+            bounded_wait=synchronize and is_pp,
+        )
 
     def before_reset(self, cache) -> None:
         """Drain pending writes before resetting the cache."""
-        self.drain(cache)
+        is_pp = getattr(cache, "pp_world_size", getattr(cache, "pp_size", 1)) > 1
+        self._drain(
+            cache,
+            synchronize=True,
+            bounded_wait=is_pp,
+        )
 
     def before_sanity_check(self, cache) -> None:
         """Drain pending writes before checking cache invariants."""
-        self.drain(cache)
+        is_pp = getattr(cache, "pp_world_size", getattr(cache, "pp_size", 1)) > 1
+        self._drain(
+            cache,
+            synchronize=True,
+            bounded_wait=is_pp,
+        )
 
     def shutdown(self, cache) -> None:
         """Drain writes and stop the background executor."""
         try:
             # atexit is not ordered across PP processes. Agent only publishes a
             # block after every shard is complete, so local retirement is safe.
-            self.drain(cache, synchronize=False)
+            self._drain(cache, synchronize=False)
         finally:
             self._closed = True
             if self._write_executor is not None:

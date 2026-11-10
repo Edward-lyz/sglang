@@ -373,10 +373,10 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
                 context.snapshot,
             )
 
-    def enqueue_dummy(self) -> None:
+    def enqueue_dummy(self, rid: str) -> None:
         """Queue a no-op task to preserve TP retirement ordering."""
         task = _PageWriteTask(
-            rid="-",
+            rid=rid,
             endpoint=None,
             block_hash_ids=(),
             data_id_list=[],
@@ -426,7 +426,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
         """Build and submit a page write for an eligible radix prefix."""
         if cache.binding is None:
             if cache.as_world_size > 1:
-                self.enqueue_dummy()
+                self.enqueue_dummy(req.rid)
             return
         task = None
         num_pages = 0
@@ -434,7 +434,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             num_pages = len(token_ids) // cache.page_size
             if num_pages <= 0:
                 if cache.as_world_size > 1:
-                    self.enqueue_dummy()
+                    self.enqueue_dummy(req.rid)
                 return
             aligned_tokens = num_pages * cache.page_size
             hashes = _request_block_hash_ids(
@@ -459,7 +459,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
                     error=RuntimeError("no radix node matched"),
                 )
                 if cache.as_world_size > 1:
-                    self.enqueue_dummy()
+                    self.enqueue_dummy(req.rid)
                 return
             data_ids = self.prepare_page_ids(cache, kv_indices)
 
@@ -483,4 +483,4 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
                 error=exc,
             )
             if cache.as_world_size > 1:
-                self.enqueue_dummy()
+                self.enqueue_dummy(req.rid)

@@ -3697,6 +3697,12 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        # Fixed PP checkpoint; it must precede every early return.
+        if self.enable_asradix_cache:
+            self.tree_cache.check_ascache_events(
+                checkpoint_seq=getattr(self, "_pp_current_scheduler_step", None)
+            )
+
         # A downstream PP stage may have queued requests beyond PP0's committed
         # microbatch. An empty authoritative plan means it must stay idle.
         if authoritative_admissions == ():
@@ -3743,8 +3749,6 @@ class Scheduler(
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
-        elif self.enable_asradix_cache:
-            self.tree_cache.check_ascache_events()
 
         # Get priority queue
         if authoritative_plan is None:

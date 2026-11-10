@@ -921,6 +921,9 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if self.enable_asradix_cache:
+                    self._pp_current_scheduler_step = self._pp_next_scheduler_step
+                    self._pp_next_scheduler_step += 1
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -1060,6 +1063,9 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if self.enable_asradix_cache:
+                    self._pp_current_scheduler_step = self._pp_next_scheduler_step
+                    self._pp_next_scheduler_step += 1
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -1341,6 +1347,9 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if self.enable_asradix_cache:
+                    self._pp_current_scheduler_step = self._pp_next_scheduler_step
+                    self._pp_next_scheduler_step += 1
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -1537,6 +1546,8 @@ class SchedulerPPMixin:
         ] * self.pp_loop_size
         self._pp_next_plan_seq = 0
         self._pp_last_received_plan_seq = -1
+        self._pp_next_scheduler_step = 0
+        self._pp_current_scheduler_step = None
         self._pp_abort_tombstones: Dict[Tuple[int, str], Dict[str, Any]] = {}
         self._pp_local_chunk_abort_records: Dict[str, Dict[str, Any]] = {}
         self._pp_pending_cache_read_aborts: Dict[int, Tuple[Req, Dict[str, Any]]] = {}
