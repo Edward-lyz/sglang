@@ -299,6 +299,57 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
     )
 
 
+_FUSED_WO_A_BLOCK_ORDER: dict = {}
+
+
+def _fused_wo_a_block_order(
+    k: int, heads_per_group: int, head_dim: int, device: torch.device
+) -> torch.Tensor:
+    """For each 32-col block of a fused-o wo_a (flash_mla permute_wv_proj), the block of
+    the plain [heads, head_dim] column order it came from. permute_wv_proj moves whole
+    32-wide blocks; read the mapping off a one-hot weight once per shape."""
+    key = (k, heads_per_group, head_dim, str(device))
+    if key not in _FUSED_WO_A_BLOCK_ORDER:
+        import deep_gemm
+        from flash_mla import fused_norm_rope_attn_rope_cast as fused
+
+        nb = k // 32
+        # Explicit fp32: model loading runs under a bf16 default dtype.
+        w = torch.zeros(1, nb, k, device=device, dtype=torch.float32)
+        w[0, torch.arange(nb), torch.arange(nb) * 32] = 1.0
+        sf = deep_gemm.transform_sf_into_required_layout(
+            torch.ones(1, nb, nb, device=device, dtype=torch.float32),
+            nb,
+            k,
+            num_groups=1,
+            recipe=(1, 1, 32),
+            is_sfa=False,
+        )
+        wp, _ = fused.permute_wv_proj(
+            (w.to(torch.float8_e4m3fn), sf), heads_per_group, head_dim
+        )
+        hit = (wp[0].float() != 0).nonzero()
+        src = torch.empty(nb, dtype=torch.long, device=device)
+        src[hit[:, 1] // 32] = hit[:, 0]
+        _FUSED_WO_A_BLOCK_ORDER[key] = src
+    return _FUSED_WO_A_BLOCK_ORDER[key]
+
+
+def wo_a_fp8_rows_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
+    """SGLANG_OPT_FP8_WO_A_GEMM on a 32x32-block ue8m0 checkpoint (V4.1 1017+): wo_a still
+    loads as bf16 (dequantized, see _prepare_deepseek_v4_weights), then post_load_weights
+    re-quantizes it losslessly to per-row 1x32 ue8m0 fp8 and frees the bf16 copy; the
+    non-fused-o path quantizes o per 32 (the reference model's act_quant) and runs
+    DeepGEMM fp8_einsum recipe (1, 1, 32). sm100 DeepGEMM ue8m0 only."""
+    if not (_FP8_WO_A_GEMM and _is_cuda and isinstance(quant_config, Fp8Config)):
+        return False
+    if quant_config.weight_block_size != [32, 32]:
+        return False
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    return bool(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)
+
+
 _MHC_POST_MULT_VALUE = 2.0
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
 
@@ -904,6 +955,13 @@ class MqaAttentionBase(nn.Module):
 
         self.fuse_wqa_wkv = fuse
         self.wo_a_fp8 = fp8
+        # (fp8 [G, R, D], DeepGEMM per-row 1x32 sf) once post_load_weights re-quantized
+        # wo_a (wo_a_fp8_rows_enabled); None keeps the bf16 wo_a path.
+        self.wo_a_fp8_rows = not fp8 and wo_a_fp8_rows_enabled(quant_config)
+        self._wo_a_rows: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        # Source 32-col block of each fused-o-layout block when _wo_a_rows is the
+        # fused-o copy (see convert_wo_a_fp8_rows).
+        self._wo_a_rows_blk: Optional[torch.Tensor] = None
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
@@ -1295,6 +1353,23 @@ class MQALayer(MqaAttentionBase):
             return False
         if self._fused_o_ready is None:
             wo_a_weight = getattr(self.wo_a, "weight", None)
+            if wo_a_weight is None and self._wo_a_rows is not None:
+                # SGLANG_OPT_FP8_WO_A_GEMM rows: post_load_weights already built the
+                # fused fp8 wo_a from the bf16 source before freeing it.
+                ok = getattr(self.wq_b, "q_b_row_permuted", False) and hasattr(
+                    self, "_wo_a_fused_w"
+                )
+                if ok:
+                    key = (id(self.freqs_cis), self.freqs_cis.device)
+                    if key not in _FUSED_O_COS_SIN:
+                        from sglang.srt.layers.attention.dsv4.fused_o_attn import (
+                            make_cos_sin_cache,
+                        )
+
+                        _FUSED_O_COS_SIN[key] = make_cos_sin_cache(self.freqs_cis)
+                    self._fused_o_cos_sin = _FUSED_O_COS_SIN[key]
+                self._fused_o_ready = bool(ok)
+                return self._fused_o_ready
             ok = (
                 getattr(self.wq_b, "q_b_row_permuted", False)
                 and wo_a_weight is not None
@@ -1330,6 +1405,72 @@ class MQALayer(MqaAttentionBase):
                 )
             self._fused_o_ready = bool(ok)
         return self._fused_o_ready
+
+    def convert_wo_a_fp8_rows(self) -> bool:
+        """SGLANG_OPT_FP8_WO_A_GEMM rows: re-quantize the bf16 wo_a (dequantized from the
+        32x32 ue8m0 checkpoint, so lossless) to per-row 1x32 fp8 and drop the bf16
+        parameter. With fused attention-o the single fp8 copy is the fused-o layout
+        (prepare_wo_a); the non-fused path permutes o's 32-wide blocks to match it."""
+        wo_a_weight = getattr(self.wo_a, "weight", None)
+        if not (
+            self.wo_a_fp8_rows
+            and wo_a_weight is not None
+            and wo_a_weight.dtype == torch.bfloat16
+        ):
+            return False
+        import deep_gemm
+
+        from sglang.srt.layers.attention.dsv4.fused_o_attn import (
+            SF_GRAN,
+            prepare_wo_a,
+            quantize_rows_ue8m0,
+        )
+
+        G, R = self.n_local_groups, self.o_lora_rank
+        D = wo_a_weight.shape[1]
+        w = wo_a_weight.data
+        if self.fused_o_attn:
+            hpg = self.n_local_heads // G
+            self._wo_a_fused_w, self._wo_a_fused_sf = prepare_wo_a(
+                w, G, hpg, self.head_dim
+            )
+            self._wo_a_rows = (self._wo_a_fused_w, self._wo_a_fused_sf)
+            self._wo_a_rows_blk = _fused_wo_a_block_order(
+                D, hpg, self.head_dim, w.device
+            )
+        else:
+            w8, sf = quantize_rows_ue8m0(w)
+            sf = deep_gemm.transform_sf_into_required_layout(
+                sf.view(G, R, D // SF_GRAN).contiguous(),
+                R,
+                D,
+                num_groups=G,
+                recipe=(1, 1, SF_GRAN),
+                is_sfa=False,
+            )
+            self._wo_a_rows = (w8.view(G, R, D), sf)
+        del self.wo_a.weight
+        return True
+
+    def _wo_a_fp8_rows_forward(self, o: torch.Tensor):
+        """o [T, G, D] bf16 -> per-32 ue8m0 fp8 (reference act_quant) -> fp8_einsum with the
+        per-row fp8 wo_a; returns wo_b's bf16 input [T, G*R]."""
+        from sglang.srt.layers.attention.dsv4.fused_o_attn import wo_a_einsum
+
+        T, G, D = o.shape
+        if self._wo_a_rows_blk is not None:
+            # The fp8 weight is in the fused-o column order: move o's 32-wide blocks
+            # (whole quant groups, so the scales are unchanged) the same way.
+            o = o.reshape(T, G, D // 32, 32).index_select(2, self._wo_a_rows_blk)
+        o8, o_sf = sglang_per_token_group_quant_fp8(
+            o.reshape(T, G * D).contiguous(),
+            32,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+        o8, o_sf = o8.view(T, G, D), o_sf.view(T, G, D // 128)
+        return wo_a_einsum(o8, o_sf, *self._wo_a_rows).flatten(1)
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
@@ -2675,6 +2816,12 @@ class MQALayer(MqaAttentionBase):
                 )
 
             o = o.view(o.shape[0], self.n_local_groups, -1)
+
+            if self._wo_a_rows is not None:
+                o, _ = self.wo_b(self._wo_a_fp8_rows_forward(o))
+                if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
+                    o = attn_tp_all_reduce(o)
+                return o
 
             if self.use_npu_arch35_mxfp8_wo_a:
                 o, o_scale = torch_npu.npu_dynamic_mx_quant(
@@ -5642,6 +5789,18 @@ class DeepseekV4ForCausalLM(nn.Module):
             return
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
+        if wo_a_fp8_rows_enabled(self.quant_config):
+            n = sum(
+                m.convert_wo_a_fp8_rows()
+                for m in self.modules()
+                if isinstance(m, MQALayer)
+            )
+            torch.cuda.empty_cache()
+            log_info_on_rank0(
+                logger,
+                f"SGLANG_OPT_FP8_WO_A_GEMM: wo_a of {n} layers re-quantized to per-row "
+                "1x32 ue8m0 fp8 (32x32-block checkpoint), bf16 copies freed",
+            )
 
         if is_nextn:
             return

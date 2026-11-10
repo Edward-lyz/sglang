@@ -1,3 +1,5 @@
+"""DeepSeek-V4 / V4.1 DSpark draft model (MoE stages, Markov / confidence heads, ctx-KV commit)."""
+
 from __future__ import annotations
 
 import copy
@@ -59,6 +61,7 @@ from sglang.srt.models.dspark import (
     run_markov_block,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_parallel,
     get_platform,
 )
@@ -1256,6 +1259,55 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
+        )
+        if (
+            envs.SGLANG_DSV41_PD_PREFILL_DRAFT_PRUNE.get()
+            and get_disagg().disaggregation_mode == "prefill"
+        ):
+            # params_dict holds every parameter alive; drop it so pruning frees them.
+            del params_dict
+            self.prune_to_ctx_kv_injection()
+
+    def prune_to_ctx_kv_injection(self) -> None:
+        """[luno-5437] SGLANG_DSV41_PD_PREFILL_DRAFT_PRUNE: a PD prefill server never
+        runs the draft; it only commits draft KV from the target aux hidden
+        (project_target_hidden -> each stage's wkv -> kv_norm + RoPE store, see
+        _commit_target_hidden_rows). Drop everything else -- MoE, the attention
+        projections around the KV, the Markov / confidence heads -- right after
+        loading, so the freed HBM is counted when the KV pool is sized. The
+        stages (layer ids, hc params, RadixAttention) and the shared embed /
+        lm_head (target-owned) stay."""
+        before = torch.cuda.memory_allocated()
+        for stage in self.stages:
+            stage.mlp = None
+            attn = stage.self_attn
+            for name in (
+                "wq_a",
+                "wq_b",
+                "wqkv_a",
+                "wo_a",
+                "wo_b",
+                "compressor",
+                "indexer",
+            ):
+                if getattr(attn, name, None) is not None:
+                    setattr(attn, name, None)
+        for head in (self.markov_head, self.confidence_head):
+            if head is None:
+                continue
+            # The worker still reads their config (configure_tp_shard, logging);
+            # only the weights go.
+            for mod in head.modules():
+                for pname, param in list(mod.named_parameters(recurse=False)):
+                    setattr(
+                        mod,
+                        pname,
+                        nn.Parameter(param.new_empty(0), requires_grad=False),
+                    )
+        torch.cuda.empty_cache()
+        logger.info(
+            "DSpark V4 draft pruned to ctx-KV injection (PD prefill): freed %.2f GiB",
+            (before - torch.cuda.memory_allocated()) / (1 << 30),
         )
 
     def _assert_confidence_head_loaded(
