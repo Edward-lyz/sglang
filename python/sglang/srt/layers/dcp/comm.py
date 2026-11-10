@@ -20,6 +20,7 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import logging
 import warnings
 from typing import Optional
 
@@ -27,6 +28,7 @@ import torch
 
 from sglang.kernels.ops.attention.dcp_fused_pack import (
     dcp_fused_pack,
+    dcp_fused_pack_chunk_elems,
     dcp_fused_pack_recv_views,
     dcp_fused_pack_supported,
 )
@@ -41,6 +43,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -484,6 +488,12 @@ def dcp_a2a_lse_reduce(
         # Opt-in replacement of the four staging launches below by one fused
         # Triton pack. The original path is preserved verbatim; unsupported
         # inputs and the cuda-graph-buffer path fall through to it.
+        if envs.SGLANG_K3_DCP_PUSH.get():
+            pushed = _dcp_push_lse_reduce(
+                cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
+            )
+            if pushed is not None:
+                return pushed
         return _dcp_a2a_lse_reduce_fused_pack(
             cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
         )
@@ -584,6 +594,102 @@ def _dcp_a2a_lse_reduce_fused_pack(
     recv_output, recv_lse = dcp_fused_pack_recv_views(
         recv_combined.reshape(-1), N, B, H_per_rank, D
     )
+    combined, _ = dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    )
+    return combined
+
+
+# ---- SGLANG_K3_DCP_PUSH: peer-memory pack + exchange ----------------------
+# One symmetric receive buffer per rank ([N][chunk] for up to
+# SGLANG_K3_DCP_PUSH_MAX_TOKENS tokens) plus a control block (ack[N],
+# data flags[N][S]); see kernels/jit/csrc/kimi_k3/comm/dcp_push.cuh.
+_DCP_PUSH_STATE: dict = {}
+
+
+def _dcp_push_state(cp_group: "GroupCoordinator", device: torch.device, elem_size: int):
+    slices = envs.SGLANG_K3_DCP_PUSH_SLICES.get()
+    key = (cp_group.unique_name, device.index, elem_size, slices)
+    state = _DCP_PUSH_STATE.get(key)
+    if state is not None:
+        return state
+    if torch.cuda.is_current_stream_capturing():
+        # Allocation is collective; it must happen in the eager warmup.
+        return None
+    import torch.distributed as dist
+    import torch.distributed._symmetric_memory as torch_symm_mem
+
+    N = cp_group.world_size
+    max_tokens = envs.SGLANG_K3_DCP_PUSH_MAX_TOKENS.get()
+    # Capacity for the largest chunk: fp32 lse block counted at 4 B / head row
+    # and the payload at elem_size; heads are only known per call, so size by
+    # the K3 maximum (96 heads x 128 dims) and check per call.
+    cap_chunk = max_tokens * 96 * (128 * elem_size + 4) + 16
+    recv = torch_symm_mem.empty(N * cap_chunk, dtype=torch.uint8, device=device)
+    ctrl = torch_symm_mem.empty(N + N * slices, dtype=torch.int32, device=device)
+    ctrl.zero_()
+    group_name = cp_group.cpu_group.group_name
+    h_recv = torch_symm_mem.rendezvous(recv, group_name)
+    h_ctrl = torch_symm_mem.rendezvous(ctrl, group_name)
+    ptrs = [int(p) for p in h_recv.buffer_ptrs] + [int(p) for p in h_ctrl.buffer_ptrs]
+    counter = torch.zeros(N * slices, dtype=torch.int32, device=device)
+    torch.cuda.synchronize(device)
+    dist.barrier(group=cp_group.cpu_group)
+    state = {
+        "recv": recv,
+        "ctrl": ctrl,
+        "handles": (h_recv, h_ctrl),
+        "ptr_table": torch.tensor(ptrs, dtype=torch.int64),
+        "counter": counter,
+        "cap_chunk": cap_chunk,
+        "slices": slices,
+        "logged": False,
+    }
+    _DCP_PUSH_STATE[key] = state
+    return state
+
+
+def _dcp_push_lse_reduce(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool,
+) -> Optional[torch.Tensor]:
+    """_dcp_a2a_lse_reduce_fused_pack with the pack + all_to_all_single done by
+    peer stores into the receive layout; the combine is unchanged, so the
+    result is bit-identical. None = fall back (shape outside the buffer)."""
+    N = cp_group.world_size
+    B, H, D = cp_attn_out.shape
+    H_per_rank = H // N
+    elem = cp_attn_out.element_size()
+    if N > 8 or (H_per_rank * D * elem) % 16 or (H_per_rank * 4) % 16:
+        return None
+    state = _dcp_push_state(cp_group, cp_attn_out.device, elem)
+    if state is None:
+        return None
+    chunk_elems, payload_elems = dcp_fused_pack_chunk_elems(B, H_per_rank, D)
+    chunk_bytes = chunk_elems * elem
+    if chunk_bytes > state["cap_chunk"]:
+        return None
+
+    from sglang.kernels.ops.kimi_k3.dcp_push import dcp_push
+
+    dcp_push(
+        cp_attn_out,
+        cp_attn_lse,
+        state["ptr_table"],
+        state["counter"],
+        chunk_bytes,
+        payload_elems * elem,
+        cp_group.rank_in_group,
+        state["slices"],
+        envs.SGLANG_K3_DCP_PUSH_BLOCK.get(),
+    )
+    if not state["logged"]:
+        state["logged"] = True
+        logger.info("K3 DCP peer-memory push active (B=%d, H=%d, D=%d)", B, H, D)
+    recv = state["recv"][: N * chunk_bytes].view(cp_attn_out.dtype)
+    recv_output, recv_lse = dcp_fused_pack_recv_views(recv, N, B, H_per_rank, D)
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
     )

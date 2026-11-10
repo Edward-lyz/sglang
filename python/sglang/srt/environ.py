@@ -1368,6 +1368,16 @@ class Envs:
     # kernel is re-specialised on the new strides and can differ from the
     # original path on elements where the rank partials nearly cancel.
     SGLANG_OPT_USE_FUSED_DCP_A2A_PACK = EnvBool(False)
+    # With SGLANG_OPT_USE_FUSED_DCP_A2A_PACK: replace the pack kernel + NCCL
+    # all_to_all_single by one kernel that stores each chunk straight into the
+    # peers' symmetric receive buffers (same layout, unchanged combine, so the
+    # result is bit-identical). Buffer capacity in tokens per call; larger
+    # calls fall back to the NCCL path. Default off.
+    SGLANG_K3_DCP_PUSH = EnvBool(False)
+    SGLANG_K3_DCP_PUSH_MAX_TOKENS = EnvInt(512)
+    # Grid = dcp_size x SLICES blocks of BLOCK threads.
+    SGLANG_K3_DCP_PUSH_SLICES = EnvInt(8)
+    SGLANG_K3_DCP_PUSH_BLOCK = EnvInt(512)
     # ====================================================================
 
     # ====================================================================
