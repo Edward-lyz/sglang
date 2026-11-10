@@ -288,6 +288,29 @@ class AsRadixCache(RadixCache):
         )
         self._warmup_as_load_kernels()
 
+    def mover_dsa_buffers(self):
+        """Return live DSA KV tensors for the standalone mover adapter."""
+        if self.attention_type != "DSA" or not self._buffer_ptrs_ready:
+            raise RuntimeError("DSA buffer pointers must be initialized first")
+        latent = []
+        for layer_id in self.layer_ids:
+            kv_cache, physical_id = self._resolve_layer_pool(layer_id)
+            if hasattr(kv_cache, "_get_key_buffer"):
+                latent.append(kv_cache._get_key_buffer(physical_id))
+            else:
+                latent.append(kv_cache.get_key_buffer(physical_id))
+
+        indexer = []
+        indexer_layers = (
+            self.indexer_layer_ids
+            if self.indexer_layer_ids is not None
+            else self.layer_ids
+        )
+        for layer_id in indexer_layers:
+            kv_cache, physical_id = self._resolve_layer_pool(layer_id)
+            indexer.append(kv_cache.get_index_k_with_scale_buffer(physical_id))
+        return latent, indexer
+
     def _warmup_as_load_kernels(self) -> None:
         """Pre-compile pack/unpack Triton kernels at init so the first AS load
         does not pay JIT compilation inside the shared-memory timeout window.

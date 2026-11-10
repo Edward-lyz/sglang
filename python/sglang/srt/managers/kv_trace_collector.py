@@ -308,16 +308,19 @@ class DSAKVTraceCollector(MLAKVTraceCollector):
                     raw_page_rows=False,
                     warnings=warnings,
                 )
-                self.append_source(
-                    layer,
-                    name="indexer_k",
-                    buffer=kv_cache.get_index_k_with_scale_buffer(layer_id),
-                    slots=token_indices,
-                    page_size=page_size,
-                    layout="raw_paged",
-                    raw_page_rows=True,
-                    warnings=warnings,
-                )
+                mapping = getattr(kv_cache, "indexer_layer_mapping", None)
+                local_layer = layer_id - int(getattr(kv_cache, "start_layer", 0))
+                if mapping is None or local_layer in mapping:
+                    self.append_source(
+                        layer,
+                        name="indexer_k",
+                        buffer=kv_cache.get_index_k_with_scale_buffer(layer_id),
+                        slots=token_indices,
+                        page_size=page_size,
+                        layout="raw_paged",
+                        raw_page_rows=True,
+                        warnings=warnings,
+                    )
                 result["layers"].append(layer)
             except Exception as exc:
                 warnings.append(

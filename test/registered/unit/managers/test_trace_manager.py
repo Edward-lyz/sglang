@@ -90,7 +90,8 @@ class FakeDSA(FakeTokenKVPool):
         ]
 
     def get_index_k_with_scale_buffer(self, layer_id):
-        return self.index_k_with_scale_buffer[layer_id]
+        mapping = getattr(self, "indexer_layer_mapping", None)
+        return self.index_k_with_scale_buffer[mapping[layer_id] if mapping else layer_id]
 
 
 class FakeMLA(FakeTokenKVPool):
@@ -123,6 +124,26 @@ class TestTraceManagerKV(unittest.TestCase):
         expected = hashlib.md5(pool.k[0][0:4].numpy().tobytes()).hexdigest()
         self.assertEqual(k_pages[0]["md5"], expected)
         self.assertEqual(k_pages[1]["source_token_count"], 3)
+
+    def test_dsa_compact_indexer_keeps_latent_only_layers(self):
+        pool = FakeDSA()
+        pool.layer_num = 2
+        pool.k.append(pool.k[0] + 9)
+        pool.v.append(pool.v[0] + 9)
+        pool.indexer_layer_mapping = {0: 0}
+        result = self.manager._collect_kv(
+            "r-dsa-compact", torch.tensor([0, 1, 2, 3]), pool, "dsa", [0, 1]
+        )
+        self.assertEqual(result["collection_status"], "ok")
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual([layer["layer_id"] for layer in result["layers"]], [0, 1])
+        self.assertEqual(
+            [source["name"] for source in result["layers"][1]["sources"]], ["k"]
+        )
+        self.assertEqual(
+            result["layers"][1]["sources"][0]["pages"][0]["md5"],
+            hashlib.md5(pool.k[1][:4].numpy().tobytes()).hexdigest(),
+        )
 
     def test_fp8_pages_hash_raw_storage_bytes(self):
         page = torch.tensor(

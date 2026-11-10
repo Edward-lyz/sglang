@@ -31,6 +31,7 @@ from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
 
+import msgspec
 import psutil  # isort: skip
 import setproctitle
 import torch
@@ -354,6 +355,25 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+
+
+class _AttentionStoreLayout(msgspec.Struct, frozen=True, kw_only=True):
+    """Per-worker AttentionStore registration layout."""
+
+    attention_name: str
+    namespace: str
+    pod_name: str
+    as_rank: int
+    as_world: int
+    layer_num: int
+    k_bytes: int
+    v_bytes: int
+    dp_id: int
+    target_layer_ids: List[int]
+    target_indexer_layer_ids: Optional[List[int]]
+    draft_layer_ids: List[int]
+    draft_kv_cache: Any
+    sdk_indexer_layer_ids: Optional[List[int]]
 
 
 class Scheduler(
@@ -1011,6 +1031,10 @@ class Scheduler(
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
+        self._as_host_registration = None
+        if self.enable_asradix_cache and os.getenv("AS_MOVER_ENDPOINT"):
+            self._prepare_attention_store_host()
+
         # Print debug info
         avail_mem = get_available_gpu_memory(
             self.device, self.ps.gpu_id, empty_cache=False
@@ -1049,14 +1073,12 @@ class Scheduler(
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
-    def _init_attention_store(self, server_args: ServerArgs) -> None:
-        """Initialize AttentionStore and connect it to the target-native cache."""
-        try:
-            from attentionstore_sdk.sdk import AttentionStoreSDK, AttentionType
-        except ImportError:
-            logger.warning("attentionstore_sdk is unavailable; disabling AsRadix use")
-            return
+    def _attention_store_layout(self, kv_allocator) -> _AttentionStoreLayout:
+        """Compute the AttentionStore registration layout for this worker.
 
+        Shared by the mover host pre-registration and the SDK init so both
+        register an identical layout.
+        """
         pod_name = os.getenv("POD_NAME")
         model_id = os.getenv("MODEL_ID")
         if not pod_name or not model_id:
@@ -1064,8 +1086,8 @@ class Scheduler(
 
         from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 
-        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        dtype_size = torch.tensor([], dtype=self.token_to_kv_pool_allocator.dtype).element_size()
+        kv_cache = kv_allocator.get_kvcache()
+        dtype_size = torch.tensor([], dtype=kv_allocator.dtype).element_size()
         target_layer_start = int(getattr(kv_cache, "start_layer", 0))
         target_layer_count = int(
             getattr(kv_cache, "layer_num", self.model_config.num_hidden_layers)
@@ -1078,10 +1100,8 @@ class Scheduler(
             as_rank = 0
             as_world = 1
             k_bytes = self.page_size * key_dim * dtype_size
-            attention_type = AttentionType.MLA
             attention_name = "MLA"
             if is_deepseek_dsa(self.model_config.hf_config):
-                attention_type = AttentionType.DSA
                 attention_name = "DSA"
                 mapping = getattr(kv_cache, "indexer_layer_mapping", None)
                 if mapping:
@@ -1114,8 +1134,7 @@ class Scheduler(
                 v_bytes = kv_cache.get_index_k_with_scale_buffer(first_layer)[0].nbytes
         else:
             as_rank = self.tp_rank
-            as_world = server_args.tp_size
-            attention_type = AttentionType.MHA
+            as_world = self.server_args.tp_size
             attention_name = "MHA"
             k_bytes = self.page_size * key_dim * dtype_size
             v_bytes = k_bytes
@@ -1134,38 +1153,144 @@ class Scheduler(
         if attention_name == "DSA" and target_indexer_layer_ids is not None:
             sdk_indexer_layer_ids = target_indexer_layer_ids + draft_layer_ids
 
+        return _AttentionStoreLayout(
+            attention_name=attention_name,
+            namespace=f"{model_id}:{as_world}",
+            pod_name=pod_name,
+            as_rank=as_rank,
+            as_world=as_world,
+            layer_num=target_layers + len(draft_layer_ids),
+            k_bytes=k_bytes,
+            v_bytes=v_bytes,
+            dp_id=0 if self.ps.dp_rank is None else self.ps.dp_rank,
+            target_layer_ids=target_layer_ids,
+            target_indexer_layer_ids=target_indexer_layer_ids,
+            draft_layer_ids=draft_layer_ids,
+            draft_kv_cache=draft_kv_cache,
+            sdk_indexer_layer_ids=sdk_indexer_layer_ids,
+        )
+
+    def _prepare_attention_store_host(self):
+        """Pre-register the mover host before KV buffer IPC export."""
         try:
-            ascli = AttentionStoreSDK(
-                attention_type=attention_type,
-                layer_num=target_layers + len(draft_layer_ids),
-                namespace=f"{model_id}:{as_world}",
-                pod_name=pod_name,
+            from attentionstore_sdk.mover_compat import MoverAttentionStoreSDK
+
+            _, kv_allocator = self.tp_worker.get_memory_pool()
+            layout = self._attention_store_layout(kv_allocator)
+            if layout.attention_name != "DSA":
+                return
+            self._as_host_registration = MoverAttentionStoreSDK.prepare_host(
+                namespace=layout.namespace,
+                pod_name=layout.pod_name,
                 model_version="v1",
-                shard_id=as_rank,
-                shard_num=as_world,
+                layer_num=layout.layer_num,
                 block_token_size=self.page_size,
-                k_bytes_per_shard_layer_per_block=k_bytes,
-                v_bytes_per_shard_layer_per_block=v_bytes,
+                latent_bytes=layout.k_bytes,
+                indexer_bytes=layout.v_bytes,
                 device_id=self.gpu_id,
-                dp_id=0 if self.ps.dp_rank is None else self.ps.dp_rank,
-                enable_as_kv_rw=True,
-                gpu_count=server_args.per_node_gpu_num,
-                indexer_layer_ids=sdk_indexer_layer_ids,
+                gpu_count=self.server_args.per_node_gpu_num,
+                dp_id=layout.dp_id,
+                indexer_layer_ids=layout.sdk_indexer_layer_ids,
             )
-            self.tree_cache.ref_ascli(ascli)
-            self.tree_cache.init_buffer_ptrs(
-                target_layer_ids,
-                attention_name,
-                indexer_layer_ids=target_indexer_layer_ids,
-            )
-            if draft_kv_cache is not None and draft_layer_ids:
-                self.tree_cache.extend_with_draft_pool(draft_kv_cache, draft_layer_ids)
             logger.info(
-                "AttentionStore initialized: type=%s layers=%d shard=%d/%d",
-                attention_name,
-                target_layers + len(draft_layer_ids),
-                as_rank,
-                as_world,
+                "AttentionStore mover host registration prepared: "
+                "layers=%d indexer_layers=%s",
+                layout.layer_num,
+                layout.sdk_indexer_layer_ids,
+            )
+        except Exception as e:
+            logger.warning("AttentionStore mover host pre-registration skipped: %s", e)
+            self._as_host_registration = None
+
+    def _init_attention_store(self, server_args: ServerArgs) -> None:
+        """Initialize AttentionStore and connect it to the target-native cache.
+
+        Uses the standalone mover adapter when AS_MOVER_ENDPOINT is set (DSA
+        only), otherwise the in-process AttentionStoreSDK.
+        """
+        use_mover = bool(os.getenv("AS_MOVER_ENDPOINT"))
+        try:
+            if use_mover:
+                from attentionstore_sdk.mover import RawCudaBuffer
+                from attentionstore_sdk.mover_compat import MoverAttentionStoreSDK
+            else:
+                from attentionstore_sdk.sdk import AttentionStoreSDK, AttentionType
+        except ImportError:
+            logger.warning("attentionstore_sdk is unavailable; disabling AsRadix use")
+            return
+
+        layout = self._attention_store_layout(self.token_to_kv_pool_allocator)
+        if use_mover and layout.attention_name != "DSA":
+            raise ValueError("AS_MOVER_ENDPOINT currently supports DSA only")
+
+        try:
+            # The mover adapter consumes the live KV tensors, so buffer pointers
+            # must be resolved before the client is constructed.
+            self.tree_cache.init_buffer_ptrs(
+                layout.target_layer_ids,
+                layout.attention_name,
+                indexer_layer_ids=layout.target_indexer_layer_ids,
+            )
+            if layout.draft_kv_cache is not None and layout.draft_layer_ids:
+                self.tree_cache.extend_with_draft_pool(
+                    layout.draft_kv_cache, layout.draft_layer_ids
+                )
+
+            if use_mover:
+                latent_buffers, indexer_buffers = self.tree_cache.mover_dsa_buffers()
+                ascli = MoverAttentionStoreSDK(
+                    namespace=layout.namespace,
+                    pod_name=layout.pod_name,
+                    model_version="v1",
+                    layer_num=layout.layer_num,
+                    block_token_size=self.page_size,
+                    latent_bytes=layout.k_bytes,
+                    indexer_bytes=layout.v_bytes,
+                    device_id=self.gpu_id,
+                    gpu_count=server_args.per_node_gpu_num,
+                    dp_id=layout.dp_id,
+                    indexer_layer_ids=layout.sdk_indexer_layer_ids,
+                    latent_buffers=[
+                        RawCudaBuffer(t.data_ptr(), t.nbytes) for t in latent_buffers
+                    ],
+                    indexer_buffers=[
+                        RawCudaBuffer(t.data_ptr(), t.nbytes) for t in indexer_buffers
+                    ],
+                    shard_id=layout.as_rank,
+                    shard_num=layout.as_world,
+                    host_registration=self._as_host_registration,
+                )
+            else:
+                attention_types = {
+                    "MLA": AttentionType.MLA,
+                    "DSA": AttentionType.DSA,
+                    "MHA": AttentionType.MHA,
+                }
+                ascli = AttentionStoreSDK(
+                    attention_type=attention_types[layout.attention_name],
+                    layer_num=layout.layer_num,
+                    namespace=layout.namespace,
+                    pod_name=layout.pod_name,
+                    model_version="v1",
+                    shard_id=layout.as_rank,
+                    shard_num=layout.as_world,
+                    block_token_size=self.page_size,
+                    k_bytes_per_shard_layer_per_block=layout.k_bytes,
+                    v_bytes_per_shard_layer_per_block=layout.v_bytes,
+                    device_id=self.gpu_id,
+                    dp_id=layout.dp_id,
+                    enable_as_kv_rw=True,
+                    gpu_count=server_args.per_node_gpu_num,
+                    indexer_layer_ids=layout.sdk_indexer_layer_ids,
+                )
+            self.tree_cache.ref_ascli(ascli)
+            logger.info(
+                "AttentionStore initialized: type=%s layers=%d shard=%d/%d mover=%s",
+                layout.attention_name,
+                layout.layer_num,
+                layout.as_rank,
+                layout.as_world,
+                use_mover,
             )
         except Exception:
             logger.exception("AttentionStore initialization failed")
