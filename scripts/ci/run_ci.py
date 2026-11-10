@@ -548,7 +548,7 @@ class MethodTarget:
 
 @dataclass
 class TestCaseResult:
-    """A single test case parsed from a JUnit XML report."""
+    """A single test case parsed from a JUnit XML report ."""
 
     target: str
     classname: str
