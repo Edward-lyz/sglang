@@ -2291,6 +2291,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                skip_radix_cache_insert=recv_req.skip_radix_cache_insert,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
@@ -2503,10 +2504,12 @@ class Scheduler(
                     for k in req.sampling_params.__struct_fields__
                     if k not in ("structural_tag", "ebnf", "regex", "json_schema")
                 }
-                logger.info(f"A new req {req.rid} has been insert into queue. "
-                            f"Prompt len: {len(req.origin_input_ids)}. "
-                            f"Sampling params: {sampling_params_log}. "
-                            f"AS Block Hashes: {as_block_hashs}")
+                logger.info(
+                    f"A new req {req.rid} has been insert into queue. "
+                    f"Prompt len: {len(req.origin_input_ids)}. "
+                    f"Sampling params: {sampling_params_log}. "
+                    f"AS Block Hashes: {as_block_hashs}"
+                )
 
     def handle_batch_generate_request(
         self,

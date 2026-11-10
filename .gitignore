@@ -129,6 +129,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.python-version
 
 # Spyder project settings
 .spyderproject
@@ -282,4 +283,12 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+# Internal, non-published docs
+internal-docs/
+
+# Local AI tool state
 .gitnexus
+.claude/
+.codex/
+.agents/

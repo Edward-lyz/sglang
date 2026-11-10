@@ -611,6 +611,7 @@ async def validate_json_request(raw_request: Request):
 
 ##### Native API endpoints #####
 
+
 def stopped_by_external():
     """
     Check if the stop signal is triggered by reading a signal file.
@@ -621,7 +622,7 @@ def stopped_by_external():
 
     try:
         if os.path.exists(signal_path):
-            with open(signal_path, 'r') as file:
+            with open(signal_path, "r") as file:
                 return file.read().strip().lower() == "stop"
     except Exception as e:
         logger.info(f"Error reading stop signal file: {e}")
@@ -675,6 +676,7 @@ async def health_generate(request: Request) -> Response:
         ):
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
+            gri.skip_radix_cache_insert = True
     else:
         gri = EmbeddingReqInput(
             rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
@@ -1118,8 +1120,7 @@ async def clear_all_cache():
 
         def _parse_index_size(text: str) -> dict:
             return {
-                m.group(1): int(m.group(2))
-                for m in _SIZE_LINE.finditer(text or "")
+                m.group(1): int(m.group(2)) for m in _SIZE_LINE.finditer(text or "")
             }
 
         # BEFORE sizes.
@@ -1137,9 +1138,7 @@ async def clear_all_cache():
 
         namespaces = list(sizes_before.keys())
         lines.append(f"[host] before: {sizes_before}")
-        logger.info(
-            f"[/clear_all_cache] host cache sizes BEFORE evict: {sizes_before}"
-        )
+        logger.info(f"[/clear_all_cache] host cache sizes BEFORE evict: {sizes_before}")
         if not namespaces:
             lines.append("[host] no namespace found, skip evictBlocks")
 
@@ -2352,6 +2351,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
                 "is_warmup": True,
+                # Warmup KV is throwaway; keep it out of the radix tree.
+                "skip_radix_cache_insert": True,
             }
             res = requests.post(
                 url + request_name,
