@@ -81,7 +81,11 @@ class FakeKVSender(BaseKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        send_aux: bool = True,
     ):
+        # send_aux is ignored: there is no aux transfer to skip. Warmup requests
+        # land here on every PP rank, including the non-aux-owner ranks of the
+        # PP+PD early-last-chunk path, which pass send_aux=False.
         self.curr_idx += len(kv_indices)
         logger.debug(
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"

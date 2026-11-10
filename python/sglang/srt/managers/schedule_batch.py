@@ -1151,6 +1151,10 @@ class Req(ReqDllmMixin):
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False
+        # PP + PD prefill early last chunk: set on non-PP0 ranks once this
+        # request's final KV/state has already been sent from the scheduler
+        # loop's CPU phase, so process_batch_result must not send it again.
+        self.pp_early_final_kv_done = False
         # Number of optimistic prefill forward passes started. preserved across retracts.
         self.prefill_attempt_count = 0
 
@@ -1743,6 +1747,7 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
+        self.pp_early_final_kv_done = False
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None

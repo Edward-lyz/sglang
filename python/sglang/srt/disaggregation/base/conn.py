@@ -146,9 +146,14 @@ class BaseKVSender(ABC):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        send_aux: bool = True,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
+
+        send_aux=False means this rank is not the aux (metadata) owner, so the last
+        chunk carries KV/state only. Only mooncake honors it; every other backend
+        requires the default.
         """
         ...
 

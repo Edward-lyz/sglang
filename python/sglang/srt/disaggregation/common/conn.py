@@ -1231,7 +1231,14 @@ class CommonKVSender(BaseKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        send_aux: bool = True,
     ):
+        """Send one KV chunk.
+
+        send_aux=False means this rank is not the aux (metadata) owner, so the
+        last chunk carries KV/state only. Used by the PP+PD early-last-chunk
+        path where PP0 is the single aux owner.
+        """
         pass
 
     def _check_bootstrap_timeout(self) -> Optional[KVPoll]:

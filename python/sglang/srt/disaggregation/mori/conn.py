@@ -1418,7 +1418,9 @@ class MoriKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        send_aux: bool = True,
     ):
+        assert send_aux, "MoriKVSender does not support skipping aux"
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )

@@ -1183,6 +1183,9 @@ class SchedulerPPMixin:
                     running_batch=self.running_batch,
                     planned_chunked_action=planned_chunked_action,
                 )
+                # Before get_new_batch_prefill so the pages this releases are
+                # already in flight when scheduling looks at them.
+                self._pp_flush_pending_final_kv()
                 prefill_plan = self.get_new_batch_prefill(
                     self.running_batch, authoritative_plan=authoritative_plan
                 )
@@ -1267,6 +1270,9 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    # Needs mb_metadata[mb_id].forward_done, recorded just above.
+                    self._pp_enqueue_pending_final_kv(batch=cur_batch, mb_id=mb_id)
+
                 if transport_expected and self.pp_group.is_last_rank:
                     control = self._pp_mb_controls[mb_id]
                     if cur_batch:
@@ -2362,7 +2368,10 @@ class SchedulerPPMixin:
                             msg_type="output",
                         )
         # send the outputs from the last round to let the next stage worker run post processing
-        if not self.pp_group.is_last_rank:
+        # The early-last-chunk path collapses the ring to a single last-rank -> PP0
+        # hop: no rank other than the last one needs to relay outputs, because no
+        # rank other than PP0 consumes next_token_ids any more.
+        if not self.pp_group.is_last_rank and not self._pp_pd_early_last_chunk_enabled:
             if pp_outputs:
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
                     send_output_work = self._pp_send_dict_to_next_stage(
@@ -2554,9 +2563,15 @@ class SchedulerPPMixin:
             ):
                 return
             if (
-                target is not None
-                and _pp_can_skip_output_comm(target)
-                and not _pp_control_has_current_aborts(target_control)
+                
+                (
+                    target is not None
+                    and _pp_can_skip_output_comm(target)
+                    and not _pp_control_has_current_aborts(target_control)
+                ) or (
+                    self._pp_pd_early_last_chunk_enabled
+                    and not self.pp_group.is_first_rank
+                )
             ):
                 next_pp_outputs, batch_result, d2h_event = (
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])

@@ -2703,7 +2703,9 @@ class NixlKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        send_aux: bool = True,
     ):
+        assert send_aux, "NixlKVSender does not support skipping aux"
         if self._send_failed:
             return
 

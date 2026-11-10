@@ -406,6 +406,14 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # PP + PD prefill: cut the last chunk's "wait one PP round" latency. On
+    # non-PP0 ranks the final KV/state is sent from the next iteration's CPU
+    # phase instead of from process_batch_result, the aux buffer (first sampled
+    # token) is written and transferred by PP0 only, and the PP output ring's
+    # relay half-circle is dropped so only the last rank sends and PP0 receives.
+    # First phase supports mooncake only, without speculative decoding,
+    # return_logprob, return_sampling_mask or grammar.
+    SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK = EnvBool(False)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)

@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.embedding_transfer.queues import (
 )
 from sglang.srt.disaggregation.encode_receiver_aiak import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
+    PendingFinalKV,
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
@@ -1705,6 +1706,14 @@ class Scheduler(
         self.disagg_prefill_inflight_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
+        # PP + PD prefill early-last-chunk: derived once here, read on the hot
+        # path. Non-prefill roles and pp_size == 1 keep the original path.
+        self._pp_pd_early_last_chunk_enabled = False
+        # Whether this rank still writes and transfers the aux (metadata) row.
+        self._pp_pd_owns_aux = True
+        # Whether this rank sends the final chunk from the loop's CPU phase.
+        self._pp_pd_early_send_final_kv = False
+        self.disagg_prefill_pending_final_kv: List[PendingFinalKV] = []
 
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
@@ -1820,6 +1829,23 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+            self._pp_pd_early_last_chunk_enabled = (
+                envs.SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK.get() and self.ps.pp_size > 1
+            )
+            if self._pp_pd_early_last_chunk_enabled:
+                self._validate_pp_pd_early_last_chunk()
+                # PP0 is the single aux owner and keeps sending its final chunk
+                # from process_batch_result (it samples first anyway), so its KV
+                # and aux stay in one transfer request.
+                self._pp_pd_owns_aux = self.pp_group.is_first_rank
+                self._pp_pd_early_send_final_kv = not self.pp_group.is_first_rank
+                logger.info(
+                    "PP+PD early-last-chunk KV send enabled: "
+                    f"pp_rank={self.pp_group.rank_in_group}, "
+                    f"owns_aux={self._pp_pd_owns_aux}, "
+                    f"speculative_algorithm={self.server_args.speculative_algorithm}."
+                )
+
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         # Init mm receiver for EPD disaggregation mode
@@ -1846,6 +1872,30 @@ class Scheduler(
             # MMPreallocQueue -> MMTransferQueue -> waiting_queue
             self.disagg_prefill_mm_prealloc_queue = MMPreallocQueue(self.mm_receiver)
             self.disagg_prefill_mm_transfer_queue = MMTransferQueue(self.mm_receiver)
+
+    def _validate_pp_pd_early_last_chunk(self):
+        """Reject configurations the early-last-chunk path does not cover yet.
+
+        The path handles the mooncake backend with either no speculative
+        decoding or DSPARK. DSPARK is safe because it never writes the draft
+        fields of the aux row (they are gated on ``is_eagle()``) and its draft
+        KV rides the target's page indices inside the same mooncake chunk; see
+        docs/design/pp-prefill-last-chunk-early-send-phase2.md sections 2 and 3.
+        Other algorithms either carry draft hidden states or have unaudited
+        draft KV ownership, hence the exact ``is_dspark()`` match rather than a
+        negated ``carries_draft_hidden_states()``.
+        """
+        if self.transfer_backend != TransferBackend.MOONCAKE:
+            raise ValueError(
+                "SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK only supports the mooncake "
+                f"transfer backend, got {self.transfer_backend.value}."
+            )
+        if not (self.spec_algorithm.is_none() or self.spec_algorithm.is_dspark()):
+            raise ValueError(
+                "SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK supports only DSPARK "
+                "speculative decoding, got "
+                f"{self.server_args.speculative_algorithm}."
+            )
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
@@ -3150,6 +3200,8 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self._pp_pd_reject_unsupported_request(req):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -3168,6 +3220,40 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _pp_pd_reject_unsupported_request(self, req: Req) -> bool:
+        """Abort requests the early-last-chunk path cannot serve. Returns True if aborted.
+
+        Per-request downgrade is impossible: the PP output ring topology is a
+        static per-round decision, so a single unsupported request in a batch
+        would make ranks disagree on whether to exchange outputs. See
+        docs/design/pp-prefill-last-chunk-early-send.md sections 5.3 and 6.3.
+
+        Constrained decoding is not listed: the prefill-side FSM has accepted no
+        generated token when the last chunk is sampled, and only the aux owner
+        advances it, so the ranks cannot diverge. See
+        docs/design/pp-prefill-last-chunk-early-send-phase2.md section 4.
+        """
+        if not self._pp_pd_early_last_chunk_enabled or req.finished():
+            return False
+
+        if req.return_logprob:
+            unsupported = "return_logprob"
+        elif req.return_sampling_mask:
+            unsupported = "return_sampling_mask"
+        else:
+            return False
+
+        error_msg = (
+            f"{unsupported} is not supported while "
+            "SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK is enabled. Drop the parameter "
+            f"or disable the env var. {req.rid=}"
+        )
+        logger.error(error_msg)
+        req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self.output_streamer.stream_output([req], req.return_logprob)
+        return True
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -4767,6 +4853,8 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                # Final chunks whose early send has not been flushed yet.
+                idle &= len(self.disagg_prefill_pending_final_kv) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0

@@ -27,6 +27,7 @@ from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import msgspec
 import numpy as np
 import torch
 
@@ -88,6 +89,20 @@ def should_force_retry(req: Req) -> bool:
 
     digest = hashlib.sha256(str(req.rid).encode()).digest()
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
+
+
+class PendingFinalKV(msgspec.Struct, omit_defaults=True):
+    """A request whose final prefill KV/state is waiting to be sent early.
+
+    Enqueued right after `_pp_launch_batch` on non-PP0 ranks; flushed from the
+    next iteration's CPU phase once `forward_done` has actually completed.
+    `end_idx` is snapshotted at enqueue time because `req.extend_range` may be
+    rewritten by later scheduling before the flush runs.
+    """
+
+    req: Req
+    end_idx: int
+    forward_done: torch.Event
 
 
 def maybe_release_metadata_buffer(
@@ -722,7 +737,20 @@ class SchedulerDisaggregationPrefillMixin:
             self.metrics_reporter.stats.run_batch_time = run_batch_time
 
         logprob_pt = 0
-        assert batch.spec_info is result.next_draft_input
+        # A skipped output comm hands back _pp_make_skip_output_result's
+        # placeholder, which carries no draft input, while batch.spec_info still
+        # holds what run_batch assigned at launch -- a real draft input on the
+        # last rank, which samples even though it no longer post-processes its own
+        # output row. So the identity only holds for a rank that consumed a real
+        # output row (PP0 via _pp_prep_batch_result, or every rank with the
+        # early-last-chunk path off). See
+        # docs/design/pp-prefill-last-chunk-early-send-phase2.md section 3.1.
+        if result.skipped_output_comm:
+            assert result.next_draft_input is None
+        else:
+            assert batch.spec_info is result.next_draft_input
+        # None on a skipped-output rank; only the is_eagle() branch below reads
+        # it and the early path admits DSPARK alone.
         draft_input = result.next_draft_input
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
@@ -753,6 +781,16 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
+                if req.pp_early_final_kv_done:
+                    # _pp_flush_pending_final_kv already did the radix insert, the
+                    # send and the inflight-queue append; next_token_id here is the
+                    # placeholder zero from the skipped PP output ring.
+                    advance_logprob_pt(i, req)
+                    continue
+                # Still queued: this post-process synchronized the forward that the
+                # flush's non-blocking query had not yet seen, so the regular path
+                # below sends it. Cancel the queue entry to keep the send single.
+                self._pp_drop_pending_final_kv(req)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
@@ -789,7 +827,12 @@ class SchedulerDisaggregationPrefillMixin:
                         i, req, logits_output
                     )
                 if not req.pending_bootstrap:
-                    self.send_kv_chunk(req, last_chunk=True)
+                    # _pp_pd_owns_aux is False only on non-PP0 ranks with the
+                    # early-last-chunk switch on: their output_ids[0] is the
+                    # placeholder zero, so they must never write the aux row.
+                    self.send_kv_chunk(
+                        req, last_chunk=True, send_aux=self._pp_pd_owns_aux
+                    )
                 req.time_stats.set_prefill_transfer_queue_entry_time()
                 if self.enable_metrics:
                     self.metrics_collector.observe_prompt_calculation_time(
@@ -797,7 +840,15 @@ class SchedulerDisaggregationPrefillMixin:
                         - req.time_stats.forward_entry_time
                     )
 
-                if req.grammar is not None:
+                # Only the aux owner holds the real sampled token; a non-owner's
+                # next_token_id is _pp_make_skip_output_result's placeholder zero,
+                # which a real xgrammar rejects (single-rank prepare_abort, so the
+                # PP ranks disagree on the request's fate) and a strict-thinking
+                # wrapper silently mis-advances. The prefill-side advance has no
+                # downstream consumer -- decode rebuilds and advances its own FSM
+                # from the real token in process_prebuilt. See
+                # docs/design/pp-prefill-last-chunk-early-send-phase2.md section 4.
+                if req.grammar is not None and self._pp_pd_owns_aux:
                     try:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:
@@ -917,7 +968,9 @@ class SchedulerDisaggregationPrefillMixin:
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):
-                    self.send_kv_chunk(req, last_chunk=True)
+                    self.send_kv_chunk(
+                        req, last_chunk=True, send_aux=self._pp_pd_owns_aux
+                    )
                     undone_reqs.append(req)
                 elif poll != KVPoll.Failed:
                     undone_reqs.append(req)
@@ -1170,6 +1223,104 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
+    def _pp_enqueue_pending_final_kv(
+        self: Scheduler, batch: ScheduleBatch, mb_id: int
+    ) -> None:
+        """Queue this microbatch's final-chunk requests for an early KV send.
+
+        Only non-PP0 ranks reach the body (see `_pp_pd_early_send_final_kv`): with
+        PP0 owning the aux row they no longer need the sampled token for the last
+        chunk, so the KV/state can leave from the next iteration's CPU phase
+        instead of waiting a full PP round for the output ring to come back.
+        """
+        if not self._pp_pd_early_send_final_kv or not batch.forward_mode.is_extend():
+            return
+
+        # KV pages must not be read by RDMA before the forward that writes them;
+        # the flush gates on this event.
+        forward_done = self.mb_metadata[mb_id].forward_done
+        for req in batch.reqs:
+            # Inverse of process_batch_result_disagg_prefill's still_chunking
+            # test: this chunk reaches the end of the input and no later chunk of
+            # the request was scheduled.
+            if (
+                req is self.chunked_req
+                or req.extend_range is None
+                or req.extend_range.end < len(req.origin_input_ids)
+            ):
+                continue
+            # Parked requests keep the handle_pending_bootstrap resend path.
+            if req.pending_bootstrap or is_aborted(req):
+                continue
+            self.disagg_prefill_pending_final_kv.append(
+                PendingFinalKV(
+                    req=req,
+                    # Snapshot: later scheduling may rewrite req.extend_range.
+                    end_idx=min(req.extend_range.end, len(req.origin_input_ids)),
+                    forward_done=forward_done,
+                )
+            )
+
+    def _pp_flush_pending_final_kv(self: Scheduler) -> None:
+        """Send the final KV/state of every queued request whose forward is done.
+
+        Called once per PP loop iteration, right after `process_prefill_chunk` and
+        before `get_new_batch_prefill`, so the pages released here are already
+        visible to this iteration's scheduling. `forward_done.query()` is
+        non-blocking on purpose: a microbatch that has not finished is retried
+        next iteration instead of stalling the CPU inside the pipeline.
+        """
+        if not self.disagg_prefill_pending_final_kv:
+            return
+
+        still_pending: List[PendingFinalKV] = []
+        for entry in self.disagg_prefill_pending_final_kv:
+            req = entry.req
+            if is_aborted(req):
+                continue
+            if not entry.forward_done.query():
+                still_pending.append(entry)
+                continue
+            # Radix dedup first: cache_unfinished_req may free pages and rewrite
+            # this request's req_to_token rows, so the send has to read them after.
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            self.send_kv_chunk(
+                req,
+                last_chunk=True,
+                end_idx=entry.end_idx,
+                send_aux=False,
+            )
+            # Tells process_batch_result_disagg_prefill not to send it again.
+            req.pp_early_final_kv_done = True
+            req.time_stats.set_prefill_transfer_queue_entry_time()
+            if self.enable_metrics:
+                self.metrics_collector.observe_prompt_calculation_time(
+                    req.time_stats.prefill_transfer_queue_entry_time
+                    - req.time_stats.forward_entry_time
+                )
+            self.disagg_prefill_inflight_queue.append(req)
+
+        self.disagg_prefill_pending_final_kv = still_pending
+
+    def _pp_drop_pending_final_kv(self: Scheduler, req: Req) -> None:
+        """Cancel a queued early send because the regular path is taking over.
+
+        The flush only sends once `forward_done.query()` is true, and it runs
+        before this iteration's post-process. A microbatch whose forward is still
+        running at flush time therefore stays queued, yet post-process
+        (`d2h_event.synchronize()`) may resolve it in the very same iteration and
+        send it the regular way. Without this cancel the next flush would send the
+        final chunk a second time, pushing the sender's cursor past its index
+        count and hanging the room forever.
+        """
+        if not self.disagg_prefill_pending_final_kv:
+            return
+        self.disagg_prefill_pending_final_kv = [
+            entry
+            for entry in self.disagg_prefill_pending_final_kv
+            if entry.req is not req
+        ]
+
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         # Only bootstrap-finalized requests; staging excluded.
         if (
@@ -1204,9 +1355,14 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        send_aux: bool = True,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
+
+        send_aux only applies to the last chunk: False means this rank is not the
+        aux owner, so the metadata buffer is neither written nor transferred.
+        Used by the PP+PD early-last-chunk path where PP0 owns the aux row.
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
@@ -1232,13 +1388,23 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            if send_aux:
+                self.disagg_metadata_buffers.set_buf(req)
+            else:
+                # The buffer stays allocated on every rank so the bootstrap
+                # metadata credit (and therefore the PP admission set) is
+                # identical across ranks; it is simply left unwritten here.
+                assert (
+                    req.metadata_buffer_index >= 0
+                ), f"metadata buffer must stay allocated on non-aux ranks, {req.rid=}"
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
             # that decode used to register the destination row.
-            seq_len = min(req.extend_range.end, transfer_input_len)
+            # end_idx is the snapshot taken by the caller, so this stays correct
+            # even when req.extend_range was rewritten by later scheduling.
+            seq_len = end_idx
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
@@ -1331,6 +1497,7 @@ class SchedulerDisaggregationPrefillMixin:
             page_indices,
             state_indices,
             num_kv_tokens=end_idx - start_idx,
+            send_aux=send_aux,
         )
         req.start_send_idx = end_idx
 

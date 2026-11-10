@@ -223,6 +223,11 @@ class MooncakeKVManager(CommonKVManager):
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
+        # PP+PD early-last-chunk keeps the aux buffer on PP0 only, so other
+        # ranks legitimately send a last chunk with aux_index=None.
+        self.allow_last_chunk_without_aux = (
+            envs.SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK.get()
+        )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -1960,12 +1965,19 @@ class MooncakeKVManager(CommonKVManager):
                                     )
                                     break
 
-                            # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
-                            )
+                            # Only the last chunk we need to send the aux data.
+                            # prefill_aux_index is None when this rank is not the
+                            # aux owner (PP+PD early-last-chunk); the room still
+                            # concludes here so decode's per-rank response
+                            # tracker still collects this rank.
+                            if kv_chunk.prefill_aux_index is None:
+                                ret = 0
+                            else:
+                                ret = self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -2254,7 +2266,11 @@ class MooncakeKVManager(CommonKVManager):
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
+        assert (
+            not is_last_chunk
+            or aux_index is not None
+            or self.allow_last_chunk_without_aux
+        ), "the last chunk must carry aux unless this rank is not the aux owner"
 
         if (
             bootstrap_room not in self.request_status
@@ -2371,6 +2387,7 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        send_aux: bool = True,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -2393,7 +2410,9 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
                 True,
-                aux_index=self.aux_index,
+                # None means "this rank does not own the aux buffer"; the chunk
+                # still carries KV/state and still concludes the room.
+                aux_index=self.aux_index if send_aux else None,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
