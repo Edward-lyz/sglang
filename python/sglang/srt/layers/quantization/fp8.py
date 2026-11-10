@@ -840,6 +840,26 @@ class Fp8LinearMethod(LinearMethodBase):
         except ValueError as e:
             logger.warning("Block-fp8 layer stays on the Triton kernel: %s", e)
             return
+        q_b_row_permute = getattr(layer, "q_b_row_permute", None)
+        if q_b_row_permute is not None:
+            # DSv4.1 fused attention (SGLANG_OPT_FLASHMLA_FUSED_ATTN_O): wq_b emits q in the row
+            # order flash_mla's fused op wants. Rows of the weight and their per-row scales move
+            # together; the 32x32 block scales are left alone, so this layer must never fall back
+            # to the Triton block-scale kernel (guarded by block_fp8_mxfp8_ready below).
+            from sglang.srt.layers.attention.dsv4.fused_o_attn import q_row_permutation
+
+            if getattr(layer, "q_b_row_permuted", False):
+                raise RuntimeError("wq_b rows are already permuted; refusing to permute twice")
+            out_row = q_row_permutation(*q_b_row_permute, layer.weight.device)
+            assert out_row.numel() == n, (out_row.numel(), n)
+            w_perm = torch.empty_like(layer.weight.data)
+            w_perm[out_row] = layer.weight.data
+            layer.weight.data.copy_(w_perm)
+            del w_perm
+            s_perm = torch.empty_like(scale_u8)
+            s_perm[out_row] = scale_u8
+            scale_u8 = s_perm
+            layer.q_b_row_permuted = True
         self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
         layer.block_fp8_mxfp8_ready = True
 

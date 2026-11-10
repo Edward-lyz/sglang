@@ -205,9 +205,22 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 def _create_flashmla_metadata():
     if get_platform().is_sm120 or _is_xpu:
         return None
+    return _flashmla_module().get_mla_metadata()[0]
+
+
+def _flashmla_module():
+    """FlashMLA module for the decode kernel and its scheduler metadata (they must come from the same one).
+
+    The V4.1 KV layouts (528 B fp8 / 288 B fp4 records) are read only by a recent FlashMLA build; the
+    installed sgl_kernel one rejects them, so SGLANG_DSV4_KV_LAYOUT=v41 switches to the top-level
+    `flash_mla` package."""
+    if envs.SGLANG_DSV4_KV_LAYOUT.get().lower() == "v41":
+        import flash_mla
+
+        return flash_mla
     import sgl_kernel.flash_mla as flash_mla
 
-    return flash_mla.get_mla_metadata()[0]
+    return flash_mla
 
 
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
@@ -4151,10 +4164,31 @@ class DeepseekV4AttnBackend(
                         extra_topk_length=extra_topk_lengths,
                     )[0]
             else:
+                fused_o = self._fused_o_args
+                if fused_o is not None and fused_o.mode == "decode":
+                    # q is permuted and not yet roped; the op ropes q, attends over the paged V4.1
+                    # caches, un-ropes o and casts to per-32 ue8m0 fp8 for wo_a's fp8 einsum.
+                    from sglang.srt.layers.attention.dsv4.fused_o_attn import fused_decode
+
+                    return fused_decode(
+                        q.squeeze(1),
+                        swa_k_cache,
+                        swa_page_indices.squeeze(1),
+                        fused_o.positions,
+                        fused_o.cos_sin_cache,
+                        self.softmax_scale,
+                        fused_o.n_wv_group,
+                        attn_sink,
+                        swa_topk_lengths,
+                        extra_k_cache,
+                        None if extra_indices is None else extra_indices.squeeze(1),
+                        extra_topk_lengths,
+                    )
+
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
                 else:
-                    from sgl_kernel.flash_mla import flash_mla_with_kvcache
+                    flash_mla_with_kvcache = _flashmla_module().flash_mla_with_kvcache
 
                 with operations_nvtx_range("attn.dsv4.flashmla_kvcache"):
                     o = flash_mla_with_kvcache(
@@ -4305,16 +4339,33 @@ class DeepseekV4AttnBackend(
             )
         kv = workspace
 
-        with operations_nvtx_range("attn.dsv4.sparse_fwd"):
-            o, _, _ = flash_mla_sparse_fwd(
-                q=q_flat,
-                kv=kv,
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.softmax_scale,
-                d_v=self.head_dim_v,
-                attn_sink=attn_sink,
-                topk_length=combined_lens,
+        fused_o = self._fused_o_args
+        if fused_o is not None and fused_o.mode == "prefill":
+            # q is permuted and not yet roped; the op ropes q, attends, un-ropes o and casts to
+            # per-32 ue8m0 fp8 for wo_a's fp8 einsum. Returns (out_fp8, out_sf), not o.
+            from sglang.srt.layers.attention.dsv4.fused_o_attn import fused_prefill
+
+            return fused_prefill(
+                q_flat,
+                kv,
+                combined_indices.unsqueeze(1),
+                fused_o.positions,
+                fused_o.cos_sin_cache,
+                self.softmax_scale,
+                fused_o.n_wv_group,
+                attn_sink,
+                combined_lens,
             )
+
+        o, _, _ = flash_mla_sparse_fwd(
+            q=q_flat,
+            kv=kv,
+            indices=combined_indices.unsqueeze(1),
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink,
+            topk_length=combined_lens,
+        )
         return o
 
     @staticmethod
@@ -4342,6 +4393,138 @@ class DeepseekV4AttnBackend(
             layer_id,
             reused.shape[0],
         )
+
+    # Set only for the duration of forward_fused_o_prefill (see below).
+    _fused_o_args = None
+
+    def fused_o_prefill_eligible(
+        self, forward_batch: ForwardBatch, num_q_tokens: int
+    ) -> bool:
+        """True iff _forward_attention would take the bf16-workspace sparse prefill path for this
+        batch, i.e. the one call site that can run flash_mla's fused attention + o cast."""
+        pool = self.token_to_kv_pool
+        meta = self.forward_metadata
+        return (
+            isinstance(pool, DeepSeekV4TokenToKVPool)
+            and isinstance(getattr(meta, "core_attn_metadata", None), DSV4AttnMetadata)
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not get_platform().is_sm120
+            and not self.trtllm_attn
+            and meta.late_layer_tail is None
+            and pool.request_window is None
+            and not use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend)
+            and (
+                num_q_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            )
+        )
+
+    def forward_fused_o_prefill(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        compress_ratio: Literal[0, 1, 2, 4, 128],
+        attn_sink: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        n_wv_group: int,
+    ):
+        """Sparse prefill through flash_mla's fused norm+RoPE+attn+inv-RoPE+fp8-cast op.
+        `q` is [T, H, 512] bf16 in the permuted row order, NOT roped; the caller must have checked
+        fused_o_prefill_eligible. Returns (out_fp8, out_sf)."""
+        from types import SimpleNamespace
+
+        self._fused_o_args = SimpleNamespace(
+            mode="prefill",
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            n_wv_group=n_wv_group,
+        )
+        try:
+            result = self._forward_attention(
+                q,
+                q,
+                q,
+                layer,
+                forward_batch,
+                compress_ratio,
+                save_kv_cache=False,
+                attn_sink=attn_sink,
+            )
+        finally:
+            self._fused_o_args = None
+        assert isinstance(result, tuple), (
+            "fused-o prefill was routed to a non-fused attention path; q is un-roped and permuted"
+        )
+        return result
+
+    def fused_o_decode_eligible(self, forward_batch: ForwardBatch) -> bool:
+        """True iff _forward_attention would reach the paged-cache decode kernel for this batch.
+
+        The fused decode op reads the pool's records in place: V4 (584 B) and V4.1 (528 B / 288 B fp4 extra)
+        records are read by the FlashMLA build at 07a1089 (the first V4.1 release); later FlashMLA builds read
+        per-token V4.1 records only, which is not the layout this pool writes."""
+        pool = self.token_to_kv_pool
+        if not isinstance(pool, DeepSeekV4TokenToKVPool):
+            return False
+        return (
+            forward_batch.forward_mode.is_decode()
+            and isinstance(
+                getattr(self.forward_metadata, "core_attn_metadata", None), DSV4AttnMetadata
+            )
+            and not get_platform().is_sm120
+            and not self.trtllm_attn
+            and not getattr(pool, "uniform_fp8", False)
+        )
+
+    def forward_fused_o_decode(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        compress_ratio: Literal[0, 1, 2, 4, 128],
+        attn_sink: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        n_wv_group: int,
+    ):
+        """Decode attention through flash_mla's fused norm+RoPE+attn+inv-RoPE+fp8-cast op.
+        `q` is [T, H, 512] bf16 in the permuted row order, NOT roped; the caller must have checked
+        fused_o_decode_eligible. Returns (out_fp8, out_sf)."""
+        from types import SimpleNamespace
+
+        if not getattr(self, "_fused_decode_logged", False):
+            self._fused_decode_logged = True
+            logger.info(
+                "fused attention-o decode active (paged %s cache, extra=%s, capturing=%s)",
+                self.token_to_kv_pool.kv_layout.value,
+                compress_ratio != 0,
+                torch.cuda.is_current_stream_capturing(),
+            )
+        self._fused_o_args = SimpleNamespace(
+            mode="decode",
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            n_wv_group=n_wv_group,
+        )
+        try:
+            result = self._forward_attention(
+                q,
+                q,
+                q,
+                layer,
+                forward_batch,
+                compress_ratio,
+                save_kv_cache=False,
+                attn_sink=attn_sink,
+            )
+        finally:
+            self._fused_o_args = None
+        assert isinstance(result, tuple), (
+            "fused-o decode was routed to a non-fused attention path; q is un-roped and permuted"
+        )
+        return result
 
     def _prepare_q8kv8_q_and_sink(
         self,
