@@ -7520,9 +7520,10 @@ class ServerArgs:
         # intra-node only. On MNNVL-fabric devices (GB200/GB300) the eager pull
         # path works across nodes via the symm-mem workspace, so opt into the
         # multinode mode automatically (a failed fabric rendezvous falls back
-        # to the legacy path at init). Elsewhere force-disable v2 on
-        # multi-node so the dispatch falls back to the legacy CustomAllreduce
-        # path, unless the MNNVL opt-in is set explicitly.
+        # to the legacy path at init). Elsewhere v2 stays on: the dispatch
+        # decides per group, so node-local groups (e.g. attn_tp under DP
+        # attention) still get v2 while node-spanning groups fall back to the
+        # legacy CustomAllreduce, which disables itself across nodes.
         if self.nnodes <= 1 or not envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
             return
         if (
@@ -7542,13 +7543,11 @@ class ServerArgs:
             )
             envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.set("1")
         if not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get():
-            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
-                logger.warning(
-                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
-                    "(custom all-reduce v2 is intra-node only).",
-                    self.nnodes,
-                )
-            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
+            logger.info(
+                "nnodes=%d: custom all-reduce v2 is used only by process groups "
+                "that stay within one node; node-spanning groups fall back.",
+                self.nnodes,
+            )
 
     def _handle_environment_variables(self):
         self._handle_multimodal_feature_transport()

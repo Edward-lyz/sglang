@@ -1,0 +1,148 @@
+{
+  "source": {
+    "code_commits": [
+      "1d006f78f7"
+    ],
+    "date": "2026-10-14",
+    "device": "NVIDIA B200 (reported as CF-NG-BZZ2-O, SM100)",
+    "nodes": 1,
+    "gpus_per_node": 8,
+    "push_slot_bytes": 33554432,
+    "raw_results": [
+      "sweep_b200_world8.json",
+      "sweep_b200_world8_run2.json",
+      "verify_world8_run3.json"
+    ]
+  },
+  "selection": {
+    "rule": "nearest global-token bucket at or below the workload",
+    "fallback": "nccl",
+    "note": "Three independent --tune sweeps; each bucket keeps the candidate with the lowest median time across all three, because single-run winners are not reproducible at small T (both the NCCL baseline and individual candidates show occasional 1.5-2.5x outliers). Margins are quoted against the most favourable NCCL sample of the three. Every measured bucket beats that optimistic NCCL number, so no bucket selects nccl: unlike the 2x4 GB300 table this single-node NVLink domain keeps winning through T=16384, though the margin narrows to 1.06-1.10x at the top two buckets. Below T=1024 the push candidates sit on a plateau within a few percent of each other, so the exact num_blocks there is not load-bearing. reduce_scatter_attn_res and attn_res_all_gather are deliberately absent: bench_sp_collective.py does not measure them, and a missing kind falls back to the separate path."
+  },
+  "configs": {
+    "reduce_scatter": {
+      "8": {
+        "strategy": "push",
+        "num_blocks": 4,
+        "block_size": 128
+      },
+      "16": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 256
+      },
+      "32": {
+        "strategy": "push",
+        "num_blocks": 32,
+        "block_size": 512
+      },
+      "64": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 256
+      },
+      "128": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 256
+      },
+      "256": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 512
+      },
+      "512": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 512
+      },
+      "1024": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 512
+      },
+      "2048": {
+        "strategy": "pull",
+        "num_blocks": 96,
+        "block_size": 1024
+      },
+      "4096": {
+        "strategy": "pull",
+        "num_blocks": 96,
+        "block_size": 1024
+      },
+      "8192": {
+        "strategy": "pull",
+        "num_blocks": 96,
+        "block_size": 1024
+      },
+      "16384": {
+        "strategy": "pull",
+        "num_blocks": 96,
+        "block_size": 1024
+      }
+    },
+    "all_gather": {
+      "8": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 128
+      },
+      "16": {
+        "strategy": "push",
+        "num_blocks": 32,
+        "block_size": 128
+      },
+      "32": {
+        "strategy": "push",
+        "num_blocks": 16,
+        "block_size": 512
+      },
+      "64": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 512
+      },
+      "128": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 512
+      },
+      "256": {
+        "strategy": "push",
+        "num_blocks": 96,
+        "block_size": 512
+      },
+      "512": {
+        "strategy": "direct",
+        "num_blocks": 2,
+        "block_size": 1024
+      },
+      "1024": {
+        "strategy": "direct",
+        "num_blocks": 2,
+        "block_size": 1024
+      },
+      "2048": {
+        "strategy": "direct",
+        "num_blocks": 2,
+        "block_size": 1024
+      },
+      "4096": {
+        "strategy": "direct",
+        "num_blocks": 2,
+        "block_size": 1024
+      },
+      "8192": {
+        "strategy": "direct",
+        "num_blocks": 4,
+        "block_size": 1024
+      },
+      "16384": {
+        "strategy": "direct",
+        "num_blocks": 8,
+        "block_size": 1024
+      }
+    }
+  }
+}

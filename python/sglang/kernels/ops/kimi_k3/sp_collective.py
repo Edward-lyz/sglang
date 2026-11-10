@@ -43,9 +43,17 @@ DEFAULT_TUNING = Tuning(num_blocks=16, block_size=256)
 _CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs", "sp_collective")
 _TABLES: dict[str, Optional[dict]] = {}
 
+# Some OEM boards report an obfuscated SKU string instead of the marketing name.
+# Alias them onto the board they actually are so one checked-in table serves
+# every machine reporting that silicon.
+_DEVICE_NAME_ALIASES = {
+    "CF-NG-BZZ2-O": "NVIDIA_B200",
+}
+
 
 def _device_name(device: torch.device) -> str:
-    return torch.cuda.get_device_name(device).replace(" ", "_").replace("/", "_")
+    name = torch.cuda.get_device_name(device).replace(" ", "_").replace("/", "_")
+    return _DEVICE_NAME_ALIASES.get(name, name)
 
 
 def _table(world_size: int, hidden_size: int, device: torch.device) -> Optional[dict]:
