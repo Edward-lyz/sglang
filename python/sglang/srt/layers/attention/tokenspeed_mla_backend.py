@@ -56,7 +56,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
-from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
@@ -143,6 +142,35 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             )
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
+        # KV-balanced decode for the DCP decode / target-verify launches of the
+        # target model (draft backends never pass DCP arguments).
+        self._kvb_decoder = None
+        if (
+            envs.SGLANG_K3_KV_BALANCED_MLA_DECODE.get()
+            and get_parallel().dcp_enabled
+            and not skip_prefill
+        ):
+            try:
+                from sglang.kernels.ops.attention.kv_balanced_mla.decoder import (
+                    KvBalancedMlaDecoder,
+                )
+            except (ImportError, AttributeError) as e:
+                raise RuntimeError(
+                    "SGLANG_K3_KV_BALANCED_MLA_DECODE needs nvidia-cutlass-dsl "
+                    f">= 4.8 and apache-tvm-ffi: {e}"
+                ) from e
+            parallel = get_parallel()
+            self._kvb_decoder = KvBalancedMlaDecoder(
+                torch.device("cuda", torch.cuda.current_device()),
+                self.page_size,
+                parallel.dcp_size,
+                parallel.dcp_rank,
+            )
+            heads = self.num_q_heads * parallel.attn_dcp_size
+            self._kvb_shapes = [(heads, 1)] + (
+                [(heads, self.num_draft_tokens)] if self.num_draft_tokens else []
+            )
+            self._kvb_decoder.reserve(model_runner.max_running_requests, self._kvb_shapes)
         if is_tokenspeed_mla_available():
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
                 self.device,
@@ -378,6 +406,13 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         )
         return block_kv_indices
 
+    def init_cuda_graph_state(self, max_bs: int, *args, **kwargs):
+        """Also size the KV-balanced decode buffers for ``max_bs`` before capture."""
+        super().init_cuda_graph_state(max_bs, *args, **kwargs)
+        if self._kvb_decoder is not None:
+            # Graph capture can't allocate or compile: size for the padded bs.
+            self._kvb_decoder.reserve(max_bs, self._kvb_shapes)
+
     def _init_cuda_graph_metadata(
         self,
         bs: int,
@@ -406,10 +441,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
     ):
         if not get_parallel().dcp_enabled:
             return super()._apply_cuda_graph_metadata(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                forward_mode,
+                bs, req_pool_indices, seq_lens, forward_mode
             )
 
         metadata = self.decode_cuda_graph_metadata[bs]
@@ -658,6 +690,20 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             if out is not None:
                 return out
 
+        if self._kvb_decoder is not None and cp_world > 1:
+            res = self._kvb_decoder.decode(
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens_i32,
+                causal_seqs,
+                softmax_scale,
+                output_scale,
+                layer.layer_id,
+            )
+            if res is not None:
+                return res if return_lse else res[0]
+
         return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
@@ -736,25 +782,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         parallel = get_parallel()
-        # FlashInfer autotunes MoE kernels with a synthetic full-model decode
-        # and discards the attention/logits result.  On multi-node GB300, the
-        # synthetic full-head DCP metadata can make both the TokenSpeed and
-        # TRTLLM decode kernels surface cudaErrorNvlinkUncorrectable.  Skip
-        # attention only inside that explicitly scoped dummy pass.  Real
-        # requests and CUDA graph capture continue through TokenSpeed below.
-        if parallel.dcp_enabled and get_in_autotune_dummy_run():
-            output = torch.zeros(
-                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
-                dtype=self.q_data_type,
-                device=q.device,
-            )
-            lse = torch.zeros(
-                (q.shape[0], layer.tp_q_head_num),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            return output, lse
-
         if not parallel.dcp_enabled:
             return super().forward_decode(
                 q,
@@ -859,7 +886,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
         # Hybrid MLA models resolve the model-side hook through the outer
         # HybridLinearAttnBackend, so their fallback MHA path can pass V as a
-        # last-dimension slice of kv_b_proj (stride(-2) > size(-1)).  The
+        # last-dimension slice of kv_b_proj (stride(-2) > size(-1)). The
         # TokenSpeed prefill kernel requires dense Q/K/V layouts even though
         # the public wrapper accepts arbitrary torch tensors.
         q = q.contiguous()

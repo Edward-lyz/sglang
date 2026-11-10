@@ -429,6 +429,10 @@ class Envs:
     # DSPARK target-verify: build the dense KDA cu_seqlens / MLA q_indptr
     # arange once per forward and share it across layers. Same values.
     SGLANG_K3_VERIFY_METADATA_HOIST = EnvBool(False)
+    # tokenspeed_mla DCP decode / target verify: run the KV-balanced FP8 MLA
+    # decode (vLLM PR #63638), which picks each request's KV split count from
+    # its own length. Needs nvidia-cutlass-dsl >= 4.8. Rounding order changes.
+    SGLANG_K3_KV_BALANCED_MLA_DECODE = EnvBool(False)
     # Dense MLP: fuse the SiTU activation with the down-proj DeepGEMM block-FP8
     # input quant (situ_and_mul_quant).
     SGLANG_K3_MLP_SITU_QUANT = EnvBool(False)
