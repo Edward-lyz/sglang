@@ -43,6 +43,8 @@ if ENABLE_JIT_DEEPGEMM:
 
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
+_MASKED_BLOCK_M = envs.SGLANG_DEEPGEMM_MASKED_BLOCK_M.get()
+_masked_block_m_logged = False
 
 
 # TODO maybe rename these functions
@@ -72,7 +74,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     ):
         with configure_deep_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
-        ):
+        ), configure_deep_gemm_masked_block_m(_MASKED_BLOCK_M):
 
             fp4_kwargs = {}
             if recipe_a is not None:
@@ -265,6 +267,25 @@ def configure_deep_gemm_num_sms(num_sms):
             yield
         finally:
             deep_gemm.set_num_sms(original_num_sms)
+
+
+@contextmanager
+def configure_deep_gemm_masked_block_m(block_m: int):
+    """Masked grouped GEMMs take block M from the global mk alignment; override it
+    only for this call so contiguous-layout padding elsewhere keeps the default."""
+    if not block_m or not ENABLE_JIT_DEEPGEMM:
+        yield
+        return
+    global _masked_block_m_logged
+    if not _masked_block_m_logged:
+        _masked_block_m_logged = True
+        logger.info(f"DeepGEMM masked grouped GEMM block_m={block_m}")
+    original = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    deep_gemm.set_mk_alignment_for_contiguous_layout(block_m)
+    try:
+        yield
+    finally:
+        deep_gemm.set_mk_alignment_for_contiguous_layout(original)
 
 
 def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
