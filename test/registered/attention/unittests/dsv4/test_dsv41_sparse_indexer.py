@@ -357,6 +357,80 @@ class TestSparseIndexer(CustomTestCase):
         ref = dense16.gather(1, pos.clamp(max=dense16.shape[1] - 1))
         self.assertTrue(torch.equal(out["paired"][valid], ref[valid]))
 
+    @unittest.skipUnless(
+        _sparse_indexer_available(), "needs DeepGEMM's paged sparse MQA logits on SM100"
+    )
+    def test_publish_decode_rows_past_deepgemm_limit(self):
+        """A verify row of a request at the context limit is longer than 2**20.
+        DeepGEMM's sparse schedule asserts on such a row (the device assert
+        surfaces as `unspecified launch failure`), so the sparse chain clamps
+        the lengths it hands over."""
+        import deep_gemm
+
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+        from sglang.srt.layers.attention.dsv4.candidate_deep_gemm import (
+            MAX_SPARSE_SEQ_LEN,
+            DeepGemmCandidateIndexer,
+        )
+        from sglang.srt.layers.attention.dsv4.candidate_indexer import IndexerInputs
+
+        torch.manual_seed(5)
+        lens = torch.tensor(
+            [MAX_SPARSE_SEQ_LEN - 1, MAX_SPARSE_SEQ_LEN + 1, MAX_SPARSE_SEQ_LEN + 3],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        bs = lens.numel()
+        max_pages = (int(lens.max()) + PAGE - 1) // PAGE
+        num_pages = bs * max_pages
+        pool = torch.randint(
+            0, 255, (num_pages, PAGE * 68), dtype=torch.uint8, device="cuda"
+        )
+        pool[:, PAGE * 64 :] = torch.randint(
+            118, 123, (num_pages, PAGE * 4), dtype=torch.uint8, device="cuda"
+        )
+        k_cache = pool.view(num_pages, PAGE, 1, 68)
+        page_table = (
+            torch.randperm(num_pages, device="cuda").view(bs, max_pages).to(torch.int32)
+        )
+        q_fp4 = torch.randint(
+            0, 255, (bs, 1, HEADS, HEAD_DIM // 2), dtype=torch.uint8, device="cuda"
+        ).view(torch.int8)
+        q_sf = (
+            torch.randint(118, 123, (bs, 1, HEADS, 4), dtype=torch.uint8, device="cuda")
+            .view(torch.int32)
+            .squeeze(-1)
+        )
+        weights = (torch.rand(bs, HEADS, device="cuda") * 0.05).to(torch.bfloat16)
+        sched = deep_gemm.get_paged_mqa_logits_metadata(
+            lens.view(-1, 1), PAGE, deep_gemm.get_num_sms()
+        )
+        impl = DeepGemmCandidateIndexer(BLOCKS, 8)
+        inputs = IndexerInputs(
+            q_fp4,
+            q_sf,
+            k_cache,
+            weights.float(),
+            SimpleNamespace(
+                compressed_seq_lens=lens,
+                page_table=page_table,
+                compressed_page_size=PAGE,
+                deep_gemm_metadata=sched,
+                max_compressed_seq_len=int(lens.max()),
+                request_ids=None,
+                use_topk_v2=True,
+                topk_metadata=plan_topk_v2(lens),
+            ),
+        )
+        source_slots = torch.empty(bs, TOPK, dtype=torch.int32, device="cuda")
+        table = impl.publish_decode(inputs, source_slots)
+        page_indices = torch.empty(bs, TOPK, dtype=torch.int32, device="cuda")
+        impl.select_decode(table, inputs, page_indices)
+        torch.cuda.synchronize()
+        for b in range(bs):
+            self.assertEqual(int((source_slots[b] >= 0).sum()), TOPK)
+            self.assertEqual(int((page_indices[b] >= 0).sum()), TOPK)
+
 
 if __name__ == "__main__":
     unittest.main()

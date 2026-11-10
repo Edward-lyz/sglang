@@ -32,6 +32,14 @@ from sglang.srt.layers.attention.dsv4.indexer import (
 
 CANDIDATE_BLOCK_SIZE = 8  # positions per block; DeepGEMM accepts 8 or 16
 
+# Longest row DeepGEMM's sparse MQA schedule takes. Measured on SM100: a row of
+# 2**20 positions runs, one of 2**20 + 1 trips the device assert
+# `logical_page_idx < block_table_stride` in sm100_sparse_mqa_logits_metadata.cuh
+# (reported as `unspecified launch failure`) whatever the page table's width.
+# A verify row can sit past the context limit (a request at context_len - 2 plus
+# the draft block), and those positions are never committed.
+MAX_SPARSE_SEQ_LEN = 1 << 20
+
 
 @dataclass
 class SparseBlockTable(CandidateMetadata):
@@ -257,18 +265,21 @@ class DeepGemmCandidateIndexer:
         )
         # per row: block count for the block top-k, sparse-row length for the consumers
         with stream_ctx:
-            nblocks, row_valid_lens = candidate_row_lens(seq_lens, self.topk_blocks)
-            blocks = amax_topk_blocks(logits, seq_lens, nblocks, self.topk_blocks)
+            # the sparse chain never sees a row longer than DeepGEMM's limit; the
+            # dense selection above keeps the true length
+            sparse_lens = seq_lens.clamp_max(MAX_SPARSE_SEQ_LEN)
+            nblocks, row_valid_lens = candidate_row_lens(sparse_lens, self.topk_blocks)
+            blocks = amax_topk_blocks(logits, sparse_lens, nblocks, self.topk_blocks)
             # in place: ascending, INT32_MAX padded, plus the blocks as pool slots / 8
             phys_blocks = sort_candidate_blocks(
                 blocks,
-                seq_lens,
+                sparse_lens,
                 metadata.page_table,
                 metadata.compressed_page_size,
             )
             schedule = build_sparse_indexer_schedule(
                 blocks,
-                seq_lens,
+                sparse_lens,
                 metadata.page_table,
                 metadata.compressed_page_size,
                 inputs.q_fp4.dtype,
