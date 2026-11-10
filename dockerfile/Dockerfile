@@ -33,6 +33,9 @@ RUN cd /tmp/aiak_sglang && find . -name "*.py" -exec cp --parents {} /sgl-worksp
     git log -1 --format="%H %s %an %ad" > /sgl-workspace/sglang/aiak-last-commit && \
     rm -rf /tmp/aiak_sglang
 
+
+RUN pip install --upgrade tokenspeed-mla --break-system-packages --proxy http://agent.baidu.com:8891
+
 RUN pip config set global.index-url http://mirrors.baidubce.com/pypi/simple/ && \
     pip config set global.trusted-host mirrors.baidubce.com
 
