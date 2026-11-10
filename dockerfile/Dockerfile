@@ -61,6 +61,38 @@ RUN set -eux; \
     SETUPTOOLS_SCM_PRETEND_VERSION="$base_version" \
         pip install -e /sgl-workspace/sglang/python --no-deps --no-build-isolation
 
+# Rust 扩展打进源码树：base 镜像设了 SGLANG_RUST_BUILD_MODE=never，而上面的 editable
+# install 没有 setuptools-rust，不会编 Rust 扩展；不打进来的话 as_native TreeCore 启动即报
+# "not bundled or cached"。这里用 base 自带的 cargo/stable（无外网，拉不到 rust-toolchain.toml
+# 固定的 1.92）+ 已缓存的 crates 编好，放到 never 模式会直接 import 的包路径下。
+# never 模式不校验 .so 与源码是否一致：改了 rust/ 或换 torch 必须重新出镜像。
+RUN cd /sgl-workspace/sglang && \
+    RUSTUP_TOOLCHAIN=stable SGLANG_RUST_BUILD_MODE=auto SGLANG_CACHE_DIR=/tmp/rust-ext-build \
+    python3 - <<'PY'
+import shutil
+import sysconfig
+from pathlib import Path
+
+import torch  # noqa: F401  libtorch must be resident before the TreeCore dlopen
+
+from sglang.srt.mem_cache.rust_tree_core import extension
+from sglang.srt.rust_extensions import load_rust_extension
+
+suffix = sysconfig.get_config_var("EXT_SUFFIX")
+for module in (
+    extension.bindings,
+    load_rust_extension("sglang.srt.rust_extensions._multimodal"),
+):
+    dst = Path("python") / (module.__name__.replace(".", "/") + suffix)
+    shutil.copy2(module.__file__, dst)
+    print("[rust-ext] bundled", module.__name__, "->", dst)
+PY
+RUN rm -rf /tmp/rust-ext-build && \
+    cd /sgl-workspace/sglang && \
+    SGLANG_RUST_BUILD_MODE=never SGLANG_CACHE_DIR=/tmp/rust-ext-empty python3 -c \
+        'import torch; from sglang.srt.mem_cache.rust_tree_core.extension import bindings; from sglang.srt.rust_extensions import load_rust_extension; m = load_rust_extension("sglang.srt.rust_extensions._multimodal"); print("[rust-ext] never-mode OK:", bindings.__file__, m.__file__)' && \
+    rm -rf /tmp/rust-ext-empty
+
 RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/msit_llm-8.3.2-py3-none-any.whl onnx --no-deps
 
 # deep_gemm 库固定成经 DSv4.1-Flash 验证过的构建（dev@1ff3932f，含 SF-alignment 修复，
