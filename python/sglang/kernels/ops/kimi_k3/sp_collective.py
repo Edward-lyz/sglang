@@ -157,6 +157,7 @@ def _jit_module(world_size: int) -> Module:
             ("reduce_scatter_res", f"{cls}::reduce_scatter_res"),
             ("reduce_scatter_pull", f"{cls}::reduce_scatter_pull"),
             ("all_gather", f"{cls}::all_gather"),
+            ("all_gather_add3", f"{cls}::all_gather_add3"),
             ("all_gather_direct", f"{cls}::all_gather_direct"),
         ],
         extra_cuda_cflags=["-O3"],
@@ -229,6 +230,29 @@ def _all_gather_op(
     _jit_module(world_size).all_gather(
         _COMM_MAP[world_size],
         input.view(-1),
+        output.view(-1),
+        ws_mc_base,
+        num_blocks,
+        block_size,
+    )
+
+
+@register_custom_op(mutates_args=["output"])
+def _all_gather_add3_op(
+    world_size: int,
+    input: torch.Tensor,
+    addend_b: torch.Tensor,
+    addend_c: torch.Tensor,
+    output: torch.Tensor,
+    ws_mc_base: int,
+    num_blocks: int,
+    block_size: int,
+) -> None:
+    _jit_module(world_size).all_gather_add3(
+        _COMM_MAP[world_size],
+        input.view(-1),
+        addend_b.view(-1),
+        addend_c.view(-1),
         output.view(-1),
         ws_mc_base,
         num_blocks,
@@ -311,6 +335,31 @@ def all_gather(
     _all_gather_op(
         world_size,
         input,
+        output,
+        ws_mc_base,
+        tuning.num_blocks,
+        tuning.block_size,
+    )
+    return output
+
+
+def all_gather_add3(
+    world_size: int,
+    input: torch.Tensor,
+    addend_b: torch.Tensor,
+    addend_c: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    ws_mc_base: int,
+    tuning: Tuning = DEFAULT_TUNING,
+) -> torch.Tensor:
+    """Push all-gather of bf16(bf16(input + addend_b) + addend_c): the add3
+    kernel's result, bit-for-bit, without materializing it."""
+    _all_gather_add3_op(
+        world_size,
+        input,
+        addend_b,
+        addend_c,
         output,
         ws_mc_base,
         tuning.num_blocks,

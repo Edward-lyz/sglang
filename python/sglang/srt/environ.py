@@ -432,6 +432,8 @@ class Envs:
     # KDA fused verify kernel (output norm) also emits the DeepGEMM block-FP8
     # input quant that o_proj consumes.
     SGLANG_K3_KDA_ONORM_QUANT = EnvBool(False)
+    # SP-MoE: fold the MoE add3 tail into the push row all-gather.
+    SGLANG_K3_SP_AG_ADD3 = EnvBool(False)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)

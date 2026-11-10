@@ -9,7 +9,7 @@
 import logging
 from collections.abc import Iterable
 from functools import cached_property
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch import nn
@@ -281,12 +281,20 @@ def _dp_local_buffer_group():
     return parallel.attn_tp_group
 
 
-def _sp_all_gather_rows(hidden_states: torch.Tensor) -> torch.Tensor:
-    """Reassemble contiguous token shards, using the tuned K3 AG when covered."""
+def _sp_all_gather_rows(hidden_states) -> torch.Tensor:
+    """Reassemble contiguous token shards, using the tuned K3 AG when covered.
+
+    hidden_states may be a _DeferredAdd3 (the MoE's pending tail add), which
+    the push AG folds into its producer loads."""
     group = get_parallel().attn_tp_group
+    addends = None
+    if isinstance(hidden_states, _DeferredAdd3):
+        hidden_states, addends = hidden_states.a, (hidden_states.b, hidden_states.c)
     hidden_states = hidden_states.contiguous()
-    full = k3_sp_collective.all_gather(hidden_states)
+    full = k3_sp_collective.all_gather(hidden_states, addends)
     if full is None:
+        if addends is not None:
+            hidden_states = _add3(hidden_states, *addends)
         full = torch.empty(
             (hidden_states.shape[0] * group.world_size, hidden_states.shape[1]),
             dtype=hidden_states.dtype,
@@ -529,6 +537,16 @@ def _add3(
     from sglang.kernels.ops.elementwise import add3
 
     return add3.add3(a, b, c, prefetch_bc=prefetch_bc)
+
+
+class _DeferredAdd3(NamedTuple):
+    """MoE output bf16(bf16(a + b) + c) not yet materialized: the SP-MoE
+    decoder hands it to the row all-gather, which applies the add on the
+    fly (see _sp_all_gather_rows)."""
+
+    a: torch.Tensor
+    b: torch.Tensor
+    c: torch.Tensor
 
 
 # One-shot log guard: proves the merged front is live (see _ep_front).
@@ -1177,7 +1195,11 @@ class KimiK3MoE(nn.Module):
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
     def _forward_unfused(
-        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prefix_sum: Optional[torch.Tensor],
+        defer_tail_add: bool = False,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1307,6 +1329,8 @@ class KimiK3MoE(nn.Module):
             # ones need the partial-sum reduction.
             if self.tp_size > 1 and not self._shared_experts_tp1:
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
+            if defer_tail_add and prefix_sum is not None:
+                return _DeferredAdd3(out, shared_output, prefix_sum)
             return _add3(out, shared_output, prefix_sum)
         return out if prefix_sum is None else out + prefix_sum
 
@@ -1474,6 +1498,7 @@ class KimiK3MoE(nn.Module):
         *,
         prefix_sum: Optional[torch.Tensor] = None,
         forward_batch: Optional[ForwardBatch] = None,
+        defer_tail_add: bool = False,
     ) -> torch.Tensor:
         """A pending prefix_sum is always consumed here: folded into the
         3-way JIT tail add when covered, plain adds otherwise (bit-identical
@@ -1500,7 +1525,14 @@ class KimiK3MoE(nn.Module):
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_unfused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                defer_tail_add=defer_tail_add and not use_dp,
+            )
+        if isinstance(out, _DeferredAdd3):
+            # defer_tail_add: the caller (SP-MoE row all-gather) applies it.
+            return out
         if use_dp:
             global_out = out
             out = get_local_dp_buffer(_dp_local_buffer_group())
@@ -2829,8 +2861,18 @@ class KimiK3DecoderLayer(nn.Module):
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
+        # The SP-MoE row all-gather can absorb the MoE's add3 tail.
+        defer = (
+            envs.SGLANG_K3_SP_AG_ADD3.get()
+            and shard_lo >= 0
+            and not keep_sharded
+            and isinstance(self.mlp, KimiK3MoE)
+        )
         out = self.mlp(
-            hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
+            hidden_states,
+            prefix_sum=prefix_sum,
+            forward_batch=forward_batch,
+            **({"defer_tail_add": True} if defer else {}),
         )
         if shard_lo >= 0:
             if keep_sharded:
