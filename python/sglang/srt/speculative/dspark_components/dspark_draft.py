@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    enable_num_token_non_padded,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -460,6 +461,22 @@ class DraftBlockProposer:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
+        if not self._dp_moe_sync:
+            # Dense (dp-local) draft: under --enable-dp-attention the draft's
+            # graph runner keeps require_mlp_sync, so replay admission reads
+            # can_run_dp_cuda_graph off this hand-built batch; without it the
+            # captured draft graphs never replay. The dense draft has no
+            # cross-DP collective, so the scheduler's global decode-sync flag
+            # is a safe gate. num_token_non_padded mirrors
+            # ForwardBatch.init_new; the replay hook localizes it per attn-TP
+            # rank when the gathered-buffer path is active.
+            draft_forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+            if enable_num_token_non_padded():
+                num_tokens = int(draft_forward_batch.input_ids.numel())
+                draft_forward_batch.num_token_non_padded = torch.tensor(
+                    num_tokens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+                draft_forward_batch.num_token_non_padded_cpu = num_tokens
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         if (
             draft_sampler is not None
