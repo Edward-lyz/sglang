@@ -314,9 +314,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += (
+                indexer_cell_size = (
                     indexer_size_per_token * effective_num_layers * element_size
                 )
+                # DCP: index-K is replicated over the widened allocator slots,
+                # so each physical token carries dcp_size index rows.
+                if not kvc.is_draft_worker:
+                    indexer_cell_size *= kvc.server_args.dcp_size
+                cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).

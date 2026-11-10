@@ -3403,6 +3403,12 @@ class KimiK3LinearForCausalLM(nn.Module):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        # DSA (Kimi-K3.1) extend runs sparse MLA on the local KV shard with
+        # gathered Q + LSE merge; no prefix-KV all-gather buffer is needed.
+        if is_deepseek_dsa(self.config):
+            return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,

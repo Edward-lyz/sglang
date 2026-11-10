@@ -4427,7 +4427,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
-            index_buf_size = size
+            # DCP: MLA KV is striped (loc // dcp_size), but index-K is replicated
+            # and addressed by the widened allocator loc, so every rank can score
+            # the whole sequence and pick the global top-k.
+            dcp_size = get_parallel().attn_dcp_size
+            index_buf_size = (size + page_size) * dcp_size - page_size
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128

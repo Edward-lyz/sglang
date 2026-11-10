@@ -372,7 +372,20 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["speculative_attention_mode"] = "decode"
 
         prefill_backend, decode_backend = attention_backends_of(server_args)
-        if decode_backend == "cutedsl_mla" or decode_backend is None:
+        if decode_backend in ("dsa", "nsa"):
+            # Kimi-K3.1 (DSA): sparse trtllm MLA on the local KV shard with the
+            # replicated index-K; only the trtllm DSA kernels return the LSE.
+            for name in ("dsa_prefill_backend", "dsa_decode_backend"):
+                value = getattr(server_args, name)
+                if value not in (None, "trtllm"):
+                    raise ValueError(
+                        f"Kimi-K3.1 DCP requires --{name.replace('_', '-')} "
+                        f"trtllm, got {value!r}."
+                    )
+                overrides[name] = "trtllm"
+            if server_args.enable_hisparse or server_args.enable_hierarchical_cache:
+                raise ValueError("Kimi-K3.1 DCP does not support HiSparse or HiCache.")
+        elif decode_backend == "cutedsl_mla" or decode_backend is None:
             logger.info(
                 "Kimi-K3 DCP keeps decode attention backend 'cutedsl_mla' "
                 f"(prefill={prefill_backend!r} -> 'trtllm_mla')."

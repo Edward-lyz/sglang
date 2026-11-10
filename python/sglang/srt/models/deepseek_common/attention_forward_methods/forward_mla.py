@@ -170,11 +170,18 @@ def _dcp_vc_then_a2a_lse_reduce(
     return out_v.flatten(1, 2)
 
 
-def _is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
+def _is_dcp_mla_decode_phase(
+    forward_batch: ForwardBatch, use_dsa: bool = False
+) -> bool:
     if not get_parallel().dcp_enabled:
         return False
     if forward_batch.forward_mode.is_decode():
         return True
+    if use_dsa:
+        # DSA (Kimi-K3.1): the replicated index-K gives every rank the global
+        # top-k, so verify and extend also run sparse MLA on the local KV shard
+        # with gathered Q heads + LSE merge (no prefix-KV all-gather).
+        return forward_batch.forward_mode.is_extend()
     if not forward_batch.forward_mode.is_target_verify() or not _is_cuda:
         return False
 
@@ -289,6 +296,9 @@ class DeepseekMLAForwardMixin:
             return False
         if not self.use_dsa:
             return False
+        # DCP needs the gathered-heads attention + LSE merge path.
+        if get_parallel().dcp_enabled:
+            return False
         if self.use_deep_gemm_bmm or _is_hip:
             return False
         if is_kv_b_lora_active(self):
@@ -356,7 +366,11 @@ class DeepseekMLAForwardMixin:
         # gathered q-proj may be 16-bit or block-FP8, w_kc is always 16-bit).
         q_replicate_active = (
             get_server_args().dcp_replicate_q_proj
-            and _is_dcp_mla_decode_phase(forward_batch)
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and _is_dcp_mla_decode_phase(forward_batch, self.use_dsa)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
@@ -685,7 +699,7 @@ class DeepseekMLAForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
-            if _is_dcp_mla_decode_phase(forward_batch):
+            if _is_dcp_mla_decode_phase(forward_batch, self.use_dsa):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
@@ -838,7 +852,7 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif _is_dcp_mla_decode_phase(forward_batch):
+                elif _is_dcp_mla_decode_phase(forward_batch, self.use_dsa):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -912,7 +926,7 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if _is_dcp_mla_decode_phase(forward_batch):
+        if _is_dcp_mla_decode_phase(forward_batch, self.use_dsa):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,
