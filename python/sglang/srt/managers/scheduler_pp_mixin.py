@@ -46,7 +46,6 @@ from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
-    is_health_check_generate_req,
 )
 from sglang.srt.mem_cache.storage.asradix.types import AttentionStoreWriteOwner
 from sglang.srt.model_executor.forward_batch_info import (
@@ -305,37 +304,6 @@ class SchedulerPPMixin:
                 f"PP batch plan relay mismatch: local={mb_id} remote={message.mb_id}"
             )
         return work_reqs, message.plan
-
-    def _pp_filter_health_check_reqs_by_plan(
-        self, recv_reqs: List[Any], authoritative_plan: Optional[Dict[str, Any]]
-    ) -> List[Any]:
-        """Relay PP0's admission decision for HEALTH_CHECK requests downstream.
-
-        PP0 decides whether a HEALTH_CHECK request enters this microbatch.
-        Downstream ranks must make the same decision instead of recomputing it
-        locally. The plan's ``requests`` list carries that decision: admit rids
-        present in the plan, drop rids absent from it.
-        """
-        if authoritative_plan is None:
-            return recv_reqs
-
-        planned_rids = {
-            entry.get("rid") for entry in authoritative_plan.get("requests", ())
-        }
-        kept: List[Any] = []
-        for recv_req in recv_reqs:
-            if not is_health_check_generate_req(recv_req):
-                kept.append(recv_req)
-                continue
-            rid = getattr(recv_req, "rid", None)
-            if rid in planned_rids:
-                recv_req._pp_admission_decision = True
-                kept.append(recv_req)
-            else:
-                self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
-                )
-        return kept
 
     @staticmethod
     def _pp_batch_contract(
@@ -1297,9 +1265,9 @@ class SchedulerPPMixin:
                         self._pp_extract_authoritative_batch_plan(mb_id, recv_reqs)
                     )
                     upstream_plan = authoritative_plan
-                recv_reqs = self._pp_filter_health_check_reqs_by_plan(
-                    recv_reqs, authoritative_plan
-                )
+                # PP0's admission decision travels with the request. An admitted
+                # health check may wait across microbatches before entering a
+                # plan, so keep it even when this plan does not execute it.
                 self.process_input_requests(recv_reqs)
                 recv_reqs = self._pp_pd_get_mm_ready_reqs(recv_reqs)
 

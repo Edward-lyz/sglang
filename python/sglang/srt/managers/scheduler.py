@@ -2447,7 +2447,8 @@ class Scheduler(
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
-            # Skip health check when server is busy — ongoing requests already carry health info.
+            # Busy servers can skip health probes. In PP, PP0 owns this decision;
+            # downstream ranks must preserve it independently of any batch plan.
             if is_health_check_generate_req(recv_req):
                 if recv_req._pp_admission_decision is None:
                     if self.ps.pp_size > 1:
@@ -2458,13 +2459,20 @@ class Scheduler(
                                 for_health_check=True
                             )
                         else:
-                            # No PP0 decision available on a downstream rank:
-                            # skip deterministically instead of diverging.
-                            recv_req._pp_admission_decision = False
+                            raise RuntimeError(
+                                "Missing PP0 health-check admission decision: "
+                                f"rid={recv_req.rid} pp_rank={self.ps.pp_rank}"
+                            )
                     else:
                         recv_req._pp_admission_decision = self.is_fully_idle(
                             for_health_check=True
                         )
+                logger.debug(
+                    "Health-check admission: rid=%s pp_rank=%s admitted=%s",
+                    recv_req.rid,
+                    self.ps.pp_rank,
+                    recv_req._pp_admission_decision,
+                )
                 if not recv_req._pp_admission_decision:
                     self.return_health_check_ipcs.append(
                         getattr(recv_req, "http_worker_ipc", None)
