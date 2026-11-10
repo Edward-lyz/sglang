@@ -214,6 +214,24 @@ def dequantize_k_cache_paged(
     # [:, 528:]
     input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
 
+    # Process multiple tokens per CTA for long cached prefixes. The original
+    # kernel launches five tiny CTAs per token, which dominates large tables.
+    # Keep the existing small-input path; both produce the same BF16 values.
+    # 中文说明：
+    # - 原 kernel 每个 token 要起 num_blocks_per_token（5）个很小的 CTA，
+    #   命中前缀很长（token 数上万）时，启动的 CTA 数量成了主要开销。
+    # - 新 kernel 一个 CTA 处理 BLOCK_TOKENS=8 个 token，CTA 数降为原来的约 1/40。
+    # - 只在 num_tokens >= 4096 时启用；小输入沿用原路径，避免影响短请求。
+    # - 两条路径只做 FP8*scale -> BF16 与 rope 拷贝，输出数值逐位一致。
+    if num_tokens >= 4096:
+        _dequantize_k_cache_paged_tiled_kernel[(triton.cdiv(num_tokens, 8),)](
+            output, quant_k_cache, input_nope_s, input_rope,
+            page_table_1_flattened, num_tokens, quant_k_cache.stride(0),
+            input_nope_s.stride(0), input_rope.stride(0),
+            BLOCK_TOKENS=8, num_warps=4,
+        )
+        return output
+
     _dequantize_k_cache_paged_kernel[(num_tokens, num_blocks_per_token)](
         output,
         input_nope_q,
@@ -586,6 +604,35 @@ def _gather_dequant_requant_fp8_paged_kernel(
 
         data = tl.load(src_ptr, mask=mask).to(tl.float8e4nv)
         tl.store(dst_ptr, data, mask=mask)
+
+
+@triton.jit
+def _dequantize_k_cache_paged_tiled_kernel(
+    out, q, scales, rope, table,
+    N, QS: tl.constexpr, SS: tl.constexpr, RS: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    # 分块去量化 kernel：一个 CTA 处理 BLOCK_TOKENS 个 token 的整行 KV（576 维）。
+    # 输入每个 token 的布局：[0:512) 为 FP8 的 nope，[512:528) 为 4 个 fp32 scale
+    # （每 128 维共用一个），其后为 64 维 bf16 的 rope；输出为 [N, 576] 的 bf16。
+    # 当前 token 行号；超出 N 的尾部行用 mask 屏蔽，避免越界读写
+    rows = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+    # 通过 page table 把逻辑 token 行映射成 KV 缓存里的物理槽位
+    ids = tl.load(table + rows, mask=rows < N, other=0)
+    cols = tl.arange(0, 512)
+    # nope 部分：加载 FP8 数据并转 fp32，乘以所在 128 维分组对应的 scale，再转 bf16 写出
+    x = tl.load(q + ids[:, None] * QS + cols[None, :],
+                mask=rows[:, None] < N, other=0.0).to(tl.float32)
+    s = tl.load(scales + ids[:, None] * SS + (cols[None, :] // 128),
+                mask=rows[:, None] < N, other=0)
+    tl.store(out + rows[:, None] * 576 + cols[None, :],
+             (x * s).to(tl.bfloat16), mask=rows[:, None] < N)
+    # rope 部分本身就是 bf16，不需要去量化，直接拷贝到输出的 [512:576)
+    rc = tl.arange(0, 64)
+    r = tl.load(rope + ids[:, None] * RS + rc[None, :],
+                mask=rows[:, None] < N, other=0)
+    tl.store(out + rows[:, None] * 576 + 512 + rc[None, :],
+             r, mask=rows[:, None] < N)
 
 
 if __name__ == "__main__":
