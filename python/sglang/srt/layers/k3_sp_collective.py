@@ -98,7 +98,8 @@ def _init_state() -> Optional[_State]:
         is None
     ):
         (logger.warning if explicit else logger.info)(
-            "K3 SP collective has no tuning table for %s; using NCCL.",
+            "K3 SP collective has no tuning table for SM%d (%s); using NCCL.",
+            get_device_sm(),
             torch.cuda.get_device_name(),
         )
         return None
