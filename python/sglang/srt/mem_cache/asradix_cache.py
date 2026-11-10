@@ -589,6 +589,58 @@ class AsRadixCache(RadixCache):
 
         # Perform the actual AS -> GPU DMA load
         load_result = self._do_as_load(load_info, host_hit_length)
+        # CPLOADSYNC: reconcile the ACTUAL AS-loaded length across the
+        # cache group. host_hit_length is agreed across ranks at match time
+        # (see match_prefix), but the per-rank AS->HBM load can still
+        # under-deliver on a subset of ranks (transient KV-pool alloc/evict
+        # pressure, read divergence) and return a different number of tokens
+        # per rank -- observed under prefill CP: one rank loaded 0 while the
+        # rest loaded the full hit. Committing a divergent cached prefix
+        # makes each rank build a different extend batch, so the per-request
+        # DSA/attention CP all-gather and all_reduce collectives mismatch in
+        # size/count and the prefill schedulers deadlock. Honor the AS hit
+        # only if ALL ranks loaded it; otherwise every rank drops it and
+        # re-forwards the prefix identically (correctness preserved; the
+        # recompute only forgoes a cache speedup for this one request, and
+        # only in the rare under-delivery window). Release the dropped
+        # pages immediately and locally -- NOT through the TP-MIN-synced
+        # deferred queue, whose drain would stall (and leak) when the queued
+        # counts differ across ranks.
+        _cpload_raw = len(load_result.indices) if (load_result is not None) else 0
+        if self.tp_world_size > 1:
+            _cpload_t = torch.tensor(_cpload_raw, dtype=torch.int)
+            torch.distributed.all_reduce(
+                _cpload_t,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            _cpload_min = int(_cpload_t.item())
+        else:
+            _cpload_min = _cpload_raw
+        if _cpload_min <= 0:
+            if load_result is not None and _cpload_raw > 0:
+                if load_result.ready_event is not None:
+                    try:
+                        load_result.ready_event.synchronize()
+                    except Exception:
+                        logger.exception("AS load drop: ready_event sync failed")
+                _free_page_ids = getattr(
+                    self.token_to_kv_pool_allocator, "free_page_ids", None
+                )
+                if (
+                    _free_page_ids is not None
+                    and load_result.page_ids_cpu is not None
+                    and load_result.page_ids_cpu.numel() > 0
+                ):
+                    _free_page_ids(load_result.page_ids_cpu)
+                else:
+                    self.token_to_kv_pool_allocator.free(load_result.indices)
+                logger.warning(
+                    f"AS load: req:{getattr(req, 'rid', '?')} dropped on all "
+                    f"ranks (a rank in the cache group loaded 0 of "
+                    f"{host_hit_length}); honoring 0 AS hit for CP consistency"
+                )
+            return empty, last_host_node
         if load_result is not None and len(load_result.indices) > 0:
             req.ever_read_as = True
 
