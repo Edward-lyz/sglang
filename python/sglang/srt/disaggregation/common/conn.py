@@ -920,66 +920,83 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
-    def _connect(self, endpoint: str, is_ipv6: bool = False):
+    def _get_socket_send_lock(self, endpoint: str):
+        # 全局锁只保护锁表；等待 endpoint 锁时不能持有全局锁。
         with self._socket_lock:
-            sock = self._socket_cache.get(endpoint)
-            if sock is not None:
-                monitor = self._monitor_cache.get(endpoint)
-                disconnected = False
-                if monitor is not None:
-                    try:
-                        monitor.recv_multipart(zmq.NOBLOCK)
-                        disconnected = True
-                    except zmq.Again:
-                        pass
-                    except zmq.ZMQError:
-                        disconnected = True
-                if not disconnected:
-                    return sock
-                sock.close(linger=0)
-                if monitor is not None:
-                    monitor.close()
-                self._socket_cache.pop(endpoint, None)
-                self._monitor_cache.pop(endpoint, None)
+            return self._socket_send_locks.setdefault(endpoint, threading.Lock())
 
-            sock = self._zmq_ctx.socket(zmq.PUSH)
+    def _connect(self, endpoint: str, is_ipv6: bool = False):
+        """Fetch a socket under its endpoint lock; production sends use the wrapper."""
+        with self._get_socket_send_lock(endpoint):
+            return self._connect_locked(endpoint, is_ipv6=is_ipv6)
+
+    def _disconnect_locked(self, endpoint: str):
+        """Discard cached sockets while holding the endpoint send lock."""
+        sock = self._socket_cache.pop(endpoint, None)
+        monitor = self._monitor_cache.pop(endpoint, None)
+        if sock is not None:
+            sock.close(linger=0)
+        if monitor is not None:
+            monitor.close(linger=0)
+
+    def _connect_locked(self, endpoint: str, is_ipv6: bool = False):
+        """Look up or rebuild a socket with the endpoint send lock held."""
+        sock = self._socket_cache.get(endpoint)
+        if sock is not None:
+            monitor = self._monitor_cache.get(endpoint)
+            disconnected = False
+            if monitor is not None:
+                try:
+                    monitor.recv_multipart(zmq.NOBLOCK)
+                    disconnected = True
+                except zmq.Again:
+                    pass
+                except zmq.ZMQError:
+                    disconnected = True
+            if not disconnected:
+                return sock
+            self._disconnect_locked(endpoint)
+
+        sock = self._zmq_ctx.socket(zmq.PUSH)
+        monitor = None
+        try:
             if is_ipv6:
                 sock.setsockopt(zmq.IPV6, 1)
-            # Do NOT disable reconnection (-1). The monitor below only reports
-            # EVENT_DISCONNECTED for a connection that was established first, so
-            # if the peer is unreachable when we connect -- or if this socket is
-            # rebuilt while the peer is still restarting -- no event is ever
-            # raised and a -1 interval leaves the socket permanently dead: the
-            # first SNDHWM (1000) messages are silently queued and every send
-            # after that blocks for SNDTIMEO and raises zmq.error.Again.
+            # 首次连接失败也要重试；仅监控 DISCONNECTED 覆盖不到这种情况。
             sock.setsockopt(zmq.RECONNECT_IVL, 100)
-            # Never queue into a pipe that is not connected. Without this the
-            # messages above are dropped into the void instead of failing
-            # loudly, and the caller cannot tell the transfer apart from a
-            # successful one.
+            # 未建立连接时不把消息排进发送队列；超时后让调用方报告传输失败。
             sock.setsockopt(zmq.IMMEDIATE, 1)
-            sock.setsockopt(zmq.SNDTIMEO, 30000)
+            sock.setsockopt(zmq.SNDTIMEO, 5000)
             sock.setsockopt(zmq.LINGER, 0)
             sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
             sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
             sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
             sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+            # 先装监控再连接，避免漏掉连接建立后立刻断开的事件。
+            monitor = sock.get_monitor_socket(zmq.EVENT_DISCONNECTED)
             sock.connect(endpoint)
-            self._socket_cache[endpoint] = sock
-            self._monitor_cache[endpoint] = sock.get_monitor_socket(
-                zmq.EVENT_DISCONNECTED
-            )
-            self._socket_send_locks.setdefault(endpoint, threading.Lock())
-            return sock
+        except Exception:
+            sock.close(linger=0)
+            if monitor is not None:
+                monitor.close(linger=0)
+            raise
+        self._socket_cache[endpoint] = sock
+        self._monitor_cache[endpoint] = monitor
+        return sock
 
     def _send_multipart_locked(
         self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
     ):
-        # Cached sockets are shared across sender threads and zmq sockets are
-        # not thread-safe; serialize sends per endpoint.
-        sock = self._connect(endpoint, is_ipv6=is_ipv6)
-        with self._socket_send_locks[endpoint]:
-            sock.send_multipart(parts)
+        # 必须先拿发送锁再取 socket：只保护 close 不够，排队的线程可能还持有
+        # 旧 socket。取连接、重建、发送、异常回收统一用这把锁串行化。
+        with self._get_socket_send_lock(endpoint):
+            sock = self._connect_locked(endpoint, is_ipv6=is_ipv6)
+            try:
+                sock.send_multipart(parts)
+            except zmq.ZMQError:
+                # 失败的 multipart 会话不复用；也不在这里盲目重发业务消息。
+                self._disconnect_locked(endpoint)
+                raise
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -1462,6 +1479,7 @@ class CommonKVReceiver(BaseKVReceiver):
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
+        self.bootstrap_infos = None
         self.kv_mgr = mgr
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False

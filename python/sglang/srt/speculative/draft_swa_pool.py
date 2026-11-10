@@ -107,6 +107,44 @@ def upload_host_ints(values, *, device) -> torch.Tensor:
     return host.to(device=device, non_blocking=True)
 
 
+# 单个页检查网格的元素上限。int64 网格最多约 32 MiB；函数总峰值还包括
+# gather 结果与布尔掩码，不能把这个值当作整段代码的显存上限。
+_FREE_SLOTS_GRID_ELEMENTS = 1 << 22
+
+
+def validate_token_ranges(target_req_to_token, req_pool_indices, starts, ends):
+    """Validate host-side row/range metadata before indexing or mutating state."""
+    if not (len(req_pool_indices) == len(starts) == len(ends)):
+        raise ValueError("Draft SWA request indices and range lengths differ")
+    num_rows, width = target_req_to_token.shape
+    for req, start, end in zip(req_pool_indices, starts, ends):
+        if not (0 <= int(req) < num_rows and 0 <= int(start) <= int(end) <= width):
+            raise ValueError(
+                f"Draft SWA range out of bounds: req_pool_idx={req}, "
+                f"range=[{start}, {end}), table_shape=({num_rows}, {width})"
+            )
+
+
+def gather_token_ranges(target_req_to_token, req_pool_indices, starts, ends):
+    """Gather validated ragged ranges, padding unused entries with -1."""
+    validate_token_ranges(target_req_to_token, req_pool_indices, starts, ends)
+    device = target_req_to_token.device
+    lengths = [int(end) - int(start) for start, end in zip(starts, ends)]
+    span = max(lengths, default=0)
+    if span == 0:
+        return target_req_to_token.new_empty((0,))
+    reqs_t = upload_host_ints(req_pool_indices, device=device)
+    starts_t = upload_host_ints(starts, device=device)
+    lens_t = upload_host_ints(lengths, device=device)
+    pos = torch.arange(span, dtype=torch.int64, device=device)
+    keep = pos.unsqueeze(0) < lens_t.unsqueeze(1)
+    # 补齐的列仍会参与 gather，事后 where 保护不了这次读取。
+    # 只把无效补齐列改成 0；有效区间已在 CPU 上校验，不用 clamp 掩盖错误。
+    indices = torch.where(keep, starts_t.unsqueeze(1) + pos.unsqueeze(0), 0)
+    gathered = target_req_to_token[reqs_t.unsqueeze(1), indices]
+    return torch.where(keep, gathered, -1).reshape(-1)
+
+
 class DraftWindowSlotMap:
     """Full (target-global) slot id -> draft-local SWA slot id, window-bounded.
 
@@ -430,42 +468,47 @@ class DraftWindowSlotMap:
         """
         if full_indices.numel() == 0:
             return 0
-        full_indices = full_indices.to(
+        full_indices = full_indices.reshape(-1).to(
             dtype=torch.int64, device=self.full_to_swa.device
         )
+        chunk_size = max(1, _FREE_SLOTS_GRID_ELEMENTS // self.page_size)
+        if full_indices.numel() <= chunk_size:
+            # 常态路径：一次处理，保留原来的返回语义。
+            return self._free_slots_chunk(full_indices, return_count=return_count)
+
         # 【修复】分片处理，避免一次性 materialize 整个索引网格。
         # 下面是 (n, page_size) 的 int64 网格，n 由调用方决定：请求的第一个
         # decode step 会把整段 prefill 前缀交给 sweep（根因见 advance_window），
         # n 到 10 万级时 n × page_size 64 ≈ 1.6 GiB 瞬时显存，在 KV cache 已吃满
-        # 的卡上直接 CUDA OOM。这里按「网格元素数」分片，把峰值显存压到
-        # grid_budget × 8 字节；span 小的常态路径只跑一个分片，没有额外开销。
+        # 的卡上直接 CUDA OOM。按「网格元素数」分片，把峰值压到
+        # _FREE_SLOTS_GRID_ELEMENTS × 8 字节；span 小的常态路径只跑一个分片。
         # 语义完全不变：每个分片仍按原顺序做 unmap / dedup / 推栈，而一个 full
         # page 只有在「最后一个仍 mapped 的槽位被解映射的那个分片」里才会满足
         # released（要求整页已 unmapped），所以不会重复入栈、也不会漏释放；
-        # 映射表、页表、空闲栈 top、释放计数都与单次调用一致。
+        # 映射表、页表、空闲栈 top 都与单次调用一致。
         # 唯一差异：跨分片的页会在「补完它的那个分片」里入栈，因此空闲栈里页的
-        # 排列顺序可能与单次调用不同（仅在 n 超过分片阈值时才会发生）。栈里的
-        # 空闲页彼此等价，只是下次分配谁先被取出的区别，不影响正确性。
-        #
-        # 计数单独在 unmap 之前整体算一次：原语义是「重复 id 各算一次」，而分片
-        # 后后面的分片看到的是前面已清零过的表，会把跨分片的重复 id 少算一次。
-        # return_count=True 不是热路径（decode / prefill 都传 False）。
-        num_mapped = (
-            int((self.full_to_swa[full_indices] > 0).sum()) if return_count else 0
-        )
-        grid_budget = 1 << 22  # 每个分片最多 4M 个网格元素 ≈ 32 MiB
-        chunk = max(1, grid_budget // self.page_size)
-        for lo in range(0, full_indices.numel(), chunk):
-            self._free_slots_chunk(full_indices[lo : lo + chunk])
-        return num_mapped
+        # 排列顺序可能与单次调用不同（只在 n 超过分片阈值时发生）。栈里的空闲页
+        # 彼此等价，只影响下次先取谁，不影响正确性。
+        count = 0
+        if return_count:
+            # 原接口按释放前的每次出现计数。先整体算一遍再开始 unmap，
+            # 防止跨分片重复 id 少算；return_count=False 不增加设备读回。
+            total = torch.zeros((), dtype=torch.int64, device=self.full_to_swa.device)
+            for part in full_indices.split(chunk_size):
+                part = part.to(dtype=torch.int64, device=self.full_to_swa.device)
+                total.add_((self.full_to_swa[part] > 0).sum())
+            count = int(total)
+        for part in full_indices.split(chunk_size):
+            self._free_slots_chunk(part, return_count=False)
+        return count
 
-    def _free_slots_chunk(self, full_indices: torch.Tensor) -> None:
+    def _free_slots_chunk(self, full_indices, *, return_count: bool) -> int:
         """One slice of ``free_slots``: unmap, then recycle completed pages.
 
         Split out only so the caller can bound the transient ``(n, page_size)``
-        index grid; the body is the single-call version verbatim minus the
-        freed-slot count, which ``free_slots`` computes over the whole input.
-        Called with the instance lock already held.
+        index grid. The caller holds the instance lock and decides the count
+        semantics: ``free_slots`` pre-counts over the whole input for its chunked
+        path, while this single-slice path counts its own input directly.
         """
         swa = self.full_to_swa[full_indices]
         # Unmapped ids read 0 and the -1 sentinel reads -1, so both drop out.
@@ -504,6 +547,9 @@ class DraftWindowSlotMap:
             torch.where(valid, self._c_zero, self._c_minus_one)
         )
 
+        # Counts each occurrence of a duplicated id; the pool state does not.
+        return int(mapped.sum()) if return_count else 0
+
     # ---- window eviction ------------------------------------------------
 
     def evict_threshold(self, committed_len: int) -> int:
@@ -532,13 +578,22 @@ class DraftWindowSlotMap:
         cadence -- every step, or every Nth step like the target's SWA eviction.
 
         The stale ranges are gathered across requests in ONE device op and freed
-        with a single ``free_slots`` call. The former per-request loop paid
+        with a single ``free_slots`` call, which slices the page grid internally.
+        The former per-request loop paid
         ``free_slots``'s full chain (``torch.unique`` plus several D2H syncs)
         once per request per step, which dominated the decode hot path at batch.
 
         ``return_count=False`` forwards to ``free_slots``: no readback, and the
         returned count is 0.
         """
+        # 使用真实表宽（含 speculative 预留空间），不是模型标称上下文。
+        # 参数都在 CPU 上，校验不引入 GPU 同步。
+        validate_token_ranges(
+            target_req_to_token,
+            req_pool_indices_cpu,
+            [0] * len(req_pool_indices_cpu),
+            committed_lens_cpu,
+        )
         # Host-side frontier advance; collect the ranges that actually moved.
         #
         # 【根因】请求的第一个 decode step 上 old_frontier 必然是 0（release_request
@@ -554,15 +609,15 @@ class DraftWindowSlotMap:
         #
         # 空转本身不算错（未映射的位置会被 free_slots 判为 no-op），但代价是：
         # 下面把整批的 [start, end) 拼成 (R, span) 的 gather，span 被撑到整个
-        # 前缀长度，free_slots 再据此造一个 (R*span, page_size) 的 int64 索引网格
+        # 前缀长度，free_slots 再据此造一个 (R×span, page_size) 的 int64 索引网格
         # —— 35 个 10 万前缀的请求 × page_size 64 ≈ 1.6 GiB 瞬时显存，在 KV cache
         # 已吃满的卡上直接 CUDA OOM。
         #
-        # 这里刻意不「跳过」这段 sweep：能安全跳过的前提是知道本请求最低被映射过
-        # 的位置，而 mapped_high_water 只由 forward 侧（note_mapped_extents）维护，
-        # PD transfer 侧和 prefill 侧的 map_slots 都不更新它 —— 用它当判据会漏掉
-        # transfer 已映射、且落在 frontier 下方的那一页，从而泄漏 draft page。
-        # 所以改为在 free_slots 里分片处理（语义完全不变），把峰值显存压住。
+        # 这里刻意不「跳过」这段 sweep：mapped_high_water 只记录映射终点、不记录
+        # 起点（map_slots 带 req_pool_idx/end_pos 时会抬升它，PD transfer 与 prefill
+        # 分块路径都传了），所以推不出本请求最低被映射过的位置；而 transfer 预分配
+        # 会映射到 frontier 下方一页左右，跳过 sweep 就会漏掉那一页、泄漏 draft page。
+        # 因此改为在 free_slots 里对页网格分片，把峰值显存压住。
         starts: list[int] = []
         ends: list[int] = []
         advancing_reqs: list[int] = []
@@ -578,37 +633,12 @@ class DraftWindowSlotMap:
         if not advancing_reqs:
             return 0
 
-        # One batched gather of every request's stale range (mirrors the map-side
-        # batching in _maintain_draft_swa_window). ``keep`` trims each row to its
-        # own [start, end) span; the trim pads with -1 rather than compacting with
-        # a boolean-mask select, which would be a host-device sync right at the
-        # top of the step. ``free_slots`` drops -1 for free.
-        device = target_req_to_token.device
-        starts_t = upload_host_ints(starts, device=device)
-        lens_t = upload_host_ints([e - s for s, e in zip(starts, ends)], device=device)
-        reqs_t = upload_host_ints(advancing_reqs, device=device)
-        span = int(max(e - s for s, e in zip(starts, ends)))
-        pos = torch.arange(span, dtype=torch.int64, device=device)
-        # 【修复】列索引必须夹在 req_to_token 的宽度内。
-        # idx 用的是「本批最大的 span」，不是每个请求自己的 span，所以 span 较小的
-        # 请求会一路读到自己的 end 之外：例如本批有个 span=97920 的请求，另一个
-        # 请求 start=97900，则它的 idx 会走到 97900+97920-1=195819，超过
-        # req_to_token 的 max_context_len（131072）→ 越界读 → CUDA device-side
-        # assert（而且是异步上报，行号往往指向后面某个无辜的 kernel）。
-        # 越界的那些列 keep 已经标掉了（keep = pos < lens），最终会被 torch.where
-        # 换成 -1 丢弃，所以夹紧只影响注定被丢弃的位置，语义不变。
-        idx = (starts_t.unsqueeze(1) + pos.unsqueeze(0)).clamp_(
-            max=target_req_to_token.shape[1] - 1
-        )
-        keep = pos.unsqueeze(0) < lens_t.unsqueeze(1)
-        gathered = target_req_to_token[reqs_t.unsqueeze(1), idx]
-        # Scalar -1 (not ``_c_minus_one``): this row is built on the TARGET
-        # device, which the map's own constants need not share.
-        stale = torch.where(keep, gathered, -1).reshape(-1)
+        # 一次批量 gather 覆盖全批 [start, end)；补齐的无效列在 gather 前已改成
+        # 安全下标、之后置 -1，free_slots 会丢弃它们。free_slots 内部再对
+        # (n, page_size) 页网格分片。
+        stale = gather_token_ranges(target_req_to_token, advancing_reqs, starts, ends)
 
-        # Free the union once, then advance the frontiers (host-only) only after
-        # the free succeeds: a mid-free failure must not leave a request reporting
-        # slots as freed that are still mapped.
+        # Free 成功后才推进 frontier：中途失败不能让请求报告已淘汰但仍映射的槽位。
         num_freed = self.free_slots(stale, return_count=return_count)
         for req_pool_idx, new_frontier in zip(advancing_reqs, ends):
             self.evict_frontier[req_pool_idx] = new_frontier
@@ -649,6 +679,11 @@ class DraftWindowSlotMap:
         # 所以 rejected tail 依旧不会漏。
         low_water = int(self.evict_frontier[idx])
         high_water = int(self.mapped_high_water[idx])
+        # frontier 以下已淘汰；旧 req_to_token 项可能仍指向已复用的 full id。
+        # 只释放剩余范围，并用 high_water 覆盖 rejected tail。
+        validate_token_ranges(
+            target_req_to_token, [idx], [0], [max(low_water, high_water)]
+        )
         num_freed = 0
         if high_water > low_water:
             num_freed = self.free_slots(

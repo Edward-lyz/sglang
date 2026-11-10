@@ -25,7 +25,8 @@ from sglang.srt.speculative.draft_swa_pool import (
     DraftWindowSlotMap,
     compact_draft_pool_multiplier,
     compute_compact_draft_pool_slots,
-    upload_host_ints,
+    gather_token_ranges,
+    validate_token_ranges,
 )
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
@@ -1051,6 +1052,19 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         req_pool_indices = [int(req.req_pool_idx) for req in batch.reqs]
         committed = [int(req.kv_committed_len) for req in batch.reqs]
+        # 有效 end 超过真实行宽时必须报错，不能 min/clamp 成最后一列：
+        # 后续 verify 仍会按完整 block 读写，映射范围与写入范围必须一致。
+        mapping_ends = [
+            (
+                max(int(reserved[i]), length + block)
+                if reserved is not None
+                else length + block
+            )
+            for i, length in enumerate(committed)
+        ]
+        validate_token_ranges(
+            target_req_to_token, req_pool_indices, [0] * len(committed), mapping_ends
+        )
         slot_map.advance_window(
             req_pool_indices_cpu=req_pool_indices,
             committed_lens_cpu=committed,
@@ -1069,8 +1083,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ends = []
         active_reqs = []
         for i, req_pool_idx in enumerate(req_pool_indices):
-            current_end = committed[i] + block
-            end = max(int(reserved[i]), current_end) if reserved is not None else current_end
+            end = mapping_ends[i]
             # Only the active SWA tail can be read by draft attention.  On the
             # first decode step the eviction frontier is zero, but ``end`` may
             # be the entire prefill context; mapping from zero would allocate
@@ -1084,38 +1097,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ends.append(end)
                 active_reqs.append(req_pool_idx)
         if starts:
-            device_ = target_req_to_token.device
-            starts_t = upload_host_ints(starts, device=device_)
-            lens_t = upload_host_ints(
-                [e - s for s, e in zip(starts, ends)], device=device_
-            )
-            span = int(max(e - s for s, e in zip(starts, ends)))
-            pos = torch.arange(span, dtype=torch.int64, device=device_)
-            # 【修复】列索引夹在 req_to_token 宽度内（同 draft_swa_pool.advance_window）。
-            # idx 用的是「本批最大的 span」，不是每个请求自己的 span：span 较小的
-            # 请求会被带着读到自己的 end 之外，当它 start 靠后（请求接近满上下文）
-            # 时就越过 req_to_token 的 max_context_len → 越界读 → device-side
-            # assert。越界列 keep 已标掉、最终被 where 换成 -1，夹紧不改语义。
-            idx = (starts_t.unsqueeze(1) + pos.unsqueeze(0)).clamp_(
-                max=target_req_to_token.shape[1] - 1
-            )
-            keep = pos.unsqueeze(0) < lens_t.unsqueeze(1)
-            reqs_t = upload_host_ints(active_reqs, device=device_)
-            gathered = target_req_to_token[reqs_t.unsqueeze(1), idx]
-            # map_slots is idempotent per id, so one flattened call over every
-            # request's [start, end) range is equivalent to the per-request
-            # calls it replaces. Rows are ragged, but trimming with
-            # ``gathered[keep]`` would be a masked_select -- a host-device sync at
-            # the very top of the step, i.e. one that waits out the PREVIOUS
-            # forward. Pad to -1 instead: map_slots resolves -1 through the
-            # trailing sentinel and skips it.
-            #
-            # assert_capacity=False for the same reason: the check reads the free
-            # count back, which is exactly the sync this path exists to avoid.
-            # The overflow is latched on the device and raised by the next
-            # checked call (the next prefill's map_slots).
+            # 与淘汰端共用安全 gather：只给无效补齐列用安全下标，之后置 -1。
+            # 有效列越界在状态变更前报错，不再静默重复最后一列。
             slot_map.map_slots(
-                torch.where(keep, gathered, -1).reshape(-1), assert_capacity=False
+                gather_token_ranges(target_req_to_token, active_reqs, starts, ends),
+                assert_capacity=False,
             )
             slot_map.note_mapped_extents(active_reqs, ends)
 
