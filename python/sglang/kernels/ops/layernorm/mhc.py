@@ -2,7 +2,6 @@ import functools
 import importlib
 import logging
 import math
-import os
 import threading
 from typing import Tuple
 
@@ -2179,8 +2178,8 @@ def _num_slices_for(k: int) -> int:
 # the Triton reduce/sinkhorn stages unchanged. `num_splits` depends only on K,
 # so a row stays batch-invariant. Enabled by default on Blackwell; set
 # SGLANG_MHC_USE_DEEPGEMM=0 to force the Triton split-K producer.
-_MHC_USE_DEEPGEMM = os.environ.get("SGLANG_MHC_USE_DEEPGEMM", "1") == "1"
-_MHC_DEEPGEMM_SPLITS = int(os.environ.get("SGLANG_MHC_DEEPGEMM_SPLITS", "16"))
+_MHC_USE_DEEPGEMM = envs.SGLANG_MHC_USE_DEEPGEMM.get()
+_MHC_DEEPGEMM_SPLITS = envs.SGLANG_MHC_DEEPGEMM_SPLITS.get()
 _mhc_deepgemm_warned = False
 
 

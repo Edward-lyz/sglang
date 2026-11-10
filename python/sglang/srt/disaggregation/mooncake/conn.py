@@ -322,7 +322,39 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             add(ptrs, lens)
         return regions
 
+    @staticmethod
+    def _assert_rdma_registerable_allocator() -> None:
+        """Reject allocator configs whose GPU memory cannot be RDMA-registered.
+
+        ``expandable_segments:True`` makes torch allocate the KV pool through the
+        CUDA VMM driver API (cuMemMap). nvidia-peermem cannot ``ibv_reg_mr`` such
+        VMM-backed device memory, so every mooncake KV registration below fails
+        silently (``rdma_transport.cpp Failed to register memory``,
+        ``nvidia_peermem`` refcount stays 0). The peer prefill/decode then cannot
+        find any KV segment descriptor and every PD transfer dies with
+        "Failed to get segment descriptor / send kv chunk / session not alive".
+        Fail loud at startup instead of silently breaking every transfer.
+        """
+        for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+            conf = os.environ.get(var, "")
+            for field in conf.split(","):
+                key, _, value = field.partition(":")
+                if (
+                    key.strip() == "expandable_segments"
+                    and value.strip().lower() == "true"
+                ):
+                    raise RuntimeError(
+                        f"{var} sets expandable_segments:True, which is "
+                        f"incompatible with mooncake PD KV transfer: the CUDA VMM "
+                        f"(cuMemMap) memory it hands out cannot be registered with "
+                        f"nvidia-peermem (ibv_reg_mr fails), so KV RDMA "
+                        f"registration fails and prefill<->decode transfer never "
+                        f"completes. Unset expandable_segments on this "
+                        f"disaggregation node."
+                    )
+
     def register_buffer_to_engine(self):
+        self._assert_rdma_registerable_allocator()
         regions = self._registerable_regions()
         if regions:
             ptrs, lens = zip(*regions)

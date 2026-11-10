@@ -1199,7 +1199,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             attn_dp_size=self.attn_dp_size,
         )
         headroom = self.swa_prefix_tails * (self.sliding_window_size + self.page_size)
-        return ceil_align(cap + headroom, self.page_size)
+        # SWA-cap multiplier: spend free GPU mem on SWA to avoid chunk fragmentation.
+        mult = envs.SGLANG_SWA_CAP_MULT.get()
+        return ceil_align(int((cap + headroom) * mult), self.page_size)
 
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the whole stage.

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -859,7 +860,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
-                if not req.pending_bootstrap:
+                if not req.pending_bootstrap and not self._prefill_fake_free_kv(req):
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
                 if self.metrics_reporter.enable_metrics:
@@ -945,6 +946,18 @@ class SchedulerDisaggregationPrefillMixin:
         )
         self.maybe_send_health_check_signal()
 
+    def _prefill_fake_free_kv(self: Scheduler, req) -> bool:
+        """Benchmark single-press: free a fake-bootstrap request's KV right after
+        prefill. aiakperf --fake-bootstrap sets req.bootstrap_host=FAKE_BOOTSTRAP_HOST
+        and no decode peer ever pulls the KV, so it would otherwise leak until an
+        impossible transfer concludes (oversubscribes SWA -> stall). Gated by env
+        SGLANG_PREFILL_FAKE_FREE_KV=1; never affects real PD (real bootstrap_host).
+        """
+        return (
+            os.environ.get("SGLANG_PREFILL_FAKE_FREE_KV", "0") == "1"
+            and getattr(req, "bootstrap_host", None) == FAKE_BOOTSTRAP_HOST
+        )
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -967,6 +980,17 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if self._prefill_fake_free_kv(req):
+                # Synthetic single-press: no decode peer pulls this KV; free it now.
+                if not isinstance(req.finished_reason, FINISH_ABORT):
+                    req.finished_reason = FINISH_LENGTH(length=0)
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                try:
+                    req.disagg_kv_sender.clear()
+                except Exception:
+                    pass
+                done_reqs.append(req)
+                continue
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
