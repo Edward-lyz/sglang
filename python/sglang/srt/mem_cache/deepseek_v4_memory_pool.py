@@ -1061,18 +1061,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         slot-id space (``req_to_token_pool`` / ``full_to_swa_index_mapping`` are
         the same objects), and the AS binding needs the draft pool's write
         pointers to persist the draft SWA layers alongside the target's.
+        Only the target pool allocates and recycles staging slot ids.
         """
-        from sglang.srt.runtime_context import get_memory, get_schedule
         from sglang.srt.mem_cache.swa_step_policy import (
             SwaStepPolicy,
             resolve_swa_step,
         )
+        from sglang.srt.runtime_context import get_memory, get_schedule
 
         memory_args = get_memory()
-        # Draft ChunkTailSWAPools registered by the AS binding; every free must fan
-        # out to them because they mirror this pool's slot ids (see
-        # free_chunk_tail_swa_slots).
-        self.draft_chunk_tail_pools: List[ChunkTailSWAPool] = []
         # swa_kv_pool is None on the encoder-replay and unified-kv paths; neither
         # exposes a paged SWA page to copy a half out of, so there is nothing to
         # stage. Returning here keeps those paths from an AttributeError.
@@ -1238,9 +1235,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
-        for _kind, buf, offset_bytes, transfer_bytes, item_bytes in (
-            self._iter_contiguous_page_buffers()
-        ):
+        for (
+            _kind,
+            buf,
+            offset_bytes,
+            transfer_bytes,
+            item_bytes,
+        ) in self._iter_contiguous_page_buffers():
             data_ptrs.append(buf.data_ptr() + offset_bytes)
             data_lens.append(transfer_bytes)
             item_lens.append(item_bytes)

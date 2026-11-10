@@ -14,6 +14,7 @@ Lifecycle:
   copy_swa_page_half(slot_id, pool, page, half) — called in detect_and_may_copy_as_swa
   free(slot_ids)                              — called by SDK after async write completes
 """
+
 from __future__ import annotations
 
 import logging
@@ -31,10 +32,10 @@ _USE_TRITON_COPY = os.environ.get("SGLANG_COPY_SWA_PAGE_HALF_TRITON", "0") == "1
 
 @triton.jit
 def _copy_swa_page_half_kernel(
-    dst_ptrs,        # pointer to array of dst base pointers (one per layer)
-    src_ptrs,        # pointer to array of src base pointers (one per layer)
-    dst_offset,      # byte offset into dst buffer for slot_id
-    src_offset,      # byte offset into src buffer for swa_page_idx + half
+    dst_ptrs,  # pointer to array of dst base pointers (one per layer)
+    src_ptrs,  # pointer to array of src base pointers (one per layer)
+    dst_offset,  # byte offset into dst buffer for slot_id
+    src_offset,  # byte offset into src buffer for swa_page_idx + half
     slot_elems: tl.constexpr,  # slot_bytes // 4, number of float32 elements
     BLOCK_SIZE: tl.constexpr,  # elements per iteration (in float32 units)
 ):
@@ -54,7 +55,6 @@ def _copy_swa_page_half_kernel(
         mask = idxs < slot_elems
         data = tl.load(src_start + idxs, mask=mask)
         tl.store(dst_start + idxs, data, mask=mask)
-
 
 
 class ChunkTailSWAPool:
@@ -105,9 +105,9 @@ class ChunkTailSWAPool:
         """
         self.num_pages = num_pages
         self.layer_num = layer_num
-        self.src_swa_page_size = src_swa_page_size          # = 256
-        self.swa_win = swa_win                              # = 128
-        self.slot_bytes = swa_win * bytes_per_token         # = 128 * 584 = 74752
+        self.src_swa_page_size = src_swa_page_size  # = 256
+        self.swa_win = swa_win  # = 128
+        self.slot_bytes = swa_win * bytes_per_token  # = 128 * 584 = 74752
         self.store_dtype = torch.uint8
         self.device = device
 
@@ -164,7 +164,10 @@ class ChunkTailSWAPool:
             logger.error(
                 "ChunkTailSWAPool double-free suspected: free_slots=%d + "
                 "freeing=%d > num_pages=%d. slot_ids=%s",
-                len(self.free_slots), len(slot_ids), self.num_pages, slot_ids,
+                len(self.free_slots),
+                len(slot_ids),
+                self.num_pages,
+                slot_ids,
             )
         self.free_slots.extend(slot_ids)
 
@@ -178,11 +181,13 @@ class ChunkTailSWAPool:
             return
         self._copy_swa_dst_ptrs = torch.tensor(
             [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)],
-            dtype=torch.int64, device=self.device,
+            dtype=torch.int64,
+            device=self.device,
         )
         self._copy_swa_src_ptrs = torch.tensor(
             [swa_kv_pool.kv_buffer[i].data_ptr() for i in range(self.layer_num)],
-            dtype=torch.int64, device=self.device,
+            dtype=torch.int64,
+            device=self.device,
         )
 
     def copy_swa_page_half(
@@ -246,14 +251,12 @@ class ChunkTailSWAPool:
 
 
 def free_chunk_tail_swa_slots(kvcache, slot_ids) -> None:
-    """Free ``slot_ids`` on the target pool *and* every registered draft pool.
+    """Return ``slot_ids`` to the target pool, which owns their allocation.
 
-    The draft worker allocates nothing itself: it mirrors the target's slot ids
-    (both share ``req_to_token_pool`` and ``full_to_swa_index_mapping``), so a
-    slot is only truly recycled once every pool has returned it. Freeing the
-    target alone leaks the draft pool monotonically until it is exhausted, at
-    which point every checkpoint degrades to the ``-1`` sentinel and AS hit rate
-    silently drops to zero.
+    Draft staging buffers use the target's slot ids without allocating from
+    their own free lists. The AS write covers both workers' buffers before
+    releasing these ids; also freeing them on the draft would duplicate entries
+    in a free list that was never depleted.
 
     ``-1`` entries are sentinels ("no SWA data for this checkpoint") and are
     never owned by any pool, so they are dropped here rather than at each caller.
@@ -265,5 +268,3 @@ def free_chunk_tail_swa_slots(kvcache, slot_ids) -> None:
     if not live:
         return
     pool.free(live)
-    for draft_pool in getattr(kvcache, "draft_chunk_tail_pools", ()):
-        draft_pool.free(live)

@@ -18,7 +18,7 @@ from .page_binding import (
     _uniform_page_bytes,
     _value_buffer,
 )
-from .schema import pad_component_major_pointers, pad_pointer_buffers
+from .schema import pad_pointer_buffers
 from .state_layout import PackedStateLayout, StateTensorSpec
 from .topology import attention_store_kda_namespaces
 from .transport import (
@@ -125,7 +125,7 @@ class KDACheckpointStore:
             )
         return dict(slot_map), int(slot_map[self._slot_group])
 
-    def _snapshot_digests(self, slot_id: int) -> Optional[list]:
+    def _snapshot_digests(self, slot_id: int, force: bool = False) -> Optional[list]:
         """Hash one KDA state slot in HBM, first and last layer per component.
 
         State buffers are ``[layer, slot, ...]``, so the slot has to be indexed
@@ -134,7 +134,7 @@ class KDACheckpointStore:
         component of every layer costs a D2H copy each and adds nothing when the
         point is to compare a write against its read-back.
         """
-        if not cache_digest_enabled():
+        if not (cache_digest_enabled() or force):
             return None
         try:
             tensors = getattr(self.layout, "tensors", ())
@@ -193,6 +193,7 @@ class KDACheckpointStore:
         timeout: float = 1.0,
         params: Optional[dict] = None,
         producer_ready=None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Write one KDA checkpoint from a logical state slot."""
         from attentionstore_sdk.sdk import BlockBatch, BufferBindings, WriteRequest
@@ -218,12 +219,26 @@ class KDACheckpointStore:
         )
         self._acquire_sdk_lock(remaining, "write")
         # Snapshot before the SDK call: this is the state content the Agent gets.
-        snapshot = self._snapshot_digests(slot_id)
+        snapshot = self._snapshot_digests(slot_id, force=on_digest_snapshot is not None)
         try:
             written = self._sdk.write(request)
         finally:
             self._sdk_lock.release()
-        self._emit_digests("write", snapshot, block_hash_id, slot_id, written)
+        if cache_digest_enabled():
+            self._emit_digests("write", snapshot, block_hash_id, slot_id, written)
+        if on_digest_snapshot is not None and snapshot:
+            try:
+                on_digest_snapshot(
+                    {
+                        "kind": "kda_state",
+                        "action": "write",
+                        "transferred": int(written),
+                        "slots": slot_map,
+                        "components": snapshot,
+                    }
+                )
+            except Exception as exc:
+                cache_digest_logger.warning("AS KDA write digest callback failed: %s", exc)
         return written
 
     def read(
@@ -232,6 +247,7 @@ class KDACheckpointStore:
         slot: Mapping[str, int] | int,
         timeout: float = 1.0,
         remote_addrs=None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Read one KDA checkpoint into a logical state slot."""
         from attentionstore_sdk.sdk import BlockBatch, BufferBindings, ReadRequest
@@ -260,9 +276,22 @@ class KDACheckpointStore:
                 self._unpack_hook([slot_map])
         finally:
             self._sdk_lock.release()
-        self._emit_digests(
-            "read", self._snapshot_digests(slot_id), block_hash_id, slot_id, count
-        )
+        snapshot = self._snapshot_digests(slot_id, force=on_digest_snapshot is not None)
+        if cache_digest_enabled():
+            self._emit_digests("read", snapshot, block_hash_id, slot_id, count)
+        if on_digest_snapshot is not None and snapshot:
+            try:
+                on_digest_snapshot(
+                    {
+                        "kind": "kda_state",
+                        "action": "read",
+                        "transferred": int(count),
+                        "slots": slot_map,
+                        "components": snapshot,
+                    }
+                )
+            except Exception as exc:
+                cache_digest_logger.warning("AS KDA read digest callback failed: %s", exc)
         return count
 
     def stop(self) -> None:
@@ -591,7 +620,9 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
                     # The Agent namespace is shared by all PP clients on the
                     # node.  Register its complete layer geometry, while the
                     # checkpoint store retains only this client's pointers.
-                    layer_num=ctx.state_layer_num if is_kda_single_shard else state_layer_num,
+                    layer_num=ctx.state_layer_num
+                    if is_kda_single_shard
+                    else state_layer_num,
                     shard_id=0 if is_kda_single_shard else ctx.state_shard_id,
                     shard_num=1 if is_kda_single_shard else ctx.state_shard_num,
                     block_token_size=ctx.block_size,
@@ -607,9 +638,7 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
                 layer_ids=state_layer_ids,
             )
             checkpoint_layout_id = "kda-state"
-            checkpoint_bytes = (
-                checkpoint_binding.bytes_per_layer * ctx.state_layer_num
-            )
+            checkpoint_bytes = checkpoint_binding.bytes_per_layer * ctx.state_layer_num
             checkpoint_fields = checkpoint_binding.payload_fields
         else:
             checkpoint_store = _PassiveStore()
@@ -909,6 +938,7 @@ class SPACheckpointStore:
         slots: Mapping[str, int],
         timeout: float = 1.0,
         params: Optional[dict] = None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Snapshot and write one SPA checkpoint."""
         snapshot = self.snapshot(slots, timeout=timeout)
@@ -918,6 +948,7 @@ class SPACheckpointStore:
                 snapshot,
                 timeout=timeout,
                 params=params,
+                on_digest_snapshot=on_digest_snapshot,
             )
         finally:
             snapshot.release()
@@ -968,6 +999,7 @@ class SPACheckpointStore:
         snapshot: PackedStateSnapshot,
         timeout: float = 1.0,
         params: Optional[dict] = None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Write a previously packed SPA checkpoint snapshot."""
         from attentionstore_sdk.sdk import (
@@ -1003,9 +1035,21 @@ class SPACheckpointStore:
             self._emit_checkpoint_digest(
                 "write", block_hash_id, self._layout_view(snapshot.tensor)
             )
-            return written
         finally:
             self._lock.release()
+        if on_digest_snapshot is not None:
+            try:
+                on_digest_snapshot(
+                    {
+                        "kind": "spa_packed_checkpoint",
+                        "action": "write",
+                        "transferred": int(written),
+                        "digest": page_digest(snapshot.tensor, 0),
+                    }
+                )
+            except Exception as exc:
+                cache_digest_logger.warning("AS SPA write digest callback failed: %s", exc)
+        return written
 
     def read(
         self,
@@ -1013,6 +1057,7 @@ class SPACheckpointStore:
         slots: Mapping[str, int],
         timeout: float = 1.0,
         remote_addrs=None,
+        on_digest_snapshot: Optional[Callable[[dict], None]] = None,
     ) -> int:
         """Read and unpack one SPA checkpoint into logical slots."""
         from attentionstore_sdk.sdk import (
@@ -1050,6 +1095,20 @@ class SPACheckpointStore:
                     "read", block_hash_id, self._layout_view(self.staging[1:2])
                 )
                 try:
+                    if on_digest_snapshot is not None:
+                        try:
+                            on_digest_snapshot(
+                                {
+                                    "kind": "spa_packed_checkpoint",
+                                    "action": "read",
+                                    "transferred": 1,
+                                    "digest": page_digest(self.staging[1:2], 0),
+                                }
+                            )
+                        except Exception as exc:
+                            cache_digest_logger.warning(
+                                "AS SPA read digest callback failed: %s", exc
+                            )
                     self.layout.unpack([slots], self._layout_view(self.staging[1:2]))
                 finally:
                     self._read_ready_event = self._record_stream_event()
@@ -1057,7 +1116,9 @@ class SPACheckpointStore:
         finally:
             self._read_lock.release()
 
-    def _emit_checkpoint_digest(self, action: str, block_hash_id: int, layout_row) -> None:
+    def _emit_checkpoint_digest(
+        self, action: str, block_hash_id: int, layout_row
+    ) -> None:
         """Print the MD5 of one packed SPA checkpoint (SGLANG_LOG_AS_CACHE_DIGEST).
 
         ``layout_row`` is a ``[1, bytes_per_block]`` uint8 view of the packed
@@ -1128,7 +1189,7 @@ class _SPAPageGeometry:
     segments: tuple[_SPASegment, ...]
     device: torch.device
 
-    def _seg(self, name: str) -> "Optional[_SPASegment]":
+    def _seg(self, name: str) -> Optional[_SPASegment]:
         for seg in self.segments:
             if seg.name == name:
                 return seg
@@ -1693,14 +1754,6 @@ def create_spag_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding
         raise ValueError("SPAG page geometry produced no segments")
     draft_pool = ctx.draft_kv_cache
     swa_seg = _spag_swa_segment(pool, draft_pool, ctx.draft_layer_ids)
-    if swa_seg is not None and draft_pool is not None:
-        # Every staging slot freed on the target must be freed on the draft too:
-        # the two pools mirror one slot-id space, so a target-only free leaks the
-        # draft's slot forever and the pool eventually hands out nothing but -1
-        # sentinels -- a silent decay back to zero checkpoints.
-        draft_tail = draft_pool.chunk_tail_swa_pool
-        if draft_tail not in pool.draft_chunk_tail_pools:
-            pool.draft_chunk_tail_pools.append(draft_tail)
 
     seg_specs = [
         SpagSegmentSpec(
@@ -1768,9 +1821,7 @@ def create_spag_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding
             page_sdk,
             page_buffers,
             digest_segments=digest_segments,
-            swa_digest=_spag_swa_digest(
-                pool, swa_seg, draft_pool, ctx.draft_layer_ids
-            ),
+            swa_digest=_spag_swa_digest(pool, swa_seg, draft_pool, ctx.draft_layer_ids),
             **io_kwargs,
         )
     except Exception as exc:  # pragma: no cover - diagnostic wiring only
@@ -1779,9 +1830,7 @@ def create_spag_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding
         )
         page_store = _BufferPageIO(page_sdk, page_buffers, **io_kwargs)
 
-    bytes_per_block = sum(
-        seg.layer_count * seg.item_bytes for seg in geometry.segments
-    )
+    bytes_per_block = sum(seg.layer_count * seg.item_bytes for seg in geometry.segments)
     if swa_seg is not None:
         bytes_per_block += swa_seg.layer_count * swa_seg.write_bytes
     try:
