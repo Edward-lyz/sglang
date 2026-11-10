@@ -274,6 +274,8 @@ class Envs:
     # - For organization-only changes, AST-check that field names, descriptor
     #   types, and defaults are unchanged and that only field order moved.
 
+    """Registry of every SGLANG_* environment variable, grouped by topic."""
+
     # ===================================================================
     # Runtime configuration and process identity
     # ===================================================================
@@ -1808,6 +1810,11 @@ class Envs:
     # symmetric-memory low-contention all-gather) instead of NCCL, so it does not take
     # SMs from the compute it overlaps under SGLANG_FUSE_CP_SWA_STORE_OVERLAP.
     SGLANG_FUSE_CP_SWA_GATHER_CE = EnvBool(False)
+    # [fusion-opt] DeepInfer-style SM-free CP gather for the local-first SWA store: the
+    # norm/RoPE/fp8 kernel writes straight into a registered symmetric buffer on the main
+    # stream, copy engines push it to the peers, readiness is cuStreamWrite/WaitValue32;
+    # the scatter waits right before attention. No side-stream kernels, no NCCL kernel.
+    SGLANG_FUSE_CP_SWA_GATHER_PUSH = EnvBool(False)
     # [fusion-opt] The FFN->attn mega_mhc also writes the attention input as mxfp8
     # (y_fp8 + per-32 ue8m0 GEMM scales, DeepInfer v4_modules/hc.py) and wqkv_a takes it
     # pre-quantized: no per_token_group_quant before wqkv_a. Prefill + DeepGEMM MXFP8
