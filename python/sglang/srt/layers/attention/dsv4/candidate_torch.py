@@ -10,6 +10,8 @@ import torch
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
     IndexerInputs,
+    PrefillIndexerInputs,
+    mask_topk_scores,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     fp4_paged_mqa_logits,
@@ -97,26 +99,43 @@ def two_level_decode_logits(
     return logits.masked_fill(~published[:, : logits.shape[-1]], -torch.inf), None
 
 
-def mask_topk_scores(
-    scores: torch.Tensor,
-    indices: torch.Tensor,
-    offsets: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Keep masked indexer scores out of attention even when top-k underfills."""
-    columns = indices.to(torch.int64)
-    if offsets is not None:
-        columns = columns - offsets[:, None]
-    selected_scores = scores.gather(1, columns.clamp(0, scores.shape[1] - 1))
-    valid = (
-        (columns >= 0) & (columns < scores.shape[1]) & (selected_scores > -torch.inf)
+def cut_request_masks(masks: CandidateMasks, tail_lens: List[int]) -> CandidateMasks:
+    """The last ``tail_lens[b]`` rows of each request's mask."""
+    assert masks.request_masks is not None, "prefill masks missing"
+    return CandidateMasks(
+        request_masks=[
+            mask[mask.shape[0] - t :] for mask, t in zip(masks.request_masks, tail_lens)
+        ]
     )
-    return indices.masked_fill(~valid, -1)
 
 
 class TorchCandidateIndexer:
-    def __init__(self, topk_blocks: int, block_size: int):
+    def __init__(self, topk_blocks: int, block_size: int, prefill_dense=None):
         self.topk_blocks = topk_blocks
         self.block_size = block_size
+        # the dense-score prefill implementation (DenseCandidateIndexer)
+        self._prefill_dense = prefill_dense
+
+    def publish_prefill(
+        self, inputs: PrefillIndexerInputs, out_positions: torch.Tensor
+    ) -> CandidateMetadata:
+        """Publish the chunk's candidates through the dense prefill indexer."""
+        return self._prefill_dense.publish_prefill(inputs, out_positions)
+
+    def select_prefill(
+        self,
+        published: CandidateMetadata,
+        inputs: PrefillIndexerInputs,
+        out_positions: torch.Tensor,
+    ) -> None:
+        """A consumer layer's top-k through the dense prefill indexer."""
+        self._prefill_dense.select_prefill(published, inputs, out_positions)
+
+    def prefill_tail(
+        self, published: CandidateMetadata, tail_lens: List[int]
+    ) -> CandidateMetadata:
+        """The published candidates of the late-layer tail rows."""
+        return self._prefill_dense.prefill_tail(published, tail_lens)
 
     def publish_decode(
         self,

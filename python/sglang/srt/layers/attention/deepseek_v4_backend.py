@@ -19,7 +19,6 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
@@ -57,11 +56,14 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
     IndexerInputs,
+    PrefillIndexerInputs,
+    expand_index_page_table,
     make_candidate_indexer,
+    mask_topk_scores,
 )
 from sglang.srt.layers.attention.dsv4.candidate_torch import (
     CandidateMasks,
-    mask_topk_scores,
+    cut_request_masks,
     published_masks,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -69,6 +71,7 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     FusedCompressMetadata,
     create_paged_compressor_data,
 )
+from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import plain_prefill_topk
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     _rope_fq4,
     token_req_indices,
@@ -124,6 +127,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -198,36 +202,6 @@ def _create_flashmla_metadata():
     import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
-
-
-def _expand_index_page_table(
-    page_table: torch.Tensor,
-    *,
-    full_page_size: int,
-    compress_ratio: int,
-    index_page_size: int,
-) -> torch.Tensor:
-    """Expand the FULL page table into the block table of a low-ratio indexer-K
-    pool, which pages at `index_page_size` slots rather than a FULL page.
-
-    The kernel resolves compressed slot j through
-    page_table[b, j // index_page_size] * index_page_size + j % index_page_size,
-    which with this expansion is the c1/c2 KV pool slot of the same position.
-    [bs, n_full_pages] -> [bs, n_full_pages * blocks_per_page], int32.
-    """
-    slots_per_page = full_page_size // compress_ratio
-    assert slots_per_page % index_page_size == 0, (
-        f"{full_page_size = } / {compress_ratio = } must be a multiple of "
-        f"{index_page_size = }"
-    )
-    blocks_per_page = slots_per_page // index_page_size
-    if blocks_per_page == 1:
-        return page_table
-    bs, n = page_table.shape
-    base = page_table.to(torch.int64) * blocks_per_page
-    offsets = torch.arange(blocks_per_page, device=page_table.device, dtype=torch.int64)
-    expanded = base.unsqueeze(-1) + offsets  # [bs, n, blocks_per_page]
-    return expanded.reshape(bs, n * blocks_per_page).to(torch.int32)
 
 
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
@@ -1269,6 +1243,7 @@ class DeepseekV4AttnBackend(
         *,
         compress_ratio: int = 4,
         use_prefill_cuda_graph: bool = False,
+        allow_row_chunk: bool = False,
     ):
         page_table = core_attn_metadata.page_table
         index_page_size = 0
@@ -1285,7 +1260,7 @@ class DeepseekV4AttnBackend(
             index_page_size = self.token_to_kv_pool.get_index_k_page_size(
                 compress_ratio
             )
-            page_table = _expand_index_page_table(
+            page_table = expand_index_page_table(
                 page_table,
                 full_page_size=self.page_size,
                 compress_ratio=compress_ratio,
@@ -1306,6 +1281,7 @@ class DeepseekV4AttnBackend(
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
+            allow_row_chunk=allow_row_chunk,
         )
 
     def init_forward_metadata_decode(
@@ -1394,6 +1370,7 @@ class DeepseekV4AttnBackend(
             self.init_forward_metadata_indexer(
                 core_attn_metadata,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                allow_row_chunk=not use_prefill_cuda_graph,
             )
             if need_compress and self.has_c4
             else None
@@ -1474,7 +1451,7 @@ class DeepseekV4AttnBackend(
         if max_seq_len is not None:
             num_pages = min(max_seq_len // self.page_size, num_pages)
         index_page_size = self.token_to_kv_pool.get_index_k_page_size(compress_ratio)
-        page_table = _expand_index_page_table(
+        page_table = expand_index_page_table(
             core.page_table[:, :num_pages],
             full_page_size=self.page_size,
             compress_ratio=compress_ratio,
@@ -1666,8 +1643,8 @@ class DeepseekV4AttnBackend(
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
         """Switch the late layers onto the tail; hand the return value back to
-        exit_late_layer_tail. The candidate-source layer published its masks over
-        the full extend, so each request's mask is cut to its tail rows."""
+        exit_late_layer_tail. The candidate-source layer already published the
+        tail's candidates onto the tail metadata (see _publish_prefill)."""
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
         saved = (
@@ -1676,21 +1653,6 @@ class DeepseekV4AttnBackend(
             get_local_dp_buffer_len(),
         )
         tail = tail_metadata.late_layer_tail
-        tail_lens_cpu = (
-            tail.local_lens_cpu
-            if tail.cp_metadata is not None
-            else tail.extend_seq_lens_cpu
-        )
-        # TODO(candidate): goes away once the source publishes its tail rows straight
-        # onto the tail metadata (publish_prefill); until then cut the full masks.
-        full_masks = self.forward_metadata.candidate_metadata
-        if isinstance(full_masks, CandidateMasks) and full_masks.request_masks:
-            tail_metadata.candidate_metadata = CandidateMasks(
-                request_masks=[
-                    mask[mask.shape[0] - t :]
-                    for mask, t in zip(full_masks.request_masks, tail_lens_cpu)
-                ]
-            )
         # The last index-source layer before the switch published its top-k into
         # the full metadata's buffers; the consumer layers after the switch read
         # the tail metadata's, so carry the tail rows over (padding stays -1).
@@ -3179,14 +3141,11 @@ class DeepseekV4AttnBackend(
                 // ratio
             )
             start += lc
-        empty_mask = torch.zeros(0, 0, dtype=torch.bool, device=device)
         num_tokens = pos.shape[0]
-        # TODO: move this to candidate indexer
         if not slot_chunks or num_tokens == 0:
             if indexer.is_candidate_source:
-                self.forward_metadata.candidate_metadata = CandidateMasks(
-                    request_masks=[empty_mask for _ in lc_per_req]
-                )
+                # no row to publish for; the consumers return here as well
+                self.forward_metadata.candidate_metadata = None
             return
         k_slots = torch.cat(slot_chunks)
         k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
@@ -3203,26 +3162,29 @@ class DeepseekV4AttnBackend(
             q_lens.to(torch.int64),
             output_size=num_tokens,
         )
-        logits = _dense_fp4_mqa_logits(
+        inputs = self._prefill_indexer_inputs(
+            layer,
             (q_fp4, q_sf),
             (k_fp4, k_sf),
             weights,
+            compress_lens,
             ks,
-            ks + compress_lens,
-            # the fused top-k reads score rows through 16-byte vectors
-            ceil_align(max(lc_per_req), 4),
+            lc_per_req,
+            list(q_lens_cpu),
         )
-        if indexer.is_candidate_source or indexer.uses_candidates:
-            self._publish_or_consume_candidates(
-                indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
-            )
         topk = indexer.index_topk
-        selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
-        topk_transform_ragged_v2(
-            logits, compress_lens, out_offsets=ks, out_indices=selected
-        )
-        if indexer.uses_candidates and not indexer.is_candidate_source:
-            selected = mask_topk_scores(logits, selected, ks)
+        # -1 is the "nothing selected" value the tail below turns into a -1 page
+        selected = torch.full((num_tokens, topk), -1, dtype=torch.int32, device=device)
+        if indexer.is_candidate_source:
+            self._publish_prefill(
+                self.candidate_indexer.publish_prefill(inputs, selected)
+            )
+        elif indexer.uses_candidates:
+            self.candidate_indexer.select_prefill(
+                self.forward_metadata.candidate_metadata, inputs, selected
+            )
+        else:
+            plain_prefill_topk(inputs, selected)
         # ascending positions, padding last: the layout the consumers expect
         unselected = torch.iinfo(torch.int32).max
         selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
@@ -3235,49 +3197,59 @@ class DeepseekV4AttnBackend(
                 chosen, selected - ks[:, None], -1
             )
 
-    # TODO(candidate): dense-prefill level one / level two inline with masks; move
-    # into the candidate indexer as publish_prefill / select_prefill.
-    def _publish_or_consume_candidates(
-        self, indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
-    ) -> None:
-        """Level one of the two-level top-k: publish block masks, or sink non-candidates."""
-        publish = [] if indexer.is_candidate_source else None
-        consume = (
-            None
-            if publish is not None
-            else published_masks(self.forward_metadata.candidate_metadata)
+    def _prefill_indexer_inputs(
+        self, layer, q, kv, weights, compress_lens, ks, lc_per_req, q_lens_cpu
+    ) -> PrefillIndexerInputs:
+        pool = self.token_to_kv_pool
+        ratio = layer.compress_ratio
+        num_tokens = q[0].shape[0]
+        index_page_size = pool.get_index_k_page_size(ratio)
+        k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
+        assert k_cache.dim() == 2
+        return PrefillIndexerInputs(
+            q_fp4=q[0],
+            q_sf=q[1],
+            weights=weights,
+            compress_lens=compress_lens,
+            request_starts=ks,
+            lens_per_request=lc_per_req,
+            rows_per_request=q_lens_cpu,
+            kv=kv,
+            k_cache=k_cache.view(k_cache.shape[0], index_page_size, 1, 68),
+            page_size=index_page_size,
+            kv_page_table=self.forward_metadata.core_metadata.page_table[:num_tokens],
+            kv_page_size=self.page_size,
+            compress_ratio=ratio,
         )
-        j = torch.arange(logits.shape[1], device=logits.device)
-        tok_start = 0
-        for b, (lc, t_len) in enumerate(zip(lc_per_req, q_lens_cpu)):
-            rows = slice(tok_start, tok_start + t_len)
-            tok_start += t_len
-            if lc == 0 or t_len == 0:
-                if publish is not None:
-                    publish.append(empty_mask)
-                continue
-            scores = logits[rows, :lc]
-            if publish is None:
-                scores.masked_fill_(~consume.request_masks[b], -torch.inf)
-                continue
-            lens = compress_lens[rows, None]
-            # the block selection tells unreachable positions apart by -inf
-            scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
-            # the block selection pads and pools a copy of its rows; bound that copy
-            step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
-            masks = [
-                select_candidate_blocks(
-                    scores[start : start + step],
-                    lens[start : start + step],
-                    topk_blocks=indexer.candidate_topk_blocks,
-                    block_size=indexer.candidate_block_size,
-                )
-                for start in range(0, t_len, step)
-            ]
-            publish.append(masks[0] if len(masks) == 1 else torch.cat(masks))
-        if publish is not None:
-            self.forward_metadata.candidate_metadata = CandidateMasks(
-                request_masks=publish
+
+    def _tail_lens_to_publish(self) -> Optional[List[int]]:
+        """Rows per request of the late-layer tail, when the layers after the
+        switch will consume what is published now."""
+        tail_metadata = self.tail_forward_metadata
+        if tail_metadata is None or tail_metadata is self.forward_metadata:
+            return None
+        tail = tail_metadata.late_layer_tail
+        return (
+            tail.local_lens_cpu
+            if tail.cp_metadata is not None
+            else tail.extend_seq_lens_cpu
+        )
+
+    def _publish_prefill(self, published: CandidateMetadata) -> None:
+        self.forward_metadata.candidate_metadata = published
+        tail_lens = self._tail_lens_to_publish()
+        if tail_lens is not None:
+            self.tail_forward_metadata.candidate_metadata = (
+                self.candidate_indexer.prefill_tail(published, tail_lens)
+            )
+
+    def _publish_prefill_masks(self, masks: CandidateMasks) -> None:
+        """The torch prefill path's inline masks (see the TODO on CandidateMasks)."""
+        self.forward_metadata.candidate_metadata = masks
+        tail_lens = self._tail_lens_to_publish()
+        if tail_lens is not None:
+            self.tail_forward_metadata.candidate_metadata = cut_request_masks(
+                masks, tail_lens
             )
 
     def _low_ratio_index_topk_prefill_graph(self, layer, pos, q, w) -> None:
@@ -3598,9 +3570,7 @@ class DeepseekV4AttnBackend(
             if masks is not None:
                 publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
         if publish is not None:
-            self.forward_metadata.candidate_metadata = CandidateMasks(
-                request_masks=publish
-            )
+            self._publish_prefill_masks(CandidateMasks(request_masks=publish))
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.
@@ -3681,7 +3651,8 @@ class DeepseekV4AttnBackend(
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
-                self.store_cache(layer_id, swa_k, forward_batch)
+                with operations_nvtx_range("attn.dsv4.store_cache"):
+                    self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
@@ -3816,40 +3787,42 @@ class DeepseekV4AttnBackend(
                     if attn_sink is not None and attn_sink.shape[0] > real_heads:
                         attn_sink = attn_sink[:real_heads]
 
-                o = flash_mla_with_kvcache_sm120(
-                    q=q,
-                    k_cache=swa_k_cache,
-                    head_dim_v=self.head_dim_v,
-                    softmax_scale=self.softmax_scale,
-                    indices=swa_page_indices,
-                    topk_length=swa_topk_lengths,
-                    attn_sink=attn_sink,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices_in_kvcache=extra_indices,
-                    extra_topk_length=extra_topk_lengths,
-                )[0]
+                with operations_nvtx_range("attn.dsv4.flashmla_kvcache_sm120"):
+                    o = flash_mla_with_kvcache_sm120(
+                        q=q,
+                        k_cache=swa_k_cache,
+                        head_dim_v=self.head_dim_v,
+                        softmax_scale=self.softmax_scale,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices_in_kvcache=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                    )[0]
             else:
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
                 else:
                     from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
-                o = flash_mla_with_kvcache(
-                    q=q,
-                    k_cache=swa_k_cache,
-                    head_dim_v=self.head_dim_v,
-                    block_table=None,
-                    cache_seqlens=None,
-                    tile_scheduler_metadata=flashmla_metadata,
-                    softmax_scale=self.softmax_scale,
-                    is_fp8_kvcache=True,
-                    indices=swa_page_indices,
-                    topk_length=swa_topk_lengths,
-                    attn_sink=attn_sink,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices_in_kvcache=extra_indices,
-                    extra_topk_length=extra_topk_lengths,
-                )[0]
+                with operations_nvtx_range("attn.dsv4.flashmla_kvcache"):
+                    o = flash_mla_with_kvcache(
+                        q=q,
+                        k_cache=swa_k_cache,
+                        head_dim_v=self.head_dim_v,
+                        block_table=None,
+                        cache_seqlens=None,
+                        tile_scheduler_metadata=flashmla_metadata,
+                        softmax_scale=self.softmax_scale,
+                        is_fp8_kvcache=True,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices_in_kvcache=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                    )[0]
 
             o = o.squeeze(1)
             return o
@@ -3931,31 +3904,34 @@ class DeepseekV4AttnBackend(
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
+            with operations_nvtx_range("attn.dsv4.dequant_compressed"):
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                    layout=token_to_kv_pool.get_extra_key_layout(layer_id),
+                )
+        with operations_nvtx_range("attn.dsv4.dequant_swa"):
             dequantize_k_cache_paged(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
-                layout=token_to_kv_pool.get_extra_key_layout(layer_id),
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+                layout=token_to_kv_pool.get_swa_key_layout(),
             )
-        dequantize_k_cache_paged(
-            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
-            page_size=cache.swa_page_size,
-            out=swa_slice,
-            layout=token_to_kv_pool.get_swa_key_layout(),
-        )
         kv = workspace
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_flat,
-            kv=kv,
-            indices=combined_indices.unsqueeze(1),
-            sm_scale=self.softmax_scale,
-            d_v=self.head_dim_v,
-            attn_sink=attn_sink,
-            topk_length=combined_lens,
-        )
+        with operations_nvtx_range("attn.dsv4.sparse_fwd"):
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.softmax_scale,
+                d_v=self.head_dim_v,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+            )
         return o
 
     def _prepare_q8kv8_q_and_sink(
