@@ -37,10 +37,7 @@ RUN pip config set global.index-url http://mirrors.baidubce.com/pypi/simple/ && 
     pip config set global.trusted-host mirrors.baidubce.com
 
 # Install deepgemm cache
-RUN wget -nv -O /tmp/cache.tar.gz \
-        http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/deep_gemm_deepseekv4_bzz2_cache_0429.tar.gz && \
-    tar -xvf /tmp/cache.tar.gz -C / && \
-    rm -f /tmp/cache.tar.gz
+RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/cache_k26_0526.tar.gz && tar -xzvf cache_k26_0526.tar.gz && rm cache_k26_0526.tar.gz
 
 # Install dependencies from configuration file
 COPY aiak_sglang/dockerfile/gpu_requirements.env /tmp/gpu_requirements.env
