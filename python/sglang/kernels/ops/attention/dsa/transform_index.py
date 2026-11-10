@@ -70,7 +70,11 @@ def transform_index_page_table_prefill_kernel(
     topk_indices_ptr: torch.Tensor,
     cu_seqlens_q_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
-    page_table_stride_0: tl.constexpr,
+    # Runtime (not constexpr): page_table is a per-batch [bs, max_seqlen_k] gather, so
+    # stride(0) == max_seqlen_k changes almost every batch. As a constexpr it forced a
+    # fresh Triton JIT compile (~90 ms on the scheduler thread) per new width; as a
+    # runtime int it only specializes on ==1 / %16, i.e. a bounded set of variants.
+    page_table_stride_0,
     page_table_stride_1: tl.constexpr,
     topk_indices_stride_0: tl.constexpr,
     topk_indices_stride_1: tl.constexpr,
