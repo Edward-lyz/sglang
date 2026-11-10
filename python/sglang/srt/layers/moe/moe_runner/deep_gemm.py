@@ -130,8 +130,16 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
     use_mxfp8: bool = False
+    # MX2 code/index: [E, K/128, N, 32] / [E, K/128, N, 4].
+    # Both grouped GEMMs decode these directly, without expanded FP4 weights.
+    is_mx2: bool = False
+    w13_index: Optional[torch.Tensor] = None
+    w2_index: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        if self.is_mx2:
+            assert self.is_fp4_experts and not self.use_mxfp8
+            assert self.w13_index is not None and self.w2_index is not None
         if self.use_mxfp8:
             assert self.block_shape == [
                 1,
@@ -204,7 +212,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
 
-        N = quant_info.w13_weight.size(1)
+        N = quant_info.w13_weight.size(2 if quant_info.is_mx2 else 1)
         K = hidden_states_shape[1]
         scale_block_size = 128
 
@@ -226,14 +234,28 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (hidden_states, hidden_states_scale),
-            w13_weight_fp8,
-            gateup_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if quant_info.is_mx2:
+            import deep_gemm
+
+            deep_gemm.m_grouped_fp8_mx2_gemm_nt_contiguous(
+                (hidden_states, hidden_states_scale),
+                quant_info.w13_weight,
+                quant_info.w13_index,
+                quant_info.w13_scale,
+                gateup_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (hidden_states, hidden_states_scale),
+                w13_weight_fp8,
+                gateup_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -367,14 +389,28 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (down_input_fp8, down_input_scale),
-            w2_weight_fp8,
-            down_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if quant_info.is_mx2:
+            import deep_gemm
+
+            deep_gemm.m_grouped_fp8_mx2_gemm_nt_contiguous(
+                (down_input_fp8, down_input_scale),
+                quant_info.w2_weight,
+                quant_info.w2_index,
+                quant_info.w2_scale,
+                down_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (down_input_fp8, down_input_scale),
+                w2_weight_fp8,
+                down_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
 
         return down_output
 
@@ -454,6 +490,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
     ) -> torch.Tensor:
         from sglang.srt.layers import deep_gemm_wrapper
 
+        if (
+            quant_info.is_mx2
+            and running_state.get("down_gemm_overlap_args") is not None
+        ):
+            raise ValueError(
+                "MX2 GEMM does not support down-GEMM communication overlap"
+            )
+
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
         masked_m = runner_input.masked_m
@@ -505,19 +549,35 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
 
         num_groups, m, k = hidden_states.shape
-        n = w13_weight.size(1)
+        n = w13_weight.size(2 if quant_info.is_mx2 else 1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (hidden_states, hidden_states_scale),
-            (w13_weight, w13_scale),
-            gateup_output,
-            masked_m,
-            expected_m,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if quant_info.is_mx2:
+            import deep_gemm
+
+            with deep_gemm_wrapper.configure_deep_gemm_masked_block_m(
+                envs.SGLANG_DEEPGEMM_MASKED_BLOCK_M.get()
+            ):
+                deep_gemm.m_grouped_fp8_mx2_gemm_nt_masked(
+                    (hidden_states, hidden_states_scale),
+                    w13_weight,
+                    quant_info.w13_index,
+                    w13_scale,
+                    gateup_output,
+                    masked_m,
+                    expected_m,
+                )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale),
+                gateup_output,
+                masked_m,
+                expected_m,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -585,7 +645,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a_down = (quant_info.block_shape[0], scale_block_size)
 
         # GroupGemm-1
-        n = w2_weight.shape[1]
+        n = w2_weight.size(2 if quant_info.is_mx2 else 1)
 
         if (
             use_mxfp8
@@ -624,16 +684,32 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (down_input, down_input_scale),
-            (w2_weight, w2_scale),
-            down_output,
-            masked_m,
-            expected_m,
-            recipe_a=recipe_a_down,
-            recipe_b=recipe_b,
-            **gemm_overlap_args_dict,
-        )
+        if quant_info.is_mx2:
+            import deep_gemm
+
+            with deep_gemm_wrapper.configure_deep_gemm_masked_block_m(
+                envs.SGLANG_DEEPGEMM_MASKED_BLOCK_M.get()
+            ):
+                deep_gemm_return_value = deep_gemm.m_grouped_fp8_mx2_gemm_nt_masked(
+                    (down_input, down_input_scale),
+                    w2_weight,
+                    quant_info.w2_index,
+                    w2_scale,
+                    down_output,
+                    masked_m,
+                    expected_m,
+                )
+        else:
+            deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (down_input, down_input_scale),
+                (w2_weight, w2_scale),
+                down_output,
+                masked_m,
+                expected_m,
+                recipe_a=recipe_a_down,
+                recipe_b=recipe_b,
+                **gemm_overlap_args_dict,
+            )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
         # Returns (block_m, threshold) only with down-gemm overlap, else None;
         # meta_overlap_args may be set without overlap, so guard the unpack.

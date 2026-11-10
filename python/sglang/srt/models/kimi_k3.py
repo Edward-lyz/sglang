@@ -620,14 +620,14 @@ class KimiK3MoE(nn.Module):
         # ModelOptFp8MoEMethod, which would allocate dense FP8 expert weights.
         moe_quant_config = quant_config
         if _k3_attn_moe_fp8:
-            from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+            from sglang.srt.layers.quantization.mxfp4 import mxfp4_config_for_moe
 
-            moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
+            moe_quant_config = mxfp4_config_for_moe(config)
         elif quant_config is not None and getattr(quant_config, "quant_format", None):
             if "mxfp4" in quant_config.quant_format:
-                from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+                from sglang.srt.layers.quantization.mxfp4 import mxfp4_config_for_moe
 
-                moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
+                moe_quant_config = mxfp4_config_for_moe(config)
 
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout

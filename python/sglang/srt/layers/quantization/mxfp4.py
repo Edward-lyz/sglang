@@ -46,6 +46,12 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.mx2_utils import (
+    MX2_FORMAT_INDEX,
+    MX2_FORMAT_PALETTE,
+    mx2_row_bytes,
+    mx2_runtime_weights,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
@@ -66,6 +72,54 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
+
+
+def mx2_config_fields(quant_config) -> tuple[Optional[str], Optional[list]]:
+    """MX2 format and palette table of a checkpoint (``w2_format`` / ``w2_palette_table``).
+
+    The MX2 converter writes them to config.json's top level, its ``text_config`` and its
+    ``quantization_config``; sglang passes the quantization config dict plus the HF config
+    (``hf_config``), so look in all of them.
+    """
+
+    def get(owner, key):
+        if owner is None:
+            return None
+        if isinstance(owner, dict):
+            return owner.get(key)
+        return getattr(owner, key, None)
+
+    hf_config = get(quant_config, "hf_config")
+    for owner in (
+        quant_config,
+        get(quant_config, "text_config"),
+        get(quant_config, "quantization_config"),
+        hf_config,
+        get(hf_config, "text_config"),
+        get(hf_config, "quantization_config"),
+    ):
+        fmt = get(owner, "w2_format")
+        if fmt:
+            return fmt, get(owner, "w2_palette_table")
+    return None, None
+
+
+def check_mx2_palette_table(table) -> None:
+    """Reject a checkpoint whose palette table is not the one the kernel decodes with."""
+    import deep_gemm
+
+    expected = [tuple(int(v) for v in row) for row in deep_gemm.MX2_PALETTE_TABLE]
+    got = [tuple(int(v) for v in row) for row in (table or [])]
+    if not got:
+        raise ValueError(
+            "MX2 index-format checkpoint has no w2_palette_table in config.json"
+        )
+    if got != expected:
+        raise ValueError(
+            "checkpoint w2_palette_table differs from deep_gemm.MX2_PALETTE_TABLE; "
+            "its weights cannot be decoded by this kernel"
+        )
+
 
 has_triton_kernels = is_triton_kernels_available()
 
@@ -244,21 +298,32 @@ class Mxfp4Config(QuantizationConfig):
         self,
         ignored_layers: Optional[list[str]] = None,
         is_checkpoint_mxfp4_serialized: bool = False,
+        mx2_format: Optional[str] = None,
+        mx2_palette_table: Optional[list] = None,
     ):
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers
+        if mx2_format not in (None, MX2_FORMAT_INDEX, MX2_FORMAT_PALETTE):
+            raise ValueError(f"unknown MX2 checkpoint format: {mx2_format}")
+        # MX2 checkpoints: which row layout the routed experts are stored in
+        # (index / palette format) and, for the index format, the palette table.
+        self.mx2_format = mx2_format
+        self.mx2_palette_table = mx2_palette_table
 
     @classmethod
     def from_config(cls, config):
 
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
+        mx2_format, mx2_palette_table = mx2_config_fields(config)
 
         if _is_hip:
             if mxfp_supported():
                 return cls(
-                    is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
+                    is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
+                    mx2_format=mx2_format,
+                    mx2_palette_table=mx2_palette_table,
                 )
             else:
 
@@ -267,7 +332,11 @@ class Mxfp4Config(QuantizationConfig):
                     f"Current platform {platform} not support mxfp4 computation"
                 )
 
-        return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
+        return cls(
+            is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
+            mx2_format=mx2_format,
+            mx2_palette_table=mx2_palette_table,
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -307,7 +376,7 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
-                return Mxfp4MoEMethod(prefix=prefix)
+                return Mxfp4MoEMethod(prefix=prefix, quant_config=self)
             else:
                 return Mxfp4DynamicQuantMoEMethod()
         else:
@@ -319,15 +388,32 @@ class Mxfp4Config(QuantizationConfig):
         return []
 
 
+def mxfp4_config_for_moe(model_config) -> Mxfp4Config:
+    """Build the routed-expert config for FP8 attention + MXFP4/MX2 experts.
+
+    Models that build the expert config themselves (e.g. kimi_k3) must carry
+    the checkpoint's MX2 fields into the weight loader.
+    """
+    mx2_format, mx2_palette_table = mx2_config_fields(model_config)
+    return Mxfp4Config(
+        is_checkpoint_mxfp4_serialized=True,
+        mx2_format=mx2_format,
+        mx2_palette_table=mx2_palette_table,
+    )
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def __init__(
         self,
         prefix: str,
+        quant_config: Optional[Mxfp4Config] = None,
     ):
         super().__init__()
 
         self.prefix = prefix
+        self.mx2_format = getattr(quant_config, "mx2_format", None)
+        self.mx2_palette_table = getattr(quant_config, "mx2_palette_table", None)
         self.topk_indices_dtype = None
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
@@ -337,6 +423,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
         # activations are quantized to fp8 per-token-group-128.
         self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        # An MX2 checkpoint (`w2_format` in its config.json) is always run as MX2:
+        # the routed experts stay in the checkpoint's own bytes/row encoding and
+        # DeepGEMM decodes them inside its grouped GEMMs; no expanded MXFP4 weight
+        # is ever materialized.
+        self.is_mx2 = self.mx2_format is not None
+        if self.is_mx2:
+            if not self.use_deep_gemm:
+                raise ValueError("MX2 checkpoints require moe_runner_backend=deep_gemm")
+            if get_moe_a2a_backend().is_megamoe():
+                raise ValueError(
+                    "MX2 checkpoints require the DeepGEMM MoE runner; "
+                    "the megamoe backend is not supported"
+                )
         self.flashinfer_mxfp4_moe_precision = (
             get_server_args().flashinfer_mxfp4_moe_precision
         )
@@ -456,12 +555,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
 
         self.hidden_size = hidden_size
+        # MX2 keeps the checkpoint encoding: 9K/32 bytes per row (index format) or 5K/16
+        # (palette format), instead of K/2. The width must follow the checkpoint: the loader
+        # copies rows of exactly this length into these buffers.
+        if self.is_mx2:
+            index_format = self.mx2_format == MX2_FORMAT_INDEX
+            w13_row_bytes = mx2_row_bytes(hidden_size, index_format)
+            w2_row_bytes = mx2_row_bytes(
+                intermediate_size_per_partition_after_pad, index_format
+            )
+        else:
+            w13_row_bytes = hidden_size // 2
+            w2_row_bytes = intermediate_size_per_partition_after_pad // 2
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
                 layer.num_local_experts,
                 2 * intermediate_size_per_partition_after_pad,
-                hidden_size // 2,
+                w13_row_bytes,
                 dtype=weight_dtype,
             ),
             requires_grad=False,
@@ -500,7 +612,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             torch.zeros(
                 layer.num_local_experts,
                 hidden_size,
-                intermediate_size_per_partition_after_pad // 2,
+                w2_row_bytes,
                 dtype=weight_dtype,
             ),
             requires_grad=False,
@@ -561,19 +673,44 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_deep_gemm:
             from deep_gemm import transform_sf_into_required_layout
 
-            # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
-            layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
-            layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+            if self.is_mx2:
+                # Split/re-order [E, N, row_bytes] into the code/index pair the
+                # MX2 GEMMs read. Pure byte shuffle, 2-bit payload untouched;
+                # a palette checkpoint's palettes become table indices.
+                index_format = self.mx2_format == MX2_FORMAT_INDEX
+                if index_format:
+                    check_mx2_palette_table(self.mx2_palette_table)
+                w13_code, w13_index = mx2_runtime_weights(
+                    layer.w13_weight.data, self.hidden_size, index_format
+                )
+                w2_code, w2_index = mx2_runtime_weights(
+                    layer.w2_weight.data,
+                    self.intermediate_size_per_partition,
+                    index_format,
+                )
+                layer.w13_weight.data = w13_code
+                layer.w2_weight.data = w2_code
+                layer.w13_index = w13_index
+                layer.w2_index = w2_index
+            else:
+                # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
+                layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
+                layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
             # Checkpoint scales are uint8 e8m0 (biased exponents). DeepGEMM
             # SM100 needs them in packed-UE8M0 TMA-aligned MN-major layout.
             # Round-trip through fp32 is exact (values are powers of two).
-            for scale_name, weight in (
-                ("w13_weight_scale", layer.w13_weight),
-                ("w2_weight_scale", layer.w2_weight),
+            for scale_name, weight, logical_k in (
+                ("w13_weight_scale", layer.w13_weight, self.hidden_size),
+                (
+                    "w2_weight_scale",
+                    layer.w2_weight,
+                    self.intermediate_size_per_partition,
+                ),
             ):
                 scale = getattr(layer, scale_name)
                 num_experts, n, _ = scale.data.shape
-                k = weight.shape[2] * 2
+                # MX2 rows are 9K/32 (or 5K/16) bytes, so the 2x back-out would be wrong.
+                k = logical_k if self.is_mx2 else weight.shape[2] * 2
                 scale_f32 = scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
                 scale.data = transform_sf_into_required_layout(
                     scale_f32,
@@ -1241,6 +1378,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_scale=layer.w2_weight_scale,
                 block_shape=[128, 128],
                 is_fp4_experts=True,
+                is_mx2=self.is_mx2,
+                w13_index=getattr(layer, "w13_index", None),
+                w2_index=getattr(layer, "w2_index", None),
             )
             return self.runner.run(dispatch_output, quant_info)
 
