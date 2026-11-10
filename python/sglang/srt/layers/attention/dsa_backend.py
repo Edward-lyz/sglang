@@ -37,7 +37,10 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
+from sglang.srt.layers.attention.dsa.dsa_dcp import (
+    dcp_flashmla_rope8_sparse_attention,
+    dcp_trtllm_sparse_attention,
+)
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -531,6 +534,20 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_identity_scale: Optional[torch.Tensor] = None
         self._q8kv8_qpad_buf: Optional[torch.Tensor] = None
 
+        # Serve the trtllm sparse decode with FlashMLA's rope-FP8 kernel instead.
+        # Same 576 B/token all-e4m3 KV cache and same absolute-slot top-k table,
+        # but at the model's real head count, so the 96 -> 128 (or 12 -> 16)
+        # query-head zero-pad and its two strided slice copies disappear.
+        self.use_flashmla_rope8_decode = (
+            self.dsa_decode_impl == "trtllm"
+            and envs.SGLANG_DSA_DECODE_FLASHMLA_ROPE8.get()
+        )
+        if self.use_flashmla_rope8_decode:
+            self._assert_flashmla_rope8_supported()
+        # ((metadata, CP metadata, rows), slices) of the latest prefill forward
+        # on the rope-FP8 kernel; see _flashmla_rope8_prefill_metadata.
+        self._rope8_prefill_cache = None
+
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
             self.workspace_buffer = get_buffer(
@@ -887,7 +904,18 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
-        use_flashmla_kv = (not self.use_mha) and dsa_impl_for_batch == "flashmla_kv"
+        use_flashmla_kv = (not self.use_mha) and (
+            dsa_impl_for_batch == "flashmla_kv"
+            # The rope-FP8 sparse decode needs the same scheduler metadata; it
+            # reuses this slot (see _compute_flashmla_metadata). Prefill builds
+            # its own sliced metadata (_flashmla_rope8_prefill_metadata):
+            # get_mla_metadata rejects prefill-sized batches.
+            or (
+                self.use_flashmla_rope8_decode
+                and dsa_impl_for_batch == "trtllm"
+                and self._batch_uses_decode_impl(forward_batch.forward_mode)
+            )
+        )
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
@@ -1299,7 +1327,7 @@ class DeepseekSparseAttnBackend(
                     ),
                     seq_len_q=1,
                 )
-                if self.dsa_decode_impl == "flashmla_kv"
+                if self._needs_flashmla_metadata()
                 else None
             ),
         }
@@ -1346,7 +1374,7 @@ class DeepseekSparseAttnBackend(
 
             seqlens_expanded = cache_seqlens_int32
             dsa_extend_seq_lens_list = [1] * bs
-            if self.dsa_decode_impl == "flashmla_kv":
+            if self._needs_flashmla_metadata():
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
                 ].slice(slice(0, bs + 1))
@@ -1408,7 +1436,7 @@ class DeepseekSparseAttnBackend(
             )
             dsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
-            if self.dsa_decode_impl == "flashmla_kv":
+            if self._needs_flashmla_metadata():
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
                 ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
@@ -3043,20 +3071,43 @@ class DeepseekSparseAttnBackend(
                 f"({self.num_dcp_q_heads}), got {num_heads}; "
                 f"{forward_batch.forward_mode} is not routed through the DCP path."
             )
-        padded_heads = next((h for h in (16, 32, 64, 128) if h >= num_heads), num_heads)
+        # FlashMLA's rope-FP8 kernel takes the real head count, so the pad is
+        # only needed on the trtllm-gen path. Engage it exactly when the batch
+        # routes through dsa_decode_impl - that is also the condition under which
+        # init_forward_metadata built the FlashMLA scheduler metadata. Note this
+        # includes target_verify / draft_extend_v2, which reach this function
+        # with is_prefill=True but are still one q token per row.
+        use_flashmla = self.use_flashmla_rope8_decode and self._batch_uses_decode_impl(
+            forward_batch.forward_mode
+        )
+        # Plain prefill rows are one q token each as well, so the same kernel
+        # serves them (no 96 -> 128 head pad); DCP prefill keeps trtllm-gen.
+        use_flashmla_prefill = (
+            self.use_flashmla_rope8_decode
+            and is_prefill
+            and not use_flashmla
+            and self.dcp_size == 1
+        )
+        use_flashmla = use_flashmla or use_flashmla_prefill
+        padded_heads = (
+            num_heads
+            if use_flashmla
+            else next((h for h in (16, 32, 64, 128) if h >= num_heads), num_heads)
+        )
         if padded_heads != num_heads:
             q_padded = q_all.new_zeros((q_all.shape[0], padded_heads, head_dim))
             q_padded[:, :num_heads] = q_all
             q_all = q_padded
 
-        self._multi_ctas_kv_counter_buffer = (
-            grow_multi_ctas_kv_counter_buffer_if_needed(
-                self._multi_ctas_kv_counter_buffer,
-                torch.device(self.device),
-                self.trtllm_num_q_heads,
-                batch_size,
+        if not use_flashmla:
+            self._multi_ctas_kv_counter_buffer = (
+                grow_multi_ctas_kv_counter_buffer_if_needed(
+                    self._multi_ctas_kv_counter_buffer,
+                    torch.device(self.device),
+                    self.trtllm_num_q_heads,
+                    batch_size,
+                )
             )
-        )
 
         q = q_all.view(batch_size, 1, padded_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
@@ -3080,6 +3131,57 @@ class DeepseekSparseAttnBackend(
             seq_lens = seq_lens[: cp_meta.total_seq_lens]
             seq_chunks = list(torch.split(seq_lens, cp_meta.split_list, dim=0))
             seq_lens = torch.cat([seq_chunks[i] for i in cp_meta.zigzag_index], dim=0)
+
+        if use_flashmla_prefill:
+            # Scheduler metadata is built from this batch's (CP-local) per-row
+            # lengths once per forward and reused by every DSA layer.
+            outs = [
+                self._flashmla_rope8_sparse_attention(
+                    query=q[start:end],
+                    kv_cache=kv,
+                    block_tables=block_tables[start:end],
+                    rope8_metadata=rope8_metadata,
+                    cache_seqlens=seq_lens[start:end],
+                    softmax_scale=bmm1_scale,
+                )
+                for start, end, rope8_metadata in self._flashmla_rope8_prefill_metadata(
+                    metadata, forward_batch, seq_lens
+                )
+            ]
+            return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+
+        if use_flashmla:
+            rope8_metadata = metadata.flashmla_metadata
+            assert rope8_metadata is not None, (
+                "SGLANG_DSA_DECODE_FLASHMLA_ROPE8 is on but the FlashMLA "
+                "scheduler metadata was not built for this batch."
+            )
+            # The metadata was built from dsa_cache_seqlens_int32 (clipped to
+            # topk); pass the same tensor so scheduling and the kernel agree.
+            # Masking is driven by the -1 entries in block_tables, not by this.
+            cache_seqlens = metadata.dsa_cache_seqlens_int32
+            if self.dcp_size > 1:
+                out, lse = dcp_flashmla_rope8_sparse_attention(
+                    attention=self._flashmla_rope8_sparse_attention,
+                    query=q,
+                    kv_cache=kv,
+                    block_tables=block_tables,
+                    rope8_metadata=rope8_metadata,
+                    cache_seqlens=cache_seqlens,
+                    softmax_scale=bmm1_scale,
+                    local_seq_lens=seq_lens,
+                    cu_seqlens_q=self.get_device_int32_arange(batch_size + 1),
+                    kv_lora_rank=self.kv_lora_rank,
+                )
+                return out, lse
+            return self._flashmla_rope8_sparse_attention(
+                query=q,
+                kv_cache=kv,
+                block_tables=block_tables,
+                rope8_metadata=rope8_metadata,
+                cache_seqlens=cache_seqlens,
+                softmax_scale=bmm1_scale,
+            )
 
         attention_kwargs = dict(
             kv_cache=kv,
@@ -3250,8 +3352,20 @@ class DeepseekSparseAttnBackend(
             force_unfused_topk=force_unfused,
         )
 
+    def _needs_flashmla_metadata(self) -> bool:
+        """Whether this backend uses the `flashmla_metadata` slot at all.
+
+        Both the flashmla_kv decode and the rope-FP8 sparse decode need FlashMLA
+        scheduler metadata, and they are mutually exclusive (rope8 only engages
+        when dsa_decode_backend == "trtllm"), so they share one allocation.
+        """
+        return self.dsa_decode_impl == "flashmla_kv" or self.use_flashmla_rope8_decode
+
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
         from sgl_kernel.flash_mla import get_mla_metadata
+
+        if self.use_flashmla_rope8_decode:
+            return self._compute_flashmla_rope8_metadata(cache_seqlens, seq_len_q)
 
         num_heads_q = self.flashmla_kv_num_q_heads
 
@@ -3270,6 +3384,185 @@ class DeepseekSparseAttnBackend(
             flashmla_metadata=flashmla_metadata,
             num_splits=num_splits,
         )
+
+    # ---- FlashMLA rope-FP8 sparse decode (drop-in for trtllm-gen) -----------
+    #
+    # trtllm-gen only accepts 16/32/64/128 query heads, so Kimi-K3.1's 96 (attn
+    # TP=1) or 12 (attn TP=8) have to be zero-padded, which costs a new_zeros of
+    # the padded Q plus two strided slice copies (pad-in, unpad-out). FlashMLA's
+    # rope-FP8 kernel takes any count <= 128 natively and reads the *same*
+    # tensors: 576 B/token all-e4m3 KV ([512 nope | 64 rope]) and a top-k table
+    # of absolute KV slots. The mapping is therefore a pure argument rename.
+
+    FLASHMLA_ROPE8_PAGE_SIZE = 64
+
+    @staticmethod
+    def _batch_uses_decode_impl(forward_mode) -> bool:
+        """Whether this forward mode is served by dsa_decode_impl.
+
+        Mirrors the branch init_forward_metadata uses to pick between
+        dsa_decode_impl and dsa_prefill_impl, so the rope-FP8 forward and its
+        scheduler metadata cannot disagree about which batches they cover.
+        """
+        return (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        )
+
+    def _flashmla_rope8_b_topk(self) -> int:
+        """B_TOPK of the kernel the real head count dispatches to."""
+        return 64 if self.num_dcp_q_heads <= 64 else 128
+
+    def _assert_flashmla_rope8_supported(self) -> None:
+        if self.device_sm_major != 10:
+            raise ValueError(
+                "SGLANG_DSA_DECODE_FLASHMLA_ROPE8 needs an SM100 device, got "
+                f"sm_{self.device_sm_major}x."
+            )
+        if self.real_page_size != self.FLASHMLA_ROPE8_PAGE_SIZE:
+            raise ValueError(
+                "SGLANG_DSA_DECODE_FLASHMLA_ROPE8 needs page_size "
+                f"{self.FLASHMLA_ROPE8_PAGE_SIZE}, got {self.real_page_size}."
+            )
+        if self.num_dcp_q_heads > 128:
+            raise ValueError(
+                "SGLANG_DSA_DECODE_FLASHMLA_ROPE8 supports at most 128 query "
+                f"heads per KV head, got {self.num_dcp_q_heads}."
+            )
+        b_topk = self._flashmla_rope8_b_topk()
+        if self.dsa_index_topk % b_topk:
+            raise ValueError(
+                "SGLANG_DSA_DECODE_FLASHMLA_ROPE8 needs a top-k that is a "
+                f"multiple of {b_topk} for {self.num_dcp_q_heads} query heads, "
+                f"got {self.dsa_index_topk}."
+            )
+        expected_kv_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        if self.kv_cache_dim != expected_kv_dim:
+            raise ValueError(
+                "SGLANG_DSA_DECODE_FLASHMLA_ROPE8 needs the all-FP8 "
+                f"{expected_kv_dim} B/token KV layout, got kv_cache_dim="
+                f"{self.kv_cache_dim}."
+            )
+
+    def _compute_flashmla_rope8_metadata(
+        self, cache_seqlens: torch.Tensor, seq_len_q: int
+    ) -> DSAFlashMLAMetadata:
+        """Scheduler metadata for the rope-FP8 sparse kernel.
+
+        Unlike `_compute_flashmla_metadata` this passes the real head count and
+        is_fp8_query=True, because get_attn_impl_meta derives k_block_size from
+        the head count on the FP8-query branch: it must come out as the kernel's
+        B_TOPK (64 for <= 64 heads, 128 above), not as h_q.
+        """
+        from flash_mla import get_mla_metadata
+
+        num_heads_q = self.num_dcp_q_heads
+        flashmla_metadata, num_splits = get_mla_metadata(
+            cache_seqlens=cache_seqlens,
+            num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
+            num_heads_k=1,
+            num_heads_q=num_heads_q,
+            is_fp8_kvcache=True,
+            topk=self.dsa_index_topk,
+            is_fp8_query=True,
+        )
+        return DSAFlashMLAMetadata(
+            flashmla_metadata=flashmla_metadata,
+            num_splits=num_splits,
+        )
+
+    # Rows per rope-FP8 prefill call. FlashMLA fa1b704 (2026-11-05) lifted the
+    # old ~10K-row get_mla_metadata limit (32768 rows verified on B200; 65536
+    # hits an illegal access in mla_combine), but 8192-row slices stay faster:
+    # 16K rows at 500K ctx take 5.95 ms in one call vs 2 x 2.76 ms, and the
+    # 16K-row metadata costs 2.7 ms vs 2 x 0.8 ms.
+    FLASHMLA_ROPE8_PREFILL_MAX_ROWS = 8192
+
+    def _flashmla_rope8_prefill_metadata(
+        self,
+        metadata: DSAMetadata,
+        forward_batch: ForwardBatch,
+        seq_lens: torch.Tensor,
+    ) -> List[Tuple[int, int, DSAFlashMLAMetadata]]:
+        """(row_start, row_end, scheduler metadata) slices for a prefill batch
+        on the rope-FP8 kernel. seq_lens are the per-row clipped lengths the
+        kernel receives (CP-local and zigzag-ordered under MLA prefill CP),
+        identical for every DSA layer of the forward, so they are computed
+        once per (metadata, CP metadata) pair."""
+        num_rows = seq_lens.shape[0]
+        key = (metadata, forward_batch.attn_cp_metadata, num_rows)
+        cached = self._rope8_prefill_cache
+        if (
+            cached is not None
+            and cached[0][0] is key[0]
+            and cached[0][1] is key[1]
+            and cached[0][2] == num_rows
+        ):
+            return cached[1]
+        step = self.FLASHMLA_ROPE8_PREFILL_MAX_ROWS
+        slices = [
+            (
+                start,
+                min(start + step, num_rows),
+                self._compute_flashmla_rope8_metadata(
+                    seq_lens[start : min(start + step, num_rows)], seq_len_q=1
+                ),
+            )
+            for start in range(0, num_rows, step)
+        ]
+        self._rope8_prefill_cache = (key, slices)
+        return slices
+
+    def _flashmla_rope8_sparse_attention(
+        self,
+        *,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        rope8_metadata: DSAFlashMLAMetadata,
+        cache_seqlens: torch.Tensor,
+        softmax_scale: float,
+        return_lse: bool = False,
+    ):
+        """Drop-in for flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla.
+
+        Argument mapping (everything is a view or a scalar - no copies):
+
+          query        [rows, 1, heads, 576] e4m3   -> q            (as-is)
+          kv_cache     [pages, 1, 64, 576]  e4m3    -> k_cache      [pages, 64, 1, 576]
+          block_tables [rows, 1, topk] int32        -> indices      (as-is)
+          seq_lens                                  -> only feeds the metadata
+          bmm1_scale   = q_scale*k_scale*scaling    -> softmax_scale
+          sparse_mla_top_k                          -> block_tables.shape[-1]
+          workspace_buffer / multi_ctas_kv_counter_buffer -> not needed
+
+        FlashMLA ignores `block_table` on the sparse path (it gathers straight
+        from `indices`), but the binding rejects None, hence the empty tensor.
+        """
+        from flash_mla import flash_mla_with_kvcache
+
+        rows, q_len, heads, head_dim = query.shape
+        out, lse = flash_mla_with_kvcache(
+            q=query,
+            # Same bytes, NHD instead of the HND view trtllm wants.
+            k_cache=kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim),
+            block_table=query.new_empty((rows, 0), dtype=torch.int32),
+            cache_seqlens=cache_seqlens,
+            head_dim_v=self.kv_lora_rank,
+            tile_scheduler_metadata=rope8_metadata.flashmla_metadata,
+            num_splits=rope8_metadata.num_splits,
+            softmax_scale=softmax_scale,
+            indices=block_tables,
+            is_fp8_kvcache=True,
+            is_fp8_query=True,
+            is_fp8_rope=True,
+        )
+        if not return_lse:
+            return out
+        # FlashMLA returns lse as [rows, heads, q_len]; trtllm's is [rows, heads].
+        assert q_len == 1, f"lse mapping assumes one q token per row, got {q_len}"
+        return out, lse.view(rows, heads, q_len)[..., 0]
 
 
 class DeepseekSparseAttnMultiStepBackend:

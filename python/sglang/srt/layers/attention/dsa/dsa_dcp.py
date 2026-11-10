@@ -84,3 +84,42 @@ def dcp_trtllm_sparse_attention(
         outputs.append(output)
     output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     return output, lse
+
+
+def dcp_flashmla_rope8_sparse_attention(
+    *,
+    attention,
+    query: torch.Tensor,
+    local_seq_lens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    kv_lora_rank: int,
+    **attention_kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``dcp_trtllm_sparse_attention`` served by FlashMLA's rope-FP8 kernel.
+
+    Same contract: query [rows, 1, heads, head_dim]; block_tables [rows, 1, topk]
+    with this rank's owned slots packed to the front and a -1 tail;
+    ``local_seq_lens`` the per-row owned count; returns
+    (out [rows, heads, kv_lora_rank], lse [rows, heads]) with out=0 / lse=-inf
+    for rows that own nothing.
+
+    Two differences from the trtllm version: the query heads are not zero-padded
+    (FlashMLA takes the real count), and there is no row chunking because
+    FlashMLA carries no softmax workspace to run out of.
+    """
+    rows, _, heads, _ = query.shape
+    if rows == 0:
+        return (
+            torch.empty(
+                (0, heads, kv_lora_rank), dtype=torch.bfloat16, device=query.device
+            ),
+            torch.empty((0, heads), dtype=torch.float32, device=query.device),
+        )
+
+    out, lse = attention(query=query, return_lse=True, **attention_kwargs)
+    out = out.view(rows, heads, -1)
+    # FlashMLA reports lse=+inf (and out=0) for a row whose every slot is -1,
+    # while the DCP merge expects -inf. fixup_zero_kv_rows writes exactly that
+    # for the rows local_seq_lens marks as empty.
+    fixup_zero_kv_rows(out, lse, local_seq_lens, cu_seqlens_q[: rows + 1], 1)
+    return out, lse
