@@ -841,7 +841,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 intermediate_conv_window_cache=intermediate_conv_window_cache,
                 intermediate_state_indices=intermediate_state_indices,
                 cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
+                draft_token_num=draft_token_num,
                 replayssm_rawv=replayssm_rawv,
                 replayssm_rawk=mamba_cache_params.replayssm_rawk,
                 replayssm_g=mamba_cache_params.replayssm_g,
@@ -1047,7 +1047,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_conv_window_cache: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
         cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
+        draft_token_num: int,
         replayssm_rawv: Optional[torch.Tensor] = None,
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
@@ -1059,6 +1059,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len = mixed_qkv.shape[0]
         h = layer.num_v_heads
+        # Non-compact target-verify is a dense [bs, draft_token_num] grid: every
+        # request contributes exactly draft_token_num tokens. Under static mode
+        # the token buffer is bucket-padded (seq_len rounds bs up to a graph
+        # tier) while forward_metadata.query_start_loc still describes only the
+        # real requests, so it must not be used here — the fused CuTe kernel
+        # needs cu_seqlens covering the full padded buffer (T % N == 0). Padding
+        # rows land in ghost cache slots and are discarded downstream, matching
+        # the non-fused fallback's `batch_size = seq_len // draft_token_num`.
+        cu_seqlens = torch.arange(
+            0,
+            seq_len + draft_token_num,
+            draft_token_num,
+            device=mixed_qkv.device,
+            dtype=torch.int32,
+        )
         x_q, x_k, x_v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         x_q = x_q.reshape(1, seq_len, h, layer.head_q_dim)
         x_k = x_k.reshape(1, seq_len, h, layer.head_k_dim)
@@ -1113,7 +1128,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             intermediate_conv_k=ic_k,
             intermediate_conv_v=ic_v,
             ssm_state_indices=cache_indices.to(torch.int32),
-            cu_seqlens=query_start_loc.to(torch.int32),
+            cu_seqlens=cu_seqlens,
             lower_bound=float(layer.lower_bound),
             scale=layer.head_q_dim**-0.5,
             replayssm_rawv=replayssm_rawv,

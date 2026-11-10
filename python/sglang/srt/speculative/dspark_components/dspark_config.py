@@ -57,9 +57,14 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
+    window_size: Optional[int]
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
+
+    def resolve_window_size(self, *, default: Optional[int] = None) -> Optional[int]:
+        """Return the configured sliding-window size, or ``default`` when unset."""
+        return self.window_size if self.window_size is not None else default
 
     def require_markov(self) -> bool:
         return int(self.markov_rank) > 0
@@ -140,6 +145,22 @@ def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
     )
 
 
+def read_draft_checkpoint_window_size(*, server_args: ServerArgs) -> Optional[int]:
+    """Read the draft checkpoint's sliding-window size, or ``None`` for a
+    full-attention draft. Raises on config-load failure."""
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_hf_config = get_config(
+        server_args.speculative_draft_model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.speculative_draft_model_revision,
+        model_override_args=json.loads(server_args.json_model_override_args),
+    )
+    return parse_dspark_draft_config(
+        draft_hf_config=draft_hf_config
+    ).resolve_window_size(default=None)
+
+
 def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
     """The checkpoint carries a bundled DSpark draft head, marked by the
     prefixed dspark_* keys on the target hf config. Single source of truth
@@ -182,6 +203,25 @@ def _get_dspark_config(config: Any) -> dict:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def _resolve_dspark_window_size(config: Any) -> Optional[int]:
+    """Window size only when all three signals agree the draft is sliding-window;
+    otherwise ``None`` (full-context draft attention)."""
+    if not _cfg_get(config, "use_sliding_window", False):
+        return None
+    layer_types = _cfg_get(config, "layer_types", None)
+    if not layer_types or not any(
+        str(lt) == "sliding_attention" for lt in layer_types
+    ):
+        return None
+    sliding_window = _cfg_get(config, "sliding_window", None)
+    if sliding_window is None:
+        return None
+    window = int(sliding_window)
+    if window <= 0:
+        return None
+    return window
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
@@ -269,6 +309,8 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         int(prefixed_block_size) if prefixed_block_size is not None else base.block_size
     )
 
+    window_size = _resolve_dspark_window_size(text_config)
+
     if prefixed_target_layer_ids is not None:
         if not isinstance(prefixed_target_layer_ids, (list, tuple)) or not len(
             prefixed_target_layer_ids
@@ -292,4 +334,5 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
+        window_size=window_size,
     )

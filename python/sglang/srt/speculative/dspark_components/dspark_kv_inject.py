@@ -20,6 +20,7 @@ class TargetHiddenKvInjector:
         device,
         verify_num_draft_tokens: int,
         block_pos_offsets: torch.Tensor,
+        slot_translator=None,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -27,6 +28,21 @@ class TargetHiddenKvInjector:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
+        # Draft-side SWA: maps target-global slot ids to the draft's own,
+        # window-bounded index space. None keeps writes in the global space.
+        self._slot_translator = slot_translator
+
+    def _to_draft_slots(self, cache_loc: torch.Tensor) -> torch.Tensor:
+        """Translate target-global write locations into draft-SWA slots.
+
+        Every location handed here was mapped earlier the same step (draft-window
+        maintenance covers the whole reserved extent), so a 0 -- the unmapped
+        sentinel -- means the mapping and the write disagree about the extent.
+        Fail loud: writing to slot 0 silently corrupts another request's KV.
+        """
+        if self._slot_translator is None:
+            return cache_loc
+        return self._slot_translator(cache_loc)
 
     def inject_target_hidden(
         self,
@@ -67,13 +83,18 @@ class TargetHiddenKvInjector:
             )
             return
 
+        # positions stay global-real (RoPE); only the write LOCATION is remapped.
+        draft_cache_loc = self._to_draft_slots(cache_loc)
+        draft_cache_loc_2d = (
+            None if cache_loc_2d is None else self._to_draft_slots(cache_loc_2d)
+        )
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 target_hidden=target_hidden,
                 pool=pool,
                 positions=positions,
-                cache_loc=cache_loc,
-                cache_loc_2d=cache_loc_2d,
+                cache_loc=draft_cache_loc,
+                cache_loc_2d=draft_cache_loc_2d,
                 commit_lens=commit_lens,
             )
 
@@ -108,13 +129,17 @@ class TargetHiddenKvInjector:
             )
 
         pool = self.draft_model_runner.token_to_kv_pool
+        draft_cache_loc = self._to_draft_slots(cache_loc)
+        draft_cache_loc_2d = (
+            None if cache_loc_2d is None else self._to_draft_slots(cache_loc_2d)
+        )
         with torch.inference_mode():
             self.draft_model.write_projected_context_kv(
                 projected_context=projected_context,
                 pool=pool,
                 positions=positions,
-                cache_loc=cache_loc,
-                cache_loc_2d=cache_loc_2d,
+                cache_loc=draft_cache_loc,
+                cache_loc_2d=draft_cache_loc_2d,
                 commit_lens=commit_lens,
             )
 

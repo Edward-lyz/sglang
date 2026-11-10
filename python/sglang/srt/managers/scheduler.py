@@ -258,6 +258,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -4314,6 +4315,17 @@ class Scheduler(
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
+            # retract_decode only frees the target-side KV (ScheduleBatch.release_req);
+            # it has no draft_worker reference, so the draft-side SWA slot map
+            # (DSpark's DraftWindowSlotMap) is not told these req_pool_idx are free.
+            # Without this, a retracted req's stale evict_frontier/mapped_high_water
+            # survives and corrupts the window mapping once the slot is reused.
+            if isinstance(self.draft_worker, BaseSpecWorker):
+                for req in retracted_reqs + reqs_to_abort:
+                    if req.req_pool_idx is not None:
+                        self.draft_worker.release_draft_kv(
+                            req_pool_idx=int(req.req_pool_idx)
+                        )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (

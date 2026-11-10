@@ -130,6 +130,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = kvc.layer_info.num_effective_layers
 
+        # Reserved bytes for a window-bounded (SWA) draft KV pool. Defaults to 0;
+        # set by the DFLASH/DSPARK branch below only when the draft is compacted.
+        self._draft_fixed_budget_bytes = 0
+        self._draft_cell_size = 0
+
         self._cell_size = (
             envs.SGLANG_K3_MLA_CELL_SIZE.get()
             if envs.SGLANG_K3_MLA_CELL_SIZE.get()
@@ -177,11 +182,56 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = scale_kv_cell_size_per_token_for_dflash(
-                    target_cell_size_per_token=self._cell_size,
-                    target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
-                )
+                if kvc.server_args.speculative_draft_window_size is not None:
+                    # Draft SWA compaction: the draft pool is a fixed byte budget
+                    # (window-bounded), not a per-target-token surcharge. Reserve
+                    # that budget out of available_bytes instead of inflating
+                    # cell_size, so the draft KV the window frees turns into
+                    # target capacity rather than idle memory.
+                    self._draft_fixed_budget_bytes = self._compact_draft_budget_bytes(
+                        kvc
+                    )
+                else:
+                    self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                        target_cell_size_per_token=self._cell_size,
+                        target_num_layers=int(num_layers),
+                        draft_num_layers=int(draft_num_layers)
+                        * kvc.server_args.dcp_size,
+                    )
+
+    def _compact_draft_budget_bytes(self, kvc: KVCacheConfigurator) -> int:
+        """Bytes to reserve for a window-bounded (SWA) draft KV pool.
+
+        Only meaningful when --speculative-draft-window-size is set and the draft
+        per-token cost is known via SGLANG_K3_DSPARK_MHA_CELL_SIZE (Kimi-K3's
+        DSpark draft). Returns 0 otherwise, which keeps the caller on the
+        per-token cell_size surcharge path unchanged.
+
+        The draft pool is sized by max_running_requests, not context length, so
+        this budget is fixed once the request cap is known. It uses the user's
+        --max-running-requests as the request-cap approximation: the final cap may
+        be clamped by token_capacity//2 later, but the budget is small enough that
+        the <1% discrepancy is immaterial.
+        """
+        draft_cell = envs.SGLANG_K3_DSPARK_MHA_CELL_SIZE.get()
+        window = kvc.server_args.speculative_draft_window_size
+        max_reqs = kvc.server_args.max_running_requests
+        gamma = kvc.server_args.speculative_num_draft_tokens
+        if draft_cell is None or window is None or max_reqs is None or gamma is None:
+            return 0
+        self._draft_cell_size = int(draft_cell)
+        from sglang.srt.speculative.draft_swa_pool import (
+            compute_compact_draft_pool_slots,
+        )
+
+        max_reqs_per_worker = int(max_reqs) // max(1, int(kvc.ps.attn_dp_size))
+        slots = compute_compact_draft_pool_slots(
+            max_num_reqs=max_reqs_per_worker,
+            window_size=int(window),
+            gamma=int(gamma),
+            page_size=int(kvc.server_args.page_size),
+        )
+        return slots * int(draft_cell)
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
@@ -302,12 +352,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        effective_bytes = available_bytes - self._draft_fixed_budget_bytes
         max_total_num_tokens = (
-            available_bytes // self._cell_size
+            effective_bytes // self._cell_size
             if self._cell_size
             else self._zero_kv_max_tokens
         )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        if self._draft_fixed_budget_bytes > 0 and self._draft_cell_size > 0:
+            merged_cell = self._cell_size + self._draft_cell_size
+            old_draft_bytes = (available_bytes // merged_cell) * self._draft_cell_size
+            reclaimed = old_draft_bytes - self._draft_fixed_budget_bytes
+            if get_parallel().tp_rank == 0:
+                logger.info(
+                    "DSpark SWA draft: reclaimed %.2f GiB for the target KV pool "
+                    "(draft pool now %.2f GiB).",
+                    reclaimed / (1 << 30),
+                    self._draft_fixed_budget_bytes / (1 << 30),
+                )
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
     def calculate_pool_sizes_from_max_tokens(

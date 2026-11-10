@@ -103,7 +103,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
-    # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
+    # Consumed by DFLASH / DSPARK (compact draft KV cache) and Llama EAGLE-3
+    # (drafter attention SWA).
     if server_args.speculative_draft_window_size is not None:
         window_size = int(server_args.speculative_draft_window_size)
         if window_size <= 0:
@@ -111,10 +112,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 f"--speculative-draft-window-size must be positive, got {window_size}."
             )
         server_args.speculative_draft_window_size = window_size
-        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH", "DSPARK"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                "speculative_algorithm=%s (honored by Llama EAGLE-3, DFLASH and "
+                "DSPARK only).",
                 server_args.speculative_algorithm,
             )
 
@@ -423,6 +425,50 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "DSpark speculative_num_draft_tokens must be >= 2 (= gamma + 1), "
             f"got {server_args.speculative_num_draft_tokens}."
         )
+
+    # Infer the draft window from the draft config unless the CLI set it. Prefill
+    # is skipped: it runs full-attention draft over the full prompt KV, so the
+    # window-compact pool would exhaust under chunked prefill there.
+    if (
+        server_args.speculative_draft_window_size is None
+        and server_args.disaggregation_mode != "prefill"
+    ):
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            read_draft_checkpoint_window_size,
+        )
+
+        try:
+            inferred_window = read_draft_checkpoint_window_size(
+                server_args=server_args
+            )
+            if inferred_window is not None:
+                server_args.speculative_draft_window_size = inferred_window
+                logger.info(
+                    "Inferred DSpark draft window size %d from the draft "
+                    "checkpoint config (use_sliding_window + layer_types + "
+                    "sliding_window).",
+                    inferred_window,
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to infer DSpark draft window size from the draft "
+                "checkpoint config; falling back to full-context draft "
+                "attention. Error: %s",
+                e,
+            )
+
+    if server_args.speculative_draft_window_size is not None:
+        # The compact draft row is [window slots][gamma block slots]; a window
+        # shorter than the block would leave the draft unable to see its own
+        # committed context.
+        resolved_gamma = int(server_args.speculative_num_draft_tokens) - 1
+        if server_args.speculative_draft_window_size < resolved_gamma:
+            raise ValueError(
+                "--speculative-draft-window-size must be >= gamma "
+                "(= --speculative-num-draft-tokens - 1). "
+                f"window_size={server_args.speculative_draft_window_size}, "
+                f"gamma={resolved_gamma}."
+            )
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48

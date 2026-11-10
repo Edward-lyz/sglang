@@ -14,11 +14,13 @@ if TYPE_CHECKING:
 
 class EagleDraftWorkerBase(ABC):
     @abstractmethod
-    def draft():
+    def draft(self):
+        """Draft candidate tokens for the speculative decoding step."""
         pass
 
     @abstractmethod
-    def draft_extend():
+    def draft_extend(self):
+        """Draft candidate tokens for the prefill (extend) phase."""
         pass
 
     @property
@@ -130,6 +132,10 @@ class BaseSpecWorker(ABC):
         Default no-op. DSpark overrides this to settle / censor its
         block-accept estimator state for the finished request.
         """
+        pass
+
+    def release_draft_kv(self, *, req_pool_idx: int) -> None:
+        """Release draft-side KV state before the request slot is reused."""
         pass
 
     def activate_step_by_batch(self, batch_size: int) -> None:

@@ -894,7 +894,14 @@ class SchedulerBatchResultProcessor:
                     else True
                 )
                 self.fire_pending_trace(req)
+                draft_req_pool_idx = req.req_pool_idx
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                if draft_req_pool_idx is not None and isinstance(
+                    self.draft_worker, BaseSpecWorker
+                ):
+                    self.draft_worker.release_draft_kv(
+                        req_pool_idx=int(draft_req_pool_idx)
+                    )
 
             req.time_stats.set_completion_time()
 

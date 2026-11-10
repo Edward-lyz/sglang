@@ -373,6 +373,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
 
+    def _release_draft_mapping(self, decode_req: DecodeRequest) -> None:
+        """Release Draft SWA pages acquired before KV transfer completes."""
+        req_pool_idx = decode_req.req.req_pool_idx
+        draft_worker = getattr(self.scheduler, "draft_worker", None)
+        release = getattr(draft_worker, "release_draft_kv", None)
+        if req_pool_idx is not None and callable(release):
+            release(req_pool_idx=int(req_pool_idx))
+
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
             isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
@@ -998,6 +1006,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
+                self._release_draft_mapping(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -1267,11 +1276,52 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
+            draft_dst_kv_indices = None
+            draft_slot_map = getattr(
+                self.draft_token_to_kv_pool, "slot_map", None
+            )
+            if draft_slot_map is not None:
+                # The target Kimi attention is not configured with a standard
+                # sliding_window_size.  Draft PD must use the compact draft
+                # map's own window; falling back to origin_input_len allocates
+                # the full prompt in the SWA pool during preallocation.
+                window_size = int(draft_slot_map.window_size)
+                window_start = max(0, origin_input_len - window_size)
+                # Align to the draft KV page. ``page_size`` above belongs to
+                # the PD transfer layout and can be much larger; using it here
+                # may round a long prompt's window start all the way to zero.
+                window_start = page_align_floor(
+                    window_start, int(draft_slot_map.page_size)
+                )
+                # Prefill transfers only the cache miss beyond total_prefix_len.
+                # Sending prefix destinations here would shift every compact
+                # draft address and make source/destination lengths diverge.
+                window_start = max(window_start, total_prefix_len)
+                full_window_slots = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx, window_start:origin_input_len
+                ]
+                # Mooncake draft DCP uses compact token slots directly; do not
+                # collapse them into target/virtual page indices.
+                draft_dst_kv_indices = (
+                    draft_slot_map.map_slots(
+                        full_window_slots,
+                        req_pool_idx=decode_req.req.req_pool_idx,
+                        end_pos=origin_input_len,
+                    )
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32)
+                )
+            metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            if draft_dst_kv_indices is not None:
+                metadata_kwargs["draft_dst_kv_indices"] = draft_dst_kv_indices
+                metadata_kwargs["draft_window_start"] = window_start
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
-                decode_prefix_len=total_prefix_len,
+                **metadata_kwargs,
             )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
@@ -1759,6 +1809,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
 
+    def _release_draft_mapping(self, decode_req: DecodeRequest) -> None:
+        """Release draft SWA pages when a transferred request is discarded."""
+        req_pool_idx = decode_req.req.req_pool_idx
+        draft_worker = getattr(self.scheduler, "draft_worker", None)
+        release = getattr(draft_worker, "release_draft_kv", None)
+        if req_pool_idx is not None and callable(release):
+            release(req_pool_idx=int(req_pool_idx))
+
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
 
@@ -2018,6 +2076,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                self._release_draft_mapping(decode_req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 decode_req.kv_receiver.clear()
@@ -2046,6 +2105,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                             decode_req.req
                         )
                     self._clean_hicache_prefetch_resources(decode_req)
+                    self._release_draft_mapping(decode_req)
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                     if self.scheduler.metrics_reporter.enable_metrics:
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -2098,7 +2158,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        for decode_req in self.queue:
+            self._release_draft_mapping(decode_req)
+        for decode_req in self.pending_reqs:
+            self._release_draft_mapping(decode_req)
         self.queue.clear()
+        self.pending_reqs.clear()
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""

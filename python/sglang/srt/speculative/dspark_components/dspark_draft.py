@@ -20,6 +20,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.draft_window import (
+    compact_draft_seq_lens,
+    fill_compact_seq_lens_cpu_bound,
+    rebuild_compact_draft_req_to_token,
+)
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.spec_info import (
@@ -310,6 +315,10 @@ class DraftBlockProposer:
         dp_moe_sync: bool = False,
         dp_vocab_sync: bool = False,
         dp_graph_rows: Optional[int] = None,
+        draft_window_size: Optional[int] = None,
+        page_size: int = 1,
+        resolve_target_req_to_token=None,
+        resolve_slot_translator=None,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -333,9 +342,97 @@ class DraftBlockProposer:
         # than inferred.
         self._idle_participation_mode: Optional[bool] = None
         self._busy_forward_mode: Optional[bool] = None
+        # Draft-side SWA. The req_to_token tensors do not exist yet at
+        # construction (pools are allocated later), so the target table is
+        # resolved lazily -- same pattern as DsparkVerifyEpilogue's commit ctx.
+        self._draft_window_size = draft_window_size
+        self._page_size = int(page_size)
+        self._resolve_target_req_to_token = resolve_target_req_to_token
+        # Resolved per call, not captured: the slot map is built later, in
+        # alloc_memory_pool. Returns None when windowing is off, which keeps the
+        # compact row (and the KV writes) in the target-global space.
+        self._resolve_slot_translator = resolve_slot_translator
+        self._compact = draft_window_size is not None
+        if self._compact and resolve_target_req_to_token is None:
+            raise ValueError(
+                "DSpark draft windowing requires resolve_target_req_to_token."
+            )
+        # Host-side planning bound for the compact seq_lens; grown on demand.
+        self._compact_seq_lens_cpu_buf: Optional[torch.Tensor] = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
+
+    def _compact_draft_lengths(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        verify_cache_loc_2d: torch.Tensor,
+        bs: int,
+        device: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Rebuild the draft-local compact window view and return
+        ``(draft_seq_lens, draft_seq_lens_cpu, draft_seq_lens_sum)``.
+
+        The compact row is ``[recent window slots][this step's block slots]``, so
+        draft attention structurally cannot reach keys outside the window. The
+        row is fully rewritten every step before the backend reads it, which is
+        why the private table needs no reclamation.
+        """
+        assert self._draft_window_size is not None
+        prefix_lens = batch.seq_lens
+        draft_prefix_lens = compact_draft_seq_lens(
+            seq_lens=prefix_lens,
+            window_size=self._draft_window_size,
+            page_size=self._page_size,
+            device=device,
+        )
+        if (
+            self._compact_seq_lens_cpu_buf is None
+            or self._compact_seq_lens_cpu_buf.numel() < bs
+        ):
+            self._compact_seq_lens_cpu_buf = torch.empty(
+                (bs,), dtype=torch.int32, device="cpu"
+            )
+        seq_lens_cpu = self._compact_seq_lens_cpu_buf[:bs]
+        fill_compact_seq_lens_cpu_bound(
+            batch_seq_lens_cpu=batch.seq_lens_cpu,
+            reserved_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
+            draft_prefix_lens=draft_prefix_lens,
+            window_size=self._draft_window_size,
+            page_size=self._page_size,
+            out=seq_lens_cpu,
+        )
+        # Host-known bound: compact_draft_seq_lens never exceeds
+        # window + page (page alignment keeps up to page_size-1 extra tokens),
+        # and the live row adds the block. Avoids the exact device-side
+        # ``.max()`` readback, which is a D2H sync on the decode hot path.
+        span_bound = (
+            self._draft_window_size
+            + (self._page_size if self._page_size > 1 else 0)
+            + self.gamma
+        )
+        rebuild_compact_draft_req_to_token(
+            draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+            target_req_to_token=self._resolve_target_req_to_token(),
+            req_pool_indices=batch.req_pool_indices,
+            prefix_lens=prefix_lens,
+            draft_prefix_lens=draft_prefix_lens,
+            verify_cache_loc_2d=verify_cache_loc_2d,
+            bs=bs,
+            block_size=self.gamma,
+            slot_translator=(
+                None
+                if self._resolve_slot_translator is None
+                else self._resolve_slot_translator()
+            ),
+            max_span=span_bound,
+        )
+        # Match the non-compact convention: seq_lens_cpu is the committed length
+        # plus this step's block, as a safe upper bound for backend planning.
+        seq_lens_cpu.add_(self.gamma)
+        return draft_prefix_lens, seq_lens_cpu, int(seq_lens_cpu.sum())
 
     def _base_logits_context(self):
         if self._dp_moe_sync:
@@ -620,6 +717,17 @@ class DraftBlockProposer:
         draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
         draft_positions = positions_2d[:, :gamma].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
+        # SWA writes must land at DRAFT-swa ids, matching the compact-row page
+        # table the SAME forward reads back. Without this, draft self-attention
+        # writes K/V at target-global slot G but reads at swa slot S=translate(G)
+        # -- the read is garbage, block-internal predictions collapse, and
+        # accept_len drops to ~1 (only the pre-committed bonus token survives).
+        if self._compact and self._resolve_slot_translator is not None:
+            translator = self._resolve_slot_translator()
+            if translator is not None:
+                draft_cache_loc = translator(draft_cache_loc).to(
+                    dtype=draft_cache_loc.dtype
+                )
 
         draft_owns_embed = hasattr(self.draft_model, "forward_embed")
         draft_input_embeds: Optional[torch.Tensor] = None
@@ -627,10 +735,24 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        if batch.seq_lens_cpu is not None:
+        if self._compact:
+            # Windowed: seq_lens is the compact row length, not the true prefix.
+            # draft_positions above stays global-real so RoPE is unaffected.
+            draft_seq_lens, draft_seq_lens_cpu, draft_seq_lens_sum = (
+                self._compact_draft_lengths(
+                    batch=batch,
+                    draft_input=draft_input,
+                    verify_cache_loc_2d=verify_cache_loc_2d,
+                    bs=bs,
+                    device=device,
+                )
+            )
+        elif batch.seq_lens_cpu is not None:
+            draft_seq_lens = prefix_lens
             draft_seq_lens_cpu = batch.seq_lens_cpu + gamma
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
         elif draft_input.reserved_seq_lens_cpu is not None:
+            draft_seq_lens = prefix_lens
             draft_seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
         else:
@@ -642,7 +764,7 @@ class DraftBlockProposer:
             device=device,
             input_ids=draft_block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
-            seq_lens=prefix_lens,
+            seq_lens=draft_seq_lens,
             out_cache_loc=draft_cache_loc,
             positions=draft_positions,
             seq_lens_cpu=draft_seq_lens_cpu,
@@ -711,6 +833,7 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            out_cache_loc_is_physical=self._compact,
         )
         self._fill_dp_moe_sync_metadata(forward_batch, batch)
         self._publish_dp_embed_rows_capacity(batch)

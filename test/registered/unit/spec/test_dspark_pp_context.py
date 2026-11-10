@@ -54,6 +54,7 @@ class TestDSparkPPContext(CustomTestCase):
         worker._draft_is_moe = False
         worker.ps = SimpleNamespace(pp_rank=0, pp_size=2)
         worker.page_size = 64
+        worker.use_compact_draft_cache = False
         full_config = MemoryPoolConfig(
             max_total_num_tokens=4096,
             max_running_requests=32,
@@ -75,6 +76,7 @@ class TestDSparkPPContext(CustomTestCase):
         worker._draft_is_moe = False
         worker.ps = SimpleNamespace(pp_rank=1, pp_size=2)
         worker.page_size = 64
+        worker.use_compact_draft_cache = False
         full_config = MemoryPoolConfig(
             max_total_num_tokens=4096,
             max_running_requests=32,
@@ -86,6 +88,48 @@ class TestDSparkPPContext(CustomTestCase):
             "memory_pool_config"
         ]
         self.assertIs(passed_config, full_config)
+
+    def test_compact_draft_cache_gives_the_draft_a_private_req_to_token(self):
+        """Draft windowing must NOT alias the target req->token table.
+
+        The compact row holds only the recent window, so sharing the target's
+        table would corrupt the target's own mapping. The KV allocator stays
+        shared either way -- the compact table owns no slots.
+        """
+        target_table = Mock(name="target_req_to_token_pool")
+        target_table.req_to_token = torch.empty((2, 128), dtype=torch.int32)
+        allocator = Mock(name="token_to_kv_pool_allocator")
+        allocator.size = 256
+        allocator.size_full = 256
+
+        for compact, expected_table in [(False, target_table), (True, None)]:
+            worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+            worker._draft_worker = Mock()
+            worker._is_pd_prefill = False
+            worker._draft_is_moe = False
+            worker.ps = SimpleNamespace(pp_rank=0, pp_size=1, tp_rank=1)
+            worker.page_size = 64
+            worker.verify_num_draft_tokens = 4
+            worker.device = "cpu"
+            worker.use_compact_draft_cache = compact
+            worker.draft_window_size = 128 if compact else None
+            worker.model_runner = SimpleNamespace(
+                req_to_token_pool=target_table,
+                token_to_kv_pool_allocator=allocator,
+            )
+            worker.draft_model_runner = SimpleNamespace(
+                token_to_kv_pool_allocator=SimpleNamespace(size=256),
+            )
+
+            worker.alloc_memory_pool(
+                memory_pool_config=None,
+                req_to_token_pool=target_table,
+                token_to_kv_pool_allocator=allocator,
+            )
+
+            kwargs = worker._draft_worker.alloc_memory_pool.call_args.kwargs
+            self.assertIs(kwargs["req_to_token_pool"], expected_table)
+            self.assertIs(kwargs["token_to_kv_pool_allocator"], allocator)
 
 
 if __name__ == "__main__":

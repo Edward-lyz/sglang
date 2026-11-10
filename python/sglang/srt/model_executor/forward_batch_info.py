@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import math
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -72,6 +73,18 @@ if TYPE_CHECKING:
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
 # ForwardBatch.apply_deprecated_skip_attn_backend_init.
 _skip_attn_backend_init_warned = False
+
+
+def _mlp_sync_token_alignment(
+    *, attn_tp_size: int, forward_mode: "ForwardMode", spec_info
+) -> int:
+    """Keep target-verify padding aligned to complete speculative request rows."""
+    if forward_mode.is_target_verify() and spec_info is not None:
+        tokens_per_req = int(getattr(spec_info, "num_tokens_per_req", 0))
+        if tokens_per_req > 0:
+            return math.lcm(attn_tp_size, tokens_per_req)
+    return attn_tp_size
+
 
 _is_npu = is_npu()
 
@@ -338,7 +351,7 @@ class NgramEmbeddingInfo:
         column_starts=None,
         req_lens=None,
         skip_token_table_update=None,
-    ) -> NgramEmbeddingInfo:
+    ) -> "NgramEmbeddingInfo":
         info = cls(
             token_table=token_table,
             column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
@@ -353,7 +366,8 @@ class NgramEmbeddingInfo:
             info.req_lens[:] = req_lens
         return info
 
-    def slice(self, bs: int) -> NgramEmbeddingInfo:
+    def slice(self, bs: int) -> "NgramEmbeddingInfo":
+        """Return an embedding info restricted to the first ``bs`` requests."""
         return NgramEmbeddingInfo(
             token_table=self.token_table,
             column_starts=self.column_starts[:bs],
@@ -387,6 +401,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     out_cache_loc: torch.Tensor
     # The sum of all sequence lengths
     seq_lens_sum: int
+    out_cache_loc_is_physical: bool = False
 
     # === Borrowed from ScheduleBatch: GPU tensors (cross-stream; clone targets for stream isolation) ===
     # FIXME(lsyin): these are currently aliased by reference from ScheduleBatch. Once
@@ -547,7 +562,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For two-batch overlap
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_padded_len: Optional[int] = None
-    tbo_children: Optional[List[ForwardBatch]] = None
+    tbo_children: Optional[List["ForwardBatch"]] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
@@ -1191,11 +1206,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
+        token_alignment = _mlp_sync_token_alignment(
+            attn_tp_size=attn_tp_size,
+            forward_mode=self.forward_mode,
+            spec_info=self.spec_info,
+        )
 
         for i in range(sync_group_size):
-            # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
+            # Target verify needs complete fixed-width request rows as well as
+            # attention-TP reduce-scatter alignment.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], token_alignment)
 
         # make sure that each rank has the same number of tokens to do collective communication.
         # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
