@@ -972,6 +972,10 @@ class Envs:
     # quant of its normed output, which the following FP8 linears reuse instead
     # of re-quantizing (bit-identical). Default off.
     SGLANG_K3_ATTN_RES_FP8_OUT = EnvBool(False)
+    # MiB of the leading local experts' gate_up weights prefetched into L2
+    # during the DeepEP dispatch wait (0 = off, default). 96 fits the Blackwell
+    # L2 next to the dispatch buffers; 48 / 128 measured worse on B300.
+    SGLANG_K3_L2_PREFETCH_W13_MB = EnvInt(0)
     # Keep only one shard-group rank's row slice of Kimi K3's replicated
     # weights, reconstructing each layer's full set with one lookahead
     # AllGather. Covers latent-MoE, TP1 shared-expert, and DP-attention
