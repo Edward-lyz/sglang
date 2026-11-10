@@ -89,6 +89,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.observability.mm_cache_trace import maybe_log_mm_cache_trace
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -1437,6 +1438,8 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+                if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                    maybe_log_mm_cache_trace(logger, req)
 
                 if is_aborted(req):
                     if self._retire_aborted_prefill_result(req):

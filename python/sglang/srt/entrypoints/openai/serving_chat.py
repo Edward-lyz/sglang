@@ -578,6 +578,27 @@ class OpenAIServingChat(OpenAIServingBase):
         self._chat_template_cache: OrderedDict[
             bytes, tuple[str, tuple[int, ...], str]
         ] = OrderedDict()
+        self._segment_tokenize_cache = None
+        if envs.SGLANG_OPT_TOKENIZE_SEGMENT_CACHE_MB.get() > 0:
+            from sglang.srt.entrypoints.openai.tokenize_cache import (
+                SegmentTokenizeCache,
+            )
+
+            # One int64 id per cached token; size the budget in tokens.
+            cache = SegmentTokenizeCache(
+                self.tokenizer_manager.tokenizer,
+                max_tokens=envs.SGLANG_OPT_TOKENIZE_SEGMENT_CACHE_MB.get()
+                * 1024
+                * 1024
+                // 8,
+            )
+            self._segment_tokenize_cache = cache if cache.enabled else None
+
+    def _encode_rendered_prompt(self, text: str) -> List[int]:
+        """Token ids of a Python-encoder prompt, through the segment cache if on."""
+        if self._segment_tokenize_cache is not None:
+            return self._segment_tokenize_cache.encode(text)
+        return self.tokenizer_manager.tokenizer.encode(text)
 
     def _handle_last_assistant_message(
         self,
@@ -1799,7 +1820,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_effort=v4_reasoning_effort,
                     reasoning_effort_profile=reasoning_effort_profile,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_rendered_prompt(real_input)
             elif is_dsv41:
                 if request.task is not None:
                     encoding_dsv41.attach_task_to_last_user_message(
@@ -1824,12 +1845,12 @@ class OpenAIServingChat(OpenAIServingBase):
                             self.tokenizer_manager.model_config.hf_config.image_token_id
                         ),
                     )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_rendered_prompt(real_input)
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_rendered_prompt(real_input)
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:

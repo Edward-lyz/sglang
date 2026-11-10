@@ -302,6 +302,10 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.chunk_tail_swa_pool import free_chunk_tail_swa_slots
+from sglang.srt.mem_cache.storage.asradix.block_hash_resume import (
+    first_rewritten_token,
+    reusable_hash_prefix,
+)
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -3148,7 +3152,24 @@ class Scheduler(
 
             from sglang.srt.mem_cache.storage.asradix.types import AS_BLOCK_SIZE
 
-            req.as_block_hashs = Tokens(req.origin_input_ids, AS_BLOCK_SIZE)
+            kept = None
+            if envs.SGLANG_OPT_AS_BLOCK_HASH_RESUME.get():
+                kept = reusable_hash_prefix(
+                    padded=req.origin_input_ids,
+                    unpadded=req.origin_input_ids_unpadded,
+                    old_hash_ids=(
+                        req.as_block_hashs.hash_ids
+                        if req.as_block_hashs is not None
+                        else None
+                    ),
+                    first_rewritten=first_rewritten_token(req.multimodal_inputs),
+                    block_size=AS_BLOCK_SIZE,
+                )
+            req.as_block_hashs = (
+                Tokens.resume(req.origin_input_ids, AS_BLOCK_SIZE, kept)
+                if kept is not None
+                else Tokens(req.origin_input_ids, AS_BLOCK_SIZE)
+            )
         except ImportError:
             logger.warning(
                 "attentionstore_sdk not available while refreshing AS block hashes "

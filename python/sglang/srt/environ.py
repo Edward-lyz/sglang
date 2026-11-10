@@ -382,6 +382,11 @@ class Envs:
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
     SGLANG_LOG_TOKEN_IDS = EnvBool(False)
+    # Budget (MB of int64 ids) of the per-tokenizer-worker segment tokenize cache;
+    # 0 disables it. Reuses the ids of a multi-turn prompt's unchanged history.
+    SGLANG_OPT_TOKENIZE_SEGMENT_CACHE_MB = EnvInt(0)
+    # One line per prefilled request: cached length and media-item hash ids.
+    SGLANG_LOG_MM_CACHE_TRACE = EnvBool(False)
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
     # ===================================================================
@@ -1581,6 +1586,12 @@ class Envs:
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
+    # Pad multimodal placeholder ids in the int64 array instead of a tensor round trip.
+    SGLANG_OPT_MM_PAD_INPUT_IDS_ARRAY = EnvBool(False)
+    # Copy each image's pinned embedding straight into the device broadcast
+    # buffer. The default concatenates them on the host first, which copies
+    # every row twice and leaves the H2D reading pageable memory.
+    SGLANG_OPT_MM_EMBED_DIRECT_H2D = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
@@ -1729,6 +1740,21 @@ class Envs:
     # copy at consume time a DMA.
     SGLANG_EPD_PINNED_POOL_GB = EnvFloat(2.0)
     SGLANG_EPD_PINNED_PAGE_SIZE_MB = EnvInt(2)
+    # Budget for polling a just-started embedding pull inside the same scheduler
+    # loop. Without it the pull is only re-checked at the next loop top, which
+    # the main loop reaches after the current forward returns, so every
+    # multimodal request waits one forward (measured 0.15-0.24s). 0 disables.
+    SGLANG_EPD_PULL_WAIT_MS = EnvFloat(0.0)
+    # Agree on multimodal receive startup once per arrival batch instead of
+    # once per request: each all_gather is main-thread GIL time that stalls
+    # the forward thread's kernel launches.
+    SGLANG_EPD_BATCH_START_SYNC = EnvBool(False)
+    # Skip the per-request zmq context when the embeddings land on the shared
+    # scheduler port, i.e. when the request creates no socket of its own.
+    SGLANG_EPD_LAZY_ZMQ_CONTEXT = EnvBool(False)
+    # Return one view over a request's embedding parts when they already sit
+    # back to back in the pinned slot, instead of copying them with torch.cat.
+    SGLANG_OPT_MM_EMBED_VIEW_CONCAT = EnvBool(False)
 
     # ===================================================================
     # Native gRPC server
@@ -2291,6 +2317,9 @@ class Envs:
     # Optional AttentionStore host scheduling and native transport features.
     # Deferred allocation preserves the all-rank publication gates.
     SGLANG_AS_DEFER_ALLOCATION_GATE = EnvBool(False)
+    # Rehash only the blocks multimodal padding rewrote, reusing the tokenizer's
+    # hashes for the unchanged head (needs an SDK with Tokens.resume).
+    SGLANG_OPT_AS_BLOCK_HASH_RESUME = EnvBool(False)
     SGLANG_HTTP_REUSE_PORT = EnvBool(False)
     SGLANG_ADMISSION_DIAG_DIR = EnvStr("")
     SGLANG_ENABLE_REQUEST_OOB_BROADCAST = EnvBool(False)
