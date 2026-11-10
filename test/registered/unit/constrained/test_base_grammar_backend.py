@@ -23,6 +23,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GRAMMAR_BACKEND_REGISTRY,
     BaseGrammarBackend,
     BaseGrammarObject,
+    GrammarRow,
     GrammarStats,
     InvalidGrammarObject,
     create_grammar_backend,
@@ -434,6 +435,230 @@ class TestLlguidanceStructuralTagTriggerPairing(unittest.TestCase):
         )
         result = backend.dispatch_structural_tag(key)
         self.assertNotIsInstance(result, InvalidGrammarObject)
+
+
+class TestGuidanceBackendExposesMaskOps(unittest.TestCase):
+    """Bug regression: reasoning models (e.g. kimi_k3, launched with
+    --reasoning-parser kimi_k3) wrap the grammar backend in
+    ReasonerGrammarBackend, whose _make_grammar_object reads
+    ``grammar_backend.allocate_vocab_mask`` / ``move_vocab_mask`` /
+    ``apply_vocab_mask`` to build the wrapper. GuidanceBackend only defined
+    these on the grammar object, not on the backend, so wrapping llguidance for
+    a reasoning model raised AttributeError before any request could be served.
+    XGrammarGrammarBackend exposes the same trio at the backend level."""
+
+    def _new_backend(self, vocab_size: int):
+        from sglang.srt.constrained.llguidance_backend import GuidanceBackend
+
+        backend = object.__new__(GuidanceBackend)
+        backend.llguidance_tokenizer = MagicMock(vocab_size=vocab_size)
+        return backend
+
+    def test_backend_exposes_the_three_ops_reasoner_reads(self):
+        backend = self._new_backend(vocab_size=64)
+        # These are exactly the attributes ReasonerGrammarBackend stores;
+        # accessing them must not raise (the pre-fix AttributeError).
+        self.assertTrue(callable(backend.allocate_vocab_mask))
+        self.assertTrue(callable(backend.move_vocab_mask))
+        self.assertTrue(callable(backend.apply_vocab_mask))
+
+    def test_allocate_vocab_mask_sizes_to_tokenizer_vocab(self):
+        backend = self._new_backend(vocab_size=100)
+        mask = backend.allocate_vocab_mask(
+            vocab_size=100, batch_size=3, device="cpu"
+        )
+        # allocate_token_bitmask packs 32 vocab ids per int32 column.
+        self.assertEqual(mask.shape[0], 3)
+        self.assertEqual(mask.shape[1], (100 + 31) // 32)
+
+
+class _RecordingGrammar(BaseGrammarObject):
+    """Records the (mask, row) values written by fill_vocab_mask."""
+
+    def __init__(self, value: int):
+        super().__init__()
+        self.value = value
+        self.filled_rows = []
+
+    def fill_vocab_mask(self, vocab_mask, idx: int) -> None:
+        self.filled_rows.append(idx)
+        vocab_mask[idx] = self.value
+
+
+class TestFillVocabMaskBatched(unittest.TestCase):
+    """fill_vocab_mask_batched is a batched restatement of the per-row loop.
+
+    Guards the contract that a regression to the batched path must preserve:
+    listed rows are filled by their own grammar, and rows omitted from the
+    entry list are left at the caller's allocated (unconstrained) value. A
+    rewrite that filled every row, or wrote the wrong row, would go red here.
+    """
+
+    def test_default_fills_listed_rows_leaves_others(self):
+        import torch
+
+        g_a, g_b = _RecordingGrammar(7), _RecordingGrammar(9)
+        vocab_mask = torch.full((3,), -1, dtype=torch.int32)
+        BaseGrammarObject.fill_vocab_mask_batched(
+            [GrammarRow(row=0, grammar=g_a), GrammarRow(row=2, grammar=g_b)],
+            vocab_mask,
+        )
+        # Row 1 was never listed, so it keeps the unconstrained -1.
+        self.assertEqual(vocab_mask.tolist(), [7, -1, 9])
+        self.assertEqual(g_a.filled_rows, [0])
+        self.assertEqual(g_b.filled_rows, [2])
+
+    def test_empty_entries_is_noop(self):
+        import torch
+
+        vocab_mask = torch.full((2,), -1, dtype=torch.int32)
+        BaseGrammarObject.fill_vocab_mask_batched([], vocab_mask)
+        self.assertEqual(vocab_mask.tolist(), [-1, -1])
+
+
+class _FakeReasonerWrapper:
+    """Minimal stand-in exercising ReasonerGrammarObject.fill_vocab_mask_batched
+    branch logic without a tokenizer/reasoning parser."""
+
+    def __init__(self, is_generation: bool, inner, think_value=None):
+        self._generation = is_generation
+        self.grammar = inner
+        self._think_value = think_value
+
+    def _is_generation(self) -> bool:
+        return self._generation
+
+    def fill_vocab_mask(self, vocab_mask, idx: int) -> None:
+        # Mirror the wrapper's thinking-phase path (token filter / no-op).
+        if self._think_value is not None:
+            vocab_mask[idx] = self._think_value
+
+
+class TestReasonerFillVocabMaskBatched(unittest.TestCase):
+    """The reasoner wrapper must route only generation-phase rows to the inner
+    grammar's batched fill; thinking-phase rows keep the per-row path so their
+    reasoning-state handling (no-op or strict token filter) is unchanged.
+
+    A regression that routed thinking-phase rows through the inner grammar
+    would silently grammar-constrain the think region for k3 -- this test goes
+    red on that.
+    """
+
+    def test_generation_rows_batched_thinking_rows_per_row(self):
+        import torch
+
+        from sglang.srt.constrained.reasoner_grammar_backend import (
+            ReasonerGrammarObject,
+        )
+
+        gen_a = _FakeReasonerWrapper(True, _RecordingGrammar(11))
+        thinking = _FakeReasonerWrapper(False, _RecordingGrammar(99), think_value=-5)
+        gen_b = _FakeReasonerWrapper(True, _RecordingGrammar(22))
+        gen_no_inner = _FakeReasonerWrapper(True, None)
+
+        vocab_mask = torch.full((4,), -1, dtype=torch.int32)
+        ReasonerGrammarObject.fill_vocab_mask_batched(
+            [
+                GrammarRow(row=0, grammar=gen_a),
+                GrammarRow(row=1, grammar=thinking),
+                GrammarRow(row=2, grammar=gen_b),
+                GrammarRow(row=3, grammar=gen_no_inner),
+            ],
+            vocab_mask,
+        )
+
+        # Generation rows filled by their inner grammar at the outer row index.
+        self.assertEqual(vocab_mask[0].item(), 11)
+        self.assertEqual(vocab_mask[2].item(), 22)
+        self.assertEqual(gen_a.grammar.filled_rows, [0])
+        self.assertEqual(gen_b.grammar.filled_rows, [2])
+        # Thinking row took the wrapper's per-row path; its inner grammar
+        # (which would over-constrain the think region) was never touched.
+        self.assertEqual(vocab_mask[1].item(), -5)
+        self.assertEqual(thinking.grammar.filled_rows, [])
+        # Generation row without an inner grammar stays unconstrained.
+        self.assertEqual(vocab_mask[3].item(), -1)
+
+
+class TestGuidanceBackendTiktokenTokenizer(unittest.TestCase):
+    """Bug regression: K3 ships a tiktoken model loaded as TiktokenTokenizer,
+    not a HF PreTrainedTokenizerFast. GuidanceBackend fed it straight to
+    llguidance's from_tokenizer (fast-only) and crashed; the tokenizer.json
+    workaround registered reserved/control slots as HF added_tokens, which
+    corrupted the token->bytes map so a K3 marker the model must emit became
+    unmatchable -- the mask went empty and the request aborted mid tool-call.
+    The fix builds the llguidance tokenizer via from_tiktoken, folding the
+    special-token strings into the byte encoder so every marker is byte-matchable
+    by a grammar literal (mirroring TiktokenTokenizer.init_xgrammar)."""
+
+    def _tiktoken_tokenizer(self):
+        import tiktoken
+
+        from sglang.srt.tokenizer.tiktoken_tokenizer import (
+            PAT_STR_B,
+            TiktokenTokenizer,
+        )
+
+        # K3 delimiter special tokens over a byte-fallback base vocab; the marker
+        # words (tools/call/argument/...) are ordinary byte-encoded text.
+        specials = {"<|open|>": 256, "<|sep|>": 257, "<|close|>": 258, "<|eos|>": 259}
+        enc = tiktoken.Encoding(
+            name="k3-synthetic",
+            pat_str=PAT_STR_B,
+            mergeable_ranks={bytes([b]): b for b in range(256)},
+            special_tokens=specials,
+        )
+        tokenizer = TiktokenTokenizer.__new__(TiktokenTokenizer)
+        tokenizer.tokenizer = enc
+        tokenizer.eos_token_id = specials["<|eos|>"]
+        tokenizer.vocab_size = enc.n_vocab
+        return tokenizer, enc, specials
+
+    def test_tiktoken_backed_k3_tool_call_grammar_accepts_wire_string(self):
+        import json
+
+        from sglang.srt.constrained.llguidance_backend import GuidanceBackend
+        from sglang.srt.entrypoints.openai.protocol import Function, Tool
+        from sglang.srt.function_call.kimik3_structural_tag import (
+            get_kimik3_structural_tag,
+        )
+
+        tokenizer, enc, specials = self._tiktoken_tokenizer()
+        # Pre-fix this raised (from_tokenizer rejects non-fast tokenizers).
+        backend = GuidanceBackend(tokenizer=tokenizer, eos_token_ids={specials["<|eos|>"]})
+
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="DeleteUser",
+                description="d",
+                parameters={
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"],
+                },
+                strict=True,
+            ),
+        )
+        tag = get_kimik3_structural_tag([tool], tool_choice="required")
+        grammar = backend.dispatch_structural_tag(json.dumps(tag.model_dump(by_alias=True)))
+        # A corrupt token->bytes map compiles but cannot match the markers;
+        # here it must yield a real grammar object.
+        self.assertNotIsInstance(grammar, InvalidGrammarObject)
+
+        wire = (
+            '<|open|>tools<|sep|>'
+            '<|open|>call tool="DeleteUser" index="1"<|sep|>'
+            '<|open|>argument key="id" type="string"<|sep|>123<|close|>argument<|sep|>'
+            '<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>'
+        )
+        # Driving every wire token must not error (the pre-fix empty-mask abort):
+        # each marker special token has to be byte-matchable by the grammar.
+        for token_id in enc.encode(wire, allowed_special=set(specials)):
+            grammar.accept_token(token_id)
+        # The full call consumed, the matcher sits at its accepting stop state.
+        self.assertTrue(grammar.ll_matcher.is_stopped())
+        self.assertFalse(grammar.ll_matcher.is_error())
 
 
 if __name__ == "__main__":

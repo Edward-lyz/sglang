@@ -339,11 +339,12 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
-        # DSV4 expert layout: env (default True = mxfp4) applies only to V4.
-        # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
-        # FP8 expert tensor layout.
+        # DSV4/Kimi K2.6 expert layout: the routed experts can be stored
+        # either as packed MXFP4 (U8/I8/F4) or converted FP8. Preserve the
+        # original DeepSeek-V4 auto-detection path, and also honor Kimi K2.6
+        # MXFP4 mode because KimiK25 wraps the DeepSeek text config.
         self.is_fp4_experts: bool = False
-        if is_deepseek_v4(self.hf_config):
+        if is_deepseek_v4(self.hf_config) or envs.SGLANG_KIMI_K26_MXFP4_MODE.get():
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
             if (
                 not envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
@@ -355,7 +356,7 @@ class ModelConfig:
                 if detected is not None:
                     self.is_fp4_experts = detected
                     logger.info(
-                        "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
+                        "Auto-detected DSV4/Kimi routed-expert layout: is_fp4_experts=%s",
                         self.is_fp4_experts,
                     )
             if envs.SGLANG_DSV4_FP4_DEQUANT.get():
@@ -743,6 +744,7 @@ class ModelConfig:
                 if (
                     envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get()
                     or is_in_ci()  # FIXME: fix this special case
+                    or is_draft_model  # spec decoding intentionally syncs draft to target
                 ):
                     logger.warning(msg)
                     self.context_len = context_length

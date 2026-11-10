@@ -157,9 +157,17 @@ class SchedulerMetricsReporter:
                 self._mfu_log_read_bytes = 0.0
                 self._mfu_log_write_bytes = 0.0
 
+            self.stats.num_max_batchs = self.scheduler.max_running_requests
+
         self.fwd_occupancy = float("nan")
 
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
+
+        # reocord iter time
+        self.iter_start_time = 0
+        self.iter_forward_start_time = 0
+        self.iter_forward_finish_time = 0
+        self.iter_finish_time = 0
 
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
@@ -852,6 +860,8 @@ class SchedulerMetricsReporter:
             self._mfu_log_read_bytes = 0.0
             self._mfu_log_write_bytes = 0.0
 
+        run_batch_msg = self._log_decode_run_batch_stats(batch)
+        msg += run_batch_msg
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
@@ -936,6 +946,83 @@ class SchedulerMetricsReporter:
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
+
+    def _log_decode_run_batch_stats(self: Scheduler, _: ScheduleBatch) -> str:
+        """Log runtime stats of running a single iteration"""
+        self.iter_finish_time = time.perf_counter()
+        generation_time = self.iter_finish_time - self.iter_start_time
+        run_batch_time = self.iter_forward_finish_time - self.iter_forward_start_time
+        iter_token_process_time = generation_time - run_batch_time
+
+        if self.enable_metrics:
+            # Run batch
+            self.stats.generation_time = generation_time
+            self.stats.run_batch_time = run_batch_time
+            self.stats.iter_token_process_time = iter_token_process_time
+
+        return f", generation_time: {generation_time * 1000:.2f} (ms), run_batch_time: {run_batch_time * 1000:.2f} (ms)"
+
+    def _log_decode_dp_balance_stats(self: Scheduler, batch: ScheduleBatch) -> str:
+        """Log DP-level load-balancing metrics for the decode stage."""
+        num_tokens_list: List[int] = []
+
+        num_total_tokens: int = 0
+        # DP all_gather latency
+        all_gather_latency_us = 0.0
+
+        if batch is None or self.dp_rank != 0:
+            return ""
+
+        assert batch.dp_global_num_tokens_for_metric is not None
+        num_tokens_list = batch.dp_global_num_tokens_for_metric
+        all_gather_latency_us = batch.all_gather_latency
+
+        if num_tokens_list:
+            total_dp = len(num_tokens_list)
+            num_total_tokens = sum(num_tokens_list)
+
+            # Compute idle ratio and utilization metrics in a unified way.
+            idle_batch_ratio = num_tokens_list.count(0) / total_dp
+            decode_bs_util: float = (
+                num_total_tokens / total_dp / self.max_running_requests
+            )
+
+            if total_dp > 1 and num_total_tokens > 0:
+                # Compute Gini coefficient and DP balance in the general case.
+                acc = 0
+                for i, val in enumerate(sorted(num_tokens_list), start=1):
+                    acc += (2 * i - total_dp - 1) * val
+                gini = acc / (total_dp * num_total_tokens)
+                # Derive DP balance score from Gini coefficient
+                dp_balance = 1.0 - gini
+            else:
+                # When there is only one DP or no tokens, use a fixed DP balance value
+                # while keeping idle_batch_ratio and decode_bs_util as computed above.
+                dp_balance = 1.0 if total_dp == 1 else 0.0
+        else:
+            total_dp = 0
+            dp_balance = 0.0
+            idle_batch_ratio = 1.0
+            decode_bs_util = 0.0
+
+        msg = (
+            f"Decode tokens_list: {num_tokens_list}, "
+            f"#total_dp: {total_dp}, "
+            f"total_tokens: {num_total_tokens}, "
+            f"#dp_balance: {dp_balance:.2f}, "
+            f"#idle_batch_ratio: {idle_batch_ratio:.2f}, "
+            f"#decode_bs_util: {decode_bs_util:.2f}, "
+        )
+
+        if self.enable_metrics:
+            self.stats.dp_balance = dp_balance
+            self.stats.idle_batch_ratio = idle_batch_ratio
+            self.stats.decode_bs_util = decode_bs_util
+
+            # DP all_gather latency
+            self.stats.all_gather_latency_us = all_gather_latency_us
+
+        return msg
 
     def log_batch_result_stats(
         self,

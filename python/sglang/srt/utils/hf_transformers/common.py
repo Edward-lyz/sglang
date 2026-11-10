@@ -208,6 +208,7 @@ def download_from_hf(
     model_path: str,
     allow_patterns: Optional[Union[str, list]] = None,
 ):
+    """Download model files from HuggingFace Hub, or return local path if it exists."""
     if os.path.exists(model_path):
         return model_path
 
@@ -263,6 +264,7 @@ def _remote_file_exists(repo_id, filename, revision=None) -> bool:
 
 
 def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
+    """Check if the given file is a GGUF model by extension or magic header."""
     model = Path(model)
     if not model.is_file():
         return False
@@ -481,6 +483,7 @@ def get_generation_config(
     revision: Optional[str] = None,
     **kwargs,
 ):
+    """Load GenerationConfig from pretrained model, returning None on failure."""
     try:
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
@@ -502,6 +505,7 @@ def get_sparse_attention_config(
     model: str,
     sparse_attention_config_filename: str = "sparse_attention_config.json",
 ) -> Dict[str, Any]:
+    """Load sparse attention config JSON for models like Qwen-1M."""
     is_local = os.path.isdir(model)
     if not is_local:
         model = download_from_hf(model, allow_patterns=["*.json"])
@@ -522,6 +526,7 @@ def get_sparse_attention_config(
 
 # Some models don't have an available processor, e.g.: InternVL
 def get_tokenizer_from_processor(processor):
+    """Extract the tokenizer from a processor object."""
     from transformers import PreTrainedTokenizerBase
 
     if isinstance(processor, PreTrainedTokenizerBase):
@@ -536,6 +541,7 @@ _ADDITIONAL_STOP_TOKEN_TEXTS = ("<|eom_id|>", "<|content_model_end_sampling|>")
 
 
 def attach_additional_stop_token_ids(tokenizer):
+    """Attach additional stop token IDs (e.g. eom_id) to the tokenizer."""
     added = tokenizer.get_added_vocab()
     stop_ids = {added[text] for text in _ADDITIONAL_STOP_TOKEN_TEXTS if text in added}
     tokenizer.additional_stop_token_ids = stop_ids or None

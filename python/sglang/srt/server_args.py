@@ -1068,15 +1068,6 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
-    dwdp_size: A[
-        int,
-        Arg(
-            help="DWDP (Distributed Weight Data Parallelism) group size. "
-            "When > 1, MoE prefill uses weight prefetch instead of token all-to-all. "
-            "Must equal tp_size. Only supported with --disaggregation-mode null or prefill.",
-        ),
-        NS("parallel"),
-    ] = 1
     dcp_comm_backend: A[
         str,
         Arg(
@@ -1104,6 +1095,15 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = None
+    dwdp_size: A[
+        int,
+        Arg(
+            help="DWDP (Distributed Weight Data Parallelism) group size. "
+            "When > 1, MoE prefill uses weight prefetch instead of token all-to-all. "
+            "Must equal tp_size. Only supported with --disaggregation-mode null or prefill.",
+        ),
+        NS("parallel"),
+    ] = 1
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -3097,12 +3097,6 @@ class ServerArgs:
         bool,
         "Enable task results pull mode for EPD.",
     ] = False
-    require_encoder_task_results: A[
-        bool,
-        "Reject multimodal requests that carry no encoder task_results instead "
-        "of encoding them locally. Set this on the EPD decode server.",
-        NS("disagg"),
-    ] = False
     enable_mooncake_in_zmq_mode: A[
         bool,
         "Enable mooncake transfer in zmq mode for EPD.",
@@ -3732,6 +3726,19 @@ class ServerArgs:
         """Resolve model/tokenizer paths backed by remote object stores."""
         if is_runai_obj_uri(self.model_path):
             ObjectStorageModel.download_and_get_path(self.model_path)
+        # Check msit trace setting
+        self._handle_msit_trace_settting()
+
+    def _handle_msit_trace_settting(self):
+        if envs.AIAK_ENABLE_TRACE.get():
+            if self.speculative_algorithm is not None:
+                raise RuntimeError(
+                    "AIAK_ENABLE_TRACE is not enabled with speculative decoding."
+                )
+            if not self.disable_cuda_graph:
+                raise RuntimeError(
+                    "AIAK_ENABLE_TRACE is not enabled with CUDA graph."
+                )
 
     def _handle_pd_disaggregation(self):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -3771,62 +3778,6 @@ class ServerArgs:
                     "communication backend (it removes the head-dim Q all-gather); "
                     f"got --dcp-comm-backend={self.dcp_comm_backend}."
                 )
-        if not self.dcp_size > 1:
-            return
-        if is_hip():
-            return
-        elif is_cuda():
-            if self.speculative_algorithm is not None:
-                model_arches = self.get_model_config().hf_config.architectures
-                decode_backend = self.decode_attention_backend or self.attention_backend
-                # Kimi Linear has no model-specific override pass, so the decode
-                # path (mode=decode + tokenspeed_mla/cutedsl_mla) must already be
-                # set explicitly and is validated directly here.
-                kimi_linear_dspark = (
-                    self.speculative_algorithm == "DSPARK"
-                    and "KimiLinearForCausalLM" in model_arches
-                    and self.speculative_attention_mode == "decode"
-                    and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
-                )
-                # Kimi-K3's override pass (_kimi_k3_overrides) runs after this
-                # validation (materialized at the end of __post_init__) and
-                # force-resolves speculative_attention_mode=decode plus a
-                # tokenspeed_mla/cutedsl_mla decode backend. The mode/backend
-                # fields are therefore not yet resolved here, so gate on
-                # arch + DSPARK only and let the override enforce the rest.
-                kimi_k3_dspark = (
-                    self.speculative_algorithm == "DSPARK"
-                    and "KimiK3ForConditionalGeneration" in model_arches
-                )
-                if kimi_linear_dspark or kimi_k3_dspark:
-                    ragged_verify_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
-                    if ragged_verify_mode != "static":
-                        raise ValueError(
-                            "Kimi Linear / Kimi-K3 DCP + DSPARK currently "
-                            "requires SGLANG_RAGGED_VERIFY_MODE=static, but got "
-                            f"{ragged_verify_mode!r}."
-                        )
-                else:
-                    raise ValueError(
-                        "Decode context parallel (--dcp-size / "
-                        "--decode-context-parallel-size > 1) with speculative "
-                        "decoding on CUDA is supported only for Kimi Linear "
-                        "(with DSPARK + --speculative-attention-mode decode + "
-                        "tokenspeed_mla, or experimental cutedsl_mla) or "
-                        "Kimi-K3 (with DSPARK), but got "
-                        f"architectures={model_arches}, "
-                        f"speculative_algorithm={self.speculative_algorithm!r}, "
-                        "speculative_attention_mode="
-                        f"{self.speculative_attention_mode!r}, "
-                        f"decode_attention_backend={decode_backend!r}."
-                    )
-        else:
-            raise ValueError(
-                "Decode context parallel (--dcp-size / "
-                "--decode-context-parallel-size > 1) is currently only "
-                f"supported on the AMD HIP platform, but got dcp_size="
-                f"{self.dcp_size} on a non-HIP platform."
-            )
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -6138,15 +6089,10 @@ class ServerArgs:
                         f"verify={verify!r}. Use SGLANG_RAGGED_VERIFY_MODE=static."
                     )
             if self.disaggregation_mode == "prefill":
-                if _algo != "DSPARK":
-                    raise ValueError(
-                        "--enable-linear-replayssm-spec is not supported on a PD "
-                        "prefill server: the ring is spec-verify-only scratch and "
-                        "the prefill server never runs spec verify."
-                    )
-                logger.warning(
-                    "--enable-linear-replayssm-spec is ignored on a DSPARK PD "
-                    "prefill server; spec verify runs on the decode server."
+                raise ValueError(
+                    "--enable-linear-replayssm-spec is not supported on a PD "
+                    "prefill server: the ring is spec-verify-only scratch and "
+                    "the prefill server never runs spec verify."
                 )
             if self.linear_replayssm_cache_len < 1:
                 raise ValueError(
@@ -7366,17 +7312,6 @@ class ServerArgs:
                 f"Model type {model_arch} is not supported for encoder disaggregation. "
                 f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
             )
-
-    def epd_requires_task_results(self) -> bool:
-        """Whether media can only be served through encoder ``task_results``.
-
-        The EPD prefill server derives it from its own flags. The EPD decode
-        server is indistinguishable from a plain PD decode server, which may
-        legitimately expand media placeholders locally, so it must opt in.
-        """
-        return self.require_encoder_task_results or (
-            self.language_only and self.encoder_transfer_backend == "zmq_to_scheduler"
-        )
 
     def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
         """
@@ -8657,13 +8592,8 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            pp_dspark_pd = (
-                (self.speculative_algorithm or "").upper() == "DSPARK"
-                and self.disaggregation_mode in ("prefill", "decode")
-            )
             assert (
-                self.disable_overlap_schedule
-                and (self.speculative_algorithm is None or pp_dspark_pd)
+                self.disable_overlap_schedule and self.speculative_algorithm is None
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
 
         assert not (

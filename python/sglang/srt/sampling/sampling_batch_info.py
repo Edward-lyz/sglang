@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
+from sglang.srt.constrained.base_grammar_backend import GrammarRow
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
@@ -252,10 +253,15 @@ class SamplingBatchInfo:
             first_grammar.apply_vocab_mask
         )  # force to use static method
 
-        # Apply the mask
-        for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(self.vocab_mask, i)
+        # Fill listed rows in one batched call; rows omitted here (finished /
+        # terminated / non-grammar requests) retain the allocated mask's
+        # unconstrained value.
+        entries = [
+            GrammarRow(row=i, grammar=grammar)
+            for i, grammar in enumerate(self.grammars)
+            if grammar and not grammar.finished and not grammar.is_terminated()
+        ]
+        first_grammar.fill_vocab_mask_batched(entries, self.vocab_mask)
 
         # Move the mask to the device if needed
         self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)

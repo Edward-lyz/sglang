@@ -37,7 +37,10 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool as assign_req_to_token_pool,
@@ -531,16 +534,24 @@ def generate_token_bitmask(
                 )
             grammar = req.grammar
             s = time.perf_counter()
-            traverse_tree(
-                retrieve_next_token_cpu[i],
-                retrieve_next_sibling_cpu[i],
-                draft_tokens_cpu[i],
-                req.grammar,
-                allocate_token_bitmask[
-                    i * num_draft_tokens : (i + 1) * num_draft_tokens
-                ],
-                vocab_size=vocab_size,
-            )
+            try:
+                traverse_tree(
+                    retrieve_next_token_cpu[i],
+                    retrieve_next_sibling_cpu[i],
+                    draft_tokens_cpu[i],
+                    req.grammar,
+                    allocate_token_bitmask[
+                        i * num_draft_tokens : (i + 1) * num_draft_tokens
+                    ],
+                    vocab_size=vocab_size,
+                )
+            except ValueError as e:
+                # A grammar error is this request's failure, not the batch's:
+                # abort it rather than let the error kill the scheduler.
+                logger.error(
+                    f"Grammar tree traversal failed for req {req.rid}, aborting: {e}"
+                )
+                req.to_finish = FINISH_ABORT(f"Grammar error: {e}")
             tree_traverse_time = time.perf_counter() - s
             if tree_traverse_time > TREE_TRAVERSE_TIME_THRESHOLD:
                 logger.warning(

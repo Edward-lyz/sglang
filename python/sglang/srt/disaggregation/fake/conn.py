@@ -46,17 +46,18 @@ class FakeKVSender(BaseKVSender):
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
         self.kv_mgr = mgr
-        self.has_sent = False
+        self.inited = False
+        self.num_pages = 0
+        self.curr_idx = 0
         self.conclude_state: Optional[KVPoll] = None
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
-        if not self.has_sent:
-            # Assume handshake completed instantly
+        # Conclude only when all chunks land (curr_idx >= num_pages) to prevent premature KV leaks.
+        if not self.inited or self.curr_idx < self.num_pages:
             return KVPoll.WaitingForInput
 
-        # Assume transfer completed instantly
         logger.debug("FakeKVSender poll success")
         self.conclude_state = KVPoll.Success
         return KVPoll.Success
@@ -66,20 +67,21 @@ class FakeKVSender(BaseKVSender):
 
     def init(
         self,
-        kv_indices: list[int],
+        num_pages: int,
         aux_index: Optional[int] = None,
     ):
+        self.inited = True
+        self.num_pages = num_pages
         logger.debug(
-            f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}"
+            f"FakeKVSender init with num_pages: {num_pages}, aux_index: {aux_index}"
         )
-        pass
 
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
     ):
-        self.has_sent = True
+        self.curr_idx += len(kv_indices)
         logger.debug(
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
         )

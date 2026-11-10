@@ -25,6 +25,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from .base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
+    GrammarRow,
     InvalidGrammarObject,
 )
 
@@ -78,7 +79,6 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def maybe_init_reasoning(self, reasoning: bool):
         if reasoning:
             self.tokens_in_think = 0
-            self.tokens_after_end = -1
         else:
             self.tokens_in_think = -1
             self.tokens_after_end = 0
@@ -109,14 +109,6 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 self.tokens_after_end -= 1
 
     def accept_token(self, token: int):
-        # Track the last accepted token on the wrapper itself (mirroring
-        # XGrammarGrammar.accept_token). Disaggregation's process_prebuilt uses
-        # `grammar.current_token is None` to detect a retracted request whose
-        # token was already accepted and must not be re-accepted. Without this,
-        # a ReasonerGrammarObject's current_token stays None forever (the inner
-        # grammar's is updated, not the wrapper's), so the guard never fires and
-        # the token is accepted twice -> "Tokens not accepted" -> FINISH_ABORT.
-        self.current_token = token
         if self._is_generation() and self.grammar is not None:
             self.grammar.accept_token(token)
         self.transfer_state(token)
@@ -156,6 +148,27 @@ class ReasonerGrammarObject(BaseGrammarObject):
             return
         if self._is_generation() and self.grammar is not None:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
+
+    @staticmethod
+    def fill_vocab_mask_batched(
+        entries: List[GrammarRow], vocab_mask: torch.Tensor
+    ) -> None:
+        """Batch the generation-phase rows through the inner grammar's native
+        fill; thinking-phase / token-filter / grammar-less rows keep the
+        per-row path so their reasoning-state handling is unchanged."""
+        native_entries: List[GrammarRow] = []
+        for entry in entries:
+            wrapper = entry.grammar
+            if wrapper._is_generation() and wrapper.grammar is not None:
+                native_entries.append(
+                    GrammarRow(row=entry.row, grammar=wrapper.grammar)
+                )
+            else:
+                wrapper.fill_vocab_mask(vocab_mask, entry.row)
+        if native_entries:
+            native_entries[0].grammar.fill_vocab_mask_batched(
+                native_entries, vocab_mask
+            )
 
     def allocate_vocab_mask(self, vocab_size, batch_size, device):
         if self.grammar is not None:

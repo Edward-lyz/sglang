@@ -160,6 +160,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        """Run the fused KDA kernel in speculative-decode target-verify mode."""
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
         # mirroring the GDN triton verify path. Reads the committed state, writes
         # per-draft-token intermediate states to the scratch buffer, does NOT mutate

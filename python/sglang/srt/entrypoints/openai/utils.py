@@ -1,6 +1,8 @@
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+import jsonschema_rs
+from jsonschema import Draft202012Validator, SchemaError
 import torch
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -124,6 +126,26 @@ def cached_tokens_details_from_dict(
         )
 
 
+def validate_json_schema(schema: dict) -> Optional[str]:
+    """Validate a JSON schema, falling back to jsonschema_rs for PCRE regex support.
+
+    Returns an error message string if validation fails, or None if the schema is valid.
+    """
+    try:
+        Draft202012Validator.check_schema(schema)
+
+        return None
+    except SchemaError as e:
+        error = str(e)
+
+    try:
+        jsonschema_rs.meta.validate(schema)
+
+        return None
+    except jsonschema_rs.ValidationError as e:
+        error = str(e)
+
+    return error
 def process_cached_tokens_details_from_ret(
     ret_item: Dict[str, Any],
     request: Union[

@@ -471,7 +471,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages=messages,
             stream=request.stream,
             tools=chat_tools or None,
-            tool_choice=request.tool_choice if chat_tools else "none",
+            # Without tools, leave tool_choice unset so the protocol default
+            # ("none") applies without marking it client-explicit.
+            tool_choice=request.tool_choice if chat_tools else None,
             parallel_tool_calls=(
                 request.parallel_tool_calls
                 if request.parallel_tool_calls is not None
@@ -807,6 +809,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         for tool in request.tools:
             if tool.type != "function":
                 continue
+            # Forward ``strict`` only when the caller set it: an explicit value
+            # opts the tool out of SGLANG_TOOL_STRICT_LEVEL promotion
+            # (see promote_tools_to_strict), an omitted one must not.
+            strict = (
+                {"strict": tool.strict} if "strict" in tool.model_fields_set else {}
+            )
             chat_tools.append(
                 Tool(
                     type="function",
@@ -814,7 +822,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         name=tool.name,
                         description=tool.description,
                         parameters=tool.parameters,
-                        strict=tool.strict,
+                        **strict,
                     ),
                 )
             )

@@ -239,6 +239,21 @@ class Eagle3MLAModel(nn.Module):
         else:
             self.fc_norm = None
 
+        # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy
+        # `use_aux_norm` flag. Matches the eagle3.1 layout.
+        use_fc_norm = getattr(config, "fc_norm", None) or getattr(
+            config, "use_aux_norm", False
+        )
+        if use_fc_norm:
+            self.fc_norm = nn.ModuleList(
+                [
+                    RMSNorm(target_hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(self.num_aux_hidden_states)
+                ]
+            )
+        else:
+            self.fc_norm = None
+
         if config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
         self.midlayer = Eagle3MLADecoderLayer(

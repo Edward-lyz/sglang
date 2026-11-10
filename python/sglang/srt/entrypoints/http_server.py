@@ -21,7 +21,9 @@ import asyncio
 import dataclasses
 import logging
 import os
+import re
 import ssl
+import subprocess
 import tempfile
 import threading
 import time
@@ -42,6 +44,7 @@ from typing import (
 
 import aiohttp
 import numpy as np
+import orjson
 import requests
 import uvicorn
 import uvloop
@@ -60,6 +63,7 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -108,6 +112,15 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
+from sglang.srt.entrypoints.warmup_sweep import (
+    claim_sweep_election,
+    mark_sweep_done,
+    reset_sweep_election,
+    resolve_sweep_lens,
+    run_prefill_sweep,
+    sweep_is_enabled,
+    wait_for_sweep_done,
+)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -153,7 +166,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
-from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.observability.func_timer import enable_func_timer, time_func_latency
 from sglang.srt.observability.trace import (
     process_tracing_init,
     set_global_trace_level,
@@ -165,6 +178,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
+    configure_logger,
     delete_directory,
     get_bool_env_var,
     is_mps,
@@ -172,6 +186,7 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.common import node_pp_rank_range
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -233,6 +248,13 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
+
+    # Configure logger to align with other sglang subprocess entry points;
+    # uvicorn spawns this worker via multiprocessing.get_context("spawn"),
+    # so without this call the worker inherits whatever misconfiguration
+    # the parent left on the root logger after re-import.
+    configure_logger(server_args, f" Tokenizer {os.getpid()}")
+
     logger.info(
         f"Start multi-tokenizer worker process {os.getpid()}, "
         f"ipc_name={port_args.tokenizer_ipc_name}"
@@ -317,7 +339,9 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        _global_state.tokenizer_manager,
+        fast_api_app.state.openai_serving_chat,
+        fast_api_app.state.openai_serving_completion,
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
@@ -426,10 +450,35 @@ async def lifespan(fast_api_app: FastAPI):
 
 
 # Fast API
+class ORJSONRequest(Request):
+    """Request whose ``json()`` uses orjson.
+
+    Large multimodal chat bodies (data-URL images are tens of MB) otherwise
+    pay stdlib ``json.loads`` inside FastAPI's dependency resolution; orjson
+    parses the same bytes several times faster with identical semantics.
+    """
+
+    async def json(self) -> Any:
+        if not hasattr(self, "_json"):
+            self._json = orjson.loads(await self.body())
+        return self._json
+
+
+class ORJSONRoute(APIRoute):
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def custom_handler(request: Request):
+            return await original_handler(ORJSONRequest(request.scope, request.receive))
+
+        return custom_handler
+
+
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
+app.router.route_class = ORJSONRoute
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -613,7 +662,27 @@ async def validate_json_request(raw_request: Request):
 ##### Native API endpoints #####
 
 
+def stopped_by_external():
+    """
+    Check if the stop signal is triggered by reading a signal file.
+    """
+    signal_path = os.environ.get("AIAK_STOP_SIGNAL_DIR", "/run/sglang/stop")
+    if not signal_path:
+        return False
+
+    try:
+        if os.path.exists(signal_path):
+            with open(signal_path, "r") as file:
+                return file.read().strip().lower() == "stop"
+    except Exception as e:
+        logger.info(f"Error reading stop signal file: {e}")
+
+    return False
+
+
+@app.get("/ready")
 @app.get("/health")
+@app.get("/health_forward")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """
@@ -622,6 +691,9 @@ async def health_generate(request: Request) -> Response:
     If the server is running something, this request will be ignored, so it creates zero overhead.
     If the server is not running anything, this request will be run, so we know whether the server is healthy.
     """
+    if request.url.path.rstrip("/") == "/ready" and stopped_by_external():
+        logger.warn("Server is shutting down")
+        return Response(content="Server is shutting down", status_code=507)
 
     if _global_state.tokenizer_manager.gracefully_exit:
         logger.info("Health check request received during shutdown. Returning 503.")
@@ -654,6 +726,7 @@ async def health_generate(request: Request) -> Response:
         ):
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
+            gri.skip_radix_cache_insert = True
     else:
         gri = EmbeddingReqInput(
             rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
@@ -688,6 +761,50 @@ async def health_generate(request: Request) -> Response:
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
+
+
+@app.get("/get_instance_info")
+async def get_instance_info():
+    "Get the instance information."
+    chunked_prefill_enabled = (
+        _global_state.tokenizer_manager.server_args.chunked_prefill_size != -1
+    )
+    current_input_tokens = 0
+    for state in _global_state.tokenizer_manager.rid_to_state.values():
+        if hasattr(state, "obj") and hasattr(state.obj, "input_ids"):
+            if isinstance(state.obj.input_ids, list):
+                current_input_tokens += len(state.obj.input_ids)
+
+    max_running_requests = None
+    if _global_state.tokenizer_manager.server_args.max_running_requests:
+        max_running_requests = (
+            _global_state.tokenizer_manager.server_args.max_running_requests
+            * _global_state.tokenizer_manager.server_args.dp_size
+        )
+
+    dp_size = _global_state.tokenizer_manager.server_args.dp_size
+    nnodes = _global_state.tokenizer_manager.server_args.nnodes
+    node_rank = _global_state.tokenizer_manager.server_args.node_rank
+    dp_per_node = dp_size // nnodes
+    start = node_rank * dp_per_node
+    pp_size = _global_state.tokenizer_manager.server_args.pp_size
+    pp_rank_range = node_pp_rank_range(pp_size, nnodes, node_rank)
+
+    return {
+        "kv_role": _global_state.tokenizer_manager.server_args.disaggregation_mode,
+        "node_rank": node_rank,
+        "dp_ranks": list(range(start, start + dp_per_node)),
+        "pp_ranks": list(pp_rank_range),
+        "dp_size": dp_size,
+        "tp_size": _global_state.tokenizer_manager.server_args.tp_size,
+        "pp_size": pp_size,
+        "nnodes": nnodes,
+        "chunked_prefill_enabled": chunked_prefill_enabled,
+        "chunked_prefill_size": _global_state.tokenizer_manager.server_args.chunked_prefill_size,
+        "active_request_count": len(_global_state.tokenizer_manager.rid_to_state),
+        "max_running_requests": max_running_requests,
+        "current_input_tokens": current_input_tokens,
+    }
 
 
 @app.get("/get_model_info")
@@ -836,12 +953,34 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
+        generator = _global_state.tokenizer_manager.generate_request(obj, request)
+
+        # Kick-start the generator before the StreamingResponse is returned:
+        # afterwards HTTP 200 is committed and failures can only be reported
+        # in-band. Pre-generation failures (validation errors, scheduler
+        # aborts) must surface as a real HTTP status, same as the non-stream
+        # branch below.
+        first_out = None
+        try:
+            first_out = await generator.__anext__()
+            _raise_stream_abort(first_out)
+        except StopAsyncIteration:
+            pass
+        except ValueError as e:
+            # A client disconnect also surfaces here. It's a client-side
+            # cancellation, not a server error or bad input -- log it and
+            # return an empty stream instead of a 400.
+            if request is not None and await request.is_disconnected():
+                logger.info(f"[http_server] Client disconnected: {e}")
+            else:
+                logger.error(f"[http_server] Error: {e}")
+                return _create_error_response(e)
 
         async def stream_results() -> AsyncIterator[bytes]:
+            if first_out is not None:
+                yield b"data: " + dumps_json(first_out) + b"\n\n"
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+                async for out in generator:
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
@@ -1003,6 +1142,138 @@ async def clear_hicache_storage_backend():
     return Response(
         content="Hierarchical cache storage backend cleared.\n",
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
+#   curl -X POST http://127.0.0.1:30000/clear_all_cache
+# Clears both the device KV cache (RadixCache + KV pool) and the host-side
+# AIBrix/BZZ KV cache service co-located on the same pod.
+# The host-side service port defaults to 8080 and can be overridden via the
+# AIAK_HOST_CACHE_PORT environment variable.
+@app.api_route("/clear_all_cache", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def clear_all_cache():
+    """Clear both device KV cache and host (AIBrix/BZZ) KV cache."""
+    lines = []
+    all_ok = True
+
+    logger.info("[/clear_all_cache] received request, starting cache clear")
+
+    # 1. Device cache: scheduler-side does 5 rounds / 100ms spacing.
+    logger.info("[/clear_all_cache] step 1/2: clearing device cache ...")
+    try:
+        device_ret = await _global_state.tokenizer_manager.flush_cache(
+            evict_evictable=True
+        )
+        device_ok = bool(device_ret.success)
+    except Exception as e:
+        device_ok = False
+        lines.append(f"[device] exception: {e}")
+        logger.exception("[/clear_all_cache] device cache clear raised")
+    if device_ok:
+        lines.append("[device] evicted evictable blocks (5 rounds)")
+        logger.info("[/clear_all_cache] device cache evict done")
+    else:
+        lines.append("[device] evict failed; see backend logs")
+        logger.warning("[/clear_all_cache] device cache evict failed")
+        all_ok = False
+
+    # 2. Host cache: call co-located AIBrix/BZZ via HTTP.
+    # All synchronous I/O is offloaded via asyncio.to_thread so the
+    # FastAPI event loop stays responsive.
+    logger.info("[/clear_all_cache] step 2/2: clearing host cache ...")
+    host_port = os.environ.get("AIAK_HOST_CACHE_PORT", "8080")
+    host_ip = None
+    try:
+        raw = await asyncio.to_thread(
+            subprocess.check_output, ["hostname", "-i"], timeout=5
+        )
+        host_ip = raw.decode().strip().split()[0]
+    except Exception as e:
+        lines.append(f"[host] hostname -i failed: {e}")
+        logger.exception("[/clear_all_cache] hostname -i failed")
+        all_ok = False
+
+    if host_ip:
+        base = f"http://{host_ip}:{host_port}"
+        logger.info(f"[/clear_all_cache] host cache service base={base}")
+
+        # AIBrix /debug/GetIndexSize returns plain text lines like:
+        #   "ns: <namespace> idx size <N>"
+        # (note: the endpoint 301-redirects to a trailing-slash URL; requests
+        #  follows redirects by default, but we request the canonical URL to
+        #  avoid the extra round-trip.)
+        _SIZE_LINE = re.compile(r"ns:\s*(\S+)\s+idx\s+size\s+(\d+)")
+
+        def _parse_index_size(text: str) -> dict:
+            return {
+                m.group(1): int(m.group(2)) for m in _SIZE_LINE.finditer(text or "")
+            }
+
+        # BEFORE sizes.
+        sizes_before = {}
+        try:
+            resp = await asyncio.to_thread(
+                requests.get, f"{base}/debug/GetIndexSize/", timeout=10
+            )
+            resp.raise_for_status()
+            sizes_before = _parse_index_size(resp.text)
+        except Exception as e:
+            lines.append(f"[host] GetIndexSize (before) failed: {e}")
+            logger.exception("[/clear_all_cache] GetIndexSize before failed")
+            all_ok = False
+
+        namespaces = list(sizes_before.keys())
+        lines.append(f"[host] before: {sizes_before}")
+        logger.info(f"[/clear_all_cache] host cache sizes BEFORE evict: {sizes_before}")
+        if not namespaces:
+            lines.append("[host] no namespace found, skip evictBlocks")
+
+        for ns in namespaces:
+            try:
+                r = await asyncio.to_thread(
+                    requests.get,
+                    f"{base}/op/evictBlocks",
+                    params={
+                        "namespace": ns,
+                        "clearCacheWithExpireAt": "true",
+                    },
+                    timeout=30,
+                )
+                if r.status_code == 200:
+                    lines.append(f"[host] evicted namespace={ns}")
+                else:
+                    lines.append(
+                        f"[host] evictBlocks namespace={ns} "
+                        f"status={r.status_code} body={r.text[:200]}"
+                    )
+                    all_ok = False
+            except Exception as e:
+                lines.append(f"[host] evictBlocks namespace={ns} error: {e}")
+                all_ok = False
+
+        # AFTER sizes.
+        if namespaces:
+            try:
+                resp = await asyncio.to_thread(
+                    requests.get, f"{base}/debug/GetIndexSize/", timeout=10
+                )
+                resp.raise_for_status()
+                sizes_after = _parse_index_size(resp.text)
+                lines.append(f"[host] after:  {sizes_after}")
+                logger.info(
+                    f"[/clear_all_cache] host cache sizes AFTER  evict: "
+                    f"{sizes_after}"
+                )
+            except Exception as e:
+                lines.append(f"[host] GetIndexSize (after) failed: {e}")
+                all_ok = False
+
+    logger.info(f"[/clear_all_cache] done, overall_success={all_ok}")
+    return Response(
+        content="\n".join(lines) + "\n",
+        status_code=200 if all_ok else HTTPStatus.MULTI_STATUS,
     )
 
 
@@ -1650,20 +1921,26 @@ async def continue_generation(
 
 
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
+@time_func_latency
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
+    # Timestamp when the HTTP request is received and handed off to the tokenizer
+    tokenizer_rev_request_time = time.time()
     return await raw_request.app.state.openai_serving_completion.handle_request(
-        request, raw_request
+        request, raw_request, tokenizer_rev_request_time
     )
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
+@time_func_latency
 async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    # Timestamp when the HTTP request is received and handed off to the tokenizer
+    tokenizer_rev_request_time = time.time()
     return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+        request, raw_request, tokenizer_rev_request_time
     )
 
 
@@ -1688,6 +1965,34 @@ async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
     """OpenAI-compatible classification endpoint."""
     return await raw_request.app.state.openai_serving_classify.handle_request(
         request, raw_request
+    )
+
+
+@app.post(
+    "/v1/chat/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_chat_tokenize(request: ChatCompletionRequest, raw_request: Request):
+    """Return the prompt token IDs used by the matching chat request."""
+    return await raw_request.app.state.openai_serving_tokenize.handle_chat_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/completions/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_completions_tokenize(
+    request: CompletionRequest, raw_request: Request
+):
+    """Return the prompt token IDs used by the matching completion request."""
+    return (
+        await raw_request.app.state.openai_serving_tokenize.handle_completions_request(
+            request, raw_request
+        )
     )
 
 
@@ -2010,6 +2315,27 @@ def _create_error_response(e):
     )
 
 
+def _raise_stream_abort(out: dict) -> None:
+    """Raise if `out` is a scheduler abort carrying an explicit HTTP status code.
+
+    TokenizerManager._handle_abort_finish_reason only raises for non-stream
+    requests; streaming aborts are yielded as ordinary outputs. Callers that
+    have not committed HTTP 200 yet use this to get the same exception -- and
+    therefore the same HTTP status -- as the non-stream path.
+    """
+    finish_reason = out["meta_info"].get("finish_reason")
+    if not isinstance(finish_reason, dict) or finish_reason.get("type") != "abort":
+        return
+    status_code = finish_reason.get("status_code")
+    if not isinstance(status_code, HTTPStatus):
+        return
+
+    message = finish_reason.get("message", "Generation aborted.")
+    if status_code == HTTPStatus.BAD_REQUEST:
+        raise ValueError(message)
+    raise HTTPException(status_code=int(status_code), detail=message)
+
+
 # FIXME: In theory we should configure ADMIN_FORCE for some entrypoints, but doing so
 # would currently cause all endpoints to go through add_api_key_middleware
 # (even when neither api-key nor admin-api-key is configured).
@@ -2166,6 +2492,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
         },
+        "is_warmup": True,
     }
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
@@ -2202,6 +2529,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             "max_tokens": max_new_tokens,
             "stream": False,
             "temperature": 0.0,
+            "is_warmup": True,
         }
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
@@ -2229,6 +2557,16 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            # Sweep the real prefill shapes before announcing readiness, so a
+            # load balancer watching /health does not send the first client
+            # request into the JIT/autotune window.
+            _maybe_run_prefill_sweep(
+                server_args=server_args,
+                url=url,
+                headers=headers,
+                ssl_verify=ssl_verify,
+                model_info=model_info,
+            )
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
@@ -2249,6 +2587,13 @@ def _execute_server_warmup(server_args: ServerArgs):
                     server_args.dp_size,
                 )
                 logger.info("End of disaggregation warmup")
+                _maybe_run_prefill_sweep(
+                    server_args=server_args,
+                    url=url,
+                    headers=headers,
+                    ssl_verify=ssl_verify,
+                    model_info=model_info,
+                )
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
@@ -2265,6 +2610,67 @@ def _execute_server_warmup(server_args: ServerArgs):
         return False
 
     return success
+
+
+def _maybe_run_prefill_sweep(
+    *,
+    server_args: ServerArgs,
+    url: str,
+    headers: Dict[str, str],
+    ssl_verify: Union[bool, str],
+    model_info: dict,
+) -> None:
+    """Extend the startup warmup with a sweep over realistic prefill lengths.
+
+    The minimal warmup above only proves liveness; the first real requests still
+    pay DeepGEMM JIT, attention-plan and MoE-buffer setup for their own shapes.
+    Opt in with SGLANG_WARMUP_PREFILL_LENS (see warmup_sweep.py).
+    """
+
+    if not model_info["is_generation"] or not sweep_is_enabled():
+        return
+
+    lens = resolve_sweep_lens(
+        chunked_prefill_size=server_args.chunked_prefill_size,
+        max_prefill_tokens=server_args.max_prefill_tokens,
+        page_size=server_args.page_size,
+        max_req_input_len=_global_state.tokenizer_manager.max_req_input_len,
+    )
+    if not lens:
+        return
+
+    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    timeout = warmup_timeout if warmup_timeout > 0 else 1800
+
+    # One sweep per server, even though every HTTP worker runs a warmup thread.
+    election_key = _sweep_election_key(server_args)
+    if election_key is not None and not claim_sweep_election(election_key):
+        wait_for_sweep_done(election_key, timeout=timeout)
+        return
+
+    try:
+        run_prefill_sweep(
+            url=url,
+            headers=headers,
+            ssl_verify=ssl_verify,
+            timeout=timeout,
+            dp_size=server_args.dp_size,
+            disaggregation_mode=server_args.disaggregation_mode,
+            lens=lens,
+            batch_size=max(envs.SGLANG_WARMUP_BATCH_SIZE.get(), 1),
+            vocab_size=_global_state.tokenizer_manager.model_config.vocab_size,
+        )
+    finally:
+        if election_key is not None:
+            mark_sweep_done(election_key)
+
+
+def _sweep_election_key(server_args: ServerArgs) -> Optional[str]:
+    """Key shared by every HTTP worker of this server, or None when alone."""
+
+    if server_args.tokenizer_worker_num == 1:
+        return None
+    return f"{get_main_process_id()}_{server_args.port}"
 
 
 def _wait_and_warmup(
@@ -2465,6 +2871,9 @@ def _setup_and_run_http_server(
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
             port_args, server_args, scheduler_infos[0]
         )
+        # The workers elect one sweeper among themselves via a marker file keyed
+        # by this pid; clear a stale marker in case the pid was recycled.
+        reset_sweep_election(f"{os.getpid()}_{server_args.port}")
 
     try:
         # Update logging configs

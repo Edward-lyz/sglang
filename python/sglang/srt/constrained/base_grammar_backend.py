@@ -15,12 +15,14 @@
 
 import logging
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 
@@ -37,6 +39,13 @@ class GrammarStats:
     tree_traversal_time: List[float] = field(default_factory=list)
     dispatch_type: Optional[str] = None
     num_timeout: int = 0
+
+
+class GrammarRow(NamedTuple):
+    """Grammar and destination row for a batched vocab-mask fill."""
+
+    row: int
+    grammar: "BaseGrammarObject"
 
 
 class BaseGrammarObject:
@@ -68,6 +77,14 @@ class BaseGrammarObject:
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         raise NotImplementedError()
+
+    @staticmethod
+    def fill_vocab_mask_batched(
+        entries: List[GrammarRow], vocab_mask: torch.Tensor
+    ) -> None:
+        """Fill listed rows, leaving unlisted rows untouched."""
+        for entry in entries:
+            entry.grammar.fill_vocab_mask(vocab_mask, entry.row)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
@@ -133,7 +150,9 @@ class BaseGrammarBackend:
 
     def __init__(self):
         self.executor = ThreadPoolExecutor()
-        self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
+        self.cache: "OrderedDict[Tuple[str, str], BaseGrammarObject]" = OrderedDict()
+        # Negative disables the bound (unbounded, legacy behavior).
+        self.cache_max_size = envs.SGLANG_GRAMMAR_CACHE_MAX_SIZE.get()
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
@@ -200,6 +219,7 @@ class BaseGrammarBackend:
     ) -> Tuple[BaseGrammarObject | Future[BaseGrammarObject], bool]:
         value = self.cache.get(key)
         if value:
+            self.cache.move_to_end(key)
             copied_value = value.copy()
             copied_value.maybe_init_reasoning(require_reasoning)
             return copied_value, True
@@ -208,6 +228,14 @@ class BaseGrammarBackend:
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
         self.cache[key] = value
+        self.cache.move_to_end(key)
+        self._evict_if_needed()
+
+    def _evict_if_needed(self):
+        if self.cache_max_size < 0:
+            return
+        while len(self.cache) > self.cache_max_size:
+            self.cache.popitem(last=False)
 
     def reset(self):
         self.cache.clear()
@@ -272,7 +300,7 @@ def create_grammar_backend(
                 "Falling back to grammar_backend='none'. "
                 "Structured outputs (JSON schema, regex, EBNF) will not be available."
             )
-            server_args.override("grammar.import_fallback", grammar_backend="none")
+            server_args.grammar_backend = "none"
             return None
     elif name == "llguidance":
         from sglang.srt.constrained.llguidance_backend import GuidanceBackend
@@ -281,8 +309,6 @@ def create_grammar_backend(
             tokenizer=tokenizer,
             any_whitespace=not server_args.constrained_json_disable_any_whitespace,
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
-            n_vocab=vocab_size,
-            eos_token_ids=eos_token_ids,
         )
     elif name == "none":
         if server_args.enable_strict_thinking:
@@ -302,9 +328,7 @@ def create_grammar_backend(
         )
 
         reasoning_parser = ReasoningParser(
-            model_type=server_args.reasoning_parser,
-            stream_reasoning=False,
-            tokenizer=tokenizer,
+            model_type=server_args.reasoning_parser, stream_reasoning=False
         )
 
         grammar_backend = ReasonerGrammarBackend(

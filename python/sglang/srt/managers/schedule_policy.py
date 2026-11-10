@@ -480,6 +480,7 @@ class PrefillAdder:
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
+        self.log_host_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
@@ -619,6 +620,20 @@ class PrefillAdder:
 
         return available_and_evictable - self.cur_rem_token_offset
 
+    def _log_evictable_size(self) -> int:
+        """Evictable size for debug logging only.
+
+        `tree_cache.evictable_size()` is NotImplementedError on split-pool caches
+        (MambaRadixCache / SWARadixCache), which expose full_/mamba_/swa_ variants
+        instead. Mirror the `rem_total_tokens` branching so logging never crashes.
+        """
+        if self.is_all_swa:
+            return self.tree_cache.swa_evictable_size()
+        elif self.is_hybrid_swa or self.is_hybrid_ssm_cache:
+            return self.tree_cache.full_evictable_size()
+        else:
+            return self.tree_cache.evictable_size()
+
     def _swa_budget_for_req(
         self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
     ) -> int:
@@ -741,6 +756,7 @@ class PrefillAdder:
         extend_input_len: int,
         max_new_tokens: int,
         retracted_stain: bool,
+        host_hit_len: int,
         mamba_gap_reserve: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
@@ -777,6 +793,7 @@ class PrefillAdder:
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
         self.log_hit_tokens += prefix_len
+        self.log_host_hit_tokens += host_hit_len
         self.log_input_tokens += extend_input_len
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
@@ -812,6 +829,7 @@ class PrefillAdder:
             trunc_len,
             0,
             req.retracted_stain,
+            host_hit_len=req.host_hit_length,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
 
@@ -819,6 +837,9 @@ class PrefillAdder:
         result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
+        # match locks this node's components, so clear any stale skip set
+        # carried from a previous scheduling of this req.
+        req.skip_lock_node_ids = {}
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
@@ -849,6 +870,7 @@ class PrefillAdder:
             req.extend_range.length,
             max_new_tokens,
             req.retracted_stain,
+            host_hit_len=req.host_hit_length,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
 
@@ -904,6 +926,7 @@ class PrefillAdder:
                 else 0
             ),
             req.retracted_stain,
+            host_hit_len=0,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
 
@@ -1021,6 +1044,7 @@ class PrefillAdder:
                 req.extend_range.length,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
+                host_hit_len=0,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             )
         else:
@@ -1041,6 +1065,7 @@ class PrefillAdder:
                 trunc_len,
                 0,
                 req.retracted_stain,
+                host_hit_len=0,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             )
 
@@ -1112,7 +1137,30 @@ class PrefillAdder:
             # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
+        logger.info(
+            f"before lock, for req {req.rid} current rem_total_tokens: "
+            f"{self.rem_total_tokens}, "
+            f"local rem total: "
+            f"{self.token_to_kv_pool_allocator.available_size() + self._log_evictable_size()}, "
+            f"avaliable: {self.token_to_kv_pool_allocator.available_size()}, "
+            f"evictable: {self._log_evictable_size()}, "
+            f"extend_input_len: {cand_extend_input_len}, "
+            f"prefix len {prefix_len}, "
+            f"host_hit_length {req.host_hit_length}"
+        )
+
         with self._lock_node(req.last_node):
+            logger.info(
+                f"after lock, for req {req.rid} current rem_total_tokens: "
+                f"{self.rem_total_tokens}, "
+                f"local rem total: "
+                f"{self.token_to_kv_pool_allocator.available_size() + self._log_evictable_size()}, "
+                f"avaliable: {self.token_to_kv_pool_allocator.available_size()}, "
+                f"evictable: {self._log_evictable_size()}, "
+                f"extend_input_len: {cand_extend_input_len}, "
+                f"prefix len {prefix_len}, "
+                f"host_hit_length {req.host_hit_length}"
+            )
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
@@ -1154,6 +1202,12 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                actual_loaded = len(new_indices)
+                logger.info(
+                    f"AS load_back: req:{req.rid}, "
+                    f"expected={req.host_hit_length}, set host_hit_length to actual={actual_loaded}"
+                )
+                req.host_hit_length = actual_loaded
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
@@ -1198,6 +1252,7 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                     req.retracted_stain,
+                    req.host_hit_length,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
             else:
@@ -1239,6 +1294,7 @@ class PrefillAdder:
                     trunc_len,
                     0,
                     req.retracted_stain,
+                    host_hit_len=req.host_hit_length,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
 

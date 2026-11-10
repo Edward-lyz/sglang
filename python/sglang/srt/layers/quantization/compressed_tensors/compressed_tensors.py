@@ -149,6 +149,16 @@ class CompressedTensorsConfig(QuantizationConfig):
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
         self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
+        # For vision-language models (e.g. Kimi-K25 compressed-tensors NVFP4),
+        # the HF `ignore` list entries are prefixed with "language_model." but
+        # sglang's internal Linear layer prefix for the language model may not
+        # carry that prefix. Keep both forms so should_ignore_layer matches.
+        expanded_ignore: List[str] = []
+        for name in self.ignore:
+            expanded_ignore.append(name)
+            if isinstance(name, str) and name.startswith("language_model."):
+                expanded_ignore.append(name.removeprefix("language_model."))
+        self.ignore = list(dict.fromkeys(expanded_ignore))
         self.sparsity_scheme_map = hf_to_sglang_mapper.apply_dict(
             self.sparsity_scheme_map
         )

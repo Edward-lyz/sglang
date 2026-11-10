@@ -109,6 +109,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.utils.common import node_pp_rank_range
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -848,7 +849,10 @@ class Engine(EngineScoreMixin, EngineBase):
                 )
 
             launch_dummy_health_check_server(
-                server_args.host, server_args.port, server_args.enable_metrics
+                server_args.host,
+                server_args.port,
+                server_args.enable_metrics,
+                server_args,
             )
 
             scheduler_init_result.wait_for_completion()
@@ -1417,10 +1421,7 @@ def _calculate_rank_ranges(
     """
     pp_size_per_node = max(pp_size // nnodes, 1)
     nnodes_per_pp_rank = max(nnodes // pp_size, 1)
-    pp_rank_range = range(
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank),
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
-    )
+    pp_rank_range = node_pp_rank_range(pp_size, nnodes, node_rank)
 
     nnodes_per_tp_group = nnodes_per_pp_rank
     tp_size_per_node = tp_size // nnodes_per_tp_group

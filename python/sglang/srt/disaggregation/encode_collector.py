@@ -10,7 +10,6 @@ including mm_cache hit rate tracking and Prometheus metric definitions.
 # at module load time.
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, Optional
 
 if TYPE_CHECKING:
@@ -69,41 +68,41 @@ class EncoderMetricsCollector:
         self._label_keys = list(labels.keys())
         self._label_vals = labels
 
-        self.cache_stats: Dict[str, CacheStats] = defaultdict(CacheStats)
+        self.cache_stats = CacheStats()
 
         # --- cache counters ---
         self.cache_hit_requests_total = Counter(
             name="sglang:encoder_cache_hit_requests_total",
             documentation="Total cache-hit encode requests.",
-            labelnames=[*self._label_keys, "source"],
+            labelnames=self._label_keys,
         )
         self.cache_total_requests_total = Counter(
             name="sglang:encoder_cache_total_requests_total",
             documentation="Total encode requests that queried the cache.",
-            labelnames=[*self._label_keys, "source"],
+            labelnames=self._label_keys,
         )
         self.cache_hit_bytes_total = Counter(
             name="sglang:encoder_cache_hit_bytes_total",
             documentation="Total embedding bytes served from cache.",
-            labelnames=[*self._label_keys, "source"],
+            labelnames=self._label_keys,
         )
         self.cache_total_bytes_total = Counter(
             name="sglang:encoder_cache_total_bytes_total",
             documentation="Total embedding bytes across all cache queries.",
-            labelnames=[*self._label_keys, "source"],
+            labelnames=self._label_keys,
         )
 
         # --- cache gauges ---
         self.cache_req_hit_rate = Gauge(
             name="sglang:encoder_cache_req_hit_rate",
             documentation="Request-level cache hit rate.",
-            labelnames=[*self._label_keys, "source"],
+            labelnames=self._label_keys,
             multiprocess_mode="mostrecent",
         )
         self.cache_byte_hit_rate = Gauge(
             name="sglang:encoder_cache_byte_hit_rate",
             documentation="Byte-level cache hit rate.",
-            labelnames=[*self._label_keys, "source"],
+            labelnames=self._label_keys,
             multiprocess_mode="mostrecent",
         )
         self.cache_entries = Gauge(
@@ -119,85 +118,46 @@ class EncoderMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-        # --- request counters ---
-        self.num_requests_total = Counter(
-            name="sglang:encoder_num_requests_total",
-            documentation="Number of encode requests processed.",
-            labelnames=self._label_keys,
-        )
-        self.num_aborted_requests_total = Counter(
-            name="sglang:encoder_num_aborted_requests_total",
-            documentation="Number of encode requests aborted.",
-            labelnames=self._label_keys,
-        )
-        self.num_failed_requests_total = Counter(
-            name="sglang:encoder_num_failed_requests_total",
-            documentation="Number of encode requests failed.",
-            labelnames=self._label_keys,
-        )
-
-        self._inc_counter(self.num_requests_total, 0)
-        self._inc_counter(self.num_aborted_requests_total, 0)
-        self._inc_counter(self.num_failed_requests_total, 0)
-
     # ---- helpers to handle optional labels ----
 
-    def _inc_counter(self, counter: Counter, value: float = 1, **extra):
+    def _inc_counter(self, counter: Counter, value: float = 1):
         """Increment a counter, handling optional labels."""
-        all_labels = {**self._label_vals, **extra}
-        if all_labels:
-            counter.labels(**all_labels).inc(value)
+        if self._label_vals:
+            counter.labels(**self._label_vals).inc(value)
         else:
             counter.inc(value)
 
-    def _set_gauge(self, gauge: Gauge, value: float, **extra):
+    def _set_gauge(self, gauge: Gauge, value: float):
         """Set a gauge value, handling optional labels."""
-        all_labels = {**self._label_vals, **extra}
-        if all_labels:
-            gauge.labels(**all_labels).set(value)
+        if self._label_vals:
+            gauge.labels(**self._label_vals).set(value)
         else:
             gauge.set(value)
 
     # ---- public API ----
 
-    def record_cache_hit(self, nbytes: int, source: str = "workflow"):
+    def record_cache_hit(self, nbytes: int):
         """Record a cache hit event."""
-        stats = self.cache_stats[source]
-        stats.record_hit(nbytes)
-        self._inc_counter(self.cache_hit_requests_total, source=source)
-        self._inc_counter(self.cache_total_requests_total, source=source)
-        self._inc_counter(self.cache_hit_bytes_total, nbytes, source=source)
-        self._inc_counter(self.cache_total_bytes_total, nbytes, source=source)
-        self._set_gauge(self.cache_req_hit_rate, stats.req_hit_rate, source=source)
-        self._set_gauge(self.cache_byte_hit_rate, stats.byte_hit_rate, source=source)
+        self.cache_stats.record_hit(nbytes)
+        self._inc_counter(self.cache_hit_requests_total)
+        self._inc_counter(self.cache_total_requests_total)
+        self._inc_counter(self.cache_hit_bytes_total, nbytes)
+        self._inc_counter(self.cache_total_bytes_total, nbytes)
+        self._set_gauge(self.cache_req_hit_rate, self.cache_stats.req_hit_rate)
+        self._set_gauge(self.cache_byte_hit_rate, self.cache_stats.byte_hit_rate)
 
-    def record_cache_miss(self, nbytes: int, source: str = "workflow"):
+    def record_cache_miss(self, nbytes: int):
         """Record a cache miss event."""
-        stats = self.cache_stats[source]
-        stats.record_miss(nbytes)
-        self._inc_counter(self.cache_total_requests_total, source=source)
-        self._inc_counter(self.cache_total_bytes_total, nbytes, source=source)
-        self._set_gauge(self.cache_req_hit_rate, stats.req_hit_rate, source=source)
-        self._set_gauge(self.cache_byte_hit_rate, stats.byte_hit_rate, source=source)
+        self.cache_stats.record_miss(nbytes)
+        self._inc_counter(self.cache_total_requests_total)
+        self._inc_counter(self.cache_total_bytes_total, nbytes)
+        self._set_gauge(self.cache_req_hit_rate, self.cache_stats.req_hit_rate)
+        self._set_gauge(self.cache_byte_hit_rate, self.cache_stats.byte_hit_rate)
 
     def set_cache_state(self, num_entries: int, used_bytes: int):
         """Update cache state metrics."""
         self._set_gauge(self.cache_entries, num_entries)
         self._set_gauge(self.cache_used_bytes, used_bytes)
-
-    def observe_one_finished_request(self):
-        """Record one finished encode request."""
-        self._inc_counter(self.num_requests_total)
-
-    def observe_one_failed_request(self):
-        """Record one failed encode request."""
-        self._inc_counter(self.num_requests_total)
-        self._inc_counter(self.num_failed_requests_total)
-
-    def observe_one_aborted_request(self):
-        """Record one aborted encode request."""
-        self._inc_counter(self.num_requests_total)
-        self._inc_counter(self.num_aborted_requests_total)
 
 
 class TransferEndpointCollector:

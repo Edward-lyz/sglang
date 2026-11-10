@@ -33,22 +33,23 @@ def _async_d2h(t: torch.Tensor) -> torch.Tensor:
     cpu_t.copy_(t, non_blocking=True)
     t.record_stream(torch.cuda.current_stream(t.device))
     return cpu_t
+def is_health_check_rid(rid: Optional[str]) -> bool:
+    """Return whether the request id is an internal health-check request."""
+    return isinstance(rid, str) and rid.startswith("HEALTH_CHECK")
+
+
+def is_health_check_rid(rid: Optional[str]) -> bool:
+    """Return whether the request id is an internal health-check request."""
+    return isinstance(rid, str) and rid.startswith("HEALTH_CHECK")
 
 
 @dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
-    next_token_ids: Optional[
-        Union[torch.Tensor, List[torch.Tensor], List[List[int]]]
-    ] = None
+    next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
-    num_block_accept_tokens: int = 0
-    num_cap_tokens: int = 0
-    # FDFO dLLM batching: per-request accepted block length and carried algo state.
-    accept_length_per_req_cpu: Optional[List[int]] = None
-    dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and
@@ -66,20 +67,9 @@ class GenerationBatchResult:
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 
-    # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
-    # these once — eagerly via the scheduler's grammar barrier inside verify(), or
-    # lazily in _resolve_spec_v2_tokens — and the latter consumes
-    # grammar_retained_tokens instead of re-advancing the FSM.
-    grammar_advanced: bool = False
-    grammar_retained_tokens: Optional[list] = None
-
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
-
-    block_accept_lens: Optional[torch.Tensor] = None
-
-    cap_lens: Optional[torch.Tensor] = None
 
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
@@ -147,12 +137,6 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
-
-        if self.block_accept_lens is not None:
-            self.block_accept_lens = _async_d2h(self.block_accept_lens)
-
-        if self.cap_lens is not None:
-            self.cap_lens = _async_d2h(self.cap_lens)
 
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
@@ -231,8 +215,6 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
         "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
         "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
-        "next_token_sampling_mask_idx": result.logits_output.next_token_sampling_mask_idx,
-        "next_token_sampling_logprobs": result.logits_output.next_token_sampling_logprobs,
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
@@ -257,8 +239,6 @@ def get_logprob_from_pp_outputs(
         next_token_token_ids_logprobs_idx=next_pp_outputs[
             "next_token_token_ids_logprobs_idx"
         ],
-        next_token_sampling_mask_idx=next_pp_outputs["next_token_sampling_mask_idx"],
-        next_token_sampling_logprobs=next_pp_outputs["next_token_sampling_logprobs"],
         input_token_logprobs=next_pp_outputs["input_token_logprobs"],
         input_top_logprobs_val=next_pp_outputs["input_top_logprobs_val"],
         input_top_logprobs_idx=next_pp_outputs["input_top_logprobs_idx"],

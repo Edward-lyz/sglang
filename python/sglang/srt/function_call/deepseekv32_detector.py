@@ -69,8 +69,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
     Reference: DeepSeek V3.2 format specification
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self,
+        tools=None,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    ):
+        super().__init__(tools, tool_choice, parallel_tool_calls)
         self.bot_token = "<｜DSML｜function_calls>"
         self.eot_token = "</｜DSML｜function_calls>"
         self.invoke_end_token = "</｜DSML｜invoke>"

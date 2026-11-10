@@ -4,7 +4,8 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any, List, NoReturn, Optional, Tuple, Union
 
 import orjson
 from fastapi import HTTPException, Request
@@ -15,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingR
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -71,12 +73,18 @@ class OpenAIServingBase(ABC):
         return explicit_lora_path
 
     async def handle_request(
-        self, request: OpenAIServingRequest, raw_request: Request
+        self,
+        request: OpenAIServingRequest,
+        raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
         """Handle the specific request type with common pattern
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
+
+        if hasattr(request, "rid") and request.rid and not request.rid.startswith("HEALTH_CHECK"):
+            logger.info(f"[trace] http server received request {request.rid}")
 
         try:
             # Validate request
@@ -89,6 +97,11 @@ class OpenAIServingBase(ABC):
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 request_logger.log_openai_received_request(request, request=raw_request)
 
+            if not envs.AIAK_ENABLE_TRACE.get():
+                if hasattr(request, 'trace_config') and request.trace_config is not None:
+                    logger.info(f"AIAK_ENABLE_TRACE environment variable is not set, the trace config "
+                                f"of req {request.rid} will not take effect")
+                    request.trace_config = None
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
@@ -101,11 +114,15 @@ class OpenAIServingBase(ABC):
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
                 return await self._handle_streaming_request(
-                    adapted_request, processed_request, raw_request
+                    adapted_request,
+                    processed_request,
+                    raw_request,
                 )
             else:
                 return await self._handle_non_streaming_request(
-                    adapted_request, processed_request, raw_request
+                    adapted_request,
+                    processed_request,
+                    raw_request,
                 )
         except HTTPException as e:
             return self.create_error_response(
@@ -239,6 +256,25 @@ class OpenAIServingBase(ABC):
             code=status_code,
         )
         return json.dumps({"error": error.model_dump()})
+
+    @staticmethod
+    def raise_abort_before_stream(finish_reason: dict) -> NoReturn:
+        """Re-raise a scheduler abort that arrived before any SSE chunk was sent.
+
+        A StreamingResponse commits HTTP 200 the moment it is returned, so an
+        abort can only be reported in-band once streaming has started. Before
+        that -- while the caller is still inside the kick-start ``__anext__()``
+        of ``_handle_streaming_request`` -- raising instead lets
+        ``handle_request`` emit the real HTTP status code, matching the
+        non-streaming path. The exception mapping mirrors
+        ``TokenizerManager._handle_abort_finish_reason`` so both modes produce
+        identical response bodies.
+        """
+        message = finish_reason.get("message", "Generation aborted.")
+        code = finish_reason["status_code"]
+        if code == HTTPStatus.BAD_REQUEST:
+            raise ValueError(message)
+        raise HTTPException(status_code=int(code), detail=message)
 
     def extract_custom_labels(self, raw_request):
         if (

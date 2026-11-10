@@ -26,8 +26,7 @@ from xgrammar import (
     StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
-    bitmask_dtype,
-    get_bitmask_shape,
+    allocate_token_bitmask,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -36,37 +35,27 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarStats,
     InvalidGrammarObject,
 )
+from sglang.srt.constrained.torch_ops.bitmask_ops import (
+    apply_token_bitmask_inplace_torch,
+)
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
-
 if _is_hip:
     from sgl_kernel import apply_token_bitmask_inplace_cuda
 else:
-    from sglang.kernels.ops.grammar.bitmask_ops import (
+    from sglang.srt.constrained.triton_ops.bitmask_ops import (
         apply_token_bitmask_inplace_triton,
     )
 
-from sglang.kernels.ops.grammar.token_filter_ops import set_token_filter_triton
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
+from sglang.srt.constrained.triton_ops.token_filter_ops import set_token_filter_triton
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
-
-
-def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
-    # Always allocate a pinned bitmask so the later H2D to the device can be a
-    # genuine non_blocking copy (a pageable source silently downgrades it to a
-    # blocking copy).
-    return torch.full(
-        get_bitmask_shape(batch_size, vocab_size),
-        -1,
-        dtype=bitmask_dtype,
-        pin_memory=True,
-    )
 
 
 class XGrammarGrammar(BaseGrammarObject):
@@ -104,8 +93,16 @@ class XGrammarGrammar(BaseGrammarObject):
                 self.accepted_tokens.append(token)
 
     def rollback(self, k: int):
-        self.matcher.rollback(k)
-        self.accepted_tokens = self.accepted_tokens[:-k]
+        # Speculative decoding may traverse grammar states for draft-token
+        # branches that were not committed to xgrammar history. In that case
+        # xgrammar raises when asked to rollback more tokens than it has saved.
+        # Bound rollback by the tokens accepted through this wrapper so
+        # reasoning-parser can remain enabled while EAGLE3 explores branches.
+        rollback_tokens = min(k, len(self.accepted_tokens))
+        if rollback_tokens <= 0:
+            return
+        self.matcher.rollback(rollback_tokens)
+        self.accepted_tokens = self.accepted_tokens[:-rollback_tokens]
 
     def is_terminated(self):
         return self.matcher.is_terminated()
@@ -113,7 +110,7 @@ class XGrammarGrammar(BaseGrammarObject):
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        return _allocate_token_bitmask(vocab_size, batch_size)
+        return allocate_token_bitmask(batch_size, vocab_size)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
@@ -129,9 +126,7 @@ class XGrammarGrammar(BaseGrammarObject):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
-
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+            apply_token_bitmask_inplace_torch(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
@@ -241,7 +236,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     @staticmethod
     def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
-        return _allocate_token_bitmask(vocab_size, batch_size)
+        return allocate_token_bitmask(batch_size, vocab_size)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:

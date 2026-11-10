@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
     TransferKVChunk,
+    build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -45,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    resolve_dcp_dst_entry_indices,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -131,6 +133,10 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     dst_kv_layer_ids: List[int]
     dst_state_layer_ids: List[List[int]]
+    dst_dcp_size: int = 1
+    dst_dcp_rank: int = 0
+    requires_dcp_relayout: bool = False
+    dcp_token_item_lens: Optional[List[int]] = None
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -163,6 +169,13 @@ class KVArgsRegisterInfo:
                 if len(msg) > 13 and msg[13] != b""
                 else []
             ),
+            # msg[14:16] belong to the staging field below; DCP trails it.
+            dst_dcp_size=(
+                int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 1
+            ),
+            dst_dcp_rank=(
+                int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
+            ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
@@ -170,6 +183,8 @@ class KVArgsRegisterInfo:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+
+    transfer_infos: dict[int, dict[str, TransferInfo]]
 
     def __init__(
         self,
@@ -187,6 +202,8 @@ class MooncakeKVManager(CommonKVManager):
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
+            self.session_cooldowns: dict[str, float] = {}  # 【新增】专门用于记录失败时间戳的字典
+            self.session_cooldown_seconds = float(os.getenv("SGLANG_MOONCAKE_COOLDOWN", "120.0"))
             self.session_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -384,10 +401,8 @@ class MooncakeKVManager(CommonKVManager):
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
         """Notify decode that a non-last staging chunk RDMA is complete."""
         na = NetworkAddress(req.endpoint, req.dst_port)
-        self._connect(
+        self._send_multipart_locked(
             na.to_tcp(),
-            is_ipv6=na.is_ipv6,
-        ).send_multipart(
             [
                 b"CHUNK_READY",
                 str(req.room).encode("ascii"),
@@ -396,7 +411,8 @@ class MooncakeKVManager(CommonKVManager):
                 str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
                 req.mooncake_session_id.encode("ascii"),
                 str(prefill_unique_rank).encode("ascii"),
-            ]
+            ],
+            is_ipv6=na.is_ipv6,
         )
 
     def _do_staging_transfer(
@@ -749,6 +765,106 @@ class MooncakeKVManager(CommonKVManager):
             dst_layer_ids=dst_layer_ids,
         )
 
+    def send_kvcache_dcp(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        dcp_token_item_lens: List[int],
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: List[int],
+    ) -> int:
+        if num_kv_tokens is None:
+            raise ValueError("PD DCP transfer requires num_kv_tokens")
+        physical_page_size = self.kv_args.page_size
+        plan = build_dcp_token_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=physical_page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+        if plan.src_token_indices.size == 0:
+            return 0
+
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if src_layer_ids or dst_layer_ids:
+            dst_indices = resolve_dcp_dst_entry_indices(
+                src_layer_ids,
+                dst_layer_ids,
+                len(self.kv_args.kv_data_ptrs),
+                len(dst_kv_ptrs),
+            )
+            src_kv_ptrs = self.kv_args.kv_data_ptrs
+            dst_kv_ptrs = [dst_kv_ptrs[j] for j in dst_indices]
+        else:
+            src_kv_ptrs, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+                self.kv_args.kv_data_ptrs,
+                dst_kv_ptrs,
+            )
+        layers_current_pp_stage = len(src_kv_ptrs)
+        src_groups, dst_groups = group_concurrent_contiguous(
+            plan.src_token_indices,
+            plan.dst_token_indices,
+        )
+
+        layers_params = [
+            (
+                src_kv_ptrs[layer_id],
+                dst_kv_ptrs[layer_id],
+                dcp_token_item_lens[layer_id],
+            )
+            for layer_id in range(layers_current_pp_stage)
+        ]
+
+        def set_transfer_blocks(
+            src_ptr: int, dst_ptr: int, token_item_len: int
+        ) -> List[Tuple[int, int, int]]:
+            return [
+                (
+                    src_ptr + int(src_group[0]) * token_item_len,
+                    dst_ptr + int(dst_group[0]) * token_item_len,
+                    len(src_group) * token_item_len,
+                )
+                for src_group, dst_group in zip(src_groups, dst_groups)
+            ]
+
+        def process_layer(src_ptr: int, dst_ptr: int, token_item_len: int) -> int:
+            return self._transfer_data(
+                mooncake_session_id,
+                set_transfer_blocks(src_ptr, dst_ptr, token_item_len),
+            )
+
+        if self.enable_custom_mem_pool:
+            futures = [
+                executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
+                for src_ptr, dst_ptr, token_item_len in layers_params
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                status = future.result()
+                if status != 0:
+                    for pending in futures:
+                        pending.cancel()
+                    return status
+            return 0
+
+        transfer_blocks = []
+        for src_ptr, dst_ptr, token_item_len in layers_params:
+            transfer_blocks.extend(
+                set_transfer_blocks(src_ptr, dst_ptr, token_item_len)
+            )
+        return self._transfer_data(mooncake_session_id, transfer_blocks)
+
     def send_kvcache_slice(
         self,
         mooncake_session_id: str,
@@ -936,9 +1052,8 @@ class MooncakeKVManager(CommonKVManager):
         data: bytes,
     ):
         na = NetworkAddress(remote, dst_port)
-        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
-
-        socket.send_multipart(
+        self._send_multipart_locked(
+            na.to_tcp(),
             [
                 MooncakeKVManager.AUX_DATA_HEADER,
                 str(room).encode("ascii"),
@@ -946,7 +1061,8 @@ class MooncakeKVManager(CommonKVManager):
                 str(aux_index).encode("ascii"),
                 struct.pack(">I", len(data)),
                 data,
-            ]
+            ],
+            is_ipv6=na.is_ipv6,
         )
 
     def _handle_aux_data(self, msg: List[bytes]):
@@ -1330,12 +1446,14 @@ class MooncakeKVManager(CommonKVManager):
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         na = NetworkAddress(remote, dst_port)
-        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+        self._send_multipart_locked(
+            na.to_tcp(),
             [
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
                 str(prefill_rank).encode("ascii"),
-            ]
+            ],
+            is_ipv6=na.is_ipv6,
         )
 
     def transfer_worker(
@@ -1406,37 +1524,78 @@ class MooncakeKVManager(CommonKVManager):
                         # Early exit if the request has failed
                         with self.session_lock:
                             if req.mooncake_session_id in self.failed_sessions:
-                                self.record_failure(
-                                    kv_chunk.room,
-                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
-                                )
-                                self.update_status(kv_chunk.room, KVPoll.Failed)
-                                self.sync_status_to_decode_endpoint(
-                                    req.endpoint,
-                                    req.dst_port,
-                                    req.room,
-                                    KVPoll.Failed,
-                                    prefill_unique_rank,
-                                )
-                                break
-
-                        chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                        if len(chunked_dst_kv_indice) < len(
-                            kv_chunk.prefill_kv_indices
-                        ):
-                            logger.warning(
-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
-                            )
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
-                            ]
+                                # Check cooldown: if the failed session's cooldown has
+                                # expired, release the session and continue transferring;
+                                # otherwise keep treating it as failed.
+                                continue_transfer = False
+                                if req.mooncake_session_id in self.session_cooldowns:
+                                    time_since_fail = (
+                                        time.time()
+                                        - self.session_cooldowns[req.mooncake_session_id]
+                                    )
+                                    if time_since_fail >= self.session_cooldown_seconds:
+                                        self.failed_sessions.remove(
+                                            req.mooncake_session_id
+                                        )
+                                        del self.session_cooldowns[
+                                            req.mooncake_session_id
+                                        ]
+                                        self.session_failures[
+                                            req.mooncake_session_id
+                                        ] = 0
+                                        logger.info(
+                                            f"Session {req.mooncake_session_id} "
+                                            f"cooldown expired, released."
+                                        )
+                                        continue_transfer = True
+                                    else:
+                                        logger.info(
+                                            f"Session {req.mooncake_session_id} is "
+                                            f"still cooling down, will check again later."
+                                        )
+                                if not continue_transfer:
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Decode instance could be dead, remote mooncake "
+                                        f"session {req.mooncake_session_id} is not alive",
+                                    )
+                                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                    )
+                                    break
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        is_dcp_transfer = (
+                            target_rank_registration_info.requires_dcp_relayout
+                        )
+                        if is_dcp_transfer:
+                            chunked_dst_kv_indice = req.dst_kv_indices
+                        else:
+                            chunked_dst_kv_indice = req.dst_kv_indices[
+                                kv_chunk.index_slice
+                            ]
+
+                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                            if len(chunked_dst_kv_indice) < len(
+                                kv_chunk.prefill_kv_indices
+                            ):
+                                logger.warning(
+                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                                )
+                                kv_chunk.prefill_kv_indices = (
+                                    kv_chunk.prefill_kv_indices[
+                                        : len(chunked_dst_kv_indice)
+                                    ]
+                                )
+
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
@@ -1446,6 +1605,27 @@ class MooncakeKVManager(CommonKVManager):
                             or skip_kv
                         ):
                             ret = 0
+                        elif is_dcp_transfer:
+                            dcp_token_item_lens = (
+                                target_rank_registration_info.dcp_token_item_lens
+                            )
+                            assert dcp_token_item_lens is not None
+                            ret = self.send_kvcache_dcp(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                dcp_token_item_lens=dcp_token_item_lens,
+                                dst_dcp_size=target_rank_registration_info.dst_dcp_size,
+                                dst_dcp_rank=target_rank_registration_info.dst_dcp_rank,
+                                src_page_offset=kv_chunk.index_slice.start or 0,
+                                decode_prefix_len=req.decode_prefix_len or 0,
+                                num_kv_tokens=kv_chunk.num_kv_tokens,
+                                executor=executor,
+                                dst_layer_ids=(
+                                    target_rank_registration_info.dst_kv_layer_ids
+                                ),
+                            )
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
@@ -1496,6 +1676,12 @@ class MooncakeKVManager(CommonKVManager):
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
                                 if self.session_failures[req.mooncake_session_id] >= 1:
                                     self.failed_sessions.add(req.mooncake_session_id)
+                                    # 【新增】记录第一次失败的时间戳
+                                    if req.mooncake_session_id not in self.session_cooldowns:
+                                        self.session_cooldowns[req.mooncake_session_id] = time.time()
+                                        logger.error(
+                                            f"Session {req.mooncake_session_id} failed, cooldown started."
+                                        )
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
                                     )
@@ -1516,12 +1702,34 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices and not skip_state:
-                                self.maybe_send_extra(
+                                state_rc = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if state_rc != 0:
+                                    with self.session_lock:
+                                        self.session_failures[
+                                            req.mooncake_session_id
+                                        ] += 1
+                                        self.failed_sessions.add(
+                                            req.mooncake_session_id
+                                        )
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Failed to send state components of {kv_chunk.room} to "
+                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                    )
+                                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                    )
+                                    break
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
@@ -1585,10 +1793,51 @@ class MooncakeKVManager(CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                _targets = [
+                    f"{r.endpoint}:{r.dst_port}"
+                    for r in self.transfer_infos.get(kv_chunk.room, {}).values()
+                    if not r.is_dummy
+                ]
+                logger.error(
+                    f"Transfer worker encountered an error processing "
+                    f"room {kv_chunk.room}: {e}. "
+                    f"is_last={kv_chunk.is_last_chunk}, "
+                    f"index_slice={kv_chunk.index_slice}, "
+                    f"targets={_targets}. "
+                    f"bootstrap_port={self.bootstrap_port}.",
+                    exc_info=True,
                 )
+                # Mark the current request as failed and notify decode endpoint
+                try:
+                    self.record_failure(
+                        kv_chunk.room,
+                        f"Transfer worker exception: {e}",
+                    )
+                    self.update_status(kv_chunk.room, KVPoll.Failed)
+
+                    # Best-effort notify decode endpoint
+                    local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+                    reqs = self.transfer_infos.get(kv_chunk.room, {}).values()
+                    for req in reqs:
+                        if not req.is_dummy:
+                            try:
+                                self.sync_status_to_decode_endpoint(
+                                    req.endpoint,
+                                    req.dst_port,
+                                    req.room,
+                                    KVPoll.Failed,
+                                    local_rank,
+                                )
+                            except Exception:
+                                pass
+                except Exception:
+                    logger.error(
+                        f"Failed to clean up after transfer worker error for room {kv_chunk.room}",
+                        exc_info=True,
+                    )
+                finally:
+                    # Clean up transfer_infos to prevent memory leak
+                    self.transfer_infos.pop(kv_chunk.room, None)
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -1636,11 +1885,13 @@ class MooncakeKVManager(CommonKVManager):
                     # Send ACK back to decode endpoint
                     try:
                         na = NetworkAddress(decode_ip, decode_port)
-                        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+                        self._send_multipart_locked(
+                            na.to_tcp(),
                             [
                                 b"ABORT_ACK",
                                 str(room_to_be_aborted).encode("ascii"),
-                            ]
+                            ],
+                            is_ipv6=na.is_ipv6,
                         )
                         logger.debug(
                             f"Sent ABORT_ACK for room {room_to_be_aborted} to "
@@ -1653,12 +1904,24 @@ class MooncakeKVManager(CommonKVManager):
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    self.decode_kv_args_table[mooncake_session_id] = (
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+                        decode_kv_args.dst_dcp_size,
+                        decode_kv_args.dst_dcp_rank,
                     )
+                    if decode_kv_args.requires_dcp_relayout:
+                        decode_kv_args.dcp_token_item_lens = (
+                            self.prepare_dcp_token_item_lens(
+                                [decode_kv_args.dst_kv_item_len]
+                                * len(self.kv_args.kv_item_lens)
+                            )
+                        )
+                    self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
+                        if mooncake_session_id in self.session_cooldowns:
+                            del self.session_cooldowns[mooncake_session_id]
                         if mooncake_session_id in self.session_failures:
                             del self.session_failures[mooncake_session_id]
                     logger.debug(
@@ -1758,6 +2021,60 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     self.update_status(bootstrap_room, status)
 
+        def heartbeat_checker():
+            while True:
+                time.sleep(self.heartbeat_interval)
+                with self.connection_lock:
+                    addresses = list(self.prefill_info_table.keys())
+
+                for bootstrap_addr in addresses:
+                    session = None
+                    try:
+                        with self.session_pool_lock:
+                            session = self.session_pool[bootstrap_addr]
+                        response = session.get(
+                            f"http://{bootstrap_addr}/health",
+                            timeout=(2, 3),
+                            headers={"Connection": "keep-alive"},
+                        )
+                        if response.status_code == 200:
+                            self.heartbeat_failures[bootstrap_addr] = 0
+
+                            current_rooms = self.addr_to_rooms_tracker[
+                                bootstrap_addr
+                            ].copy()
+
+                            for bootstrap_room in current_rooms:
+                                # Remove KVPoll.Success requests from the tracker
+                                if bootstrap_room not in self.request_status:
+                                    self.addr_to_rooms_tracker[bootstrap_addr].discard(
+                                        bootstrap_room
+                                    )
+                        else:
+                            logger.info(
+                                f"Attempting to reconnect to {bootstrap_addr}..."
+                            )
+                            self.heartbeat_failures[bootstrap_addr] = (
+                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                            )
+                            with self.session_pool_lock:
+                                if bootstrap_addr in self.session_pool:
+                                    del self.session_pool[bootstrap_addr]
+                    except Exception as e:
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                        self.heartbeat_failures[bootstrap_addr] = (
+                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                        )
+
+                    if (
+                        self.heartbeat_failures.get(bootstrap_addr, 0)
+                        >= self.max_failures
+                    ):
+                        self._handle_node_failure(bootstrap_addr)
+                        with self.session_pool_lock:
+                            if bootstrap_addr in self.session_pool:
+                                del self.session_pool[bootstrap_addr]
+
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()
 
@@ -1769,6 +2086,7 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
@@ -1807,6 +2125,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
             )
         )
@@ -1887,6 +2206,7 @@ class MooncakeKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -1900,6 +2220,7 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
                 False,
+                num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         else:
@@ -1910,6 +2231,7 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         self._record_transfer_indices(kv_indices, state_indices)
@@ -1928,6 +2250,13 @@ class MooncakeKVSender(CommonKVSender):
             return status
         else:
             return self.conclude_state
+
+    def clear(self) -> None:
+        """Remove the bootstrap room entry from the KV manager's request status."""
+        if self.bootstrap_room in self.kv_mgr.request_status:
+            self.kv_mgr.request_status.pop(self.bootstrap_room)
+
+            # self.kv_mgr.transfer_finish_times.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
@@ -2011,6 +2340,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
+            dst_dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
+            dst_dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
             if (
                 self.kv_mgr.enable_staging
                 and self.kv_mgr._staging_ctx.allocator is not None
@@ -2043,6 +2374,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             packed_state_layer_ids,
                             packed_staging_base_ptr,
                             staging_total_size_str,
+                            dst_dcp_size,
+                            dst_dcp_rank,
                         ]
                     )
             except zmq.ZMQError:

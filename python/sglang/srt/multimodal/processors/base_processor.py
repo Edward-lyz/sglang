@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
+import requests
 import torch
 from PIL import Image
 from transformers import BaseImageProcessor
@@ -181,10 +182,11 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    prefer_tokenized_input = False
+    precompute_hash_before_cpu_transfer = False
     auto_mm_processor_worker_num = 1
     auto_mm_io_worker_num = 4
     supports_mm_processor_concurrency = False
-    supports_metadata_only_mm_data = False
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -193,7 +195,6 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
-        self.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
         configured_mm_feature_transport = getattr(
             server_args, "mm_feature_transport", "cpu"
         )
@@ -451,50 +452,40 @@ class BaseMultimodalProcessor(ABC):
         )
         assert all(isinstance(modality, Modality) for modality in modality_list)
 
+        # Embeddings may arrive as one tensor or a list of per-part tensors
+        # (one per pulled task); slice per-item views instead of concatenating.
+        embedding_parts_per_modality = {
+            modality: list(emb) if isinstance(emb, (list, tuple)) else [emb]
+            for modality, emb in embeddings.items()
+        }
+        # modality -> (part index, rows consumed within that part)
+        consumed_per_modality = {}
+
         mm_items = []
-        if embeddings is None:
-            for modality, offset in zip(modality_list, offsets):
-                mm_items.append(
-                    MultimodalDataItem(
-                        modality=modality,
-                        offsets=[offset],
-                        precomputed_embeddings=None,
-                        format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
-                    )
+        for modality, offset in zip(modality_list, offsets):
+            num_tokens = offset[1] - offset[0] + 1
+            embedding_parts = embedding_parts_per_modality[modality]
+            part_idx, embedding_start = consumed_per_modality.get(modality, (0, 0))
+            while embedding_start >= embedding_parts[part_idx].shape[0]:
+                part_idx += 1
+                embedding_start = 0
+            embedding_slice = embedding_parts[part_idx][
+                embedding_start : embedding_start + num_tokens
+            ]
+            # An item never spans parts: each pulled task covers whole images.
+            assert embedding_slice.shape[0] == num_tokens, (
+                f"embedding part {part_idx} for {modality} has "
+                f"{embedding_parts[part_idx].shape[0] - embedding_start} rows "
+                f"left, but the item at offset {offset} needs {num_tokens}"
+            )
+            consumed_per_modality[modality] = (part_idx, embedding_start + num_tokens)
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=modality,
+                    offsets=[offset],
+                    precomputed_embeddings=embedding_slice,
                 )
-        else:
-            embedding_parts_per_modality = {
-                modality: list(emb) if isinstance(emb, (list, tuple)) else [emb]
-                for modality, emb in embeddings.items()
-            }
-            consumed_per_modality = {}
-            for modality, offset in zip(modality_list, offsets):
-                num_tokens = offset[1] - offset[0] + 1
-                embedding_parts = embedding_parts_per_modality[modality]
-                part_idx, embedding_start = consumed_per_modality.get(modality, (0, 0))
-                while embedding_start >= embedding_parts[part_idx].shape[0]:
-                    part_idx += 1
-                    embedding_start = 0
-                embedding_slice = embedding_parts[part_idx][
-                    embedding_start : embedding_start + num_tokens
-                ]
-                assert embedding_slice.shape[0] == num_tokens, (
-                    f"embedding part {part_idx} for {modality} has "
-                    f"{embedding_parts[part_idx].shape[0] - embedding_start} rows "
-                    f"left, but the item at offset {offset} needs {num_tokens}"
-                )
-                consumed_per_modality[modality] = (
-                    part_idx,
-                    embedding_start + num_tokens,
-                )
-                mm_items.append(
-                    MultimodalDataItem(
-                        modality=modality,
-                        offsets=[offset],
-                        precomputed_embeddings=embedding_slice,
-                        format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
-                    )
-                )
+            )
 
         return MultimodalProcessorOutput(
             input_ids=input_ids,
@@ -522,6 +513,7 @@ class BaseMultimodalProcessor(ABC):
         """
         process multimodal data with transformers AutoProcessor
         """
+        defer_feature_cpu_transfer = kwargs.pop("_defer_feature_cpu_transfer", False)
         processor, tokenizer = self._resolve_processor(processor)
 
         if images:
@@ -594,16 +586,13 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if not self.keep_mm_feature_on_device:
+        if not self.use_cuda_ipc and not defer_feature_cpu_transfer:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if self.use_cuda_ipc:
-                    pass
-                else:
-                    if feature_name in result and isinstance(
-                        result[feature_name], torch.Tensor
-                    ):
-                        result[feature_name] = result[feature_name].to("cpu")
+                if feature_name in result and isinstance(
+                    result[feature_name], torch.Tensor
+                ):
+                    result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
@@ -674,8 +663,8 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
-        except ValueError as e:
-            # Bad input (e.g. invalid base64) -> 400, not 500.
+        except (ValueError, OSError, requests.RequestException) as e:
+            # Invalid or unavailable user-provided media -> 400, not 500.
             data_str = str(data)
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."
@@ -1189,6 +1178,10 @@ class BaseMultimodalProcessor(ABC):
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
+            except ValueError as e:
+                raise ValueError(
+                    f"An exception occurred while loading multimodal data: {e}"
+                ) from e
             except Exception as e:
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
@@ -1338,6 +1331,7 @@ class BaseMultimodalProcessor(ABC):
             images=images,
             audios=audios,
             videos=videos,
+            _defer_feature_cpu_transfer=self.precompute_hash_before_cpu_transfer,
             **kwargs,
         )
 
@@ -1377,9 +1371,31 @@ class BaseMultimodalProcessor(ABC):
                 pool_byte_offset=byte_offset,
                 pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
             )
-        if self.keep_mm_feature_on_device:
-            return tensor
         return tensor.cpu()
+
+    @staticmethod
+    def _move_feature_to_cpu(value):
+        if isinstance(value, torch.Tensor):
+            return value.cpu()
+        if isinstance(value, list):
+            return [BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value)
+        return value
+
+    def _precompute_hashes_before_cpu_transfer(
+        self, mm_items: List[MultimodalDataItem]
+    ) -> None:
+        if not self.precompute_hash_before_cpu_transfer:
+            return
+
+        for item in mm_items:
+            item.set_pad_value()
+            if not self.use_cuda_ipc:
+                item.feature = self._move_feature_to_cpu(item.feature)
+                item.precomputed_embeddings = self._move_feature_to_cpu(
+                    item.precomputed_embeddings
+                )
 
     def resolve_image_token_counts(self, images: List) -> List[int]:
         """Per-image expanded token counts, computed without re-tokenizing.
@@ -1493,6 +1509,7 @@ class BaseMultimodalProcessor(ABC):
             # Drift happens when Retokenization is not identity: Decode(X) => String => Re-tokenize => Y, X != Y.
             if (
                 envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+                and not getattr(self, "preserve_processor_input_ids", False)
                 and base_output.input_ids is not None
                 and input_ids is not None
                 and raw_images
@@ -1599,14 +1616,9 @@ class BaseMultimodalProcessor(ABC):
             ):
                 item.set_pad_value()
 
-        """
-        solution for cuda-ipc memory-leak:
-        1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
-        2. if can not get a slice , transport normal tensor
-        3. copy tensor in scheduler and release it (use position mark)
-        4. copy
-        """
+        self._precompute_hashes_before_cpu_transfer(all_collected_items)
 
+        # Wrap GPU features in the bounded IPC pool; pool misses fall back to CPU.
         if self.use_cuda_ipc:
             # post-process, prepare for cuda-ipc transfer
             for item in all_collected_items:

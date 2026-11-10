@@ -42,8 +42,13 @@ class DeepSeekV31Detector(BaseFormatDetector):
     Reference: https://www.modelscope.cn/models/deepseek-ai/DeepSeek-V3.1
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self,
+        tools=None,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    ):
+        super().__init__(tools, tool_choice, parallel_tool_calls)
         self.bot_token = "<｜tool▁calls▁begin｜>"
         self.eot_token = "<｜tool▁calls▁end｜>"
         self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"

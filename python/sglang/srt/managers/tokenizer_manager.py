@@ -50,7 +50,6 @@ from sglang.srt.disaggregation.encode_receiver_aiak import create_mm_receiver
 from sglang.srt.disaggregation.encode_utils import (
     expand_media_placeholders_with_offsets,
     num_tokens_from_grid,
-    original_image_sizes_from_task_results,
     update_raw_text,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -132,7 +131,6 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
-from sglang.srt.utils.common import load_image
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     collect_scheduler_processes,
     pyspy_dump_schedulers,
@@ -170,16 +168,6 @@ def _reject_missing_dispatched_encoder_embedding(server_args, request_obj, mm_in
                 "The request was not run locally in language-only mode."
             ),
         )
-
-
-def _read_image_size(image) -> Tuple[int, int]:
-    """Return an image's ``(width, height)`` without decoding its pixels.
-
-    ``load_image`` with GPU decode disabled hands back a lazily opened PIL
-    image, so the size comes from the header alone.
-    """
-    image, size = load_image(image, gpu_image_decode=False)
-    return tuple(size) if size is not None else (image.width, image.height)
 
 
 @lru_cache(maxsize=1)
@@ -979,7 +967,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _expand_decode_input_ids(
         self, input_ids: List[int], task_results: Optional[List[Dict]]
-    ) -> Optional[List[int]]:
+    ) -> List[int]:
         """Expand multimodal placeholder tokens for decode disaggregation.
 
         Decode nodes skip image/video downloading and never run the vision
@@ -991,18 +979,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ``encoder_addr.img_grid_thw`` maps to exactly one placeholder token in
         the prompt (image: 1 row; video: N rows, one per chunk). KimiK25 pools
         the temporal dim away, so each row counts as ``(h//merge_h)*(w//merge_w)``.
-
-        Returns ``None`` when ``task_results`` carries no usable grids, so the
-        caller can fall back to reading the image dimensions locally.
-
-        Kimi-K3 additionally frames each image span with its original
-        resolution, so when ``encoder_addr.original_image_sizes`` is present the
-        placeholder is expanded through the same helper the prefill node uses,
-        keeping both nodes' origin_input_ids identical. That helper skips already
-        framed video placeholders, so sizes are needed only for the images.
         """
         if not task_results:
-            return None
+            logger.debug(
+                "Skipping mm processing for decode "
+                "disaggregation mode - no task_results available"
+            )
+            return input_ids
 
         grid_thws = []
         for task_result in task_results:
@@ -1017,82 +1000,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for grid_thw in grid_thws
         ]
         if not token_counts:
-            return None
+            return input_ids
 
         media_token_id = self.mm_processor.IM_TOKEN_ID
-        image_sizes = original_image_sizes_from_task_results(task_results)
-        if image_sizes is not None:
-            from sglang.srt.multimodal.processors.kimi_k3 import (
-                _expand_k3_media_prompt_token_ids,
-            )
-
-            expanded_ids = (
-                _expand_k3_media_prompt_token_ids(
-                    input_ids,
-                    media_token_id,
-                    token_counts,
-                    [tuple(size) for size in image_sizes],
-                    self.tokenizer,
-                )
-                .flatten()
-                .tolist()
-            )
-            logger.debug(
-                f"Decode expanded input_ids via task_results img_grid_thw "
-                f"+ original_image_sizes: {len(expanded_ids)} tokens"
-            )
-            return expanded_ids
-
         expanded_ids, _ = expand_media_placeholders_with_offsets(
             input_ids, token_counts, media_token_id
         )
         logger.debug(
             f"Decode expanded input_ids via task_results "
             f"img_grid_thw: {len(expanded_ids)} tokens"
-        )
-        return expanded_ids
-
-    async def _expand_decode_input_ids_from_image_sizes(
-        self, input_ids: List[int], obj: GenerateReqInput
-    ) -> List[int]:
-        """Expand placeholders on a decode node without any vision work.
-
-        A PD-disaggregated deployment does not necessarily route encoder
-        metadata (``task_results``) to the decode node, but the decode node
-        still sizes its KV allocation from ``origin_input_ids`` and must agree
-        with prefill token for token. For models whose media token count is a
-        function of the uploaded image dimensions, reading each image's header
-        is enough: no pixel decode, no resize, no vision tower.
-        """
-        if not obj.image_data and not getattr(obj, "video_data", None):
-            return input_ids
-
-        expand = getattr(self.mm_processor, "expand_input_ids_from_image_sizes", None)
-        if expand is None or getattr(obj, "video_data", None):
-            # Silently keeping the unexpanded prompt would mis-size the decode
-            # KV allocation and only surface much later as a KV-transfer
-            # failure, so refuse the request here instead.
-            raise ValueError(
-                "Decode-side multimodal prompt expansion is unavailable for "
-                f"{type(self.mm_processor).__name__}: the request carries no "
-                "encoder task_results and only image inputs can be expanded "
-                "from their dimensions. The decode node cannot size its KV "
-                "cache for this request."
-            )
-
-        loop = asyncio.get_running_loop()
-        image_sizes = await asyncio.gather(
-            *(
-                loop.run_in_executor(
-                    self.mm_processor.io_executor, _read_image_size, image
-                )
-                for image in obj.image_data
-            )
-        )
-        expanded_ids = expand(input_ids, image_sizes)
-        logger.debug(
-            f"Decode expanded input_ids via local image sizes {image_sizes}: "
-            f"{len(expanded_ids)} tokens"
         )
         return expanded_ids
 
@@ -1236,16 +1152,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 if mm_inputs is None:
                     if self.server_args.disaggregation_mode == "decode":
-                        expanded_ids = self._expand_decode_input_ids(
+                        input_ids = self._expand_decode_input_ids(
                             input_ids, getattr(obj, "task_results", None)
                         )
-                        if expanded_ids is None:
-                            expanded_ids = (
-                                await self._expand_decode_input_ids_from_image_sizes(
-                                    input_ids, obj
-                                )
-                            )
-                        input_ids = expanded_ids
                     else:
                         if self.server_args.language_only:
                             logger.warning(
@@ -3565,15 +3474,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return None
 
         # Pull mode: task_results provided by router
-        if self.server_args.encoder_transfer_backend == "zmq_to_scheduler":
-            if obj.task_results:
-                obj.need_wait_for_mm_inputs = True
-                return None
-            if obj.contains_mm_input():
-                raise ValueError(
-                    "Multi-modal request requires task_results from IC when "
-                    "encoder_transfer_backend=zmq_to_scheduler (pull mode)"
-                )
+        if (
+            self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and obj.task_results
+        ):
+            obj.need_wait_for_mm_inputs = True
             return None
 
         # Push mode: adaptive dispatch + mm_receiver.send_encode_request

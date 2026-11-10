@@ -277,29 +277,6 @@ class KimiGPUProcessorWrapper:
         self.tokenizer = hf_processor.tokenizer
         self.media_processor = hf_processor.media_processor
 
-    def image_token_counts_from_sizes(
-        self, image_sizes: List[tuple[int, int]]
-    ) -> List[int]:
-        """NaViT feature count per image, derived from (width, height) alone.
-
-        ``navit_resize_config`` is pure math on the source dimensions, so a node
-        that never touches pixels -- e.g. the decode node of a PD-disaggregated
-        deployment -- can still reproduce the prompt length the vision path
-        would have produced.
-        """
-        return [
-            navit_resize_config(
-                width,
-                height,
-                self._patch_size,
-                self._merge_kernel_size,
-                self._in_patch_limit,
-                self._patch_limit_on_one_side,
-                self._fixed_output_tokens,
-            )["num_tokens"]
-            for width, height in image_sizes
-        ]
-
     def __call__(self, text=None, images=None, **kwargs):
         # process_mm_data passes images via kwargs["images"]
         images = images or kwargs.pop("images", None)

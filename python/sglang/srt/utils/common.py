@@ -3045,14 +3045,74 @@ def _configure_uvicorn_access_log_filter(
             filters_list.append(filter_name)
 
 
-def launch_dummy_health_check_server(host, port, enable_metrics):
+def node_pp_rank_range(pp_size: int, nnodes: int, node_rank: int) -> range:
+    """Contiguous pipeline-parallel ranks hosted by one node.
+
+    Mirrors the engine launch topology (engine._calculate_rank_ranges);
+    lenient by design so it also covers nnodes > pp_size, where several
+    nodes share one stage via TP spanning nodes.
+    """
+    pp_size_per_node = max(pp_size // nnodes, 1)
+    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
+    start = pp_size_per_node * (node_rank // nnodes_per_pp_rank)
+    return range(start, start + pp_size_per_node)
+
+
+def _build_dummy_instance_info(server_args, master_ip: str) -> dict:
+    """Static /get_instance_info payload for non-master nodes.
+
+    Worker nodes run no tokenizer manager, so runtime counters are zeros.
+    Kept module-level so the field contract is unit-testable without
+    booting the dummy health server.
+    """
+    pp_rank_range = node_pp_rank_range(
+        server_args.pp_size, server_args.nnodes, server_args.node_rank
+    )
+    dp_per_node = server_args.dp_size // server_args.nnodes
+    start = server_args.node_rank * dp_per_node
+    return {
+        "kv_role": server_args.disaggregation_mode,
+        "node_rank": server_args.node_rank,
+        "dp_ranks": list(range(start, start + dp_per_node)),
+        "pp_ranks": list(pp_rank_range),
+        "dp_size": server_args.dp_size,
+        "tp_size": server_args.tp_size,
+        "pp_size": server_args.pp_size,
+        "nnodes": server_args.nnodes,
+        "chunked_prefill_enabled": server_args.chunked_prefill_size != -1,
+        "chunked_prefill_size": server_args.chunked_prefill_size,
+        "active_request_count": 0,
+        "max_running_requests": (
+            server_args.max_running_requests * server_args.dp_size
+            if server_args.max_running_requests
+            else None
+        ),
+        "current_input_tokens": 0,
+        "master_node_ip": master_ip,
+    }
+
+
+def launch_dummy_health_check_server(host, port, enable_metrics, server_args=None):
+    """Launch a dummy health check server in a background daemon thread.
+
+    Args:
+        host: The host address to bind the server.
+        port: The port number to bind the server.
+        enable_metrics: Whether to enable prometheus metrics middleware.
+        server_args: Optional server arguments containing node configuration.
+    """
     import asyncio
 
+    import aiohttp
     import uvicorn
     from fastapi import FastAPI, Response
 
     from sglang.srt.utils.network import NetworkAddress
 
+    # Lazily-initialized, reusable session for forwarding /ready to the master node.
+    # Reusing it keeps the TCP connection to the master alive across checks and
+    # avoids spinning up a new client (and connector) on every health-check probe.
+    _ready_session = None
     app = FastAPI()
 
     @app.get("/ping")
@@ -3065,10 +3125,44 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         """Check the health of the http server."""
         return Response(status_code=200)
 
+    @app.get("/health_forward")
+    async def health_forward():
+        """Check the health of the http server."""
+        return Response(status_code=200)
+
     @app.get("/health_generate")
     async def health_generate():
         """Check the health of the http server."""
         return Response(status_code=200)
+
+    @app.get("/ready")
+    async def ready():
+        """Check readiness by forwarding to master node."""
+        import os
+
+        nonlocal _ready_session
+        master = os.environ.get("MASTER_IP", host)
+        try:
+            if _ready_session is None or _ready_session.closed:
+                _ready_session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=10)
+                )
+            async with _ready_session.get(f"http://{master}:{port}/ready") as resp:
+                if resp.status != 200:
+                    return Response(status_code=503)
+        except Exception:
+            return Response(status_code=503)
+        return Response(status_code=200)
+
+    @app.get("/get_instance_info")
+    async def get_instance_info():
+        """Get the instance information by returning local node's config."""
+        import os
+
+        if server_args is None:
+            return Response(status_code=404)
+        master_ip = os.environ.get("MASTER_IP", host)
+        return _build_dummy_instance_info(server_args, master_ip)
 
     # Add prometheus middleware
     if enable_metrics:

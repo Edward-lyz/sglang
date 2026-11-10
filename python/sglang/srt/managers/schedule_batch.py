@@ -114,6 +114,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
     from typing import Any, Dict
@@ -289,6 +290,10 @@ class MultimodalDataItem:
     def set(self, key: str, value: Any):
         self.__setitem__(key, value)
 
+    def set_hash(self, hash_value: int) -> None:
+        self.hash = hash_value
+        self.pad_value = _compute_pad_value(hash_value)
+
     @staticmethod
     def is_empty_list(l):
         if l is None:
@@ -451,10 +456,6 @@ class MultimodalProcessorOutput:
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
 
-    # EPD: pinned-pool buffer addresses backing zero-copy precomputed-embedding
-    # views (first attn-tp rank only; None elsewhere).
-    pool_buffer_addrs: Optional[List[int]] = None
-
     @staticmethod
     def from_dict(d: dict) -> MultimodalProcessorOutput:
         return MultimodalProcessorOutput(
@@ -475,7 +476,6 @@ class MultimodalProcessorOutput:
             vision_position_ids=d.get("vision_position_ids"),
             media_nums_per_sample=d.get("media_nums_per_sample"),
             visible_frame_counts=d.get("visible_frame_counts"),
-            pool_buffer_addrs=d.get("pool_buffer_addrs"),
         )
 
     @staticmethod
@@ -534,38 +534,10 @@ class MultimodalInputs:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
-    # EPD: pinned-pool buffer addresses backing zero-copy precomputed-embedding
-    # views (first attn-tp rank only). See release_pool_buffers().
-    pool_buffer_addrs: Optional[List[int]] = None
-
     def release_features(self):
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
             item.feature = None
-
-    def release_pool_buffers(self):
-        """Return pinned-pool pages backing precomputed embeddings once prefill
-        has consumed them. Idempotent; a no-op on ranks without a pool."""
-        addrs = self.pool_buffer_addrs
-        if not addrs:
-            return
-        self.pool_buffer_addrs = None
-        for item in self.mm_items:
-            item.precomputed_embeddings = None
-        from sglang.srt.disaggregation.embedding_transfer.mooncake_transport import (
-            _MooncakeBufferManager,
-        )
-
-        buf_mgr = _MooncakeBufferManager.get_instance_if_exists()
-        if buf_mgr is None:
-            return
-        for addr in addrs:
-            try:
-                buf_mgr.release_buffer(addr)
-            except Exception as e:
-                logger.warning(
-                    "release_pool_buffers: failed to free addr=%s: %s", addr, e
-                )
 
     @staticmethod
     def from_processor_output(obj: MultimodalProcessorOutput):
@@ -631,7 +603,6 @@ class MultimodalInputs:
             "vision_position_ids",
             "media_nums_per_sample",
             "visible_frame_counts",
-            "pool_buffer_addrs",
         ]
         for arg in optional_args:
             val = getattr(obj, arg, None)
@@ -772,10 +743,12 @@ class Req(ReqDllmMixin):
         routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        dispatch_to_scheduler_time: Optional[float] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
+        skip_radix_cache_insert: bool = False,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
@@ -788,6 +761,8 @@ class Req(ReqDllmMixin):
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
+        is_warmup=False,
+        trace_config=None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
@@ -851,6 +826,9 @@ class Req(ReqDllmMixin):
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
         self._is_reasoning_over = False
         self.reasoning_tokens = 0
+        # How much of the think-end marker the output tail matches; the marker
+        # can span several tokens and several decode steps.
+        self._think_end_match_len = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -861,6 +839,11 @@ class Req(ReqDllmMixin):
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        # The thinking-related fields are mutated in the scheduler event loop.
+        # They are not designed for concurrent multi-thread mutation.
+        self.thinking_budget: Optional[int] = None
+        self.thinking_inject_index: int = 0
+        self.thinking_prompt_token_ids: Optional[List[int]] = None
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -950,8 +933,20 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # per-component nodes this req skipped locking (e.g. mamba on the decode
+        # hold, already COW'd), so their dec releases only what it took.
+        self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # Whether this is a warmup request (used to control trace behavior)
+        self.is_warmup: bool = is_warmup
+        self.trace_config: Optional[Dict[str, Any]] = trace_config
+        # AttentionStore (AS) parameters
+        self.as_block_hashs = None
+        self.as_kv_cache_params = None
+        self.as_max_hit_host_ip: list = []
+        self.as_max_hit_token_len: list = []
+        self.ever_read_as: bool = False
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1038,6 +1033,7 @@ class Req(ReqDllmMixin):
             None
         )
         self.grammar_wait_ct = 0
+        self.continuation_token_ids: Optional[List[int]] = None
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
@@ -1081,6 +1077,12 @@ class Req(ReqDllmMixin):
         self.time_stats.set_metrics_collector(metrics_collector)
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
+
+        # Timestamp when tokenizer dispatches the request to the scheduler
+        self.dispatch_to_scheduler_time = dispatch_to_scheduler_time
+        # TODO (suhang): Move the dispatch_to_scheduler_time synchronization into Req’s own initializer:
+        # Once dispatch_to_scheduler_time is passed into Req
+        # TimeStats can synchronize it automatically, so the scheduler no longer needs that extra getattr check.
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -1550,6 +1552,113 @@ class Req(ReqDllmMixin):
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
+    def init_thinking_budget(self):
+        """Initialize per-request thinking budget state.
+
+        This reads `thinking_budget` and `thinking_prompt_token_ids` from
+        `self.sampling_params` and prepares request-local mutable fields for decode.
+
+        Notes:
+        - `thinking_budget` is an int state machine: `>0` counts down, `==0` starts
+          injection, `-1` means thinking is finished/disabled.
+        - `thinking_prompt_token_ids` passed from the request must NOT include the
+          `</think>` token; the server appends `think_end_id` here to ensure the
+          injected sequence always terminates the thinking segment.
+        """
+        thinking_budget = getattr(self.sampling_params, "thinking_budget", None)
+        if thinking_budget is None:
+            return
+        if self.tokenizer is None:
+            return
+
+        self.thinking_budget = int(thinking_budget)
+        self.thinking_inject_index = 0
+
+        prompt_token_ids = getattr(
+            self.sampling_params, "thinking_prompt_token_ids", None
+        )
+        self.thinking_prompt_token_ids = list(prompt_token_ids or [])
+
+        think_end_id = getattr(self.tokenizer, "think_end_id", None)
+        if think_end_id is None:
+            # Fallback for when the server is launched without --reasoning-parser:
+            # infer think_end_id from tokenizer vocab and cache it on the tokenizer.
+            # Only accept single-token encodings to match the current state machine.
+            ids = self.tokenizer.encode("</think>", add_special_tokens=False)
+            if len(ids) == 1:
+                think_end_id = int(ids[0])
+                self.tokenizer.think_end_id = think_end_id
+        if think_end_id is not None:
+            self.thinking_prompt_token_ids.append(int(think_end_id))
+
+    def inject_thinking_prompt_tokens(
+        self,
+        draft_tokens: torch.Tensor,
+        start_idx: int,
+        max_count: int,
+        advance: bool = True,
+    ) -> int:
+        """Inject thinking prompt token ids into a token tensor.
+
+        This is used to truncate the `<think>...</think>` segment by injecting a
+        predefined token sequence (e.g. "思考已达上限，请开始回答" + `</think>`).
+
+        Semantics:
+        - Only active when `self.thinking_budget == 0` (budget reached, start injecting).
+        - `advance=False` is for speculative draft stage (write tokens without consuming
+          the inject sequence).
+        - `advance=True` is for verify/sample stage (commit the injection and advance
+          `thinking_inject_index`; when finished, set `thinking_budget = -1`).
+
+        Args:
+            draft_tokens: The target tensor to be overwritten in-place.
+            start_idx: Start offset in `draft_tokens` to write.
+            max_count: Maximum number of tokens to inject.
+            advance: Whether to advance the injection cursor and update state.
+
+        Returns:
+            The number of injected tokens.
+        """
+        if self.thinking_budget != 0 or not self.thinking_prompt_token_ids:
+            return 0
+        inject_index = self.thinking_inject_index
+        remains = len(self.thinking_prompt_token_ids) - inject_index
+        if remains <= 0:
+            return 0
+        count = min(max_count, remains)
+        inject_ids = self.thinking_prompt_token_ids[inject_index : inject_index + count]
+        draft_tokens[start_idx : start_idx + count] = torch.tensor(
+            inject_ids, dtype=draft_tokens.dtype, device=draft_tokens.device
+        )
+        if advance:
+            self.thinking_inject_index += count
+            if self.thinking_inject_index >= len(self.thinking_prompt_token_ids):
+                self.thinking_budget = -1  # -1 means thinking is finished/disabled
+        return count
+
+    def update_thinking_state(self, new_token_ids: List[int]) -> None:
+        """Update thinking budget state given newly accepted token ids.
+
+        Behavior:
+        - If `think_end_id` is observed, set `thinking_budget = -1` to stop all future
+          thinking budget accounting/injection for this request.
+        - Otherwise, if `thinking_budget > 0`, decrement by 1 per token.
+
+        This function does not perform injection; it only maintains the state machine.
+        """
+        if self.thinking_budget is None or self.thinking_budget < 0:
+            return
+        if self.tokenizer is None:
+            return
+
+        think_end_id = getattr(self.tokenizer, "think_end_id", None)
+        for token_id in new_token_ids:
+            if think_end_id is not None and token_id == think_end_id:
+                self.thinking_budget = -1  # -1 means thinking is finished/disabled
+                continue
+            if self.thinking_budget > 0:
+                self.thinking_budget -= 1
+
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
@@ -1563,6 +1672,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
+        self.skip_lock_node_ids = {}
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -1686,8 +1796,6 @@ class Req(ReqDllmMixin):
     def set_finish_with_abort(self, error_msg: str):
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
-        if self.multimodal_inputs is not None:
-            self.multimodal_inputs.release_pool_buffers()
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = array(
@@ -1699,19 +1807,50 @@ class Req(ReqDllmMixin):
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
 
-    def update_reasoning_tokens(self, token_id, think_end_id):
+    def init_continuation_reasoning_state(self, think_end_ids) -> None:
+        """Restore reasoning state from continuation tokens.
+
+        They bypass ``update_reasoning_tokens``, so replay the think-end matcher,
+        including a marker split across requests.
+        """
+        if (
+            not self.require_reasoning
+            or not think_end_ids
+            or not self.continuation_token_ids
+        ):
+            return
+
+        matcher = TokenSequenceMatcher(think_end_ids)
+        match = 0
+        for token_id in self.continuation_token_ids:
+            match = matcher.advance(match, token_id)
+            if match == len(matcher):
+                self._is_reasoning_over = True
+                self._think_end_match_len = 0
+                return
+
+        self._think_end_match_len = match
+
+    def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:
             return
 
         if not isinstance(token_id, list):
             token_id = [token_id]
 
-        try:
-            end_pos = token_id.index(think_end_id)
-            self.reasoning_tokens += end_pos + 1
-            self._is_reasoning_over = True
-        except ValueError:
-            self.reasoning_tokens += len(token_id)
+        # The marker may span both several tokens and several decode steps, so
+        # the partial match carries over between calls.
+        matcher = TokenSequenceMatcher(think_end_ids)
+        match = self._think_end_match_len
+        for pos, token in enumerate(token_id):
+            match = matcher.advance(match, token)
+            if match == len(matcher):
+                self.reasoning_tokens += pos + 1
+                self._is_reasoning_over = True
+                return
+
+        self._think_end_match_len = match
+        self.reasoning_tokens += len(token_id)
 
     def __repr__(self):
         return (
@@ -1990,6 +2129,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For processing logprobs
     return_logprob: bool = False
 
+    # For logits and logprob post processing
+    temp_scaled_logprobs: bool = False
+    top_p_normalized_logprobs: bool = False
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -2032,6 +2175,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+    dp_global_num_tokens_for_metric: Optional[List[int]] = None
+
+    # DP all_gather latency for this batch
+    all_gather_latency: float = 0.0
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
     # Sampling info
@@ -3118,6 +3265,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            dp_global_num_tokens_for_metric=self.dp_global_num_tokens_for_metric,
+            all_gather_latency=self.all_gather_latency,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
@@ -3172,7 +3321,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
-                            req.last_node, req.swa_uuid_for_lock
+                            req.last_node,
+                            req.swa_uuid_for_lock,
+                            skip_lock_node_ids=req.skip_lock_node_ids,
                         )
                         req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():

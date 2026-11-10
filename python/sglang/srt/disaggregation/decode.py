@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from torch.distributed import ProcessGroup
+from sglang.srt.managers.utils import is_health_check_rid
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -206,6 +207,9 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         mamba_size: int = None,
         start_layer: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        linear_replayssm_cache_len: int = 16,
+        mamba_envelope_layout: bool = False,
+        enable_linear_replayssm_spec: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -250,6 +254,9 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            linear_replayssm_cache_len=linear_replayssm_cache_len,
+            mamba_envelope_layout=mamba_envelope_layout,
+            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
         )
 
     def clear(self):
@@ -482,6 +489,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        # Configure receiver ZMQ MAX_SOCKETS from server_args
+        receiver_class = get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
+        max_sockets = self.scheduler.server_args.disaggregation_zmq_max_sockets
+        if hasattr(receiver_class, "configure_max_sockets"):
+            receiver_class.configure_max_sockets(max_sockets)
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
         if self.enable_staging and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool
@@ -521,6 +533,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req = self._create_receiver_and_enqueue(
                 req, is_rebootstrap=is_rebootstrap
             )
+            if decode_req is None:
+                return
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req, self.scheduler.server_args):
@@ -582,11 +596,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
 
-        kv_receiver = kv_receiver_class(
-            mgr=self.kv_manager,
-            bootstrap_addr=_bootstrap_addr(req),
-            bootstrap_room=req.bootstrap_room,
-        )
+        try:
+            kv_receiver = kv_receiver_class(
+                mgr=self.kv_manager,
+                bootstrap_addr=_bootstrap_addr(req),
+                bootstrap_room=req.bootstrap_room,
+            )
+        except Exception as e:
+            message = f"Failed to create kv_receiver for request {req.rid}: {e}"
+            logger.error(message)
+            # Clean up leaked required_prefill_response_num_table entry
+            self.kv_manager.required_prefill_response_num_table.pop(
+                req.bootstrap_room, None
+            )
+            prepare_abort(
+                req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            self.scheduler.output_streamer.stream_output(
+                [req], req.return_logprob
+            )
+            return None
 
         decode_req = DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
@@ -869,7 +898,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._update_handshake_waiters(rids_to_check)
 
         failed_reqs = []
-        preallocated_reqs = []
+        preallocated_reqs: List[DecodeRequest] = []
         indices_to_remove = set()
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
@@ -1206,6 +1235,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+
+        if preallocated_reqs:
+            rids = [r.req.rid for r in preallocated_reqs if not r.req.rid.startswith("HEALTH_CHECK")]
+            if rids:
+                logger.info(f"[trace] decode bootstrap completed: {rids}")
+
+        if failed_reqs:
+            rids = [r.req.rid for r in failed_reqs if not r.req.rid.startswith("HEALTH_CHECK")]
+            if rids:
+                logger.info(f"[trace] reqs were aborted during bootstrap: {rids}")
 
         return preallocated_reqs, failed_reqs
 
@@ -1874,7 +1913,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         else:
             polls = self._poll_with_metadata_gate()
 
-        transferred_reqs = []
+        transferred_reqs: List[Req] = []
+        failed_reqs: List[Req] = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1918,6 +1958,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 indices_to_remove.add(i)
+                failed_reqs.append(decode_req.req)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
@@ -1945,6 +1986,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 else:
                     transferred_reqs.append(decode_req.req)
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.observe_kvcache_transfer_time(
+                            time.perf_counter() - decode_req.req.time_stats.decode_transfer_queue_entry_time
+                        )
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -1972,6 +2017,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        if transferred_reqs:
+            rids = [r.rid for r in transferred_reqs if not r.rid.startswith("HEALTH_CHECK")]
+            if rids:
+                logger.info(f"[trace] recv kvcache completed: {rids}")
+        if failed_reqs:
+            rids = [r.rid for r in failed_reqs if not r.rid.startswith("HEALTH_CHECK")]
+            if rids:
+                logger.info(f"[trace] recv kvcache failed: {rids}")
+
         return transferred_reqs
 
     def release_memory_occupation(self):
@@ -1990,6 +2044,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
+            self.iter_start_time = time.perf_counter()
+            self.metrics_reporter.iter_start_time = self.iter_start_time
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -2029,6 +2085,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
+            self.iter_start_time = time.perf_counter()
+            self.metrics_reporter.iter_start_time = self.iter_start_time
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -2170,6 +2228,12 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+
+        if self.enable_metrics:
+            for req in can_run_list:
+                self.metrics_collector.observe_request_waiting_time(
+                    req.time_stats.get_request_waiting_time(),
+                )
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

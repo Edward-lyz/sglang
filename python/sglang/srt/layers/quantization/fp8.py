@@ -381,6 +381,15 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return Mxfp4HummingMoEMethod(fp8_method, prefix=prefix)
+            # Kimi K2.6 Mega-MoE consumes raw MXFP4 expert weights via
+            # build_mega_moe_experts_weights() in Fp8MoEMethod, so avoid the
+            # FlashInfer MXFP4 wrappers that pre-shuffle weights for TRT-LLM.
+            if (
+                envs.SGLANG_KIMI_K26_MXFP4_MODE.get()
+                and envs.SGLANG_DSV4_FP4_EXPERTS.get()
+                and get_moe_a2a_backend().is_megamoe()
+            ):
+                return fp8_method
 
             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
                 # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.

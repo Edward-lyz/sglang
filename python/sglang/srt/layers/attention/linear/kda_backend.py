@@ -78,6 +78,16 @@ class KDAKernelDispatcher:
             self.decode_kernel if decode_backend.is_flashinfer() else triton_kernel
         )
 
+        # target_verify (MTP / speculative decode) kernel: each decode backend
+        # verifies with its own kernel. FlashInfer decode uses recurrent_kda (SM100,
+        # chain only); Triton -- and CuTe DSL, which has no verify of its own -- use
+        # the Triton fused KDA verify, which handles chain + tree
+        # (retrieve_parent_token) and per-step checkpointing and is the reference the
+        # KDA backend correctness tests assert against.
+        self.verify_kernel = (
+            self.decode_kernel if decode_backend.is_flashinfer() else triton_kernel
+        )
+
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_flashkda():

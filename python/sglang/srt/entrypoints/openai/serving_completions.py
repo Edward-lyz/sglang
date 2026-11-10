@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.openai.utils import (
     should_include_usage,
     to_openai_style_logprobs,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
@@ -34,8 +35,8 @@ from sglang.srt.parser.code_completion_parser import (
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
-    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +125,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
-            return_prompt_token_ids=request.return_token_ids,
             rid=request.rid,
             session_id=request.session_id,
             extra_key=self._compute_extra_key(request),
@@ -133,7 +133,23 @@ class OpenAIServingCompletion(OpenAIServingBase):
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
+            # AttentionStore parameters (populated below from kv_transfer_params)
+            as_kv_cache_params=None,
+            as_max_hit_host_ip=None,
+            as_max_hit_token_len=None,
+            trace_config=request.trace_config,
+            is_warmup=request.is_warmup
         )
+
+        # Convert kv_cache_params and kv_transfer_params to as_* flat fields
+        if request.kv_transfer_params is not None:
+            kv_cache_dict = request.kv_cache_params.dict() if request.kv_cache_params else {}
+            adapted_request.as_kv_cache_params = {
+                key: str(value) if value is not None else ""
+                for key, value in kv_cache_dict.items()
+            }
+            adapted_request.as_max_hit_host_ip = request.kv_transfer_params.max_hit_host_ip
+            adapted_request.as_max_hit_token_len = request.kv_transfer_params.max_hit_token_len
 
         return adapted_request, request
 
@@ -163,6 +179,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
             "sampling_seed": request.seed,
+            "thinking_budget": request.thinking_budget,
+            "thinking_prompt_token_ids": request.thinking_prompt_token_ids,
         }
 
         # Handle response_format constraints
@@ -218,6 +236,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming completion response"""
         created = int(time.time())
@@ -225,7 +244,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # State tracking for streaming
         stream_offsets = {}
         n_prev_tokens = {}
-        n_prev_token_ids = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -244,7 +262,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             )
 
             async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
+                adapted_request, raw_request, tokenizer_rev_request_time
             ):
                 index = content.get("index", 0)
 
@@ -315,32 +333,18 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         )
                     n_prev_tokens[index] = total_output_logprobs
 
-                chunk_token_ids = None
-                chunk_prompt_token_ids = None
-                if request.return_token_ids:
-                    output_ids = content["output_ids"]
-                    if (
-                        not self.tokenizer_manager.server_args.incremental_streaming_output
-                    ):
-                        n_prev_token_id = n_prev_token_ids.get(index, 0)
-                        chunk_token_ids = output_ids[n_prev_token_id:]
-                        n_prev_token_ids[index] = len(output_ids)
-                    else:
-                        chunk_token_ids = output_ids
-                    if is_first_chunk:
-                        chunk_prompt_token_ids = content.get("prompt_token_ids")
-
                 # Generate delta
-                if self.tokenizer_manager.server_args.incremental_streaming_output:
-                    delta = text
-                else:
-                    delta = text[offset:]
+                delta = text[offset:]
                 stream_offsets[index] = len(content["text"])
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Abort with an explicit error status_code is a system error
-                # (timeout, OOM, validation): emit a streaming error chunk.
+                # (timeout, OOM, validation). If no chunk has been sent yet the
+                # HTTP status is still ours to choose, so raise and let the
+                # kick-start in _handle_streaming_request turn it into a real
+                # error response; otherwise HTTP 200 is already committed and the
+                # only option is an in-band error chunk.
                 # A graceful abort (no status_code, e.g. user-initiated via
                 # /abort_request or session lifecycle cleanup) falls through
                 # to the normal chunk path, matching the non-stream behavior
@@ -348,6 +352,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 if finish_reason_type == "abort" and isinstance(
                     finish_reason.get("status_code"), HTTPStatus
                 ):
+                    if not stream_started:
+                        self.raise_abort_before_stream(finish_reason)
                     code = finish_reason["status_code"]
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
@@ -360,6 +366,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
                     text=delta,
+                    tokens=content.get("generated_token_num", 1),
                     logprobs=logprobs,
                     finish_reason=finish_reason_type,
                     matched_stop=(
@@ -367,8 +374,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         if finish_reason and "matched" in finish_reason
                         else None
                     ),
-                    token_ids=chunk_token_ids,
-                    prompt_token_ids=chunk_prompt_token_ids,
                 )
                 chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -386,8 +391,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                     )
 
-                yield f"data: {chunk.model_dump_json()}\n\n"
+                # Set before the yield: once the chunk leaves this generator
+                # HTTP 200 is committed, and the flag is what guards against
+                # raising after that point.
                 stream_started = True
+                yield f"data: {chunk.model_dump_json()}\n\n"
 
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
@@ -457,6 +465,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     choices=[],
                     model=request.model,
                     usage=usage,
+                    trace_info={"prompt": request.prompt} if (envs.AIAK_ENABLE_TRACE.get() and request.trace_config \
+                                    and request.trace_config.get('trace_prompt')) else None
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
@@ -474,11 +484,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
+        tokenizer_rev_request_time: Optional[float] = None,
     ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming completion request"""
         try:
             generator = self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
+                adapted_request, raw_request, tokenizer_rev_request_time
             )
             ret = await generator.__anext__()
         except ValueError as e:
@@ -569,14 +580,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
-                token_ids=(
-                    ret_item["output_ids"] if request.return_token_ids else None
-                ),
-                prompt_token_ids=(
-                    ret_item.get("prompt_token_ids")
-                    if request.return_token_ids
-                    else None
-                ),
             )
             choices.append(choice_data)
 
@@ -594,6 +597,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
             sglext=response_sglext,
+            trace_info={"prompt": request.prompt} if (envs.AIAK_ENABLE_TRACE.get() and request.trace_config \
+                            and request.trace_config.get('trace_prompt')) else None
         )
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:

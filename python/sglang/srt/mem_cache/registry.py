@@ -128,6 +128,15 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         )
         return cache
 
+    if server_args.enable_asradix_cache:
+        from sglang.srt.mem_cache.asradix_cache import AsRadixCache
+
+        return AsRadixCache(
+            params=params,
+            server_args=server_args,
+            tp_rank=ctx.tp_rank,
+        )
+
     if server_args.enable_lmcache:
         from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
             LMCRadixCache,

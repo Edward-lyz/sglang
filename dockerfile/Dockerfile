@@ -37,9 +37,7 @@ RUN pip config set global.index-url http://mirrors.baidubce.com/pypi/simple/ && 
     pip config set global.trusted-host mirrors.baidubce.com
 
 # Install deepgemm cache
-RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/cache_kimi_k3_0807_aiak.tar.gz && tar -xzvf cache_kimi_k3_0807_aiak.tar.gz && rm cache_kimi_k3_0807_aiak.tar.gz
-# K3/K3.1 prefill increment (incl. DSA indexer mqa_logits); archive root is cache/
-RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/cache_kimi_k3_k31_1030_aiak.tgz && mkdir -p /root/.cache/deep_gemm && tar -xzf cache_kimi_k3_k31_1030_aiak.tgz -C /root/.cache/deep_gemm && rm cache_kimi_k3_k31_1030_aiak.tgz
+RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/cache_k3_0728.tar.gz && tar -xzvf cache_k3_0728.tar.gz && rm cache_k3_0728.tar.gz
 
 RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/sglang-prestop-pyspy-dump.sh
 
@@ -47,8 +45,6 @@ RUN cd /root && wget http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/sgl
 COPY aiak_sglang/dockerfile/gpu_requirements.env /tmp/gpu_requirements.env
 RUN pip install --no-cache-dir --force-reinstall -r /tmp/gpu_requirements.env && \
     rm -rf /tmp/gpu_requirements.env
-
-RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/mooncake_transfer_engine_cuda13-0.3.12.post1-cp312-cp312-manylinux_2_28_x86_64.whl
 
 # NOTE: Move these into the basic image to minimize difference with the community.
 RUN pip install jsonschema_rs

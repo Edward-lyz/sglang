@@ -23,6 +23,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
+    FINISH_ABORT,
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -45,6 +46,9 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
+    enable_hierarchical_cache: bool
+    enable_asradix_cache: bool
+    load_inquirer_get_loads: Callable[..., Any]
     _test_stream_output_count: int = 0
 
     def _get_storage_backend_type(self) -> str:
@@ -65,6 +69,11 @@ class SchedulerOutputStreamer:
             - {"device": X, "host": Y} without storage breakdown
             - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
+        # Only show details if HiCache or AsRadixCache is enabled
+        if not self.enable_hierarchical_cache and not self.enable_asradix_cache:
+            return None
+
+        # Only show if there are any cached tokens
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
@@ -339,6 +348,27 @@ class _GenerationStreamAccumulator:
             req.finished_output = True
             if req.finished_len is None:
                 req.finished_len = len(req.output_ids)
+            # Trace log for request finalization. Abort is logged in all
+            # disaggregation roles; normal completion is logged for the
+            # centralized (null) and decode roles (prefill role only
+            # forwards the first token and hands off to the decode role).
+            # Skip internal health-check probes (rid like "HEALTH_CHECK_...").
+            if not req.rid.startswith("HEALTH_CHECK"):
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    logger.info(
+                        f"[trace] Request {req.rid} aborted. "
+                        f"reason={req.finished_reason.message!r}, "
+                        f"status_code={req.finished_reason.status_code}, "
+                        f"input_len={len(req.origin_input_ids)}, "
+                        f"output_len={len(req.output_ids)}"
+                    )
+                elif self.disaggregation_mode != DisaggregationMode.PREFILL:
+                    logger.info(
+                        f"[trace] Request {req.rid} finished. "
+                        f"finished_reason={req.finished_reason.to_json() if req.finished_reason else None}, "
+                        f"input_len={len(req.origin_input_ids)}, "
+                        f"output_len={len(req.output_ids)}"
+                    )
             should_output = True
         else:
             if req.stream:
