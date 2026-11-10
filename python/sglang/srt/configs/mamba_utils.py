@@ -15,6 +15,7 @@
 import logging
 from abc import ABC
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import List, Optional
 
 import numpy as np
@@ -24,6 +25,13 @@ from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+
+class LinearStateKind(str, Enum):
+    """Physical state organization used by a linear-attention cache."""
+
+    STANDARD = "standard"
+    KDA = "kda"
 
 
 def extra_groups_for_head_shards(ngroups: int, tp_size: int):
@@ -153,11 +161,16 @@ class BaseLinearStateParams(ABC):
         return per_layer * len(self.layers)
 
     @property
-    def is_kda(self) -> bool:
+    def state_kind(self) -> LinearStateKind:
         """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
         the ReplaySSM ring ``g_cache`` layout ([.., L] scalar vs [.., L, K]
         per-K) and the gate-generic decode kernel's ``IS_KDA`` path."""
-        return False
+        return LinearStateKind.STANDARD
+
+    @property
+    def is_kda(self) -> bool:
+        """Return whether this cache uses KDA recurrent state."""
+        return self.state_kind is LinearStateKind.KDA
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -321,5 +334,6 @@ class KimiLinearCacheParams(BaseLinearStateParams):
     shape: KimiLinearStateShape
 
     @property
-    def is_kda(self) -> bool:
-        return True
+    def state_kind(self) -> LinearStateKind:
+        """Return the KDA recurrent-state organization."""
+        return LinearStateKind.KDA

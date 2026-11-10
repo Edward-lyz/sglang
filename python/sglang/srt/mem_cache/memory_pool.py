@@ -478,6 +478,7 @@ class MambaPool:
         self.size = size
         self.device = device
         self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
+        self.linear_state_kind = cache_params.state_kind
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         # ReplaySSM spec-verify (Part B of #28511): GDN REUSES the linear_replayssm

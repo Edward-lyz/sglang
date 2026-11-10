@@ -499,7 +499,7 @@ class Scheduler(
             page_size=self.page_size,
         )
 
-        # Initialize AttentionStore SDK and wire it into AsRadixCache.
+        # Initialize AttentionStore and attach its binding to the selected cache.
         # Must run after tree_cache, token_to_kv_pool_allocator and draft_worker
         # are ready (kv_cache_builder.build / maybe_register_hicache_draft above).
         if self.enable_asradix_cache:
@@ -990,146 +990,116 @@ class Scheduler(
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
     def _init_attention_store(self, server_args):
-        """Initialize AttentionStore SDK and inject into AsRadixCache.
-
-        Detects attention type (MLA/DSA/MHA) and computes per-shard byte sizes
-        for the SDK, following the v4 branch initialization pattern.
-        """
+        """Construct one typed AS binding and attach it after TP consensus."""
         import os
 
+        binding = None
+        init_error = None
+        cache_plan = None
         try:
-            from attentionstore_sdk.sdk import AttentionStoreSDK, AttentionType
-        except ImportError:
-            logger.warning(
-                "attentionstore_sdk not installed. AS features will be disabled."
+            from sglang.srt.mem_cache.asradix_cache import AttentionStoreInitContext
+
+            pod_name = os.getenv("POD_NAME")
+            model_id = os.getenv("MODEL_ID")
+            if pod_name is None or model_id is None:
+                raise ValueError(
+                    "enable_asradix_cache but POD_NAME or MODEL_ID not set"
+                )
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+            cache_plan = self.tree_cache.attention_store_plan
+            target_start = int(getattr(kv_cache, "start_layer", 0))
+            target_count = int(
+                getattr(kv_cache, "layer_num", self.model_config.num_hidden_layers)
             )
-            return
-
-        POD_NAME = os.getenv("POD_NAME")
-        MODEL_ID = os.getenv("MODEL_ID")
-        if POD_NAME is None or MODEL_ID is None:
-            raise ValueError("enable_asradix_cache but POD_NAME or MODEL_ID not set.")
-
-        # ---- Detect attention type and compute SDK params ----
-        from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
-
-        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        bytes_per_element = torch.tensor(
-            [], dtype=self.token_to_kv_pool_allocator.dtype
-        ).element_size()
-        kv_lora_plus_head_dim = kv_cache.get_key_buffer(0).size(-1)
-        v_bytes_per_shard_layer_per_block = 0
-
-        if self.model_config.attention_arch == AttentionArch.MLA:
-            # MLA: tp_rank=0 since MLA is TP-independent for KV cache
-            as_tp_rank = 0
-            as_tp_rank_num = 1
-
-            k_bytes_per_shard_layer_per_block = (
-                self.page_size * kv_lora_plus_head_dim * bytes_per_element
+            target_layer_ids = tuple(range(target_start, target_start + target_count))
+            draft_layer_ids = ()
+            draft_kv_cache = None
+            if self.draft_worker is not None and self.spec_algorithm.is_eagle():
+                draft_layers, draft_kv_cache = self._get_draft_kv_info()
+                draft_start = int(getattr(draft_kv_cache, "start_layer", 0))
+                draft_count = int(getattr(draft_kv_cache, "layer_num", draft_layers))
+                draft_layer_ids = tuple(range(draft_start, draft_start + draft_count))
+            binding = self.tree_cache.create_attention_store_binding(
+                AttentionStoreInitContext(
+                    kv_cache=kv_cache,
+                    req_to_token_pool=self.req_to_token_pool,
+                    namespace_base=model_id,
+                    pod_name=pod_name,
+                    model_version="v1",
+                    page_size=self.page_size,
+                    # AS collectives use the attention-TP cache group, so the
+                    # SDK shard identity must use that group's local topology.
+                    tp_rank=self.ps.attn_tp_rank,
+                    tp_size=self.ps.attn_tp_size,
+                    pp_rank=0 if self.ps.pp_rank is None else self.ps.pp_rank,
+                    dp_rank=self.ps.attn_dp_rank,
+                    device_id=self.ps.gpu_id,
+                    gpu_count=server_args.per_node_gpu_num,
+                    target_layer_ids=target_layer_ids,
+                    draft_kv_cache=draft_kv_cache,
+                    draft_layer_ids=draft_layer_ids,
+                )
             )
-            v_bytes_per_shard_layer_per_block = 0
+        except Exception as exc:
+            init_error = exc
 
-            if is_deepseek_dsa(self.model_config.hf_config):
-                # DSA (NSA): MLA-based key + index_k_with_scale_buffer as V
-                attention_type = AttentionType.DSA
-                attention_type_str = "DSA"
-                # Compute V bytes from index_k_with_scale_buffer layout:
-                # buffer shape is (num_pages, page_size * (index_head_dim + scale_dim))
-                # so buf[0].nbytes already includes page_size factor
-                index_k_buf = kv_cache.get_index_k_with_scale_buffer(0)
-                v_bytes_per_shard_layer_per_block = index_k_buf[0].nbytes
+        # Enable AS only when every TP rank initialized successfully.
+        ready = torch.tensor(1 if binding is not None else 0, dtype=torch.int)
+        tp_group = getattr(self.tree_cache, "tp_group", None)
+        tp_world_size = getattr(self.tree_cache, "tp_world_size", 1)
+        if tp_world_size > 1:
+            torch.distributed.all_reduce(
+                ready, op=torch.distributed.ReduceOp.MIN, group=tp_group
+            )
+        if ready.item() == 0:
+            if binding is not None:
+                try:
+                    binding.cache_store.stop()
+                except Exception as stop_error:
+                    logger.warning(
+                        "Failed to stop AS binding after TP init rollback: %s",
+                        stop_error,
+                    )
+            self.ascli = None
+            if init_error is not None:
+                message = f"AttentionStore initialization failed: {init_error}"
             else:
-                attention_type = AttentionType.MLA
-                attention_type_str = "MLA"
-        else:
-            # MHA: TP-sharded, separate K and V buffers
-            as_tp_rank = self.tp_rank
-            as_tp_rank_num = server_args.tp_size
-            attention_type = AttentionType.MHA
-            attention_type_str = "MHA"
-            k_bytes_per_shard_layer_per_block = (
-                self.page_size * kv_lora_plus_head_dim * bytes_per_element
-            )
-            v_bytes_per_shard_layer_per_block = k_bytes_per_shard_layer_per_block
-
-        # ---- Compute layers (target + draft) ----
-        target_layers = self.model_config.num_hidden_layers
-        target_layer_ids = list(range(target_layers))
-
-        draft_layer_ids = []
-        draft_kv_cache = None
-        if self.draft_worker is not None and self.spec_algorithm.is_eagle():
-            draft_layers, draft_kv_cache = self._get_draft_kv_info()
-            if draft_layers > 0:
-                draft_layer_ids = list(
-                    range(target_layers, target_layers + draft_layers)
+                message = (
+                    "AttentionStore initialization failed on another cache-group rank"
                 )
-                logger.info(
-                    f"EAGLE draft detected: {draft_layers} draft layers, "
-                    f"total AS layers = {target_layers + draft_layers}"
-                )
+            raise RuntimeError(message) from init_error
 
-        total_layers = target_layers + len(draft_layer_ids)
-        model_name = MODEL_ID + ":" + str(as_tp_rank_num)
-        dp_rank = 0 if self.ps.dp_rank is None else self.ps.dp_rank
-
-        # ---- Initialize AS SDK ----
-        self.ascli = None
-        try:
-            self.ascli = AttentionStoreSDK(
-                attention_type=attention_type,
-                layer_num=total_layers,
-                namespace=model_name,
-                pod_name=POD_NAME,
-                model_version="v1",
-                shard_id=as_tp_rank,
-                shard_num=as_tp_rank_num,
-                block_token_size=self.page_size,
-                k_bytes_per_shard_layer_per_block=k_bytes_per_shard_layer_per_block,
-                v_bytes_per_shard_layer_per_block=v_bytes_per_shard_layer_per_block,
-                device_id=self.ps.gpu_id,
-                dp_id=dp_rank,
-                enable_as_kv_rw=True,
-                gpu_count=self.server_args.per_node_gpu_num,
-            )
-            self.tree_cache.ref_ascli(self.ascli)
+        self.tree_cache.ref_as_binding(binding)
+        self.ascli = binding.cache_store
+        if self.ps.attn_tp_rank == 0:
             logger.info(
-                f"AttentionStoreSDK registered: model_name={model_name}, "
-                f"POD_NAME={POD_NAME}, tp_rank={as_tp_rank}, "
-                f"tp_rank_num={as_tp_rank_num}, layers={total_layers}, "
-                f"page_size={self.page_size}, "
-                f"k_bytes={k_bytes_per_shard_layer_per_block}, "
-                f"v_bytes={v_bytes_per_shard_layer_per_block}, "
-                f"device_id={self.ps.gpu_id}, dp_rank={dp_rank}, "
-                f"attention_type={attention_type_str},"
-                f"per_node_gpu_num={self.server_args.per_node_gpu_num}"
+                "AttentionStore initialized: cache_plan=%s namespace=%s "
+                "dp_rank=%s attn_tp_size=%s page_size=%s bytes_per_block=%s "
+                "endpoints=%s",
+                cache_plan.name,
+                binding.namespace,
+                self.ps.attn_dp_rank,
+                self.ps.attn_tp_size,
+                self.page_size,
+                binding.bytes_per_block,
+                [
+                    {
+                        "name": endpoint.name,
+                        "role": endpoint.role.value,
+                        "namespace": endpoint.namespace,
+                        "payload_fields": tuple(endpoint.payload_fields),
+                        "bytes_per_block": endpoint.bytes_per_block,
+                    }
+                    for endpoint in binding.endpoints
+                ],
             )
-        except Exception as e:
-            logger.error(f"AttentionStore SDK init failed: {e}")
-            return
-
-        # ---- Initialize buffer pointers for target layers ----
-        try:
-            self.tree_cache.init_buffer_ptrs(target_layer_ids, attention_type_str)
-        except Exception as e:
-            logger.error(f"Failed to initialize AS buffer pointers: {e}")
-            return
-
-        # ---- Extend with draft KV pool if EAGLE is enabled ----
-        if draft_kv_cache is not None and draft_layer_ids:
-            try:
-                self.tree_cache.extend_with_draft_pool(draft_kv_cache, draft_layer_ids)
-            except Exception as e:
-                logger.error(
-                    f"Failed to extend AS buffer pointers with draft pool: {e}"
-                )
-
-        logger.info(
-            f"AttentionStore fully initialized: target_layers={target_layers}, "
-            f"draft_layers={len(draft_layer_ids)}, total_layers={total_layers}, "
-            f"attention_type={attention_type_str}"
+        logger.debug(
+            "AttentionStore layout: dp_rank=%s attn_tp_rank=%s layout_id=%s",
+            self.ps.attn_dp_rank,
+            self.ps.attn_tp_rank,
+            binding.layout_id,
         )
+        return
 
     def _get_draft_kv_info(self):
         """Get draft model's layer count and KV cache for EAGLE integration.
@@ -3811,14 +3781,10 @@ class Scheduler(
             # finishing between rounds also get reclaimed.
             ROUNDS = 5
             INTERVAL_S = 0.1
-            # Drain any pending AS writes first so the nodes they hold
-            # locked become evictable. Otherwise /clear_all_cache would
-            # leave those nodes in the tree, AND a later reset() (e.g.
-            # via /flush_cache) on a still-populated _as_write_queue would
-            # orphan their references and trip the cross-tree assertion in
-            # dec_lock_ref.
-            if hasattr(self.tree_cache, "_drain_as_write_queue"):
-                self.tree_cache._drain_as_write_queue()
+            # Retire pending AS writes first so their retained cache nodes
+            # become evictable before the best-effort sweep.
+            if hasattr(self.tree_cache, "drain_attention_store_writes"):
+                self.tree_cache.drain_attention_store_writes()
             for i in range(1, ROUNDS + 1):
                 evict_size = self.tree_cache.evictable_size()
                 if evict_size > 0:
