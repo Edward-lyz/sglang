@@ -528,11 +528,15 @@ def _send_kvcache_dcp_with_draft_tail(
     )
     if ret == 0 and src_mla_entry_count < len(mgr.kv_args.kv_item_lens):
         draft_total_kv_heads = mgr.kv_args.draft_kv_head_num * mgr.attn_tp_size
-        ret = mgr.send_kvcache_dcp_draft(
+        ret = mgr.send_kvcache_draft(
             req.mooncake_session_id,
             kv_chunk.prefill_kv_indices,
             target_rank_registration_info.dst_kv_ptrs,
-            chunked_dst_kv_indice,
+            (
+                req.draft_dst_kv_indices
+                if req.draft_dst_kv_indices is not None
+                else chunked_dst_kv_indice
+            ),
             src_mla_entry_count=src_mla_entry_count,
             dst_mla_entry_count=dst_mla_entry_count,
             dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
@@ -542,6 +546,7 @@ def _send_kvcache_dcp_with_draft_tail(
             src_page_offset=kv_chunk.index_slice.start or 0,
             decode_prefix_len=req.decode_prefix_len or 0,
             num_kv_tokens=kv_chunk.num_kv_tokens,
+            draft_window_start=req.draft_window_start,
             executor=executor,
         )
     return ret
