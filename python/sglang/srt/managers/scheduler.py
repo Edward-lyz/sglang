@@ -3777,10 +3777,34 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
+        skip_waiting_admission = False
         resumed_chunked_req = self.chunked_req
         if resumed_chunked_req is not None:
             resumed_chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(resumed_chunked_req)
+            if authoritative_admissions is None:
+                post_chunk_budget_state = adder.budget_state()
+                # NO_TOKEN takes precedence over chunk exhaustion in
+                # budget_state(), so inspect the chunk budget explicitly.
+                chunk_budget_exhausted = (
+                    self.dllm_config is None
+                    and adder.rem_chunk_tokens is not None
+                    and adder.rem_chunk_tokens <= 0
+                )
+                skip_waiting_admission = (
+                    post_chunk_budget_state == AddReqResult.OTHER
+                    or chunk_budget_exhausted
+                )
+                if (
+                    skip_waiting_admission
+                    and post_chunk_budget_state == AddReqResult.NO_TOKEN
+                ):
+                    if self.enable_hierarchical_cache:
+                        running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                            not running_batch.is_empty()
+                        )
+                    else:
+                        running_batch.batch_is_full = True
 
         if self.enable_lora:
             running_loras = {
@@ -3795,15 +3819,21 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
-        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-        if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
-        cache_read_aborted_reqs = set()
         candidate_reqs = self.waiting_queue
         if authoritative_admissions is not None:
             candidate_reqs = self._pp_select_authoritative_waiting_reqs(
                 authoritative_admissions, resumed_chunked_req
             )
+        elif skip_waiting_admission:
+            # A resumed chunk is admitted outside the waiting-queue loop, so it
+            # cannot propagate add_one_req()'s stop result. If it closes the
+            # budget, do not match/load another request that cannot run.
+            candidate_reqs = ()
+
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if mamba_allocator is not None:
+            mamba_allocator.alloc_group_begin(len(candidate_reqs))
+        cache_read_aborted_reqs = set()
         # Get requests from the waiting queue to a new prefill batch
         for req in candidate_reqs:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
