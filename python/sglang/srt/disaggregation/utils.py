@@ -195,6 +195,35 @@ def poll_and_all_reduce_attn_cp_tp_group(
     return tensor_to_reduce.tolist()
 
 
+def poll_and_all_reduce_attn_cp_tp_group_with_readiness(
+    pollers,
+    forward_ready: List[bool],
+    send_ready: List[bool],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> Tuple[List[int], List[int]]:
+    """Carry forward readiness in the existing transfer-status reductions.
+
+    Early KV sends can finish at different times on attention shards. A failure
+    must not release pages while a peer is still writing them, and Success must
+    not be advertised before every shard has submitted its final send.
+    """
+    polls = _poll_with_failure_injection(pollers)
+    polls = [
+        KVPoll.Transferring if poll == KVPoll.Success and not sent else poll
+        for poll, sent in zip(polls, send_ready, strict=True)
+    ]
+    # Two host bytes per request, with the same TP -> CP collective order and
+    # number of rounds as poll_and_all_reduce_attn_cp_tp_group. No GPU wait.
+    tensor_to_reduce = torch.tensor(
+        [polls, forward_ready], dtype=torch.uint8, device="cpu"
+    )
+    for group in (attn_tp_cpu_group, attn_cp_cpu_group):
+        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    polls, ready = tensor_to_reduce.tolist()
+    return polls, ready
+
+
 def poll_and_all_reduce_with_staging(
     decode_reqs,
     staging_handler,

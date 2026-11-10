@@ -170,18 +170,63 @@ class AttentionStoreIntegrationMixin:
             )
         return int(tensor.item())
 
-    def sync_attention_store_read_abort(self, req) -> bool:
+    def sync_attention_store_read_abort(self, req, *, check_load_back=False) -> bool:
         """Return the stage-wide AttentionStore read-abort decision.
 
         PP stages do not call request admission in lockstep, so this path must
         not issue a PP collective.
         """
-        abort = torch.tensor(
-            int(bool(getattr(req, "_as_cache_read_abort_reason", None))),
-            dtype=torch.int64,
+        reason = getattr(req, "_as_cache_read_abort_reason", None)
+        # Preserve the retryable replay-abort classification on every shard.
+        # MAX gives a replay resource failure priority over a cache-read abort.
+        local_abort = (
+            2 if getattr(req, "_pp_replay_local_abort", False) else int(bool(reason))
         )
+        if self.as_world_size <= 1:
+            # PP stages decide asynchronously; with no attention peers there
+            # is nothing to reduce, allocate or read back through a tensor.
+            return bool(local_abort)
+
+        values = [local_abort]
+        if check_load_back:
+            # Load-back has its own collectives. Different local prefixes or
+            # restore lengths cannot safely take different paths through it.
+            shape = (
+                len(req.prefix_indices),
+                req.host_hit_length,
+                req.swa_host_hit_length,
+                req.mamba_host_hit_length,
+            )
+            values.extend(shape)
+            values.extend(-value for value in shape)
+        # This is host control data reduced over CPU/Gloo attention groups.
+        # Keep it on CPU even if a caller has changed torch's default device.
+        abort = torch.tensor(values, dtype=torch.int64, device="cpu")
         self._all_reduce_attn_groups(abort, torch.distributed.ReduceOp.MAX)
-        return bool(abort.item())
+        reduced = abort.tolist()
+        abort_kind = reduced[0]
+        if check_load_back and any(
+            high != -low for high, low in zip(reduced[1:5], reduced[5:9])
+        ):
+            abort_kind = 2
+            reason = f"PP replay load-back shapes differ across attention shards: local={shape}"
+        if abort_kind:
+            req._pp_replay_local_abort = abort_kind == 2
+            if self.as_world_size > 1:
+                if reason:
+                    logger.error(
+                        "Attention-shard request abort: rid=%s reason=%s",
+                        req.rid,
+                        reason,
+                    )
+                # PP controls compare the full abort record. Rank-local details
+                # remain in logs; the propagated reason must agree across TP/CP.
+                req._as_cache_read_abort_reason = (
+                    "PP replay admission failed on an attention shard"
+                    if abort_kind == 2
+                    else "AttentionStore cache read failed on an attention shard"
+                )
+        return bool(abort_kind)
 
     def _tp_min(self, value: int) -> int:
         """Reduce a write-retirement value across local attention shards."""
@@ -338,9 +383,6 @@ class AttentionStoreIntegrationMixin:
         max_hit_len = len(params.key) // block_size * block_size
         joint_pp_match = self.pp_world_size > 1
         local_result = self._match_as_aligned_local_prefix(params, local_result)
-        if req._as_cache_read_abort_reason:
-            # Rematch already gave up; skip the Agent RPC for a request being dropped.
-            return zero_match_result(self, local_result)
         local_hit_len = len(local_result.device_indices)
         if local_hit_len == max_hit_len and not joint_pp_match:
             return local_result
@@ -373,7 +415,11 @@ class AttentionStoreIntegrationMixin:
             and self.pp_rank != 0
             and bool(getattr(req, "_as_pp_match_decision_required", False))
         )
-        if authoritative_pp_match:
+        if req._as_cache_read_abort_reason:
+            # Skip the RPC, but still join the stage-local match reduction below.
+            # A local rematch failure must not shift the TP/CP collective order.
+            match_count = 0
+        elif authoritative_pp_match:
             # Later PP stages consume PP0's keyed decision. They must not create
             # a second storage snapshot while independently rebuilding the batch.
             match_count = self._validate_authoritative_match_decision(

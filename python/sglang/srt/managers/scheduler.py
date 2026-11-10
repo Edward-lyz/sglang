@@ -3593,6 +3593,7 @@ class Scheduler(
                 f"PP replay could not admit request locally: result={result}, "
                 f"rid={req.rid}"
             )
+        message = req._as_cache_read_abort_reason or message
         return self._abort_local_request(
             req,
             reason_code=reason_code,
@@ -4143,11 +4144,11 @@ class Scheduler(
                         "reason_code": "PP_REPLAY_OTHER",
                         "reason": reason,
                     }
-                    pp_local_aborts.append(
-                        self._abort_failed_replay_record(resumed_chunked_req, record)
-                    )
+                    # Prior chunks can still own an in-flight proxy send. Stop
+                    # scheduling now, then release at the existing safe point.
+                    self._pp_defer_chunked_cache_read_abort(resumed_chunked_req, record)
+                    pp_local_aborts.append(record)
                     cache_read_aborted_reqs.add(resumed_chunked_req)
-                    self.chunked_req = None
                 else:
                     self.chunked_req = new_chunked_req
             if authoritative_admissions is None:
@@ -4203,8 +4204,11 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(candidate_reqs))
         # Get requests from the waiting queue to a new prefill batch
         for req in candidate_reqs:
+            replay_rejection = None
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
-                continue
+                if authoritative_plan is None:
+                    continue
+                replay_rejection = "PP replay LoRA is not schedulable locally"
 
             running_bs = len(running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -4217,12 +4221,8 @@ class Scheduler(
 
             if running_batch.batch_is_full:
                 if authoritative_plan is not None:
-                    pp_local_aborts.append(
-                        self._abort_failed_replay(req, AddReqResult.OTHER)
-                    )
-                    cache_read_aborted_reqs.add(req)
-                    continue
-                if (
+                    replay_rejection = "PP replay request slots exhausted locally"
+                elif (
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
@@ -4232,11 +4232,32 @@ class Scheduler(
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
-                    continue
+                    if authoritative_plan is None:
+                        continue
+                    replay_rejection = "PP replay cache prefetch is not ready locally"
                 # Pop the number of tokens loaded from storage (L3 hits)
-                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
-                if loaded_tokens > 0:
-                    req.storage_hit_length = loaded_tokens
+                else:
+                    loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                    if loaded_tokens > 0:
+                        req.storage_hit_length = loaded_tokens
+
+            if authoritative_plan is not None:
+                # Prefix matching contains TP/CP collectives. Every shard must
+                # agree to enter it, even when only one ran out of request slots.
+                if replay_rejection is not None:
+                    req._pp_replay_local_abort = True
+                    req._as_cache_read_abort_reason = replay_rejection
+                if (
+                    adder._sync_attention_store_read_abort(req, AddReqResult.CONTINUE)
+                    == AddReqResult.ABORT
+                ):
+                    pp_local_aborts.append(
+                        self._abort_failed_replay(req, AddReqResult.OTHER)
+                        if req._pp_replay_local_abort
+                        else self._abort_failed_cache_read(req)
+                    )
+                    cache_read_aborted_reqs.add(req)
+                    continue
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
@@ -4255,7 +4276,12 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.ABORT:
-                    pp_local_aborts.append(self._abort_failed_cache_read(req))
+                    if req._pp_replay_local_abort:
+                        pp_local_aborts.append(
+                            self._abort_failed_replay(req, AddReqResult.OTHER)
+                        )
+                    else:
+                        pp_local_aborts.append(self._abort_failed_cache_read(req))
                     cache_read_aborted_reqs.add(req)
                     # Preserve the fixed PP candidate sequence after a local abort.
                     continue

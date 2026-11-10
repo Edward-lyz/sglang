@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
+    poll_and_all_reduce_attn_cp_tp_group_with_readiness,
     poll_and_all_reduce_pp,
     prepare_abort,
     setup_state_kv_args,
@@ -860,6 +861,23 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            # Early transfer failure can retire a request before its delayed PP
+            # result returns. Do not send from already released KV/metadata, or
+            # restart a send whose failure is waiting on the forward fence.
+            if req.pp_early_final_kv_registered and (
+                is_aborted(req) or req.pp_pending_transfer_failure
+            ):
+                # An older middle-chunk result may precede the final forward.
+                # Leave its pending entry/event for the non-blocking flush.
+                if req.inflight_middle_chunks > 0:
+                    req.inflight_middle_chunks -= 1
+                else:
+                    req.time_stats.set_prefill_finished_time()
+                    if req.multimodal_inputs is not None:
+                        req.multimodal_inputs.release_pool_buffers()
+                advance_logprob_pt(i, req)
+                req.time_stats.set_last_chunked_prefill_finish_time()
+                continue
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -871,8 +889,8 @@ class SchedulerDisaggregationPrefillMixin:
 
                 req.output_ids.append(next_token_id)
                 if req.pp_early_final_kv_done:
-                    # _pp_flush_pending_final_kv already did the radix insert, the
-                    # send and the inflight-queue append; next_token_id here is the
+                    # The early path already registered the request, inserted
+                    # the radix entry and sent KV; next_token_id here is the
                     # placeholder zero from the skipped PP output ring.
                     advance_logprob_pt(i, req)
                     continue
@@ -881,7 +899,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # below sends it. Cancel the queue entry to keep the send single.
                 self._pp_drop_pending_final_kv(req)
                 maybe_cache_unfinished_req(req, self.tree_cache)
-                self.disagg_prefill_inflight_queue.append(req)
+                if not req.pp_early_final_kv_registered:
+                    self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
@@ -1028,17 +1047,37 @@ class SchedulerDisaggregationPrefillMixin:
         success_rids = set(transfer_status[0]) if transfer_status is not None else set()
         failed_rids = set(transfer_status[1]) if transfer_status is not None else set()
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
+        if (
+            self._pp_pd_early_send_final_kv
+            and transfer_status is not None
+            and not any(
+                req.rid in success_rids
+                or req.rid in failed_rids
+                or req.pp_pending_transfer_failure
+                for req in self.disagg_prefill_inflight_queue
+            )
+        ):
+            # Early registration alone must not activate another TP/CP poll.
+            # The fixed pre-scheduling poll still advances status each round;
+            # without a terminal PP decision there is nothing to retire here.
+            return []
+
+        polls, forward_ready = self._poll_disagg_prefill_inflight_queue()
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        for req, poll, ready in zip(
+            self.disagg_prefill_inflight_queue, polls, forward_ready, strict=True
+        ):
+            if req.rid in failed_rids:
+                # Consensus can pass through this stage before its GPU finishes.
+                # Retain it until cleanup is safe, even if later packets omit it.
+                req.pp_pending_transfer_failure = True
+            if not ready:
+                undone_reqs.append(req)
+                continue
             if transfer_status is not None:
-                if req.rid in failed_rids:
+                if req.pp_pending_transfer_failure:
                     self.handle_inflight_transfer_failure(req)
                     done_reqs.append(req)
                     continue
@@ -1102,6 +1141,10 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
         for req in done_reqs:
+            if req.pp_early_final_kv_registered:
+                # A failed transfer can finish before the next early-send
+                # flush. Its forward fence was checked above on every shard.
+                self._pp_drop_pending_final_kv(req)
             req.time_stats.set_completion_time()
             if self.enable_metrics and not isinstance(
                 req.finished_reason, FINISH_ABORT
@@ -1178,22 +1221,64 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Used by PP, inspect terminal transfer states without popping requests.
         """
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
+        polls, forward_ready = self._poll_disagg_prefill_inflight_queue()
 
         success_rids: List[str] = []
         failed_rids: List[str] = []
 
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if poll == KVPoll.Success:
-                success_rids.append(req.rid)
-            elif poll == KVPoll.Failed:
+        for req, poll, ready in zip(
+            self.disagg_prefill_inflight_queue, polls, forward_ready, strict=True
+        ):
+            # The flush also inserts into the cache and enqueues AS writes.
+            # Those commits must happen in the same round on attention shards.
+            req.pp_early_final_kv_forward_ready = bool(ready)
+            if not ready:
+                continue
+            if req.pp_pending_transfer_failure or poll == KVPoll.Failed:
                 failed_rids.append(req.rid)
+            elif poll == KVPoll.Success:
+                success_rids.append(req.rid)
 
         return success_rids, failed_rids
+
+    def _poll_disagg_prefill_inflight_queue(
+        self: Scheduler,
+    ) -> Tuple[List[int], List[int]]:
+        """Poll aligned queues without a separate early-send readiness barrier."""
+        queue = self.disagg_prefill_inflight_queue
+        pollers = [req.disagg_kv_sender for req in queue]
+        if not self._pp_pd_early_send_final_kv:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                pollers, self.attn_cp_cpu_group, self.attn_tp_cpu_group
+            )
+            return polls, [True] * len(queue)
+
+        pending = {
+            id(entry.req): entry for entry in self.disagg_prefill_pending_final_kv
+        }
+        entries = [pending.get(id(req)) for req in queue]
+        forward_ready = [
+            entry is None or entry.forward_done.query() for entry in entries
+        ]
+        send_ready = [entry is None for entry in entries]
+        if self.ps.attn_tp_size > 1 or self.ps.attn_cp_size > 1:
+            return poll_and_all_reduce_attn_cp_tp_group_with_readiness(
+                pollers,
+                forward_ready,
+                send_ready,
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
+
+        # PP16/TP1/CP1: keep the existing poll path; no readiness collective or
+        # extra tensor allocation. The event is only queried, never waited on.
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            pollers, self.attn_cp_cpu_group, self.attn_tp_cpu_group
+        )
+        return [
+            KVPoll.Transferring if poll == KVPoll.Success and not sent else poll
+            for poll, sent in zip(polls, send_ready, strict=True)
+        ], forward_ready
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         error_message = (
@@ -1352,7 +1437,11 @@ class SchedulerDisaggregationPrefillMixin:
             ):
                 continue
             # Parked requests keep the handle_pending_bootstrap resend path.
-            if req.pending_bootstrap or is_aborted(req):
+            if (
+                req.pending_bootstrap
+                or is_aborted(req)
+                or req.pp_early_final_kv_registered
+            ):
                 continue
             self.disagg_prefill_pending_final_kv.append(
                 PendingFinalKV(
@@ -1362,6 +1451,11 @@ class SchedulerDisaggregationPrefillMixin:
                     forward_done=forward_done,
                 )
             )
+            # Every attention shard has the same batch and order here. Local
+            # event.query() may control the send, but must not change the next
+            # positional transfer-status collective's roster.
+            req.pp_early_final_kv_registered = True
+            self.disagg_prefill_inflight_queue.append(req)
 
     def _pp_flush_pending_final_kv(self: Scheduler) -> None:
         """Send the final KV/state of every queued request whose forward is done.
@@ -1370,18 +1464,25 @@ class SchedulerDisaggregationPrefillMixin:
         before `get_new_batch_prefill`, so the pages released here are already
         visible to this iteration's scheduling. `forward_done.query()` is
         non-blocking on purpose: a microbatch that has not finished is retried
-        next iteration instead of stalling the CPU inside the pipeline.
+        next iteration instead of stalling the CPU inside the pipeline. With
+        TP/CP, reuse readiness from the existing transfer-status reduction so
+        cache commits and their AttentionStore write queues stay aligned too.
         """
-        if not self.disagg_prefill_pending_final_kv:
+        if not self._pp_pd_early_send_final_kv:
             return
 
         still_pending: List[PendingFinalKV] = []
         for entry in self.disagg_prefill_pending_final_kv:
             req = entry.req
-            if is_aborted(req):
-                continue
-            if not entry.forward_done.query():
+            ready = (
+                req.pp_early_final_kv_forward_ready
+                if self.ps.attn_tp_size > 1 or self.ps.attn_cp_size > 1
+                else req.pp_early_final_kv_forward_ready or entry.forward_done.query()
+            )
+            if not ready:
                 still_pending.append(entry)
+                continue
+            if is_aborted(req) or req.pp_pending_transfer_failure:
                 continue
             # Radix dedup first: cache_unfinished_req may free pages and rewrite
             # this request's req_to_token rows, so the send has to read them after.
@@ -1400,8 +1501,6 @@ class SchedulerDisaggregationPrefillMixin:
                     req.time_stats.prefill_transfer_queue_entry_time
                     - req.time_stats.forward_entry_time
                 )
-            self.disagg_prefill_inflight_queue.append(req)
-
         self.disagg_prefill_pending_final_kv = still_pending
 
     def _pp_drop_pending_final_kv(self: Scheduler, req: Req) -> None:

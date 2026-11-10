@@ -1084,7 +1084,7 @@ class PrefillAdder:
                 )
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
-            if _rem_tokens <= 0:
+            if _rem_tokens <= 0 and planned_admission is None:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
@@ -1129,6 +1129,7 @@ class PrefillAdder:
             start, end = self._validate_authoritative_extend_range(
                 req, planned_admission.extend_range, prefix_len=None
             )
+            new_len = end - start
             if start != prefix_len:
                 # Local prefix != PP0 chunk start: abort this req, not the scheduler.
                 req._pp_replay_local_abort = True
@@ -1136,15 +1137,20 @@ class PrefillAdder:
                     "PP replay chunk start unreachable on this stage: "
                     f"rid={req.rid} planned_start={start} local_prefix={prefix_len}"
                 )
-                return None
-            new_len = end - start
-            if new_len > _rem_tokens:
+            elif new_len > _rem_tokens:
                 req._pp_replay_local_abort = True
                 req._as_cache_read_abort_reason = (
                     "PP replay resumed chunk exceeds the local token budget: "
                     f"rid={req.rid} planned={planned_admission.extend_range} "
                     f"available={_rem_tokens}"
                 )
+            # All attention shards replay the same admission. Agree on its
+            # cancellation before any shard mutates the request or batch.
+            if (
+                self._sync_attention_store_read_abort(req, AddReqResult.CONTINUE)
+                == AddReqResult.ABORT
+            ):
+                req._pp_replay_local_abort = True
                 return None
             truncated = end < len(req.full_untruncated_fill_ids)
         req.set_extend_range(prefix_len, prefix_len + new_len)
@@ -1237,18 +1243,28 @@ class PrefillAdder:
         return start, end
 
     def _sync_attention_store_read_abort(
-        self, req: Req, result: AddReqResult
+        self, req: Req, result: AddReqResult, *, check_load_back: bool = False
     ) -> AddReqResult:
         """Synchronize one request's AS read outcome within its PP stage.
 
-        Every request considered by ``add_one_req`` must reach this helper
-        exactly once, including local admission early returns, so attention
-        lanes enter the stage-local collective in the same order.
+        Each phase must reach this helper exactly once on every attention
+        shard. Authoritative replay has a preflight before load-back's own
+        collectives; only a stage-wide successful preflight proceeds to the
+        final admission sync. The scheduler also gates prefix matching before
+        calling ``add_one_req``.
         """
         sync_read_abort = getattr(
             type(self.tree_cache), "sync_attention_store_read_abort", None
         )
-        if callable(sync_read_abort) and sync_read_abort(self.tree_cache, req):
+        if callable(sync_read_abort):
+            aborted = (
+                sync_read_abort(self.tree_cache, req, check_load_back=True)
+                if check_load_back
+                else sync_read_abort(self.tree_cache, req)
+            )
+            if aborted:
+                return AddReqResult.ABORT
+        elif req._as_cache_read_abort_reason or req._pp_replay_local_abort:
             return AddReqResult.ABORT
         return result
 
@@ -1414,14 +1430,30 @@ class PrefillAdder:
         truncation_align_size: Optional[int],
         planned_admission: Optional[PlannedAdmission] = None,
     ):
+        before_load_back = planned_admission is not None
+
+        def sync_admission(result: AddReqResult) -> AddReqResult:
+            if planned_admission is not None and result != AddReqResult.CONTINUE:
+                # A replay rank cannot merely stop locally: all attention
+                # shards must omit the same committed request from the batch.
+                if not req._as_cache_read_abort_reason:
+                    req._as_cache_read_abort_reason = (
+                        f"PP replay admission failed: rid={req.rid} result={result}"
+                    )
+                if result in (AddReqResult.NO_TOKEN, AddReqResult.OTHER):
+                    req._pp_replay_local_abort = True
+            return self._sync_attention_store_read_abort(
+                req, result, check_load_back=before_load_back
+            )
+
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
         if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
-            return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
+            return sync_admission(AddReqResult.OTHER)
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
-            return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
+            return sync_admission(AddReqResult.OTHER)
 
         if (
             planned_admission is None
@@ -1469,7 +1501,7 @@ class PrefillAdder:
                     f"prefix: local={current_prefix_len} "
                     f"planned={authoritative_start}"
                 )
-                return self._sync_attention_store_read_abort(req, AddReqResult.ABORT)
+                return sync_admission(AddReqResult.ABORT)
             # Include any host-hit prefix still awaiting load-back, but reserve
             # and schedule no token beyond PP0's committed end position.
             cand_extend_input_len = authoritative_end - current_prefix_len
@@ -1509,7 +1541,7 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
-            return self._sync_attention_store_read_abort(req, AddReqResult.NO_TOKEN)
+            return sync_admission(AddReqResult.NO_TOKEN)
 
         chunk_tokens_limit = self.rem_chunk_tokens
         if self.is_hybrid_swa:
@@ -1524,9 +1556,7 @@ class PrefillAdder:
             if swa_needed >= self.rem_swa_tokens:
                 swa_cap = self._swa_chunk_cap(budgeted_max_new, req.swa_host_hit_length)
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
-                    return self._sync_attention_store_read_abort(
-                        req, AddReqResult.NO_TOKEN
-                    )
+                    return sync_admission(AddReqResult.NO_TOKEN)
                 chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
         if (
@@ -1537,7 +1567,7 @@ class PrefillAdder:
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
-            return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
+            return sync_admission(AddReqResult.OTHER)
 
         logger.info(
             f"before lock, for req {req.rid} current rem_total_tokens: "
@@ -1565,7 +1595,7 @@ class PrefillAdder:
             )
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
-                return self._sync_attention_store_read_abort(req, AddReqResult.NO_TOKEN)
+                return sync_admission(AddReqResult.NO_TOKEN)
 
             if self.is_hybrid_swa:
                 # self.rem_swa_tokens may decrease after the lock acquisition
@@ -1579,9 +1609,7 @@ class PrefillAdder:
                         budgeted_max_new, req.swa_host_hit_length
                     )
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
-                        return self._sync_attention_store_read_abort(
-                            req, AddReqResult.NO_TOKEN
-                        )
+                        return sync_admission(AddReqResult.NO_TOKEN)
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
@@ -1596,7 +1624,7 @@ class PrefillAdder:
                     waiting_queue_len=self.waiting_queue_len,
                 )
             ):
-                return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
+                return sync_admission(AddReqResult.OTHER)
 
             if (
                 planned_admission is None
@@ -1630,9 +1658,7 @@ class PrefillAdder:
                     self.cost_chunk_cap,
                 )
                 if verdict == "defer":
-                    return self._sync_attention_store_read_abort(
-                        req, AddReqResult.OTHER
-                    )
+                    return sync_admission(AddReqResult.OTHER)
                 if verdict == "chunk":
                     # Route through the existing truncation branch below.
                     chunk_tokens_limit = (
@@ -1640,6 +1666,13 @@ class PrefillAdder:
                         if chunk_tokens_limit is not None
                         else cost_limit
                     )
+
+            if planned_admission is not None:
+                # Local budget failures above join this same preflight. Do not
+                # enter load-back collectives while a peer is already aborting.
+                if sync_admission(AddReqResult.CONTINUE) == AddReqResult.ABORT:
+                    return AddReqResult.ABORT
+                before_load_back = False
 
             if req.needs_host_load_back():
                 try:
@@ -1665,12 +1698,6 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
-
-            read_result = self._sync_attention_store_read_abort(
-                req, AddReqResult.CONTINUE
-            )
-            if read_result == AddReqResult.ABORT:
-                return read_result
 
             if planned_admission is None:
                 input_tokens = self.ceil_paged_tokens(
@@ -1706,7 +1733,7 @@ class PrefillAdder:
                         f"planned_start={authoritative_start} "
                         f"local_prefix={len(req.prefix_indices)}"
                     )
-                    return AddReqResult.ABORT
+                    return sync_admission(AddReqResult.ABORT)
                 input_tokens = self.ceil_paged_tokens(
                     authoritative_end - authoritative_start
                 )
@@ -1719,7 +1746,7 @@ class PrefillAdder:
                 # If without chunked prefill:
                 # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
                 # - if the can_run_list is empty, always accept the first prefill request
-                return AddReqResult.OTHER
+                return sync_admission(AddReqResult.OTHER)
 
             if planned_admission is not None:
                 if self.dllm_config is not None:
@@ -1735,10 +1762,16 @@ class PrefillAdder:
                         f"rid={req.rid} planned={planned_admission.extend_range} "
                         f"available={available_chunk_tokens}"
                     )
-                    return self._sync_attention_store_read_abort(
-                        req, AddReqResult.ABORT
-                    )
+                    return sync_admission(AddReqResult.ABORT)
 
+            # Validate both the restored prefix and the local chunk budget
+            # before the final sync. No request has been admitted yet, and an
+            # abort on any attention shard must cancel it on all of them.
+            read_result = sync_admission(AddReqResult.CONTINUE)
+            if read_result == AddReqResult.ABORT:
+                return read_result
+
+            if planned_admission is not None:
                 truncated = authoritative_end < len(req.full_untruncated_fill_ids)
                 req.set_extend_range(authoritative_start, authoritative_end)
                 self.can_run_list.append(req)

@@ -501,7 +501,9 @@ class SchedulerPPMixin:
         for req in self.waiting_queue:
             req_pp_batch_plan_id = int(getattr(req, "_pp_batch_plan_id", -1))
             record = by_request.get((req_pp_batch_plan_id, req.rid))
-            if record is None and req_pp_batch_plan_id == -1:
+            if record is None:
+                # A yielded/replayed request can still carry its previous plan
+                # id when the current plan cancels it before installing a row.
                 record = by_request.get((current_batch_plan_id, req.rid))
             if record is None:
                 kept_waiting.append(req)
@@ -519,15 +521,13 @@ class SchedulerPPMixin:
                 getattr(self.chunked_req, "_pp_batch_plan_id", -1)
             )
             record = by_request.get((chunked_pp_batch_plan_id, self.chunked_req.rid))
-            if record is None and chunked_pp_batch_plan_id == -1:
+            if record is None:
+                # The cancelled admission is absent from `requests`, so this
+                # chunk has not been rebound from the previous plan id yet.
                 record = by_request.get((current_batch_plan_id, self.chunked_req.rid))
             if record is not None:
                 if not self.chunked_req.finished():
-                    self.chunked_req._as_cache_read_abort_reason = record.get("reason")
-                    if str(record.get("reason_code", "")).startswith("PP_REPLAY_"):
-                        self._abort_failed_replay_record(self.chunked_req, record)
-                    else:
-                        self._abort_failed_cache_read(self.chunked_req)
+                    self._pp_defer_chunked_cache_read_abort(self.chunked_req, record)
                 self.chunked_req = None
 
     def _pp_apply_local_aborts_to_plan(
@@ -547,9 +547,10 @@ class SchedulerPPMixin:
             {**record, "pp_batch_plan_id": int(plan["pp_batch_plan_id"])}
             for record in local_aborts
         )
-        chunked_rid = upstream_contract.get("chunked_rid")
+        transition = plan["chunked_transition"]
+        chunked_rids = {upstream_contract.get("chunked_rid"), transition.get("rid")}
         for record in local_aborts:
-            if record["rid"] == chunked_rid:
+            if record["rid"] in chunked_rids:
                 # Retain the abort until already-relayed chunk plans drain.
                 self._pp_local_chunk_abort_records.setdefault(
                     str(record["rid"]), dict(record)
@@ -593,9 +594,14 @@ class SchedulerPPMixin:
             if request.get("rid") in active_set
         )
         outgoing["contract"] = local_contract
+        if transition.get("rid") in local_abort_rids:
+            # Downstream removes the cancelled local chunk before replay. It
+            # must receive neither a resume admission nor a resume transition.
+            outgoing["chunked_transition"] = {"rid": None, "action": "none"}
         outgoing["aborts"] = _pp_merge_abort_records(
             tuple(plan.get("aborts", ())), local_aborts
         )
+        self._pp_validate_authoritative_plan_schema(mb_id, outgoing)
         return outgoing
 
     def _pp_project_locally_aborted_chunked_requests(
@@ -786,7 +792,10 @@ class SchedulerPPMixin:
             if req.finished():
                 continue
             req._as_cache_read_abort_reason = record.get("reason")
-            self._abort_failed_cache_read(req)
+            if str(record.get("reason_code", "")).startswith("PP_REPLAY_"):
+                self._abort_failed_replay_record(req, record)
+            else:
+                self._abort_failed_cache_read(req)
 
     def _pp_install_authoritative_batch_plan(
         self, mb_id: int, plan: Dict[str, Any]
@@ -3058,8 +3067,12 @@ class SchedulerPPMixin:
             )
             if target is not None or control_transport:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if target is None or (
-                    not target.forward_mode.is_prebuilt()
+                # PP0's transport decision survives downstream cancellation.
+                # Always return its control message, even for a pure middle
+                # chunk: PP0 cannot know yet that a later stage aborted it.
+                if control_transport or (
+                    target is not None
+                    and not target.forward_mode.is_prebuilt()
                     and (
                         not _pp_can_skip_output_comm(target)
                         or _pp_control_has_current_aborts(target_control)
@@ -3272,13 +3285,14 @@ class SchedulerPPMixin:
                 and target_control is not None
                 and target_control["transport"]
             )
-            if (target is None and not control_transport) or (
-                target is not None and target.forward_mode.is_prebuilt()
+            if not control_transport and (
+                target is None or target.forward_mode.is_prebuilt()
             ):
                 return
             if (
                 target is not None
                 and _pp_can_skip_output_comm(target)
+                and not control_transport
                 and not _pp_control_has_current_aborts(target_control)
             ) or (
                 self._pp_pd_early_last_chunk_enabled and not self.pp_group.is_first_rank
