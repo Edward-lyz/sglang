@@ -1128,7 +1128,7 @@ class SchedulerDisaggregationPrefillMixin:
                         req.time_stats.prefill_kv_transfer_finish_time
                         - req.time_stats.prefill_transfer_queue_entry_time
                     )
-                    if not envs.SGLANG_PP_PD_PREFILL_EARLY_STREAM_OUTPUT:
+                    if not envs.SGLANG_PP_PD_PREFILL_EARLY_STREAM_OUTPUT.get():
                         self.metrics_collector.observe_time_to_first_token(
                             req.time_stats.prefill_kv_transfer_finish_time
                             - req.time_stats.prefill_bootstrap_queue_entry_time
