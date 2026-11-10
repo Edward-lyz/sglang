@@ -61,6 +61,38 @@ RUN set -eux; \
     SETUPTOOLS_SCM_PRETEND_VERSION="$base_version" \
         pip install -e /sgl-workspace/sglang/python --no-deps --no-build-isolation
 
+# Rust 扩展打进源码树：base 镜像设了 SGLANG_RUST_BUILD_MODE=never，而上面的 editable
+# install 没有 setuptools-rust，不会编 Rust 扩展；不打进来的话 as_native TreeCore 启动即报
+# "not bundled or cached"。这里用 base 自带的 cargo/stable（无外网，拉不到 rust-toolchain.toml
+# 固定的 1.92）+ 已缓存的 crates 编好，放到 never 模式会直接 import 的包路径下。
+# never 模式不校验 .so 与源码是否一致：改了 rust/ 或换 torch 必须重新出镜像。
+RUN cd /sgl-workspace/sglang && \
+    RUSTUP_TOOLCHAIN=stable SGLANG_RUST_BUILD_MODE=auto SGLANG_CACHE_DIR=/tmp/rust-ext-build \
+    python3 - <<'PY'
+import shutil
+import sysconfig
+from pathlib import Path
+
+import torch  # noqa: F401  libtorch must be resident before the TreeCore dlopen
+
+from sglang.srt.mem_cache.rust_tree_core import extension
+from sglang.srt.rust_extensions import load_rust_extension
+
+suffix = sysconfig.get_config_var("EXT_SUFFIX")
+for module in (
+    extension.bindings,
+    load_rust_extension("sglang.srt.rust_extensions._multimodal"),
+):
+    dst = Path("python") / (module.__name__.replace(".", "/") + suffix)
+    shutil.copy2(module.__file__, dst)
+    print("[rust-ext] bundled", module.__name__, "->", dst)
+PY
+RUN rm -rf /tmp/rust-ext-build && \
+    cd /sgl-workspace/sglang && \
+    SGLANG_RUST_BUILD_MODE=never SGLANG_CACHE_DIR=/tmp/rust-ext-empty python3 -c \
+        'import torch; from sglang.srt.mem_cache.rust_tree_core.extension import bindings; from sglang.srt.rust_extensions import load_rust_extension; m = load_rust_extension("sglang.srt.rust_extensions._multimodal"); print("[rust-ext] never-mode OK:", bindings.__file__, m.__file__)' && \
+    rm -rf /tmp/rust-ext-empty
+
 RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/msit_llm-8.3.2-py3-none-any.whl onnx --no-deps
 
 # deep_gemm 库固定成经 DSv4.1-Flash 验证过的构建（dev@1ff3932f，含 SF-alignment 修复，
@@ -78,16 +110,26 @@ RUN set -eux; \
         https://cce-ai-datasets.bj.bcebos.com/hac_test/vllm/DeepGemm/develop/torch2.13.0/deep_gemm-0.1.8+1ff3932f-cp312-cp312-linux_x86_64.whl; \
     python3 -c "import importlib.metadata as m; v=m.version('deep_gemm'); print('[deep_gemm] installed', v); assert v == '0.1.8+1ff3932f', v"
 
+# FlashMLA 07a1089：带 fused_norm_rope_attn_rope_cast（mega-attn fused-o），读引擎的 V4 584B / V4.1 池。
+# base 镜像的 sgl_kernel.flash_mla 没有这个算子、也没有顶层 flash_mla 包，缺它时
+# SGLANG_OPT_FLASHMLA_FUSED_ATTN_O 会每层静默失效（日志刷 "stays unfused"）。
+# 顶层 flash_mla 只被 fused-o 路径(fused_o_attn.py)使用，不改普通 attention(走 sgl_kernel.flash_mla)。
+# 仅适配 py3.12 + torch2.13 + cu130 + sm100/sm103；换 torch/CUDA 必须重编（文件名不体现这点）。
+# 校验只读 dist-info 版本，不 import CUDA 扩展：构建环境无 GPU 驱动(libcuda.so.1)，import 会失败。
+RUN pip install --no-deps --no-cache-dir \
+        https://cce-ai-datasets.bj.bcebos.com/hac_test/vllm/FlashMLA/develop/flash_mla-1.0.0+07a1089.sm100a.sm103a-cp312-cp312-linux_x86_64.whl && \
+    python3 -c "import importlib.metadata as m; v=m.version('flash_mla'); print('[flash_mla] installed', v); assert v.startswith('1.0.0+07a1089'), v"
+
 # DSv4.1-Flash 的 JIT 预编译缓存：DeepGEMM cubin、Triton kernel、sgl-kernel JIT、tilelang。
 # 内容取自跑最终 megamoe+DSpark 配置的 dsv41-flash PD pod(deep_gemm dev@1ff3932f,与上面 pin 的 wheel 同源):
-# prefill(dp8) + decode(dp8) 两侧 /root/.cache + /root/.tilelang 的并集,0919 在 bzz2 PD pod 上重烤。
+# prefill(tp4 cp4 fake-dp2) + decode(dp8) 两侧 /root/.cache + /root/.tilelang 的并集,1028 在 bzz2 PD pod 上重烤。
 # 换了 deep_gemm 就必须同步重烤这份(源码变→JIT cache key 变),两者要成对更新。
 # 包内顶层就是 root/,所以解到 / 即落回原路径,省掉容器启动时的 kernel 编译;打包时已排除 pip HTTP 缓存。
 #
 # 刷新方式:在装了新 wheel 的 PD pod 上跑最终配置(prefill+decode),各自打包 /root/.cache + /root/.tilelang
 # 取并集上传 BOS,再替换下面的 URL。包内路径约定不能变,末尾 test 会挡住路径不对的包。
 RUN wget -q -O /tmp/dsv41-flash-cache.tar.gz \
-        https://cce-ai-datasets.bj.bcebos.com/hac_test/vllm/DeepGemm/develop/torch2.13.0/deep_gemm_deepseekv41_flash_pd_cache_0919.tar.gz && \
+        https://cce-ai-datasets.bj.bcebos.com/hac_test/vllm/DeepGemm/develop/torch2.13.0/deep_gemm_deepseekv41_flash_pd_cache_1028.tar.gz && \
     tar -xzf /tmp/dsv41-flash-cache.tar.gz -C / --exclude='root/.cache/pip' && \
     rm -f /tmp/dsv41-flash-cache.tar.gz && \
     test -d /root/.cache/sglang/deep_gemm/cache && test -d /root/.tilelang/cache

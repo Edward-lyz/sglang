@@ -2218,7 +2218,10 @@ class MQALayer(MqaAttentionBase):
         self._fused_o_q_raw = False
         if (
             self.fused_o_attn
-            and forward_batch.forward_mode.is_decode()
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
             and kernel_num_heads == self.n_local_heads
             and not is_unified_kv_triton()
             and attn_backend.fused_o_decode_eligible(forward_batch)
