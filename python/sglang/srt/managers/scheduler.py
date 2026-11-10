@@ -5010,7 +5010,10 @@ class Scheduler(
         # the in-flight forward (the WAR barrier chains schedule_stream behind
         # it), so the probe instead waits on this event, which is recorded
         # after this batch's prep writes but before _apply_war_barrier runs.
-        self.prep_done_event.record()
+        # Explicit stream: under SGLANG_ENABLE_PREFILL_FWD_THREAD this runs on
+        # the forward worker thread, whose current stream is the legacy default
+        # stream (non-blocking w.r.t. schedule_stream), not schedule_stream.
+        self.prep_done_event.record(self.schedule_stream)
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
