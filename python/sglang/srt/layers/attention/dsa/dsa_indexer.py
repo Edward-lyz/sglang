@@ -8,11 +8,16 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
-from sglang.kernels.ops.attention.fused_store_index_cache import (
+from sglang.jit_kernel.dsa import (
+    aiter_paged_mqa_logits,
+    cutedsl_paged_mqa_logits,
+    deepgemm_paged_mqa_logits_native,
+    deepgemm_paged_mqa_logits_split,
+)
+from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
@@ -25,7 +30,8 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
-from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
+from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -49,7 +55,6 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -59,26 +64,11 @@ global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_xpu = is_xpu()
-
-if not _is_npu:
-    from sglang.kernels.ops.attention.dsa import (
-        aiter_paged_mqa_logits,
-        cutedsl_paged_mqa_logits,
-        deepgemm_paged_mqa_logits_native,
-        deepgemm_paged_mqa_logits_split,
-    )
-else:
-    aiter_paged_mqa_logits = None
-    cutedsl_paged_mqa_logits = None
-    deepgemm_paged_mqa_logits_native = None
-    deepgemm_paged_mqa_logits_split = None
-
-if _is_cuda:
-    from sglang.kernels.ops.attention.dsa import pick_dsl_expand
+if not _is_hip:
+    # Preserve the original eager import behavior on non-ROCm platforms.
+    from sglang.jit_kernel.dsa import pick_dsl_expand
 else:
     pick_dsl_expand = None
-
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
@@ -122,7 +112,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.server_args import get_global_server_args
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
@@ -144,7 +134,7 @@ def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
 
 def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
     attn_backend = get_attn_backend()
-    server_args = get_server_args()
+    server_args = get_global_server_args()
     prefill_backend, decode_backend = server_args.get_attention_backends()
     prefill_backend = (
         getattr(attn_backend, "prefill_attention_backend_str", None) or prefill_backend
@@ -171,8 +161,8 @@ def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
 
 
 if _is_cuda:
-    from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
-    from sglang.kernels.ops.quantization.dsv32 import (
+    from sglang.jit_kernel.dsv4 import fused_q_indexer_rope_first_quant
+    from sglang.jit_kernel.dsv32 import (
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
     )
@@ -340,10 +330,8 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
-    elif _is_xpu:
-        from sgl_kernel import hadamard_transform
     else:
-        from sglang.kernels.ops.quantization.hadamard import hadamard_transform
+        from sglang.jit_kernel.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -380,7 +368,6 @@ class Indexer(MultiPlatformOp):
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
-        config=None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -406,7 +393,7 @@ class Indexer(MultiPlatformOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            pp_size = get_server_args().pp_size
+            pp_size = get_global_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
@@ -442,15 +429,9 @@ class Indexer(MultiPlatformOp):
                 params_dtype=torch.bfloat16,
                 prefix=add_prefix("weights_proj", prefix),
             )
-        if (
-            config is not None
-            and getattr(config, "index_k_norm_type", "layer") == "rms"
-        ):
-            self.k_norm = RMSNorm(self.head_dim)
-        else:
-            self.k_norm = LayerNorm(
-                self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
-            )
+        self.k_norm = LayerNorm(
+            self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
+        )
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,
@@ -458,15 +439,11 @@ class Indexer(MultiPlatformOp):
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
-            device=get_server_args().device,
+            device=get_global_server_args().device,
         )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
-        self.num_init_tokens = self.num_local_tokens = 0
-        if config is not None:
-            self.num_init_tokens = getattr(config, "index_init_tokens", 0)
-            self.num_local_tokens = getattr(config, "index_local_tokens", 0)
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_server_args().dsa_paged_mqa_logits_backend
@@ -685,10 +662,6 @@ class Indexer(MultiPlatformOp):
             out_cache_loc = forward_batch.out_cache_loc
         pool = get_token_to_kv_pool()
         page_size = pool.page_size
-        if hasattr(pool, "invalidate_index_buffer_for_layer"):
-            pool.invalidate_index_buffer_for_layer(layer_id)
-        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
-            return
         if (
             not _is_fp8_fnuz
             and out_cache_loc is not None
@@ -817,61 +790,6 @@ class Indexer(MultiPlatformOp):
             return
         dst.copy_(src)
 
-    @staticmethod
-    def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
-        # Read path: prefer the owner-broadcast scratch buffer under DSA cache
-        # layer split; fall back to the owned buffer for plain pools. Stores go
-        # through get_index_k_with_scale_buffer() (owned buffer) instead.
-        if hasattr(pool, "get_broadcastable_index_k_with_scale_buffer"):
-            return pool.get_broadcastable_index_k_with_scale_buffer(layer_id)
-        return pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-
-    @staticmethod
-    def _pad_heads_for_deep_gemm(q_fp8, weights):
-        """Pad q and weights to 32 heads when num_heads < 32,
-        so that block_q = 128/num_heads doesn't exceed seq_len_alignment(4)."""
-        num_heads = q_fp8.shape[1]
-        if num_heads >= 32:
-            return q_fp8, weights, num_heads
-        target_heads = 32
-        q_fp8 = torch.nn.functional.pad(q_fp8, (0, 0, 0, target_heads - num_heads))
-        weights = torch.nn.functional.pad(weights, (0, target_heads - num_heads))
-        return q_fp8, weights, num_heads
-
-    def _mask_init_and_local_tokens(
-        self,
-        logits: torch.Tensor,
-        lengths: torch.Tensor,
-        row_starts: Optional[torch.Tensor] = None,
-    ):
-        if self.num_init_tokens == 0 and self.num_local_tokens == 0:
-            return logits
-        if row_starts is None:
-            row_starts = lengths.new_zeros(lengths.shape[0])
-        num_init_tokens = self.num_init_tokens
-        num_local_tokens = self.num_local_tokens
-        if num_init_tokens > 0:
-            init_idxs = (
-                torch.arange(
-                    num_init_tokens, dtype=lengths.dtype, device=lengths.device
-                )[None, :]
-                + row_starts[:, None]
-            )
-            init_idxs.clamp_max_(logits.shape[-1] - 1)
-            logits.scatter_(dim=1, index=init_idxs, value=float("inf"))
-        if num_local_tokens > 0:
-            local_idxs = (
-                lengths[:, None]
-                - 1
-                + row_starts[:, None]
-                - torch.arange(
-                    num_local_tokens, dtype=lengths.dtype, device=lengths.device
-                )[None, :]
-            )
-            local_idxs.clamp_min_(0)
-            logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
-        return logits
-
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -903,7 +821,9 @@ class Indexer(MultiPlatformOp):
             block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
+        kv_cache_fp8 = get_token_to_kv_pool().get_index_k_with_scale_buffer(
+            layer_id=layer_id
+        )
 
         blocksize = page_size
         if (
@@ -933,7 +853,7 @@ class Indexer(MultiPlatformOp):
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
         ):
-            assert pick_dsl_expand is not None, "CuTe DSL paged MQA is CUDA-only."
+            assert pick_dsl_expand is not None, "Not supported on AMD/ROCm. "
             dsl_expand_factor, dsl_atom = pick_dsl_expand(
                 next_n,
                 batch_size=B,
@@ -1032,7 +952,6 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        self._mask_init_and_local_tokens(logits, seqlens_32)
         topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
@@ -1055,7 +974,7 @@ class Indexer(MultiPlatformOp):
         total_mem = torch.cuda.get_device_properties(device_index).total_memory
 
         total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
-        mem_fraction_static = get_server_args().mem_fraction_static
+        mem_fraction_static = get_global_server_args().mem_fraction_static
         if mem_fraction_static is None:
             static_budget = total_mem_budget
         else:
@@ -1207,13 +1126,10 @@ class Indexer(MultiPlatformOp):
                         clean_logits=False,
                     )
                 else:
-                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[:q_offset], weights[:q_offset]
-                    )
                     logits = deep_gemm.fp8_mqa_logits(
-                        q_padded,
+                        q_fp8[:q_offset],
                         kv_fp8,
-                        w_padded,
+                        weights[:q_offset],
                         ks,
                         ke,
                         clean_logits=False,
@@ -1221,7 +1137,6 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
-            self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
             return topk_result
@@ -1263,20 +1178,16 @@ class Indexer(MultiPlatformOp):
                         clean_logits=False,
                     )
                 else:
-                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[start:end], weights[start:end]
-                    )
                     logits_chunk = deep_gemm.fp8_mqa_logits(
-                        q_padded,
+                        q_fp8[start:end],
                         kv_fp8,
-                        w_padded,
+                        weights[start:end],
                         ks[start:end],
                         ke[start:end],
                         clean_logits=False,
                     )
 
             lengths_chunk = seq_lens_expanded[start:end]
-            self._mask_init_and_local_tokens(logits_chunk, lengths_chunk, ks[start:end])
 
             # RAGGED: use global offset; PAGED: construct local cu_seqlens_q per chunk
             if global_topk_offset is not None:
@@ -1473,11 +1384,10 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
-                q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
                 logits = deep_gemm.fp8_mqa_logits(
-                    q_padded,
+                    q_fp8,
                     kv_fp8,
-                    w_padded,
+                    weights,
                     ks,
                     ke,
                     clean_logits=False,
@@ -1520,11 +1430,10 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
 
             with self._with_real_sm_count():
-                q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
                 logits = deep_gemm.fp8_mqa_logits(
-                    q_padded,
+                    q_fp8,
                     kv_fp8,
-                    w_padded,
+                    weights,
                     ks,
                     ke,
                     clean_logits=False,
@@ -1555,7 +1464,7 @@ class Indexer(MultiPlatformOp):
             "piecewise/breakable CUDA graph"
         )
         if not _is_npu:
-            from sglang.kernels.ops.attention.dsa.tilelang_kernel import fp8_index
+            from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
 
         page_size = get_token_to_kv_pool().page_size
         assert page_size == 64, "only support page size 64"
@@ -1650,28 +1559,24 @@ class Indexer(MultiPlatformOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
 
-        pool = get_token_to_kv_pool()
-        if hasattr(pool, "invalidate_index_buffer_for_layer"):
-            pool.invalidate_index_buffer_for_layer(layer_id)
-        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
-            return
-
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,
-                pool.page_size,
+                get_token_to_kv_pool().page_size,
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
             fused_store_index_k_cache(
                 key,
                 buf,
                 out_cache_loc,
-                pool.page_size,
+                get_token_to_kv_pool().page_size,
             )
             return
 
@@ -1681,8 +1586,10 @@ class Indexer(MultiPlatformOp):
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
         if _use_aiter:
-            page_size = pool.page_size
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            page_size = get_token_to_kv_pool().page_size
+            buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():
@@ -1704,7 +1611,7 @@ class Indexer(MultiPlatformOp):
         if not out_cache_loc.is_contiguous():
             out_cache_loc = out_cache_loc.contiguous()
 
-        pool.set_index_k_scale_buffer(
+        get_token_to_kv_pool().set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=out_cache_loc,
             index_k=k_fp8,
@@ -1734,9 +1641,9 @@ class Indexer(MultiPlatformOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         if _is_hip:
-            from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
+            from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
-            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+            from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -2342,8 +2249,7 @@ class Indexer(MultiPlatformOp):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-            # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
-            return topk_indices[0].squeeze(1)
+            return topk_indices[0]
 
     def do_npu_cp_balance_indexer(
         self,
@@ -2420,7 +2326,7 @@ def pcg_dsa_indexer_prefill_split(
     # captured graph reads it at a fixed address; eager code instead allocates
     # and returns a fresh, naturally-sized tensor each call.
     assert _is_cuda, "Internal error: DSA graph dispatch is only supported on CUDA"
-    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+    from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
     forward_context = get_tc_piecewise_forward_context()
     forward_batch = forward_context.forward_batch
