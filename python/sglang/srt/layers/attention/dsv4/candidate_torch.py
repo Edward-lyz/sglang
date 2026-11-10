@@ -109,13 +109,15 @@ def two_level_decode_logits(
     topk_blocks: int,
     block_size: int,
     published: Optional[torch.Tensor],
+    _consumer_live_prefix: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Apply candidate-block filtering and return logits plus an optional published mask.
 
     Mask columns past each sequence length to -inf before selection: the paged
     logits kernel leaves that tail uninitialized, and an all -inf block means
     unreachable. This path is graph-captured and must not synchronize with the host.
-    Work scales with allocated page-table capacity, not live sequence length.
+    Work normally scales with allocated page-table capacity. The private decode
+    consumer opt-in writes only its live prefix and vector padding on CUDA.
     """
     if not (is_candidate_source or uses_candidates):
         return logits, None
@@ -148,6 +150,7 @@ def two_level_decode_logits(
             topk_blocks=topk_blocks,
             block_size=block_size,
             published=None if is_candidate_source else published,
+            _consumer_live_prefix=_consumer_live_prefix and not is_candidate_source,
         )
 
     lens_col = seq_lens if seq_lens.dim() > 1 else seq_lens.unsqueeze(-1)
@@ -266,6 +269,7 @@ class TorchCandidateIndexer:
             topk_blocks=self.topk_blocks,
             block_size=self.block_size,
             published=candidate_metadata.mask,
+            _consumer_live_prefix=metadata.use_topk_v2,
         )
         # raw positions into `selected`; `page_indices` gets the unfiltered slots
         # here and is rewritten with the masked selection just below

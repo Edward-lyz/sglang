@@ -12,6 +12,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -180,14 +181,35 @@ class NgramEmbeddingManager:
                 end = len(fill_ids) - 1
                 ids = fill_ids[max(0, end - n1) : end]
                 rows.append([0] * (n1 - len(ids)) + list(ids))
-            slots = torch.tensor(
-                [req.kv.req_pool_idx for req in batch.reqs],
-                dtype=torch.int64,
-                device=history.device,
-            )
-            history[slots] = torch.tensor(
-                rows, dtype=history.dtype, device=history.device
-            ).view(len(rows), n1)
+            if (
+                history.device.type == "cuda"
+                and torch.version.hip is None
+                and is_pin_memory_available(history.device)
+            ):
+                # Keep the preceding forward fence on the schedule stream without
+                # making list-to-device construction wait for it on the host.
+                slots = torch.tensor(
+                    [req.kv.req_pool_idx for req in batch.reqs],
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=True,
+                ).to(history.device, non_blocking=True)
+                history[slots] = (
+                    torch.tensor(
+                        rows, dtype=history.dtype, device="cpu", pin_memory=True
+                    )
+                    .to(history.device, non_blocking=True)
+                    .view(len(rows), n1)
+                )
+            else:
+                slots = torch.tensor(
+                    [req.kv.req_pool_idx for req in batch.reqs],
+                    dtype=torch.int64,
+                    device=history.device,
+                )
+                history[slots] = torch.tensor(
+                    rows, dtype=history.dtype, device=history.device
+                ).view(len(rows), n1)
             return
         if not batch.forward_mode.is_extend_without_speculative():
             return
