@@ -19,11 +19,13 @@ import hashlib
 import logging
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.mem_cache import as_probe as _asp
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -66,6 +68,7 @@ class _AsLoadBatchPlan:
     inplace_pairs: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
     local_scratch: Optional[torch.Tensor] = None
     gathered_scratch: Optional[torch.Tensor] = None
+    metadata_host: Optional[torch.Tensor] = None  # 中文：保活 pinned 主机内存，直到异步 H2D 拷贝完成
 
 
 @dataclass
@@ -74,6 +77,7 @@ class _AsLoadResult:
     page_ids_cpu: torch.Tensor
     ready_event: Optional[Any]
     resources: Tuple[Any, ...] = ()
+    padding_page_ids_cpu: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -84,6 +88,36 @@ class _AsPendingLoad:
     resources: Tuple[Any, ...]
     pages_released: bool = False
     lock_released: bool = False
+
+
+@dataclass
+class _AsLoadSubmitted:
+    """推迟等待模式下：分片读已提交、尚未等待时交给准入的临时结果。"""
+
+    indices: torch.Tensor
+
+
+@dataclass
+class _AsDeferredLoad:
+    """一次已提交、推迟到组 batch 前才等待的 mover 读。"""
+
+    steps: Any  # _as_load_steps 生成器，停在"已提交"处
+    req: Any
+    last_host_node: TreeNode
+    load_info: dict
+    keep_len: int  # 准入时交给请求的已加载 token 数（与插入树时的截断一致）
+    full_input_ids: Any  # 准入时完整序列快照；使用0.5.17请求字段，不依赖旧fill_ids
+    hash_ids: frozenset  # 本次读覆盖的块 hash，用于同批前缀冲突检测
+
+
+@dataclass
+class AsDeferredLoadOutcome:
+    """推迟读收尾后交给调度器的结果：成功时 new_node 是插入树后的末节点。"""
+
+    req: Any
+    old_node: TreeNode
+    new_node: Optional[TreeNode]
+    ok: bool
 
 
 # Minimum number of AS-matched blocks to justify a DMA read
@@ -103,6 +137,7 @@ class _AsWriteTask:
     write_params: Any
     submit_time: float
     num_pages: int
+    trace_recorder: Optional[Any] = None
 
 
 def _get_as_load_group():
@@ -224,6 +259,14 @@ class AsRadixCache(RadixCache):
         # Pending AS loads awaiting async-completion cleanup (deferred page-ID
         # release + lock_ref release). Drained FIFO in check_ascache_events.
         self._as_pending_loads: List[_AsPendingLoad] = []
+        # 中文：批量准入作用域内攒下的 (stream, event)；None 表示当前不在作用域内，需立即等待
+        self._as_load_handoff_events = None
+        # 推迟等待：mover 下准入只提交读，组 batch 前统一等待并插入 radix 树
+        self._as_deferred_loads: List[_AsDeferredLoad] = []
+        self._as_deferred_hashes = set()
+        self._as_defer_load_wait = (
+            os.environ.get("AS_MOVER_DEFER_LOAD_WAIT", "0") == "1"
+        )
 
         # Allgather mode: packed (default/fallback), auto (in-place when pages
         # are contiguous + pynccl available), inplace (force, fall back to packed).
@@ -234,10 +277,22 @@ class AsRadixCache(RadixCache):
             raise ValueError(
                 "AS_LOAD_ALLGATHER_MODE must be one of: packed, auto, inplace"
             )
+        self._as_contiguous_scan = (
+            os.environ.get("AS_LOAD_CONTIGUOUS_SCAN", "0") == "1"
+        )
+        self._as_pad_allgather = (
+            os.environ.get("AS_MOVER_PAD_ALLGATHER", "0") == "1"
+        )
+        self._as_retain_padding = (
+            os.environ.get("AS_MOVER_RETAIN_PADDING", "0") == "1"
+        )
+        self._as_retained_padding_tokens = 0
 
         # Call parent init (RadixCache)
         super().__init__(params)
 
+        # 独立 mover 的写 lane 串行执行；增加 Python 写线程未证明吞吐收益。
+        # 保持单写线程，并继续按 TP 一致的 FIFO 前缀释放缓存锁。
         self._write_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="as_writer"
         )
@@ -605,6 +660,21 @@ class AsRadixCache(RadixCache):
 
         return result
 
+    def protected_size(self):
+        """统计逻辑缓存锁与仍归缓存节点所有的通信补齐页。"""
+        # Communication pages have no logical cache keys. Count their physical
+        # ownership separately so allocator/cache memory checks still balance.
+        return super().protected_size() + self._as_retained_padding_tokens
+
+    def _delete_leaf(self, node):
+        padding = getattr(node, "_as_padding_page_ids_cpu", None)
+        if padding is not None:
+            assert node.lock_ref == 0, "Cannot reclaim in-flight AS padding"
+            self._free_deferred_page_ids(padding)
+            self._as_retained_padding_tokens -= padding.numel() * self.page_size
+            node._as_padding_page_ids_cpu = None
+        return super()._delete_leaf(node)
+
     def reset(self):
         """Drain AS I/O before clearing tree, allocator-facing, and scratch state."""
         write_tasks = self._as_write_queue
@@ -626,6 +696,7 @@ class AsRadixCache(RadixCache):
             raise RuntimeError("Failed to drain AS-load state during cache reset")
 
         super().reset()
+        self._as_retained_padding_tokens = 0
 
         # Drop persistent overlap scratch so the next load reallocates cleanly.
         self._as_local_scratch = None
@@ -633,6 +704,213 @@ class AsRadixCache(RadixCache):
         self._as_scratch_ready_event = None
 
     # ===== HiCache-compatible hooks =====
+
+    @contextmanager
+    def batch_as_load_handoffs(self):
+        """Defer KV-consumer fences while admission only manipulates page IDs.
+
+        Pending-load locks still protect every in-flight KV destination. Flush
+        before batch preparation, and on all early-return/exception paths.
+        Nested scopes share the outer owner's queue.
+        """
+        # 中文说明：进入作用域后，_handoff_as_load 只登记 (stream, event)，不立刻等待；
+        # 退出作用域（含异常/提前返回）时统一 flush，保证事件一定会被等待。
+        # 嵌套进入时复用最外层的队列，由最外层负责 flush 和清理。
+        if self._as_load_handoff_events is not None:
+            yield
+            return
+        self._as_load_handoff_events = []
+        try:
+            yield
+        finally:
+            try:
+                self.flush_as_load_handoffs()
+            finally:
+                self._as_load_handoff_events = None
+
+    def flush_as_load_handoffs(self, *, wait_for_kv=True):
+        """Commit loads, and optionally fence the compute stream for KV reads."""
+        # 中文：先按准入顺序收尾推迟等待的 mover 读（它们会登记就绪事件），
+        # 再把攒下的“KV 已就绪”事件逐个挂到对应计算流上。返回推迟读的结果，
+        # 调度器据此迁移请求锁，或把失败的请求退回等待队列。
+        outcomes = self._finish_deferred_as_loads()
+        if not wait_for_kv:
+            # Current-batch preparation only manipulates indices and metadata.
+            # The owning scope's finally block fences KV before forward begins,
+            # including early returns and exceptions during preparation.
+            return outcomes
+        events = self._as_load_handoff_events
+        if events is None:
+            return outcomes
+        self._as_load_handoff_events = []
+        for stream, event in events:
+            stream.wait_event(event)
+        return outcomes
+
+    def _can_defer_as_load(self, load_info) -> bool:
+        """只在 mover、多卡、本地读、且处于批量准入作用域内时推迟等待。"""
+        return (
+            self._as_defer_load_wait
+            and self._as_load_handoff_events is not None
+            and self.tp_world_size > 1
+            and not load_info.get("remote_addrs")
+            and type(self.ascli).__name__ == "MoverAttentionStoreSDK"
+        )
+
+    def deferred_as_load_conflict(self, req) -> bool:
+        """本批已有在途推迟读覆盖了 req 要从 AS 读的前缀时返回 True。
+
+        只要 req 的 AS 读范围里有任一块已在本批的推迟读里，就保守地视为冲突：
+        这些块要到组 batch 前才插入 radix 树，现在再读会给同一前缀占两份页。
+        """
+        if not self._as_deferred_hashes or getattr(req, "host_hit_length", 0) <= 0:
+            return False
+        node = getattr(req, "last_host_node", None)
+        info = getattr(node, "_as_load_info", None) if node is not None else None
+        if info is None:
+            return False
+        start = info["start_block"]
+        n_blocks = info["as_hit_tokens"] // self.page_size
+        hashes = info["as_block_hashs"].hash_ids[start : start + n_blocks]
+        return any(h in self._as_deferred_hashes for h in hashes)
+
+    def _register_deferred_as_load(self, steps, submitted, req, last_host_node, load_info):
+        """登记一次推迟读，返回准入要用的（截断后的）页与仍是旧节点的 last_node。
+
+        截断规则与 _insert_as_loaded 一致（按 page 对齐键长裁掉尾部），
+        保证准入时的预算/前缀长度与组 batch 前真正插入树时完全相同。
+        """
+        local_hit_len = load_info["start_block"] * self.page_size
+        assert len(req.prefix_indices) == local_hit_len, (
+            f"prefix_indices length {len(req.prefix_indices)} != local_hit_len {local_hit_len}"
+        )
+        loaded = submitted.indices
+        token_ids = req.full_untruncated_fill_ids[
+            : local_hit_len + len(loaded) + int(self.is_eagle)
+        ]
+        key_len = len(
+            RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle).page_aligned(
+                self.page_size
+            )
+        )
+        keep_len = min(max(key_len - local_hit_len, 0), len(loaded)) if key_len > 0 else 0
+        start = load_info["start_block"]
+        n_blocks = len(loaded) // self.page_size
+        hash_ids = frozenset(load_info["as_block_hashs"].hash_ids[start : start + n_blocks])
+        # 推迟窗口内（未被接纳的请求没有请求锁）锁住本地前缀末节点，
+        # 防止后续请求的主动驱逐回收这些页；提交或失败后释放。
+        self.inc_lock_ref(last_host_node)
+        self._as_deferred_loads.append(
+            _AsDeferredLoad(
+                steps=steps,
+                req=req,
+                last_host_node=last_host_node,
+                load_info=load_info,
+                keep_len=keep_len,
+                full_input_ids=req.full_untruncated_fill_ids,
+                hash_ids=hash_ids,
+            )
+        )
+        self._as_deferred_hashes.update(hash_ids)
+        _asp.add("defer.n")
+        return loaded[:keep_len], last_host_node
+
+    def _finish_deferred_as_loads(self) -> List[AsDeferredLoadOutcome]:
+        """按准入顺序恢复每个推迟读并提交到 radix 树。
+
+        各 rank 的准入顺序相同，恢复时的 allgather 与 TP 成败屏障次序也就一致。
+        任一恢复抛异常时，仍把剩下的读跑完（它们的 DMA 在途）再抛出。
+        """
+        if not self._as_deferred_loads:
+            return []
+        pending, self._as_deferred_loads = self._as_deferred_loads, []
+        self._as_deferred_hashes = set()
+        outcomes = []
+        first_error = None
+        _asp_t0 = _asp.now()
+        for d in pending:
+            if first_error is not None:
+                try:
+                    self._run_as_load_steps(d.steps)
+                except Exception:
+                    logger.exception("AS deferred load drain failed after an earlier error")
+                finally:
+                    self.dec_lock_ref(d.last_host_node)
+                continue
+            committed = False
+            try:
+                _asp_tr = _asp.now()
+                result = self._run_as_load_steps(d.steps)
+                _asp.add("flush.resume_ms", _asp.ms(_asp_tr))
+                committed = True  # _commit_deferred_as_load 负责释放临时锁
+                outcomes.append(self._commit_deferred_as_load(d, result))
+            except Exception as error:
+                logger.exception("AS deferred load failed")
+                first_error = error
+                if not committed:
+                    self.dec_lock_ref(d.last_host_node)
+        if _asp.ENABLED:
+            _asp.emit(
+                "deferred_flush",
+                n=len(pending),
+                ok=sum(int(o.ok) for o in outcomes),
+                total_ms=_asp.ms(_asp_t0),
+            )
+        if first_error is not None:
+            raise first_error
+        return outcomes
+
+    def _commit_deferred_as_load(self, d, result) -> AsDeferredLoadOutcome:
+        """读成功则插入树（与非推迟路径同一个 _insert_as_loaded），失败只回报。"""
+        try:
+            return self._commit_deferred_as_load_locked(d, result)
+        finally:
+            # 树插入（成功）或页释放（失败）之后再放开本地前缀的临时锁
+            self.dec_lock_ref(d.last_host_node)
+
+    def _commit_deferred_as_load_locked(self, d, result) -> AsDeferredLoadOutcome:
+        req = d.req
+        # 中文：deferred恢复也必须经过新基线的CP长度一致性检查。
+        result = self._reconcile_as_load_result(
+            result, d.load_info["as_hit_tokens"]
+        )
+        if result is None or len(result.indices) == 0:
+            # 失败分支已在生成器里释放了页；调度器负责把已接纳的请求退回重算
+            return AsDeferredLoadOutcome(
+                req=req, old_node=d.last_host_node, new_node=None, ok=False
+            )
+        local_hit_len = d.load_info["start_block"] * self.page_size
+        saved_prefix = req.prefix_indices
+        saved_fill = req.full_untruncated_fill_ids
+        # _insert_as_loaded 要求 prefix_indices 只含本地命中部分，并按准入时的 fill_ids 算键
+        req.prefix_indices = saved_prefix[:local_hit_len]
+        req.full_untruncated_fill_ids = d.full_input_ids
+        try:
+            loaded_indices, new_node = self._insert_as_loaded(
+                req, d.last_host_node, d.load_info, result
+            )
+        finally:
+            req.prefix_indices = saved_prefix
+            req.full_untruncated_fill_ids = saved_fill
+        if len(loaded_indices) != d.keep_len:
+            raise RuntimeError(
+                "AS deferred load length changed between admission and commit: "
+                f"admitted={d.keep_len}, committed={len(loaded_indices)}"
+            )
+        if len(loaded_indices) > 0:
+            req.ever_read_as = True
+        return AsDeferredLoadOutcome(
+            req=req, old_node=d.last_host_node, new_node=new_node, ok=True
+        )
+
+    def _handoff_as_load(self, event):
+        """Defer a KV-ready wait, or apply it immediately outside a scope."""
+        # 中文：作用域内推迟等待（记录当前流和事件）；作用域外保持原行为，立即等待
+        stream = torch.cuda.current_stream()
+        if self._as_load_handoff_events is None:
+            stream.wait_event(event)
+        else:
+            self._as_load_handoff_events.append((stream, event))
 
     def init_load_back(
         self,
@@ -664,59 +942,23 @@ class AsRadixCache(RadixCache):
             return empty, last_host_node
 
         # Perform the actual AS -> GPU DMA load
-        load_result = self._do_as_load(load_info, host_hit_length)
-        # CPLOADSYNC: reconcile the ACTUAL AS-loaded length across the
-        # cache group. host_hit_length is agreed across ranks at match time
-        # (see match_prefix), but the per-rank AS->HBM load can still
-        # under-deliver on a subset of ranks (transient KV-pool alloc/evict
-        # pressure, read divergence) and return a different number of tokens
-        # per rank -- observed under prefill CP: one rank loaded 0 while the
-        # rest loaded the full hit. Committing a divergent cached prefix
-        # makes each rank build a different extend batch, so the per-request
-        # DSA/attention CP all-gather and all_reduce collectives mismatch in
-        # size/count and the prefill schedulers deadlock. Honor the AS hit
-        # only if ALL ranks loaded it; otherwise every rank drops it and
-        # re-forwards the prefix identically (correctness preserved; the
-        # recompute only forgoes a cache speedup for this one request, and
-        # only in the rare under-delivery window). Release the dropped
-        # pages immediately and locally -- NOT through the TP-MIN-synced
-        # deferred queue, whose drain would stall (and leak) when the queued
-        # counts differ across ranks.
-        _cpload_raw = len(load_result.indices) if (load_result is not None) else 0
-        if self.tp_world_size > 1:
-            _cpload_t = torch.tensor(_cpload_raw, dtype=torch.int)
-            torch.distributed.all_reduce(
-                _cpload_t,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            _cpload_min = int(_cpload_t.item())
+        if self._can_defer_as_load(load_info):
+            # 中文：mover 推迟等待：只跑到分片读提交完就返回页号，组 batch 前再收尾
+            steps = self._as_load_steps(load_info, host_hit_length, defer=True)
+            try:
+                submitted = next(steps)
+            except StopIteration as stop:
+                # 没走到提交（分配失败、无分片等）：按原路径的同步结果处理
+                load_result = stop.value
+            else:
+                return self._register_deferred_as_load(
+                    steps, submitted, req, last_host_node, load_info
+                )
         else:
-            _cpload_min = _cpload_raw
-        if _cpload_min <= 0:
-            if load_result is not None and _cpload_raw > 0:
-                if load_result.ready_event is not None:
-                    try:
-                        load_result.ready_event.synchronize()
-                    except Exception:
-                        logger.exception("AS load drop: ready_event sync failed")
-                _free_page_ids = getattr(
-                    self.token_to_kv_pool_allocator, "free_page_ids", None
-                )
-                if (
-                    _free_page_ids is not None
-                    and load_result.page_ids_cpu is not None
-                    and load_result.page_ids_cpu.numel() > 0
-                ):
-                    _free_page_ids(load_result.page_ids_cpu)
-                else:
-                    self.token_to_kv_pool_allocator.free(load_result.indices)
-                logger.warning(
-                    f"AS load: req:{getattr(req, 'rid', '?')} dropped on all "
-                    f"ranks (a rank in the cache group loaded 0 of "
-                    f"{host_hit_length}); honoring 0 AS hit for CP consistency"
-                )
-            return empty, last_host_node
+            load_result = self._do_as_load(load_info, host_hit_length)
+        load_result = self._reconcile_as_load_result(
+            load_result, host_hit_length
+        )
         if load_result is not None and len(load_result.indices) > 0:
             req.ever_read_as = True
 
@@ -733,6 +975,39 @@ class AsRadixCache(RadixCache):
 
         return empty, last_host_node
 
+    def _reconcile_as_load_result(self, result, expected_tokens):
+        """Publish an AS hit only when every cache rank loaded it completely."""
+        local_tokens = len(result.indices) if result is not None else 0
+        complete = int(local_tokens == expected_tokens and expected_tokens > 0)
+        if self.tp_world_size > 1:
+            state = torch.tensor(complete, dtype=torch.int)
+            torch.distributed.all_reduce(
+                state, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+            complete = int(state.item())
+        if complete:
+            return result
+        if result is not None:
+            # 中文：有rank未读到完整前缀时，所有rank放弃这次命中。
+            # 先等DMA/NCCL真正完成，再本地释放；不能进入长度可能不一致的TP FIFO。
+            if result.ready_event is not None:
+                result.ready_event.synchronize()
+            free_page_ids = getattr(
+                self.token_to_kv_pool_allocator, "free_page_ids", None
+            )
+            if free_page_ids is not None and result.page_ids_cpu is not None:
+                free_page_ids(result.page_ids_cpu)
+                padding = result.padding_page_ids_cpu
+                if padding is not None and padding.numel() > 0:
+                    free_page_ids(padding)
+            else:
+                self.token_to_kv_pool_allocator.free(result.indices)
+        logger.warning(
+            "AS load dropped on every rank: local=%d expected=%d",
+            local_tokens, expected_tokens,
+        )
+        return None
+
     def shutdown(self):
         """Drain asynchronous AttentionStore writes before process shutdown."""
         self._shutdown_as_writer()
@@ -745,12 +1020,13 @@ class AsRadixCache(RadixCache):
         """Check for completed AS load/write tasks and clean up.
 
         TP-synchronized via all_reduce(MIN), mirroring HiRadixCache.writing_check().
-        The single-threaded executor (max_workers=1) guarantees FIFO completion,
-        so counting from the front is safe. Pending AS loads drain the same way;
+        Reclaim only the completed FIFO prefix: concurrent writers may finish
+        out of order, but later completions never pass a hole. Pending AS loads drain the same way;
         their ready_event fences the deferred page-ID and lock_ref release.
 
         Called by the scheduler each iteration.
         """
+        _asp_t0 = _asp.now()
         load_finish_count = self._finished_as_load_count()
 
         # Single-card: skip sync, use simple early return
@@ -785,18 +1061,26 @@ class AsRadixCache(RadixCache):
             if future.done():
                 finish_count += 1
             else:
-                break  # FIFO: later tasks can't be done before this one
+                break  # Never reclaim later tasks ahead of an unfinished prefix.
+                # 中文：多个写线程可能乱序完成；只回收队首连续已完成的前缀，
+                # 遇到未完成的任务就停，保证各 TP rank 解锁的节点顺序一致。
 
         # Step 2: TP sync — take MIN so all ranks process the same count
         count_tensor = torch.tensor([finish_count, load_finish_count], dtype=torch.int)
+        _asp_tar = _asp.now()
         torch.distributed.all_reduce(
             count_tensor,
             op=torch.distributed.ReduceOp.MIN,
             group=self.tp_group,
         )
         finish_count, load_finish_count = map(int, count_tensor.tolist())
+        _asp.add("check.n")
+        _asp.add("check.ar_ms", _asp.ms(_asp_tar))
+        _asp.add("check.qlen", len(self._as_write_queue))
+        _asp.add("check.reclaimed", finish_count)
 
         if finish_count == 0 and load_finish_count == 0:
+            _asp.add("check.ms", _asp.ms(_asp_t0))
             return
 
         # Step 3: Process exactly finish_count tasks — all ranks unlock
@@ -811,8 +1095,16 @@ class AsRadixCache(RadixCache):
                     f"AS write task failed: node_id={id(task.node)}, error={e}"
                 )
             self.dec_lock_ref(task.node)
+            if _asp.ENABLED:
+                # 从提交写到这里解锁，KV 槽位一直被这个写占着
+                _asp.emit(
+                    "write_reclaim",
+                    hold_ms=_asp.ms(task.submit_time),
+                    pages=task.num_pages,
+                )
 
         self._as_write_queue = self._as_write_queue[finish_count:]
+        _asp.add("check.ms", _asp.ms(_asp_t0))
 
     def _finished_as_load_count(self) -> int:
         finish_count = 0
@@ -917,6 +1209,28 @@ class AsRadixCache(RadixCache):
         node: Optional[TreeNode],
         deferred_page_ids: List[torch.Tensor],
     ) -> None:
+        padding = result.padding_page_ids_cpu
+        retain_padding = (
+            self._as_retain_padding
+            and node is not None
+            and result.ready_event is not None
+            and padding is not None
+            and padding.numel() > 0
+        )
+        previous_padding = None
+        combined_padding = None
+        if retain_padding:
+            previous_padding = getattr(node, "_as_padding_page_ids_cpu", None)
+            combined_padding = (
+                padding
+                if previous_padding is None
+                else torch.cat((previous_padding, padding)).contiguous()
+            )
+        elif padding is not None:
+            deferred_page_ids = [
+                *deferred_page_ids,
+                padding,
+            ]
         if deferred_page_ids:
             page_ids = torch.cat(deferred_page_ids).contiguous()
         else:
@@ -928,10 +1242,18 @@ class AsRadixCache(RadixCache):
             return
 
         locked = False
+        padding_attached = False
         try:
             if node is not None:
                 self.inc_lock_ref(node)
                 locked = True
+            if retain_padding:
+                # The pending load's node lock protects these pages until its
+                # ready event. Afterwards they stay with the physical KV run,
+                # avoiding small holes that obstruct later in-place loads.
+                node._as_padding_page_ids_cpu = combined_padding
+                self._as_retained_padding_tokens += padding.numel() * self.page_size
+                padding_attached = True
             self._as_pending_loads.append(
                 _AsPendingLoad(
                     ready_event=result.ready_event,
@@ -944,7 +1266,12 @@ class AsRadixCache(RadixCache):
             # Queue insertion is the ownership handoff. If it fails, make the
             # asynchronous writes quiescent before undoing temporary state.
             result.ready_event.synchronize()
+            if padding_attached:
+                node._as_padding_page_ids_cpu = previous_padding
+                self._as_retained_padding_tokens -= padding.numel() * self.page_size
             self._free_deferred_page_ids(page_ids)
+            if retain_padding:
+                self._free_deferred_page_ids(padding)
             if locked:
                 self.dec_lock_ref(node)
             raise
@@ -998,7 +1325,32 @@ class AsRadixCache(RadixCache):
         )
 
         # Include the boundary token reserved for EAGLE bigram key construction.
-        token_ids = req.fill_ids[: total_prefix_len + int(self.is_eagle)]
+        # Req.fill_ids was renamed upstream; use the complete untruncated
+        # sequence so AS-loaded prefixes build the same key as normal matches.
+        full_input_ids = getattr(req, "full_untruncated_fill_ids", None)
+        if full_input_ids is None:
+            full_input_ids = getattr(req, "fill_ids", None)
+        if full_input_ids is None:
+            get_fill_ids = getattr(req, "get_fill_ids", None)
+            full_input_ids = get_fill_ids() if get_fill_ids is not None else None
+        required_input_len = total_prefix_len + int(self.is_eagle)
+        if full_input_ids is None or len(full_input_ids) < required_input_len:
+            logger.warning(
+                "AS load skipped for req:%s: request input sequence is unavailable "
+                "or shorter than the loaded prefix (required=%d, available=%d)",
+                req.rid,
+                required_input_len,
+                len(full_input_ids) if full_input_ids is not None else 0,
+            )
+            deferred_page_ids.append(loaded_page_ids)
+            self._queue_as_load_completion(load_result, None, deferred_page_ids)
+            return (
+                torch.empty(
+                    (0,), dtype=loaded_indices.dtype, device=loaded_indices.device
+                ),
+                last_host_node,
+            )
+        token_ids = full_input_ids[:required_input_len]
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
@@ -1071,6 +1423,13 @@ class AsRadixCache(RadixCache):
             return False
         return True
 
+    def _get_as_trace(self, req):
+        if req is None:
+            return None
+        from sglang.srt.mem_cache.as_trace import get_recorder
+
+        return get_recorder(req, self)
+
     def _as_match(self, req, local_result: MatchResult, key) -> Optional[MatchResult]:
         """Query AS for additional prefix hits beyond local radix tree match.
 
@@ -1085,12 +1444,25 @@ class AsRadixCache(RadixCache):
         remote_addrs = req.as_max_hit_host_ip
         remote_len = req.as_max_hit_token_len
 
+        as_match_count = 0
+        match_error = None
+        remote_match = bool(remote_len and len(remote_len) == 1 and remote_len[0] > 0)
+
         # If remote hit info indicates a specific hit length, use it directly
-        if remote_len and len(remote_len) == 1 and remote_len[0] > 0:
-            as_hit_tokens = (
-                (remote_len[0] - local_hit_len) // self.page_size
-            ) * self.page_size
+        if remote_match:
+            as_match_count = max((remote_len[0] - local_hit_len) // self.page_size, 0)
+            as_hit_tokens = as_match_count * self.page_size
             if as_hit_tokens <= 0:
+                recorder = self._get_as_trace(req)
+                if recorder is not None:
+                    recorder.record(
+                        "AS_MATCH",
+                        raw_match_blocks=as_match_count,
+                        final_match_blocks=0,
+                        start_block=start_block,
+                        hash_ids=recorder.hash_ids(as_block_hashs),
+                        status="miss",
+                    )
                 return None
         else:
             # Each TP rank queries AS independently
@@ -1103,6 +1475,7 @@ class AsRadixCache(RadixCache):
                 )
             except Exception as e:
                 logger.warning(f"AS match failed: {e}")
+                match_error = str(e)
                 as_match_count = 0
 
             # TP sync: all_reduce(MIN) so all ranks agree on the same match count
@@ -1116,6 +1489,17 @@ class AsRadixCache(RadixCache):
                 as_match_count = int(match_tensor.item())
 
             if as_match_count < AS_MIN_MATCH_BLOCKS:
+                recorder = self._get_as_trace(req)
+                if recorder is not None:
+                    recorder.record(
+                        "AS_MATCH",
+                        raw_match_blocks=as_match_count,
+                        final_match_blocks=0,
+                        start_block=start_block,
+                        hash_ids=recorder.hash_ids(as_block_hashs),
+                        status="error" if match_error else "miss",
+                        error=match_error,
+                    )
                 return None
 
             as_hit_tokens = as_match_count * self.page_size
@@ -1124,17 +1508,65 @@ class AsRadixCache(RadixCache):
         if self.is_eagle:
             as_hit_tokens -= self.page_size
             if as_hit_tokens <= 0:
+                recorder = self._get_as_trace(req)
+                if recorder is not None:
+                    recorder.record(
+                        "AS_MATCH",
+                        raw_match_blocks=as_match_count,
+                        final_match_blocks=0,
+                        start_block=start_block,
+                        hash_ids=recorder.hash_ids(as_block_hashs),
+                        status="miss",
+                    )
                 return None
 
         # Cap AS hit so that at least 1 token remains for extend forward pass.
-        # Without this, local_hit + AS_hit could cover all fill_ids, making
-        # extend_input_len=0 and causing an empty-tensor crash in model forward.
+        # ``Req.fill_ids`` was renamed and split upstream: the complete current
+        # sequence is now ``full_untruncated_fill_ids`` while ``fill_len`` and
+        # ``get_fill_ids()`` can describe only the current extend range. Use the
+        # complete sequence here because this cap mirrors the old
+        # ``len(req.fill_ids)`` behavior. Keep the legacy fallback for mixed
+        # deployments, and skip the AS hit rather than crash if neither API is
+        # available.
+        full_input_ids = getattr(req, "full_untruncated_fill_ids", None)
+        if full_input_ids is None:
+            full_input_ids = getattr(req, "fill_ids", None)
+        if full_input_ids is None:
+            logger.warning(
+                "AS match skipped for req:%s: request has no full input "
+                "token sequence",
+                req.rid,
+            )
+            return None
+
+        full_input_len = len(full_input_ids)
         max_as_tokens = (
-            (len(req.fill_ids) - local_hit_len - 1) // self.page_size * self.page_size
+            (full_input_len - local_hit_len - 1) // self.page_size * self.page_size
         )
         if max_as_tokens <= 0:
+            recorder = self._get_as_trace(req)
+            if recorder is not None:
+                recorder.record(
+                    "AS_MATCH",
+                    raw_match_blocks=as_match_count,
+                    final_match_blocks=0,
+                    start_block=start_block,
+                    hash_ids=recorder.hash_ids(as_block_hashs),
+                    status="miss",
+                )
             return None
         as_hit_tokens = min(as_hit_tokens, max_as_tokens)
+
+        recorder = self._get_as_trace(req)
+        if recorder is not None:
+            recorder.record(
+                "AS_MATCH",
+                raw_match_blocks=as_match_count,
+                final_match_blocks=as_hit_tokens // self.page_size,
+                start_block=start_block,
+                hash_ids=recorder.hash_ids(as_block_hashs),
+                status="hit",
+            )
 
         # Store load info on the last_device_node for init_load_back to use
         last_node = local_result.last_device_node
@@ -1143,6 +1575,7 @@ class AsRadixCache(RadixCache):
             "start_block": start_block,
             "as_hit_tokens": as_hit_tokens,
             "as_block_hashs": as_block_hashs,
+            "req": req,
             "remote_addrs": remote_addrs,
             "remote_len": remote_len,
         }
@@ -1285,12 +1718,23 @@ class AsRadixCache(RadixCache):
             metadata_spans.append((start, len(metadata_rows)))
             plan.descriptors = build_as_load_descriptors(plan.segments, device)
 
-        metadata = torch.tensor(metadata_rows, dtype=torch.int64, device=device)
+        # Keep the pinned slab alive through the load completion resources.
+        # A synchronous tensor constructor would drain previous loads here.
+        # 中文说明：元数据先放进 pinned（锁页）内存，再用 non_blocking 异步拷到 GPU。
+        # 直接 torch.tensor(..., device=device) 是同步拷贝，会等前面所有 stream 上的
+        # 恢复任务做完，把准入线程卡住；pinned + 异步则不会。
+        # pinned 内存必须活到本次恢复结束（H2D 拷贝在后台完成），所以挂到每个
+        # plan.metadata_host 上，随 load 的 resources 一起保活。
+        metadata_host = torch.tensor(
+            metadata_rows, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        metadata = metadata_host.to(device=device, non_blocking=True)
         max_local_nbytes = max(plan.local_nbytes for plan in plans)
         self._ensure_as_load_scratch(max_local_nbytes, world, device, load_stream)
 
         for bi, (plan, (start, end)) in enumerate(zip(plans, metadata_spans)):
             plan.metadata = metadata[start:end]
+            plan.metadata_host = metadata_host
             plan.local_scratch = self._as_local_scratch[: plan.local_nbytes]
             plan.gathered_scratch = self._as_gathered_scratch[bi % 2][
                 : plan.local_nbytes * world
@@ -1483,9 +1927,26 @@ class AsRadixCache(RadixCache):
     def _do_as_load(
         self, load_info: dict, host_hit_length: int
     ) -> Optional[_AsLoadResult]:
+        """Execute the actual AS -> GPU DMA read synchronously."""
+        return self._run_as_load_steps(
+            self._as_load_steps(load_info, host_hit_length, defer=False)
+        )
+
+    @staticmethod
+    def _run_as_load_steps(steps):
+        """把 _as_load_steps 生成器跑完，返回其结果（_AsLoadResult 或 None）。"""
+        try:
+            while True:
+                next(steps)
+        except StopIteration as stop:
+            return stop.value
+
+    def _as_load_steps(self, load_info: dict, host_hit_length: int, defer: bool = False):
         """Execute the actual AS -> GPU DMA read.
 
         Allocates HBM slots and calls ascli.read() to DMA load KV data.
+        生成器：defer=True 时在分片读提交后 yield 一次 _AsLoadSubmitted，
+        恢复后继续等待、allgather 与成败屏障；最终 return _AsLoadResult 或 None。
         """
         if not self._buffer_ptrs_ready:
             logger.warning("AS load: buffer pointers not initialized, skipping")
@@ -1508,29 +1969,78 @@ class AsRadixCache(RadixCache):
             "handoff": 0.0,
             "tp_sync": 0.0,
         }
+        # ASPROBE：逐 layer batch 记录 stream_wait 耗时与句柄 id，
+        # 用来判断 mover 是否把全部层的读都压在第一个 batch 的等待里。
+        _asp_sw_bi = []
+        _asp_hid = []
 
         as_block_hashs = load_info["as_block_hashs"]
         start_block = load_info["start_block"]
         as_hit_tokens = load_info["as_hit_tokens"]
         remote_addrs = load_info.get("remote_addrs", [])
 
+        # 中文：补齐、分片和allgather必须始终使用同一个KV副本组。
+        # 0.5.17的NSA prefill CP下attn-TP可能只有1个rank。
+        attn_tp = _get_as_load_group()
+        world = attn_tp.world_size
+        rank = attn_tp.rank_in_group
+        real_n_blocks = as_hit_tokens // self.page_size
+        padded_chunk = (real_n_blocks + world - 1) // world
+        request_padding = (
+            self._as_pad_allgather
+            and world > 1
+            and real_n_blocks >= world
+            and (world - 1) * padded_chunk < real_n_blocks
+            and real_n_blocks % world != 0
+            and not remote_addrs
+        )
+        padded_n_blocks = (
+            padded_chunk * world if request_padding else real_n_blocks
+        )
+        allocation_tokens = padded_n_blocks * self.page_size
+
         # Check available space; evict proactively if needed
         available = self.token_to_kv_pool_allocator.available_size()
-        if available < as_hit_tokens:
+        if available < allocation_tokens:
             evictable = self.evictable_size()
             if evictable > 0:
-                evict_tokens = max(as_hit_tokens - available, 0) + self.page_size
+                evict_tokens = max(allocation_tokens - available, 0) + self.page_size
                 logger.debug(
                     f"AS load: proactive evict {evict_tokens} tokens "
-                    f"(need={as_hit_tokens}, available={available}, evictable={evictable})"
+                    f"(need={allocation_tokens}, available={available}, evictable={evictable})"
                 )
                 self.evict(EvictParams(num_tokens=evict_tokens))
+
+        use_padding = False
+        if request_padding:
+            # Every rank must choose the same collective shape, including when
+            # one allocator cannot reserve the temporary padding pages.
+            padding_state = torch.tensor(
+                int(
+                    type(self.ascli).__name__ == "MoverAttentionStoreSDK"
+                    and callable(
+                        getattr(self.token_to_kv_pool_allocator, "free_page_ids", None)
+                    )
+                    and self.token_to_kv_pool_allocator.available_size()
+                    >= allocation_tokens
+                ),
+                dtype=torch.int,
+            )
+            torch.distributed.all_reduce(
+                padding_state,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            use_padding = bool(padding_state.item())
+        if not use_padding:
+            allocation_tokens = as_hit_tokens
 
         # Prefer one physical run so NCCL can allgather directly into the KV
         # buffers. Custom/non-paged allocators retain the original behavior.
         used_contiguous_alloc = False
         data_id_list = None
         alloc_t0 = time.perf_counter()
+        alloc_indices = None
         try:
             alloc_contiguous_with_page_ids = getattr(
                 self.token_to_kv_pool_allocator,
@@ -1538,7 +2048,15 @@ class AsRadixCache(RadixCache):
                 None,
             )
             if alloc_contiguous_with_page_ids is not None:
-                contiguous_result = alloc_contiguous_with_page_ids(as_hit_tokens)
+                contiguous_result = alloc_contiguous_with_page_ids(allocation_tokens)
+                if contiguous_result is None and self._as_contiguous_scan:
+                    alloc_scan = getattr(
+                        self.token_to_kv_pool_allocator,
+                        "alloc_contiguous_by_scan_with_page_ids",
+                        None,
+                    )
+                    if alloc_scan is not None:
+                        contiguous_result = alloc_scan(allocation_tokens)
                 if contiguous_result is None:
                     alloc_indices = None
                 else:
@@ -1548,23 +2066,37 @@ class AsRadixCache(RadixCache):
                     self.token_to_kv_pool_allocator, "alloc_contiguous", None
                 )
                 alloc_indices = (
-                    alloc_contiguous(as_hit_tokens)
+                    alloc_contiguous(allocation_tokens)
                     if alloc_contiguous is not None
                     else None
                 )
             if alloc_indices is not None:
                 used_contiguous_alloc = True
             else:
-                alloc_indices = self.token_to_kv_pool_allocator.alloc(as_hit_tokens)
+                alloc_indices = self.token_to_kv_pool_allocator.alloc(allocation_tokens)
         except Exception:
-            logger.warning(f"AS load: failed to allocate {as_hit_tokens} tokens")
-            return None
+            logger.exception("AS load: failed to allocate %d tokens", allocation_tokens)
         alloc_ms = (time.perf_counter() - alloc_t0) * 1000
 
-        if alloc_indices is None or len(alloc_indices) == 0:
+        # 中文：CPU分配状态在进入任何GPU collective之前统一。
+        # 否则一张卡提前return、其余卡yield/做allgather，会在CP下永久等待。
+        allocation_ok = int(
+            alloc_indices is not None and len(alloc_indices) == allocation_tokens
+        )
+        if self.tp_world_size > 1:
+            allocation_state = torch.tensor(allocation_ok, dtype=torch.int)
+            torch.distributed.all_reduce(
+                allocation_state,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            allocation_ok = int(allocation_state.item())
+        if not allocation_ok:
+            if alloc_indices is not None and len(alloc_indices) > 0:
+                self.token_to_kv_pool_allocator.free(alloc_indices)
             logger.warning(
                 f"AS load: alloc failed, "
-                f"need={as_hit_tokens}, "
+                f"need={allocation_tokens}, "
                 f"available={self.token_to_kv_pool_allocator.available_size()}, "
                 f"evictable={self.evictable_size()}"
             )
@@ -1627,12 +2159,7 @@ class AsRadixCache(RadixCache):
         # _allgather_loaded_kv collective), otherwise the per-rank shard offsets and
         # the all-gather layout disagree when dp_size > 1 (global tp_rank 0..15 with
         # an attn-TP world of 8 would over-shard and index out of range).
-        # Under NSA prefill CP the attn-TP group is size 1; shard over the group
-        # that actually holds KV replicas (see _get_as_load_group).
-        attn_tp = _get_as_load_group()
         n_blocks = page_rows.numel()
-        world = attn_tp.world_size
-        rank = attn_tp.rank_in_group
         if world > 1 and n_blocks > 0:
             chunk = n_blocks // world
             n_shard = chunk * world
@@ -1658,6 +2185,7 @@ class AsRadixCache(RadixCache):
 
         # Shard (floor) slice each rank reads — identical for every batch.
         local_lo = rank * chunk
+        local_read_blocks = min(chunk, max(real_n_blocks - local_lo, 0))
         local_start_block = start_block + local_lo
         shard_indices = alloc_indices[: n_shard * self.page_size]
         shard_page_rows = page_rows[:n_shard]
@@ -1720,6 +2248,25 @@ class AsRadixCache(RadixCache):
                         rank,
                         allow_inplace,
                     )
+                    if use_padding and local_read_blocks < chunk:
+                        # These owned pages participate in NCCL but have no AS
+                        # blocks. Initialize them without reading beyond the hit.
+                        padding_start = local_lo + local_read_blocks
+                        padding_indices = alloc_indices[
+                            padding_start * self.page_size :
+                        ]
+                        padding_rows = page_rows[padding_start:]
+                        for layer_id in self.layer_ids:
+                            key, value, value_paged = self._get_layer_kv_tensors(layer_id)
+                            # Bytewise zero also supports FP8 storage, whose
+                            # native index_fill_ operation is unavailable.
+                            key.view(torch.uint8).index_fill_(0, padding_indices, 0)
+                            if value is not None:
+                                value.view(torch.uint8).index_fill_(
+                                    0,
+                                    padding_rows if value_paged else padding_indices,
+                                    0,
+                                )
                     candidate_inplace_batches = sum(
                         plan.inplace_pairs is not None for plan in plans
                     )
@@ -1733,7 +2280,9 @@ class AsRadixCache(RadixCache):
 
             all_data_ids = _materialize_data_id_list()
             failed = failed or page_ids_failed or len(all_data_ids) != n_blocks
-            local_data_ids = all_data_ids[local_lo : local_lo + chunk]
+            local_data_ids = all_data_ids[
+                local_lo : local_lo + local_read_blocks
+            ]
             shard_data_ids = all_data_ids[:n_shard]
             if self._as_allgather_mode == "packed":
                 pages_contiguous = bool(shard_data_ids) and all(
@@ -1846,6 +2395,16 @@ class AsRadixCache(RadixCache):
                     except Exception as e:
                         logger.warning(f"AS shard scatter b0 failed: {e}")
                         failed = True
+                if defer and preflight_state:
+                    # 中文：推迟等待——分片读已交给 mover，先把页号交回准入，
+                    # 组 batch 前再从这里继续等待与 allgather。是否 yield 只看
+                    # 已在各 rank 间归约过的 preflight_state，本地提交失败也照样
+                    # yield，失败留到恢复后的 TP 成败屏障统一处理，保证集体通信次序一致。
+                    yield _AsLoadSubmitted(indices=alloc_indices[:as_hit_tokens])
+                    # 推迟期间其它请求的 pack/unpack 可能已排在本请求之前，
+                    # 继续前补上跨请求复用 scratch 的栅栏。
+                    if self._as_scratch_ready_event is not None:
+                        load_stream.wait_event(self._as_scratch_ready_event)
 
                 for bi, plan in enumerate(plans if preflight_state else []):
                     with torch.cuda.stream(load_stream):
@@ -1866,7 +2425,10 @@ class AsRadixCache(RadixCache):
                                 )
                                 rd_cur = -1
                         _diag["sw"] += (time.perf_counter() - _tsw) * 1000
-                        if rd_cur != chunk:
+                        if _asp.ENABLED:
+                            _asp_sw_bi.append(_asp.ms(_tsw))
+                            _asp_hid.append(id(handle) if handle is not None else 0)
+                        if rd_cur != local_read_blocks:
                             failed = True
 
                         # Queue pack after scatter(b), then submit scatter(b+1)
@@ -1970,20 +2532,79 @@ class AsRadixCache(RadixCache):
         if n_remainder > 0 and not failed:
             _materialize_data_id_list()
             _t_remainder = time.perf_counter()
+            rh = None
+            tail_wait_started = False
+            tail_stream_ordered = False
+            tail_scatter_started = False
             try:
-                rh = self.ascli.read_submit(
-                    layer_ids=self.layer_ids,
+                tail_args = dict(
                     tokens=as_block_hashs,
                     start_transfer_block_index=start_block + n_shard,
                     k_dest_ptrs=self.k_buffer_ptrs,
                     v_dest_ptrs=self.v_buffer_ptrs,
-                    data_id_list=data_id_list[n_shard:],
+                    data_id_list=data_id_list[n_shard:real_n_blocks],
                     timeout=1,
                     remote_addrs=remote_addrs_arg,
                 )
-                rem_rd = self.ascli.read_wait(rh)
+                if world > 1 and chunk > 0:
+                    # Keep the replicated tail off the host admission critical
+                    # path, using the shard pipeline's refcounted SDK protocol.
+                    # 中文说明：多卡下尾部（remainder）各 rank 都要完整读取。原来用
+                    # read_submit + read_wait 同步等待，会卡住主机准入线程；这里改成与分片
+                    # 流水线相同的 fetch -> acquire -> scatter -> 在 load_stream 上等待 的
+                    # 引用计数协议，host 不再阻塞，只由 load_stream 排队等待数据到位。
+                    tail_offsets = self.ascli.read_fetch(**tail_args)
+                    self.ascli.read_acquire(tail_offsets, 1)
+                    tail_scatter_started = True
+                    rh = self.ascli.read_scatter(
+                        tail_offsets, layer_ids=self.layer_ids, refcounted=True
+                    )
+                    tail_wait_started = True
+                    rem_rd = self.ascli.read_stream_wait(rh, load_stream_ptr)
+                    tail_stream_ordered = True
+                    # SDK stream_wait maps native failures (including an
+                    # unproven completion) to a zero prefix. Quarantine on any
+                    # incomplete result rather than inferring DMA quiescence.
+                    # 中文：读取不完整时不能推断 DMA 已停止，宁可隔离这批句柄、不复用。
+                    if rem_rd != n_remainder:
+                        scatter_handles_quiescent = False
+                    self.ascli.read_release_on_stream(rh, load_stream_ptr)
+                    # The request readiness event must cover BOTH packed
+                    # unpacks and tail scatters, including deferred load cleanup.
+                    # 中文：请求的“就绪事件”必须同时覆盖分片 unpack 和尾部 scatter，
+                    # 否则后续延迟清理可能在尾部数据还没写完时就释放页。
+                    if last_unpack_event is not None:
+                        load_stream.wait_event(last_unpack_event)
+                    tail_ready = torch.cuda.Event()
+                    tail_ready.record(load_stream)
+                    last_unpack_event = tail_ready
+                else:
+                    # 中文：单卡或没有分片时保持原来的同步读取路径
+                    rh = self.ascli.read_submit(
+                        layer_ids=self.layer_ids, **tail_args
+                    )
+                    rem_rd = self.ascli.read_wait(rh)
             except Exception as e:
                 logger.warning(f"AS remainder read failed: {e}")
+                if tail_scatter_started:
+                    # Submission can fail before returning its scatter handle.
+                    # 中文：提交阶段失败时可能拿不到 scatter 句柄，无法确认 DMA 是否已停，按不安全处理
+                    scatter_handles_quiescent = False
+                if world > 1 and chunk > 0 and rh is not None:
+                    try:
+                        if not tail_wait_started:
+                            # 中文：尚未开始等待：同步等待完成并释放句柄，-2 表示无法证明已停止
+                            cleanup_ret = self.ascli.read_sync_wait(rh)
+                            if cleanup_ret == -2:
+                                scatter_handles_quiescent = False
+                            self.ascli.read_release(rh)
+                        elif not tail_stream_ordered:
+                            # A failed stream wait may already have consumed the
+                            # handle. Retain allocation/SHM rather than reuse it.
+                            # 中文：stream 等待失败时句柄可能已被消费，保留分配和共享内存，不再复用
+                            scatter_handles_quiescent = False
+                    except Exception:
+                        scatter_handles_quiescent = False
                 rem_rd = -1
             if rem_rd != n_remainder:
                 failed = True
@@ -1999,7 +2620,7 @@ class AsRadixCache(RadixCache):
             else:
                 ready_event = torch.cuda.Event()
                 ready_event.record(load_stream)
-            torch.cuda.current_stream().wait_event(ready_event)
+            self._handoff_as_load(ready_event)  # 中文：批量准入作用域内只登记，不立刻阻塞计算流
             _diag["handoff"] += (time.perf_counter() - _t_handoff) * 1000
 
         # Single all-or-nothing barrier across ranks.
@@ -2022,7 +2643,7 @@ class AsRadixCache(RadixCache):
             "unpack=%.1f) remainder=%.1f handoff=%.1f tp_sync=%.1f "
             "(n_batches=%d, inplace=%d, candidate=%d, chunk=%d, pynccl=%d, "
             "pages_contig=%d, contig_alloc=%d, cpu_page_ids=%d, mode=%s, "
-            "preflight=%d->%d)",
+            "preflight=%d->%d, padded=%d, local_read=%d, padding_pages=%d)",
             (time.perf_counter() - _t_load0) * 1000,
             alloc_ms,
             _diag["indices"],
@@ -2050,7 +2671,29 @@ class AsRadixCache(RadixCache):
             self._as_allgather_mode,
             local_preflight_state,
             preflight_state,
+            use_padding,
+            local_read_blocks,
+            n_blocks - real_n_blocks,
         )
+        if _asp.ENABLED:
+            _asp_total = _asp.ms(_t_load0)
+            _asp.add("load.n")
+            _asp.add("load.ms", _asp_total)
+            _asp.add("load.sw_ms", _diag["sw"])
+            _asp.add("load.tp_sync_ms", _diag["tp_sync"])
+            _asp.emit(
+                "load",
+                total_ms=_asp_total,
+                sw_ms=_diag["sw"],
+                sw_bi=_asp_sw_bi,
+                distinct_handles=len(set(h for h in _asp_hid if h)),
+                n_batches=len(batches),
+                remainder_ms=_diag["remainder"],
+                tp_sync_ms=_diag["tp_sync"],
+                hit_tokens=as_hit_tokens,
+                ok=ok,
+                deferred=int(defer),
+            )
 
         if ok == 0:
             # Both streams may still be writing the freed rows. Drain them
@@ -2080,14 +2723,34 @@ class AsRadixCache(RadixCache):
                 self.token_to_kv_pool_allocator.free(alloc_indices)
             return None
 
-        page_ids_cpu = torch.tensor(
+        all_page_ids_cpu = torch.tensor(
             _materialize_data_id_list(), dtype=torch.int64, device="cpu"
         ).contiguous()
+        page_ids_cpu = all_page_ids_cpu[:real_n_blocks]
+        req = load_info.get("req")
+        recorder = self._get_as_trace(req)
+        if recorder is not None:
+            # Debug checksum collection reads KV, unlike admission.
+            # 中文说明：调试用的 MD5 采集会真正读取 KV 数据，而准入阶段只处理页索引；
+            # 因为 handoff 已被推迟，这里需要立即补上等待，保证读到的是恢复完成后的数据。
+            if ready_event is not None:
+                torch.cuda.current_stream().wait_event(ready_event)
+            page_ids = page_ids_cpu.tolist()
+            recorder.record(
+                "AS_READ",
+                hash_ids=recorder.hash_ids(as_block_hashs),
+                data_id_list=page_ids,
+                actual_blocks=len(page_ids),
+                start_transfer_block_index=start_block,
+                md5_after_read=recorder.collect_page_md5(page_ids),
+                status="ok",
+            )
         return _AsLoadResult(
-            indices=alloc_indices,
+            indices=alloc_indices[:as_hit_tokens],
             page_ids_cpu=page_ids_cpu,
             ready_event=ready_event,
             resources=(plans, packed_metadata, page_rows, alloc_indices),
+            padding_page_ids_cpu=all_page_ids_cpu[real_n_blocks:],
         )
 
     def _shutdown_as_writer(self):
@@ -2134,6 +2797,11 @@ class AsRadixCache(RadixCache):
         """
         try:
             t0 = time.perf_counter()
+            md5_before_write = (
+                task.trace_recorder.collect_page_md5(task.data_id_list, write=True)
+                if task.trace_recorder is not None
+                else None
+            )
             w_res = self.ascli.write(
                 layer_ids=task.layer_ids,
                 tokens=task.as_block_hashs,
@@ -2146,15 +2814,41 @@ class AsRadixCache(RadixCache):
                 params=task.write_params,
             )
             t1 = time.perf_counter()
+            if _asp.ENABLED:
+                _asp.emit(
+                    "write",
+                    qdelay_ms=(t0 - task.submit_time) * 1000,
+                    exec_ms=(t1 - t0) * 1000,
+                    pages=task.num_pages,
+                    result=w_res,
+                )
 
             logger.info(
                 f"AS write: type={self.attention_type}, "
                 f"pages num={task.num_pages}, result={w_res}, "
                 f"cost={(t1 - t0) * 1000:.2f}ms"
             )
+            if task.trace_recorder is not None:
+                task.trace_recorder.record(
+                    "AS_WRITE",
+                    hash_ids=task.trace_recorder.hash_ids(task.as_block_hashs),
+                    data_id_list=task.data_id_list,
+                    start_transfer_block_index=0,
+                    md5_before_write=md5_before_write,
+                    status="ok",
+                )
             return w_res
         except Exception as e:
             logger.warning(f"AS write failed: {e}")
+            if task.trace_recorder is not None:
+                task.trace_recorder.record(
+                    "AS_WRITE",
+                    hash_ids=task.trace_recorder.hash_ids(task.as_block_hashs),
+                    data_id_list=task.data_id_list,
+                    start_transfer_block_index=0,
+                    status="error",
+                    error=str(e),
+                )
             return 0
 
     def _check_as_write_replicas(self, snapshot, aligned_tokens, block_hashes):
@@ -2304,6 +2998,7 @@ class AsRadixCache(RadixCache):
                 write_params=write_params,
                 submit_time=time.perf_counter(),
                 num_pages=num_pages,
+                trace_recorder=self._get_as_trace(req),
             )
 
             # Lock the node before submitting write task
@@ -2313,6 +3008,7 @@ class AsRadixCache(RadixCache):
             # Submit to executor and track
             future = self._submit_as_write_task(task)
             self._as_write_queue.append((future, task))
+            _asp.emit("write_submit", qdepth=len(self._as_write_queue), pages=num_pages)
 
             logger.debug(
                 f"AS write task submitted: num_pages={num_pages}, "

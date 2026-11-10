@@ -300,6 +300,8 @@ else:
         pass
 
 
+from sglang.srt.mem_cache import as_probe as _asp
+
 logger = logging.getLogger(__name__)
 
 
@@ -3347,6 +3349,13 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+        _asp_t0 = _asp.now()
+        if _asp.ENABLED:
+            # 上一批之后、本次调用之前累积的计数（空转迭代里的 check 等）
+            _asp_between = getattr(self, "_asp_between", None) or {}
+            for _k, _v in _asp.take().items():
+                _asp_between[_k] = _asp_between.get(_k, 0.0) + _v
+            self._asp_between = _asp_between
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -3357,15 +3366,78 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
-        ret, running_batch = self._get_new_batch_prefill_raw(
-            prefill_delayer_single_pass=prefill_delayer_single_pass,
-            running_batch=running_batch,
+        # 中文说明：准入阶段只操作页索引，不需要等 KV 数据真正恢复完。
+        # 开启 AS radix cache 时，把这一轮准入里所有请求的“KV 就绪”等待
+        # 合并延后，统一在建 batch 之前（flush_as_load_handoffs）一次性等待，
+        # 避免每个请求准入时都阻塞当前 stream。
+        load_scope = (
+            self.tree_cache.batch_as_load_handoffs()
+            if self.enable_asradix_cache else nullcontext()
         )
+        with load_scope:
+            ret, running_batch = self._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+                running_batch=running_batch,
+            )
 
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
 
+        if _asp.ENABLED:
+            _asp_c = _asp.take()
+            if ret is None:
+                for _k, _v in _asp_c.items():
+                    self._asp_between[_k] = self._asp_between.get(_k, 0.0) + _v
+            else:
+                _asp_between, self._asp_between = self._asp_between, {}
+                _asp.emit(
+                    "admit",
+                    reqs=len(ret.reqs),
+                    total_ms=_asp.ms(_asp_t0),
+                    **_asp_c,
+                    **{"between." + _k: _v for _k, _v in _asp_between.items()},
+                )
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _apply_deferred_as_load_outcomes(self, can_run_list, outcomes):
+        """推迟 AS 读收尾后修正已接纳的请求。
+
+        成功：准入时请求锁在旧节点上，插入树后把锁挪到新的末节点，保证这些页在
+        前向和 KV 传输期间不被驱逐。失败：释放旧节点上的请求锁，把请求移出本批、
+        退回等待队列头部，下一轮重新匹配（仍命中则重读，否则重算）。
+        各 rank 的成败经过同一个 TP 屏障，决策一致。
+        """
+        admitted = set(can_run_list)
+        failed = []
+        for o in outcomes:
+            if o.req not in admitted:
+                # 未被接纳：成功的已作为普通缓存插入树，失败的页已释放
+                continue
+            if o.ok:
+                if o.new_node is not o.old_node:
+                    self.tree_cache.inc_lock_ref(o.new_node)
+                    self.tree_cache.dec_lock_ref(o.old_node)
+                    o.req.last_node = o.new_node
+            else:
+                if o.req is self.chunked_req:
+                    # 分块请求的 fill_ids 已被截断，无法安全退回；这种组合极少见
+                    raise RuntimeError(
+                        f"AS deferred load failed for chunked request {o.req.rid}"
+                    )
+                self.tree_cache.dec_lock_ref(o.old_node)
+                failed.append(o.req)
+        if not failed:
+            return can_run_list
+        logger.warning(
+            "AS deferred load failed; requeue %d request(s): %s",
+            len(failed),
+            [r.rid for r in failed],
+        )
+        failed_set = set(failed)
+        can_run_list[:] = [r for r in can_run_list if r not in failed_set]
+        for r in reversed(failed):
+            self.waiting_queue.insert(0, r)
+        return can_run_list
 
     def _get_new_batch_prefill_raw(
         self,
@@ -3507,11 +3579,20 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
+            if self.enable_asradix_cache and self.tree_cache.deferred_as_load_conflict(req):
+                # 中文：本批已有在途的推迟 AS 读覆盖了它要读的前缀；先停止接纳，
+                # 下一批它能直接命中那些页插入 radix 树后的 HBM，避免同一前缀读两份。
+                _asp.add("admit.defer_conflict")
+                break
+            _asp_ta = _asp.now()
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            # add_one_req 内含 init_load_back -> _do_as_load
+            _asp.add("admit.add_n")
+            _asp.add("admit.add_ms", _asp.ms(_asp_ta))
 
             if self.enable_asradix_cache and res == AddReqResult.CONTINUE:
                 # AS restores can take long enough for previous-batch
@@ -3524,7 +3605,10 @@ class Scheduler(
                 # 看到的可用/可驱逐预算更准确。只会释放所有 rank 都写完的任务，
                 # 已准入请求的锁不受影响。
                 evictable_before = self.tree_cache.evictable_size()
+                _asp_tr = _asp.now()
                 self.tree_cache.check_ascache_events()
+                _asp.add("admit.reclaim_n")
+                _asp.add("admit.reclaim_ms", _asp.ms(_asp_tr))
                 as_admission_reclaimed_tokens += max(
                     0, self.tree_cache.evictable_size() - evictable_before
                 )
@@ -3598,7 +3682,25 @@ class Scheduler(
                     req.time_stats.get_request_waiting_time()
                 )
 
+        # Admission only handles indices. Restore the KV dependency before
+        # any batch preparation/forward consumer can observe cached data.
+        # 中文说明：准入阶段推迟的 KV 就绪等待，必须在构造 batch、
+        # 任何前向读取缓存数据之前补上，否则可能读到尚未恢复完的 KV。
+        if self.enable_asradix_cache:
+            _asp_tf = _asp.now()
+            deferred_outcomes = self.tree_cache.flush_as_load_handoffs(
+                wait_for_kv=os.environ.get("AS_MOVER_DEFER_KV_FENCE", "0") != "1"
+            )
+            _asp.add("admit.flush_ms", _asp.ms(_asp_tf))
+            if deferred_outcomes:
+                can_run_list = self._apply_deferred_as_load_outcomes(
+                    can_run_list, deferred_outcomes
+                )
+                if not can_run_list:
+                    return None, running_batch
+
         # Create a new batch
+        _asp_ti = _asp.now()
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -3615,13 +3717,16 @@ class Scheduler(
         )
 
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
+        _asp.add("admit.init_ms", _asp.ms(_asp_ti))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
 
+        _asp_tp = _asp.now()
         new_batch.prepare_for_extend()
+        _asp.add("admit.prepare_ms", _asp.ms(_asp_tp))
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
