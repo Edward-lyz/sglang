@@ -287,6 +287,11 @@ class AsRadixCache(RadixCache):
             os.environ.get("AS_MOVER_RETAIN_PADDING", "0") == "1"
         )
         self._as_retained_padding_tokens = 0
+        self._as_refresh_pending = (
+            os.environ.get("AS_MOVER_REFRESH_PENDING_PREFIXES", "0") == "1"
+        )
+        self._as_refresh_channel = None
+        self._as_refresh_stub = None
 
         # Call parent init (RadixCache)
         super().__init__(params)
@@ -1429,6 +1434,67 @@ class AsRadixCache(RadixCache):
         from sglang.srt.mem_cache.as_trace import get_recorder
 
         return get_recorder(req, self)
+
+    def refresh_pending_prefixes(self, requests) -> None:
+        """Give queued local mover prefixes recent eviction priority, without I/O."""
+        if (
+            not self._as_refresh_pending
+            or self.real_tp_rank != 0
+            or self._disagg_mode != "prefill"
+            or self.ascli is None
+            or getattr(self.ascli, "_mover", None) is None
+        ):
+            return
+        try:
+            hashes = []
+            request_count = 0
+            for req in requests:
+                tokens = getattr(req, "as_block_hashs", None)
+                if tokens is None or getattr(req, "ever_read_as", False):
+                    continue
+                ids = tokens.hash_ids
+                if len(ids) == 0:
+                    continue
+                hashes.extend(map(int, ids))
+                request_count += 1
+            if not hashes:
+                return
+            import grpc
+            from attentionstore_sdk.api.agentservice import (
+                agent_service_pb2,
+                agent_service_pb2_grpc,
+            )
+
+            if self._as_refresh_stub is None:
+                self._as_refresh_channel = grpc.insecure_channel(
+                    os.environ.get(
+                        "AS_MOVER_AGENT", "unix:/var/attentionstore/agent_grpc.sock"
+                    )
+                )
+                atexit.register(self._as_refresh_channel.close)
+                self._as_refresh_stub = (
+                    agent_service_pb2_grpc.AttentionStoreAgentServiceStub(
+                        self._as_refresh_channel
+                    )
+                )
+            started = time.perf_counter()
+            # Agent reverses this ordered list, protecting the next request's
+            # prefix first. This changes only LRU metadata: no lease, SHM pin,
+            # SSD fetch, CUDA allocation or transfer is started here.
+            self._as_refresh_stub.RefreshBlockEvictOrder(
+                agent_service_pb2.RefreshBlockEvictOrderRequest(
+                    namespace=self.ascli.namespace, block_hash_ids=hashes
+                ),
+                timeout=1.0,
+            )
+            logger.info(
+                "AS pending prefix refresh: requests=%d blocks=%d cost=%.2fms",
+                request_count, len(hashes), (time.perf_counter() - started) * 1000,
+            )
+        except Exception as error:
+            # Priority is a hint, not ownership. Normal AS match/read and all
+            # existing miss/failure handling remain authoritative.
+            logger.warning("AS pending prefix refresh failed: %s", error)
 
     def _as_match(self, req, local_result: MatchResult, key) -> Optional[MatchResult]:
         """Query AS for additional prefix hits beyond local radix tree match.

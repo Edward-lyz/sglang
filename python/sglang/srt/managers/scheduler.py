@@ -3492,6 +3492,9 @@ class Scheduler(
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
 
+        if self.enable_asradix_cache:
+            self.tree_cache.refresh_pending_prefixes(self.waiting_queue)
+
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
