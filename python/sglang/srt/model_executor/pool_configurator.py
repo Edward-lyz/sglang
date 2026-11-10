@@ -22,6 +22,7 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
+    get_dsa_indexer_layer_pattern,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -239,22 +240,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 if (
                     envs.SGLANG_INDEXER_CACHE_OPT.get()
                     and not kvc.server_args.enable_dsa_cache_layer_split
+                    and not kvc.server_args.enable_hisparse
+                    and not kvc.server_args.enable_hierarchical_cache
                 ):
-                    pattern = getattr(
-                        model_config.hf_text_config, "index_topk_pattern", None
-                    )
-                    if pattern is None:
-                        pattern = getattr(
-                            model_config.hf_config, "index_topk_pattern", None
+                    pattern = get_dsa_indexer_layer_pattern(model_config.hf_config)
+                    start = kvc.layer_info.start_layer
+                    local_pattern = pattern[start : start + num_layers]
+                    if len(local_pattern) == num_layers:
+                        indexer_num_layers = sum(
+                            str(item).lower() not in ("s", "shared")
+                            for item in local_pattern
                         )
-                    if pattern is not None:
-                        start = kvc.layer_info.start_layer
-                        local_pattern = pattern[start : start + num_layers]
-                        if len(local_pattern) == num_layers:
-                            indexer_num_layers = sum(
-                                str(item).lower() not in ("s", "shared")
-                                for item in local_pattern
-                            )
                 cell_size += (
                     indexer_size_per_token * indexer_num_layers * element_size
                 )

@@ -12,6 +12,7 @@ from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, mambaish_config
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_dsa_index_head_dim,
+    get_dsa_indexer_layer_pattern,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -1103,16 +1104,13 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        index_topk_pattern = getattr(
-            self.model_config.hf_text_config, "index_topk_pattern", None
+        index_topk_pattern = get_dsa_indexer_layer_pattern(
+            self.model_config.hf_config
         )
-        if index_topk_pattern is None:
-            index_topk_pattern = getattr(
-                self.model_config.hf_config, "index_topk_pattern", None
-            )
         if (
             index_topk_pattern is not None
             and not self.server_args.enable_hisparse
+            and not self.server_args.enable_hierarchical_cache
             and dsa_cp_layer_shard_rank is None
         ):
             pool_kwargs["index_topk_pattern"] = index_topk_pattern

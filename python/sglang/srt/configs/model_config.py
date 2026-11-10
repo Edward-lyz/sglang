@@ -224,6 +224,31 @@ def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+def get_dsa_indexer_layer_pattern(config: PretrainedConfig) -> list[str]:
+    """Return the physical indexer producer/shared pattern.
+
+    GLM-5.2 declares this directly as ``indexer_types``. Older DSA configs
+    may use ``index_topk_pattern`` or derive it from frequency/offset.
+    """
+    assert is_deepseek_dsa(config)
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        return [
+            "S" if str(item).lower() in ("s", "shared") else "F"
+            for item in indexer_types
+        ]
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        return [
+            "S" if str(item).lower() in ("s", "shared") else "F"
+            for item in pattern
+        ]
+    return [
+        "S" if dsa_layer_skips_topk(config, layer_id) else "F"
+        for layer_id in range(config.num_hidden_layers)
+    ]
+
+
 REQUANTIZATION_METHODS = ["quark_mxfp4"]
 
 
