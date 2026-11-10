@@ -365,7 +365,7 @@ def maybe_o_proj_push_rs(o_proj, x) -> Optional[torch.Tensor]:
     out = torch.empty((rows, _HIDDEN_SIZE), dtype=torch.bfloat16, device=x.device)
     import deep_gemm
 
-    deep_gemm.fp8_gemm_nt_push_rs(
+    launched = deep_gemm.fp8_gemm_nt_push_rs(
         (q_input, x_scale),
         (o_proj.weight, o_proj.weight_scale_inv),
         out,
@@ -374,6 +374,11 @@ def maybe_o_proj_push_rs(o_proj, x) -> Optional[torch.Tensor]:
         _PUSH_LAYOUT.stride_bytes,
         _PUSH_LAYOUT.rank,
     )
+    if launched is False:
+        # DeepGEMM picks a non-swap-AB config for this shape (no push
+        # epilogue): nothing was pushed, run the plain GEMM + RS. Same shape on
+        # every rank, so the ranks agree.
+        return None
     _PUSHED_O_PROJ[out.data_ptr()] = out
     if not _PUSH_RS_LOGGED:
         _PUSH_RS_LOGGED = True

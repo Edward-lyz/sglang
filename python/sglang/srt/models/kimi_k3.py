@@ -2601,9 +2601,6 @@ class KimiK3DecoderLayer(nn.Module):
                 _sp_inner_o_proj_forward = o_proj.forward
 
                 def _sp_o_proj_forward(x, *args, **kwargs):
-                    pushed = k3_sp_collective.maybe_o_proj_push_rs(o_proj, x)
-                    if pushed is not None:
-                        return pushed, None
                     output_rows = k3_sp_collective.get_o_proj_output_rows(x.shape[0])
                     if k3_sp_collective.requires_symmetric_rs(output_rows, x.device):
                         output = k3_sp_collective.get_o_proj_output_buffer(
@@ -2620,6 +2617,23 @@ class KimiK3DecoderLayer(nn.Module):
                     return _sp_inner_o_proj_forward(x, *args, **kwargs)
 
                 o_proj.forward = _sp_o_proj_forward
+
+                # GEMM-RS replaces only the GEMM, at the quant-method level:
+                # the attention's own o_proj wraps (MLA output gate + its
+                # alt-stream join, prequant registration) run first, so the
+                # pushed rows are exactly what the plain GEMM would produce.
+                quant_method = getattr(o_proj, "quant_method", None)
+                if quant_method is not None:
+                    _sp_inner_apply = quant_method.apply
+
+                    def _sp_push_rs_apply(layer, x, bias=None, **kwargs):
+                        if layer is o_proj and bias is None and not kwargs:
+                            pushed = k3_sp_collective.maybe_o_proj_push_rs(layer, x)
+                            if pushed is not None:
+                                return pushed
+                        return _sp_inner_apply(layer, x, bias=bias, **kwargs)
+
+                    quant_method.apply = _sp_push_rs_apply
 
         # Must stay last in __init__: it shrinks `weight.data` to this rank's
         # row slice, and every init-time eligibility gate that inspects a
