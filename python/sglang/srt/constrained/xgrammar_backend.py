@@ -236,7 +236,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     @staticmethod
     def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
-        return allocate_token_bitmask(batch_size, vocab_size)
+        return allocate_vocab_bitmask(batch_size, vocab_size, device)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
