@@ -29,7 +29,9 @@ from .coordinator import (
     CheckpointedPageCacheCoordinator,
     _acquire_node_release,
     _contiguous_page_ids,
+    _materialize_page_ids,
     _noop_release,
+    _page_id_metadata,
     _request_block_hash_ids,
 )
 from .types import (
@@ -157,7 +159,9 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
                 context.token_ids,
                 context.req.extra_key,
                 is_bigram=cache.tree_core.is_eagle,
-            ).page_aligned(cache.page_size)
+            )
+            if len(key) % cache.page_size:
+                key = key.page_aligned(cache.page_size)
             match = UnifiedRadixCache.match_prefix(
                 cache,
                 MatchPrefixParams(key=key),
@@ -266,14 +270,32 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
         """Derive the plan-specific extra arguments of the load-back read.
 
         Returns ``(positional, keyword)``. SPA appends the checkpoint slot map
-        that names where the terminal blob must land; other plans carry their
-        recurrent state inside the page blocks and override this.
+        that names where the terminal blob must land. Plans that carry their
+        state inside page blocks can specialize ``_prepare_read`` instead.
         """
         swa_indices = cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
             loaded[-cache.page_size :]
         )
         swa_page_id = int(swa_indices[0].item()) // cache.page_size
         return (self.state_slots(cache, req.kv.req_pool_idx, swa_page_id),), {}
+
+    def _prepare_read(self, cache, req, load_info, loaded):
+        """Resolve physical page IDs and plan-specific read arguments."""
+        page_ids = _contiguous_page_ids(loaded, cache.page_size)
+        read_args, read_kwargs = self._read_payload_args(cache, req, load_info, loaded)
+        return page_ids, read_args, read_kwargs
+
+    def _free_loaded_pages(self, cache, loaded, *, start_pos: int) -> None:
+        """Release a validated, page-aligned alloc_extend_swa_tail result."""
+        allocator = cache.token_to_kv_pool_allocator
+        # Only the last page owns SWA slots. Free its peer before returning all
+        # full pages; free_segment(loaded) would try to return unmapped SWA pages.
+        # Use the paged allocator's fixed-shape segment release paths.
+        tail_start = max(0, len(loaded) - cache.page_size)
+        allocator.free_swa_segment(
+            loaded[tail_start:], start_pos=start_pos + tail_start
+        )
+        allocator.free_full_segment(loaded, start_pos=start_pos)
 
     def _restored_swa_len(self, cache, token_count: int) -> int:
         """Tokens at the restored tail whose SWA state this read really fills.
@@ -407,14 +429,19 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
         device = cache.token_to_kv_pool_allocator.device
         prefix_cpu = torch.tensor([local_hit_len], dtype=torch.int64)
         seq_cpu = torch.tensor([local_hit_len + token_count], dtype=torch.int64)
-        last_loc_value = int(req.prefix_indices[-1].item()) if local_hit_len else -1
+        # The allocator consumes a one-element tensor; keep an existing index on device.
+        last_loc = req.prefix_indices[-1].reshape(1) if local_hit_len else None
         try:
             loaded = cache.token_to_kv_pool_allocator.alloc_extend_swa_tail(
                 prefix_cpu.to(device),
                 prefix_cpu,
                 seq_cpu.to(device),
                 seq_cpu,
-                torch.tensor([last_loc_value], dtype=torch.int64, device=device),
+                (
+                    last_loc.to(device=device, dtype=torch.int64)
+                    if last_loc is not None
+                    else torch.tensor([-1], dtype=torch.int64, device=device)
+                ),
                 token_count,
                 # One whole SWA page, even though a plan may restore only its
                 # upper half: alloc_extend_swa_tail maps the *last* swa_tail_len
@@ -444,23 +471,12 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
             cache._as_min(0)
             return empty, anchor
         try:
-            page_ids = _contiguous_page_ids(loaded, cache.page_size)
-        except ValueError as exc:
-            cache.token_to_kv_pool_allocator.free(loaded)
-            cache._log_as_failure(
-                "load_back",
-                rid=req.rid,
-                requested=requested,
-                error=exc,
-                started=started,
-            )
-            cache._as_min(0)
-            return empty, anchor
-        try:
-            read_args, read_kwargs = self._read_payload_args(
+            page_ids, read_args, read_kwargs = self._prepare_read(
                 cache, req, load_info, loaded
             )
         except Exception as exc:
+            # Validation may have failed on malformed indices or a missing SWA
+            # mapping, so keep the arbitrary-index cleanup for this branch.
             cache.token_to_kv_pool_allocator.free(loaded)
             cache._log_as_failure(
                 "load_back",
@@ -472,7 +488,7 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
             cache._as_min(0)
             return empty, anchor
         if cache._as_min(1) == 0:
-            cache.token_to_kv_pool_allocator.free(loaded)
+            self._free_loaded_pages(cache, loaded, start_pos=local_hit_len)
             return empty, anchor
         read_error = None
         try:
@@ -505,18 +521,18 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
                 started=started,
             )
         if read_count != requested:
-            cache.token_to_kv_pool_allocator.free(loaded)
+            self._free_loaded_pages(cache, loaded, start_pos=local_hit_len)
             return empty, anchor
 
         total_prefix_len = local_hit_len + token_count
         token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
-        values = torch.cat([req.prefix_indices, loaded]).to(
-            dtype=torch.int64, copy=True
-        )
+        values = torch.cat([req.prefix_indices, loaded]).to(dtype=torch.int64)
         restored_swa_len = self._restored_swa_len(cache, token_count)
         cache.insert(
             InsertParams(
-                key=RadixKey(token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle),
+                key=RadixKey(
+                    token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
+                ),
                 value=values,
                 prev_prefix_len=local_hit_len,
                 # Everything before the restored window is an SWA tombstone. This
@@ -529,7 +545,9 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
         match = UnifiedRadixCache.match_prefix(
             cache,
             MatchPrefixParams(
-                key=RadixKey(token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle),
+                key=RadixKey(
+                    token_ids, req.extra_key, is_bigram=cache.tree_core.is_eagle
+                ),
                 req=req,
             ),
         )
@@ -651,6 +669,38 @@ class SPAGCacheCoordinator(SPACacheCoordinator):
 
     write_thread_name = "as_spag_writer"
 
+    # prepare_write only checks the captured slot count. The writer's page IDs
+    # come from the protected tree indices after commit, so these views need no
+    # copy even if the request's slot mapping changes during the local commit.
+    def capture_finished(
+        self, cache, req, is_insert: bool
+    ) -> AttentionStoreWriteContext:
+        """Capture the committed slot range without copying its indices."""
+        committed_len = req.effective_kv_committed_len()
+        token_ids = (req.origin_input_ids + req.output_ids)[:committed_len]
+        snapshot = cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :committed_len
+        ]
+        return AttentionStoreWriteContext(
+            req=req,
+            token_ids=token_ids,
+            snapshot=snapshot,
+            is_insert=is_insert,
+        )
+
+    def capture_unfinished(self, cache, req) -> AttentionStoreWriteContext:
+        """Capture the filled slot range without copying its indices."""
+        token_ids = req.get_fill_ids()
+        snapshot = cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : len(token_ids)
+        ]
+        return AttentionStoreWriteContext(
+            req=req,
+            token_ids=token_ids,
+            snapshot=snapshot,
+            is_insert=True,
+        )
+
     @staticmethod
     def _swa_policy(cache):
         """Return the engine's ``SwaStepPolicy``, or ``None`` when SWA is off."""
@@ -680,8 +730,8 @@ class SPAGCacheCoordinator(SPACacheCoordinator):
             cache.page_size
         )
 
-    def _read_payload_args(self, cache, req, load_info, loaded):
-        """Name the destination SWA page for the restored trailing window.
+    def _prepare_read(self, cache, req, load_info, loaded):
+        """Resolve page IDs and the trailing SWA window with one D2H transfer.
 
         ``floor_remote_terminal`` guarantees the restored range ends on a
         checkpoint, so exactly one block of this read carries a window: the last
@@ -690,11 +740,21 @@ class SPAGCacheCoordinator(SPACacheCoordinator):
         """
         policy = self._swa_policy(cache)
         if policy is None:
-            return (), {}
-        swa_indices = cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            loaded[-cache.page_size :]
+            return _contiguous_page_ids(loaded, cache.page_size), (), {}
+        page_meta = _page_id_metadata(loaded, cache.page_size)
+        # Preserve validation before an unsafe mapping lookup: malformed pages
+        # use the padding slot until the host validator reports the error.
+        tail_slot = torch.where(
+            page_meta[:, 1].all(), loaded[-cache.page_size :][:1], 0
         )
-        swa_page_id = int(swa_indices[0].item()) // cache.page_size
+        swa_index = cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+            tail_slot
+        )
+        # Both computations stay on the current device stream. Materialize them
+        # together so page validation and SWA lookup share one synchronization.
+        host_meta = torch.cat((page_meta.reshape(-1), swa_index)).cpu()
+        page_ids = _materialize_page_ids(host_meta[:-1].reshape(-1, 2), cache.page_size)
+        swa_page_id = int(host_meta[-1].item()) // cache.page_size
         if swa_page_id == 0:
             # Page 0 is the padding sink every cleared full->swa entry maps to,
             # so a real fresh allocation never lands there. Reading into it would
@@ -706,10 +766,14 @@ class SPAGCacheCoordinator(SPACacheCoordinator):
         end_pos = (
             int(load_info["start_block"]) + int(load_info["block_count"])
         ) * cache.page_size
-        return (), {
-            "swa_ids": (swa_page_id,),
-            "swa_block_step": policy.block_step_for_position(end_pos),
-        }
+        return (
+            page_ids,
+            (),
+            {
+                "swa_ids": (swa_page_id,),
+                "swa_block_step": policy.block_step_for_position(end_pos),
+            },
+        )
 
     def _restored_swa_len(self, cache, token_count: int) -> int:
         """Keep the inherited page granularity.
@@ -762,7 +826,6 @@ class SPAGCacheCoordinator(SPACacheCoordinator):
         cache_len = (len(token_ids) // cache.page_size) * cache.page_size
         if cache_len == 0 or len(snapshot) < cache_len:
             return None
-        token_ids = token_ids[:cache_len]
         requested = 0
         try:
             hashes = _request_block_hash_ids(

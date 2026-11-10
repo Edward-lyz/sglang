@@ -249,10 +249,11 @@ class AttentionStoreCoordinator:
         device = torch.device(device)
         if device.type not in ("cuda", "xpu"):
             return None
+        # Resolve an unindexed pool device (e.g. "cuda") from the producer
+        # stream instead of the writer thread's current device.
+        if stream is not None:
+            device = torch.device(stream.device)
         device_module = torch.get_device_module(device)
-        # This may be called from the writer thread (do_write), whose current
-        # device can differ from the KV pool's; pin it so the event and the
-        # producer stream are created on the same device.
         with device_module.device(device):
             if stream is None:
                 stream = device_module.current_stream(device)
