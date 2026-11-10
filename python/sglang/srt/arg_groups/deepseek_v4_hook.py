@@ -332,8 +332,15 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.disaggregation_mode == "decode"
             and cfg.disaggregation_transfer_backend == "fake"
         )
+        # Compact ragged verify is decode-local (prefill never runs target
+        # verify), so only the PD decode server may run it; prefill stays static.
+        ragged_verify_mode = read_ragged_verify_mode()
+        verify_mode_ok = ragged_verify_mode is RaggedVerifyMode.STATIC or (
+            ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and cfg.disaggregation_mode == "decode"
+        )
         if (
-            read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            not verify_mode_ok
             or (
                 cfg.disaggregation_transfer_backend != "mooncake"
                 and not is_fake_decode_benchmark
@@ -345,7 +352,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake "
+                "DeepSeek-V4.1 DSpark PD requires static verify (compact is "
+                "allowed on the decode server only), Mooncake "
                 "(or fake for decode-only synthetic benchmarking), "
                 "DP=1 and CP=1 (prefill CP allowed experimentally). Both "
                 "servers must enable DSpark with the same block size and TP size."
@@ -380,12 +388,17 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
             # The late-layer tail slice needs per-request LOCAL tokens. With
-            # dp_size==1 (incl. dp1 + prefill-CP) that holds. With dp_size>1 the
-            # DP-wide input_ids_global gather breaks the tail slice (batch_size
-            # mismatch), so reject only true DP fan-out (dp_size>1).
+            # dp_size==1 (incl. dp1 + prefill-CP) that holds. With REAL dp_size>1
+            # the DP-wide input_ids_global gather breaks the tail slice (batch_size
+            # mismatch). But under "fake DP" (DWDP / local-control-broadcast, which
+            # sets SGLANG_SCHEDULER_SKIP_ALL_GATHER) each DP worker is independent
+            # and does NOT do the DP-wide gather, so the per-request tail slice
+            # still holds -> allow swa there. Reject only real DP fan-out.
             (
-                "DP attention with dp_size>1",
-                cfg.enable_dp_attention and cfg.dp_size > 1,
+                "real DP attention with dp_size>1",
+                cfg.enable_dp_attention
+                and cfg.dp_size > 1
+                and not cfg.enable_dp_attention_local_control_broadcast,
             ),
         )
         for feature, enabled in incompatible:

@@ -44,6 +44,11 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     quant_method = lm_head.quant_method
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)
+    from sglang.srt.layers.lm_head_mxfp8 import maybe_mxfp8_lm_head
+
+    logits = maybe_mxfp8_lm_head(hidden, lm_head)
+    if logits is not None:
+        return logits
     weight = lm_head.weight
     return torch.matmul(hidden.to(weight.dtype), weight.T)
 

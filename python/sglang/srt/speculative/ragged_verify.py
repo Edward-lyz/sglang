@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import logging
 from enum import Enum
 from typing import List, Optional, Sequence, Tuple
 
@@ -8,6 +9,8 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 
 class RaggedVerifyMode(str, Enum):
@@ -223,6 +226,44 @@ def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     if spec_info is None:
         return None
     return spec_info.ragged_verify_layout
+
+
+def resolve_compact_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
+    """The ragged layout of a COMPACT target-verify batch, else None (static and
+    cap-accept verify keep one equal block per request)."""
+    if not forward_batch.forward_mode.is_target_verify():
+        return None
+    layout = resolve_ragged_verify_layout(forward_batch)
+    if layout is None or read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
+        return None
+    return layout
+
+
+def ragged_verify_token_rows(
+    qo_indptr: torch.Tensor, num_tokens: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Request row (int64 [num_tokens]) of every packed verify token and the row's
+    first token (qo_indptr[row], int64 [num_tokens]). Host-free and capturable:
+    reads the device qo_indptr the graph runner refreshes in place on replay.
+    Graph padding tokens at or past qo_indptr[-1] land on the last row; their
+    cache loc is 0, so every consumer already masks them."""
+    bs = qo_indptr.shape[0] - 1
+    tokens = torch.arange(num_tokens, dtype=qo_indptr.dtype, device=qo_indptr.device)
+    rows = torch.searchsorted(qo_indptr[1:].contiguous(), tokens, right=True)
+    rows = rows.clamp_(0, max(bs - 1, 0))
+    return rows, qo_indptr.to(torch.int64)[rows]
+
+
+_COMPACT_ADAPT_LOGGED: set = set()
+
+
+def log_compact_adapt_once(key: str, msg: str, *args) -> None:
+    """One `[compact-adapt]` line per key and process, so the server log proves
+    which compact-specific branches ran (graph-captured ones log at capture)."""
+    if key in _COMPACT_ADAPT_LOGGED:
+        return
+    _COMPACT_ADAPT_LOGGED.add(key)
+    logger.info("[compact-adapt] %s: " + msg, key, *args)
 
 
 class RaggedTargetVerifyGeometry(msgspec.Struct):

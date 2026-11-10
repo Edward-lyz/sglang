@@ -8,6 +8,9 @@ import torch
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
+from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+    PointMassTrimmedVerifySlots,
+)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -68,8 +71,10 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    compact_trimmed_slots_need_point_mass,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.ragged_verify import log_compact_adapt_once
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -901,6 +906,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
+        if (
+            run_compact
+            and envs.SGLANG_DSPARK_COMPACT_POINT_MASS_TRIMMED.get()
+            and compact_trimmed_slots_need_point_mass(sampling_info)
+        ):
+            # After the grammar mask, so a masked token 0 cannot leave an
+            # all -inf (NaN-softmax) trimmed slot.
+            PointMassTrimmedVerifySlots.execute(
+                logits=logits_output.next_token_logits,
+                verify_lens=layout.verify_lens,
+                stride=self.verify_num_draft_tokens,
+            )
+            log_compact_adapt_once(
+                "compact_trimmed_slots_point_mass",
+                "compact verify trimmed slots hold a point mass before "
+                "top-p/top-k renorm (bs=%d)",
+                bs,
+            )
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = (

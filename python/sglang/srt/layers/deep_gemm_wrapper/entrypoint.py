@@ -252,15 +252,41 @@ def gemm_nt_mxfp8_f8f8bf16(
 
     disable_cast = lhs[1].dtype == torch.int and rhs[1].dtype == torch.int
 
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.fp8_fp4_gemm_nt(
-            lhs,
-            rhs,
-            out,
-            recipe_a=(1, 32),
-            recipe_b=(1, 32),
-            disable_ue8m0_cast=disable_cast,
-        )
+    block_mult = _dense_block_multiple_override(n, k)
+    if block_mult is not None:
+        deep_gemm.set_block_size_multiple_of(tuple(block_mult))
+    try:
+        with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+            deep_gemm.fp8_fp4_gemm_nt(
+                lhs,
+                rhs,
+                out,
+                recipe_a=(1, 32),
+                recipe_b=(1, 32),
+                disable_ue8m0_cast=disable_cast,
+            )
+    finally:
+        if block_mult is not None:
+            deep_gemm.set_block_size_multiple_of((1, 1))
+
+
+_DENSE_BLOCK_OVERRIDES = None
+
+
+def _dense_block_multiple_override(n: int, k: int):
+    """SGLANG_DG_DENSE_BLOCK_MULTIPLE="N:K:bm:bn,..." narrows DeepGEMM's block-size
+    candidates for that (N, K) MXFP8 dense GEMM (set_block_size_multiple_of)."""
+    global _DENSE_BLOCK_OVERRIDES
+    if _DENSE_BLOCK_OVERRIDES is None:
+        table = {}
+        spec = envs.SGLANG_DG_DENSE_BLOCK_MULTIPLE.get()
+        for item in filter(None, (s.strip() for s in spec.split(","))):
+            n_, k_, bm, bn = (int(v) for v in item.split(":"))
+            table[(n_, k_)] = (bm, bn)
+        _DENSE_BLOCK_OVERRIDES = table
+    if not _DENSE_BLOCK_OVERRIDES or not hasattr(deep_gemm, "set_block_size_multiple_of"):
+        return None
+    return _DENSE_BLOCK_OVERRIDES.get((n, k))
 
 
 def gemm_nt_bf16bf16f32(

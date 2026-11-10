@@ -98,6 +98,61 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         deep_gemm.set_num_sms(current_num_sms)
 
 
+
+@contextmanager
+def _mega_moe_decode_block_m_remap(deep_gemm, buf, num_tokens: int, enabled: bool):
+    """sglang#46593: inside decode CUDA graphs (decode, target verify, draft) let
+    DeepGEMM remap its MegaMoE BLOCK_M choice (e.g. 16/32 -> 64, 64 -> 96). The
+    default tile covers mean + 1 sigma tokens per expert; under skewed routing hot
+    experts spill into a second M block that streams their weights again.
+
+    Needs a DeepGEMM build that honours DG_MEGA_MOE_BLOCK_M_REMAP (patch in
+    docker/patches/); without it the remap is detected as ignored and skipped.
+    """
+    remap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_REMAP.get()
+    if (
+        not enabled
+        or not remap
+        or not get_is_capture_mode()
+        or "DG_MEGA_MOE_BLOCK_M_REMAP" in os.environ
+    ):
+        yield
+        return
+    args = dict(
+        num_ranks=buf.group.size(),
+        num_experts=buf.num_experts,
+        num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+        num_tokens=max(num_tokens, 1),
+        num_topk=buf.num_topk,
+        mma_type=buf.mma_type,
+    )
+    default_block_m = deep_gemm.get_block_m_for_mega_moe(**args)
+    os.environ["DG_MEGA_MOE_BLOCK_M_REMAP"] = remap
+    try:
+        block_m = deep_gemm.get_block_m_for_mega_moe(**args)
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        if block_m == default_block_m and f"{default_block_m}:" in remap:
+            log_community_opt_once(
+                "sglang#46593 mega_moe decode BLOCK_M remap ignored",
+                "DeepGEMM ignored DG_MEGA_MOE_BLOCK_M_REMAP=%s (BLOCK_M stays %d); "
+                "this DeepGEMM build lacks the remap hook",
+                remap,
+                default_block_m,
+            )
+        else:
+            log_community_opt_once(
+                f"sglang#46593 mega_moe decode BLOCK_M {default_block_m}->{block_m}",
+                "capture: DeepGEMM MegaMoE BLOCK_M %d -> %d (num_tokens=%d, mma=%s)",
+                default_block_m,
+                block_m,
+                num_tokens,
+                buf.mma_type,
+            )
+        yield
+    finally:
+        os.environ.pop("DG_MEGA_MOE_BLOCK_M_REMAP", None)
+
 def _get_mega_moe_symm_buffer(
     group,
     num_experts: int,
@@ -231,7 +286,25 @@ def forward_mega_moe(
     else:
         mega_stream_ctx = nullcontext()
     # The fused kernel adds the shared expert itself.
-    shared_output = None if fused_shared else moe._forward_shared_experts(hidden_states)
+    # [fusion-opt] SGLANG_FUSE_MEGA_MHC_FP8_SHARED_INPUT: the attn->FFN mega_mhc
+    # already wrote this exact input as DeepGEMM mxfp8; hand it to gate_up.
+    shared_x_quant = None
+    stash = getattr(moe, "_mhc_shared_x_quant", None)
+    if stash is not None and stash[0] is hidden_states and not fused_shared:
+        shared_x_quant = stash[1]
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "fusion-opt mega_mhc_fp8_shared_input",
+            "shared expert gate_up takes the attn->FFN mega_mhc mxfp8 output "
+            "(tokens=%d)",
+            num_tokens,
+        )
+    shared_output = (
+        None
+        if fused_shared
+        else moe._forward_shared_experts(hidden_states, pre_quant_input=shared_x_quant)
+    )
 
     # Optionally fuse the routed scaling into the shared-expert residual add:
     # one torch.add(shared, y, alpha=scale) instead of y.mul_(scale) then
@@ -511,7 +584,16 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
     # vllm#57604: the sm100 fp8xfp4 staging kernel does the int32 cast, the
     # padded-row mask and the routed-scaling multiply itself.
-    fold_staging = (
+    # SGLANG_OPT_MEGA_MOE_STAGING_FOLD_FP4 extends the fold to W4A4 (mxf4xmxf4): the
+    # sglang staging kernel then packs E2M1 acts with DeepGEMM's own MXFP4 recipe.
+    fold_staging_fp4 = (
+        envs.SGLANG_OPT_MEGA_MOE_STAGING_FOLD.get()
+        and envs.SGLANG_OPT_MEGA_MOE_STAGING_FOLD_FP4.get()
+        and _device_sm != 90
+        and _mega_moe_mma_type() == "mxf4xmxf4"
+        and not fuse_shared
+    )
+    fold_staging = fold_staging_fp4 or (
         envs.SGLANG_OPT_MEGA_MOE_STAGING_FOLD.get()
         and _device_sm != 90
         and _mega_moe_mma_type() == "fp8xfp4"
@@ -613,7 +695,31 @@ def _run_mega_routed(
         )
 
     mma_type = _mega_moe_mma_type()
-    if mma_type == "mxf4xmxf4":
+    if mma_type == "mxf4xmxf4" and fold_staging_fp4:
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "mega_moe_staging_fold_fp4",
+            "mega_moe_pre_dispatch (sglang, MXFP4 acts) takes topk_idx=%s as-is and "
+            "masks padded rows in-kernel (tokens=%d)",
+            str(topk_ids_in.dtype).removeprefix("torch."),
+            num_tokens,
+        )
+        mega_moe_pre_dispatch(
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            quant_group_size=32,
+            num_token_non_padded=staging_num_token_non_padded,
+            # DeepGEMM reads topk rows [0, max(num_tokens, 1)) only.
+            fill_padded_tail=False,
+            fp4=True,
+        )
+    elif mma_type == "mxf4xmxf4":
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
         # only emits FP8.
@@ -707,7 +813,11 @@ def _run_mega_routed(
         device=hidden_states.device,
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
-    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    # Fused shared experts lay out their SFs by BLOCK_M before this call, so the
+    # remap only applies without them.
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm), _mega_moe_decode_block_m_remap(
+        deep_gemm, buf, num_tokens, enabled=not fuse_shared
+    ):
         deep_gemm.fp8_fp4_mega_moe(
             y,
             moe.experts.mega_l1_weights,

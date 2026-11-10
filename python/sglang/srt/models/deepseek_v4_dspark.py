@@ -160,8 +160,46 @@ class DSparkAttention(MqaAttentionBase):
             )
 
     def kv_proj_only(self, x: torch.Tensor) -> torch.Tensor:
-        kv, _ = self.wkv(x)
+        kv, _ = self.wkv(self._x_in(x))
         return kv
+
+    def _x_in(self, x: torch.Tensor):
+        """[fusion-opt] SGLANG_FUSE_HC_COMBINE_NORM_MXFP8: wq_a / wkv input. The draft
+        stage's fused hc_combine_norm already wrote this very x as DeepGEMM mxfp8;
+        both projections reuse it instead of casting x twice."""
+        stash = getattr(self, "_x_mxfp8", None)
+        if stash is not None and stash[0] is x:
+            return stash[1]
+        return x
+
+    def x_mxfp8_ok(self) -> bool:
+        """wq_a and wkv both run the DeepGEMM MXFP8 ue8m0 route."""
+        ok = getattr(self, "_x_mxfp8_route_ok", None)
+        if ok is None:
+            from sglang.srt.layers import deep_gemm_wrapper
+            from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
+
+            def route(lin) -> bool:
+                qm = getattr(lin, "quant_method", None)
+                return bool(
+                    getattr(qm, "mxfp8_dense_backend", None)
+                    == Mxfp8DenseGemmBackend.DEEP_GEMM
+                    and (
+                        getattr(qm, "use_mxfp8", False)
+                        or (
+                            getattr(qm, "block_fp8_as_mxfp8", False)
+                            and getattr(lin, "block_fp8_mxfp8_ready", False)
+                        )
+                    )
+                )
+
+            ok = bool(
+                route(self.wq_a)
+                and route(self.wkv)
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            )
+            self._x_mxfp8_route_ok = ok
+        return ok
 
     def _store_block_kv(
         self,
@@ -196,15 +234,64 @@ class DSparkAttention(MqaAttentionBase):
             positions=positions,
         )
 
+    def _fused_qnorm_mxfp8(self, q: torch.Tensor):
+        """[fusion-opt] SGLANG_FUSE_QNORM_MXFP8_DEEPGEMM for the draft: q_norm and
+        wq_b's per-32 ue8m0 input cast in one launch (DeepGEMM MXFP8 wq_b only).
+        Returns the wq_b input, or None to keep the stock q_norm + in-GEMM cast."""
+        if not envs.SGLANG_FUSE_QNORM_MXFP8_DEEPGEMM.get() or not q.is_cuda:
+            return None
+        ok = getattr(self, "_wq_b_mxfp8_ok", None)
+        if ok is None:
+            from sglang.srt.layers import deep_gemm_wrapper
+            from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
+
+            qm = self.wq_b.quant_method
+            n, k = self.wq_b.weight.shape[0], self.wq_b.weight.shape[-1]
+            ok = bool(
+                getattr(qm, "mxfp8_dense_backend", None) == Mxfp8DenseGemmBackend.DEEP_GEMM
+                and (
+                    getattr(qm, "use_mxfp8", False)
+                    or (
+                        getattr(qm, "block_fp8_as_mxfp8", False)
+                        and getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
+                    )
+                )
+                and n % 64 == 0
+                and k % 128 == 0
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            )
+            self._wq_b_mxfp8_ok = ok
+        if not ok:
+            return None
+        from sglang.kernels.ops.layernorm.qnorm_mxfp8_deepgemm import (
+            fused_qnorm_mxfp8_deepgemm,
+        )
+        from sglang.srt.layers.quantization.mxfp8_input import Mxfp8DeepGemmInput
+
+        fused = fused_qnorm_mxfp8_deepgemm(q, self.q_norm.weight, self.q_norm.variance_epsilon)
+        if fused is None:
+            return None
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "fusion-opt qnorm_mxfp8_deepgemm draft",
+            "draft q_norm + wq_b input cast in one Triton launch (tokens=%d)",
+            q.shape[0],
+        )
+        _, (qq, qs) = fused
+        return Mxfp8DeepGemmInput(qq, qs)
+
     def _compute_q(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_a(x)
-        q = self.q_norm(q)
-        q, _ = self.wq_b(q)
+        q, _ = self.wq_a(self._x_in(x))
+        q_in = self._fused_qnorm_mxfp8(q)
+        if q_in is None:
+            q_in = self.q_norm(q)
+        q, _ = self.wq_b(q_in)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
             if self._use_fast_kernel and not _is_npu:
@@ -623,7 +710,10 @@ class DSparkV4MarkovHead(nn.Module):
 def build_dspark_v4_confidence_head(
     *, config: DeepSeekV4Config, markov_rank: int
 ) -> Optional[DSparkConfidenceHead]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    if (
+        read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+        and not envs.SGLANG_DSPARK_STATIC_CONFIDENCE_PROBE.get()
+    ):
         return None
     if not hasattr(config, "enable_confidence_head"):
         logger.warning(
@@ -794,11 +884,24 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
         residual = hidden_states
-        x = self._hc_combine(
-            hidden_states, prev_pre, self.input_layernorm, stats_stream
+        mode = forward_batch.forward_mode
+        fp8_mode = envs.SGLANG_FUSE_HC_COMBINE_NORM_MXFP8.get() and (
+            mode.is_decode() or mode.is_target_verify()
         )
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            x = self.self_attn(positions, x, forward_batch)
+        x, x_quant = self._hc_combine(
+            hidden_states,
+            prev_pre,
+            self.input_layernorm,
+            stats_stream,
+            want_fp8=fp8_mode and self.self_attn.x_mxfp8_ok(),
+            return_quant=True,
+        )
+        self.self_attn._x_mxfp8 = (x, x_quant) if x_quant is not None else None
+        try:
+            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                x = self.self_attn(positions, x, forward_batch)
+        finally:
+            self.self_attn._x_mxfp8 = None
         attn_pre, attn_post, attn_comb = self._hc_mix_stats(
             hidden_states,
             self.hc_attn_fn,
@@ -811,10 +914,15 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
-        x = self._hc_combine(
-            hidden_states, attn_pre, self.post_attention_layernorm, stats_stream
+        x, ffn_x_quant = self._hc_combine(
+            hidden_states,
+            attn_pre,
+            self.post_attention_layernorm,
+            stats_stream,
+            want_fp8=self._hc_combine_fp8_ok(forward_batch, attn_side=False),
+            return_quant=True,
         )
-        x = self._run_ffn(x, forward_batch)
+        x = self._run_ffn(x, forward_batch, x_quant=ffn_x_quant)
         ffn_pre, ffn_post, ffn_comb = self._hc_mix_stats(
             hidden_states,
             self.hc_ffn_fn,
@@ -827,12 +935,19 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
         return hidden_states, ffn_pre
 
-    def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+    def _run_ffn(
+        self, x: torch.Tensor, forward_batch: ForwardBatch, x_quant=None
+    ) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.dim)
-        y = self._run_moe_ffn_dp_sync(
-            x, forward_batch, input_ids=None, input_ids_global=None
-        )
+        # x_quant: the shared expert's prequantized gate_up input (see forward_mega_moe).
+        self.mlp._mhc_shared_x_quant = (x, x_quant) if x_quant is not None else None
+        try:
+            y = self._run_moe_ffn_dp_sync(
+                x, forward_batch, input_ids=None, input_ids_global=None
+            )
+        finally:
+            self.mlp._mhc_shared_x_quant = None
         return y.view(shape)
 
 

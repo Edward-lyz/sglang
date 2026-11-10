@@ -1543,8 +1543,34 @@ class MQALayer(MqaAttentionBase):
             )
             if fused is not None:
                 return fused  # (q_normed_bf16, Mxfp8SwizzledInput)
+        if _is_cuda and envs.SGLANG_FUSE_QNORM_MXFP8_DEEPGEMM.get():
+            # The multi-stream prepare (kv/index source layers) takes this route, so
+            # route it through the same DeepGEMM-layout fused q_norm + cast.
+            q_raw = qkv_a[..., : self.q_lora_rank] if qkv_a is not None else self.wq_a(x)[0]
+            return self._q_norm_for_wq_b(q_raw)
         q_lora = self._compute_q_a(x, qkv_a=qkv_a)
         return q_lora, q_lora
+
+    def _wq_b_takes_deepgemm_mxfp8_input(self) -> bool:
+        """wq_b runs the block-FP8-as-MXFP8 DeepGEMM route, so it can take a
+        prequantized Mxfp8DeepGemmInput."""
+        qm = self.wq_b.quant_method
+        n, k = self.wq_b.weight.shape[0], self.wq_b.weight.shape[-1]
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        return bool(
+            getattr(qm, "mxfp8_dense_backend", None) == Mxfp8DenseGemmBackend.DEEP_GEMM
+            and (
+                getattr(qm, "use_mxfp8", False)
+                or (
+                    getattr(qm, "block_fp8_as_mxfp8", False)
+                    and getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
+                )
+            )
+            and n % 64 == 0
+            and k % 128 == 0
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        )
 
     def _tk_qnorm_cast_ok(self) -> bool:
         """[fusion-opt] Gate of SGLANG_OPT_TK_QNORM_CAST: wq_b runs the block-FP8-as-MXFP8
@@ -1572,6 +1598,38 @@ class MQALayer(MqaAttentionBase):
 
         return tk_qnorm_cast_enabled()
 
+    def _wo_a_fp8_out_ok(self) -> bool:
+        """[fusion-opt] Gate of SGLANG_FUSE_WO_A_FP8_OUT_DECODE: wo_b runs the DeepGEMM
+        MXFP8 ue8m0 route, so the fused-o decode wo_a einsum can emit its input."""
+        ok = getattr(self, "_wo_a_fp8_out_cached", None)
+        if ok is None:
+            ok = False
+            if (
+                _is_cuda
+                and envs.SGLANG_FUSE_WO_A_FP8_OUT_DECODE.get()
+                and get_platform().is_blackwell
+            ):
+                from sglang.srt.layers import deep_gemm_wrapper
+
+                qm = self.wo_b.quant_method
+                w = getattr(self, "_wo_a_fused_w", None)
+                n_out = w.shape[1] if w is not None else 0
+                ok = bool(
+                    getattr(qm, "mxfp8_dense_backend", None)
+                    == Mxfp8DenseGemmBackend.DEEP_GEMM
+                    and (
+                        getattr(qm, "use_mxfp8", False)
+                        or (
+                            getattr(qm, "block_fp8_as_mxfp8", False)
+                            and getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
+                        )
+                    )
+                    and n_out % 128 == 0
+                    and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                )
+            self._wo_a_fp8_out_cached = ok
+        return ok
+
     def _q_norm_for_wq_b(self, q_lora: torch.Tensor):
         """Returns (normed bf16 q_lora, wq_b input). With SGLANG_OPT_TK_QNORM_CAST the
         TileKernels norm_forward_and_per_token_cast does q_norm and wq_b's per-32 ue8m0
@@ -1595,6 +1653,34 @@ class MQALayer(MqaAttentionBase):
                 )
                 normed, (q, sf) = fused
                 return normed, Mxfp8DeepGemmInput(q, sf)
+        if (
+            _is_cuda
+            and envs.SGLANG_FUSE_QNORM_MXFP8_DEEPGEMM.get()
+            and self._wq_b_takes_deepgemm_mxfp8_input()
+        ):
+            from sglang.kernels.ops.layernorm.qnorm_mxfp8_deepgemm import (
+                fused_qnorm_mxfp8_deepgemm,
+            )
+
+            fused = fused_qnorm_mxfp8_deepgemm(
+                q_lora, self.q_norm.weight, self.q_norm.variance_epsilon
+            )
+            if fused is not None:
+                from sglang.srt.utils.community_opt import log_community_opt_once
+
+                log_community_opt_once(
+                    "fusion-opt qnorm_mxfp8_deepgemm",
+                    "q_norm + wq_b input cast in one Triton launch (layer=%d, tokens=%d)",
+                    self.layer_id,
+                    q_lora.shape[0],
+                )
+                normed, (q, sf) = fused
+                q_in = Mxfp8DeepGemmInput(q, sf)
+                indexer = getattr(self, "indexer", None)
+                if indexer is not None:
+                    # The V4.1 indexer's wq_b reads the same normed q_lora.
+                    indexer._q_lora_mxfp8 = (normed, q_in)
+                return normed, q_in
         q_lora = self.q_norm(q_lora)
         return q_lora, q_lora
 
@@ -2701,6 +2787,25 @@ class MQALayer(MqaAttentionBase):
                 self._fused_o_cos_sin,
                 self.n_local_groups,
             )
+            if self._wo_a_fp8_out_ok():
+                # [fusion-opt] SGLANG_FUSE_WO_A_FP8_OUT_DECODE: DeepGEMM's einsum
+                # epilogue writes wo_b's mxfp8 input; no per_token_group_quant.
+                from sglang.srt.layers.attention.dsv4.fused_o_attn import (
+                    wo_a_einsum_mxfp8,
+                )
+                from sglang.srt.utils.community_opt import log_community_opt_once
+
+                log_community_opt_once(
+                    "fusion-opt wo_a_einsum_fp8_out",
+                    "wo_a einsum writes wo_b's mxfp8 input (layer=%d, tokens=%d)",
+                    self.layer_id,
+                    o_fp8.shape[0],
+                )
+                d_fp8, d_sf = wo_a_einsum_mxfp8(
+                    o_fp8, o_sf, self._wo_a_fused_w, self._wo_a_fused_sf
+                )
+                o, _ = self.wo_b(Mxfp8DeepGemmInput(d_fp8, d_sf))
+                return o
             o = wo_a_einsum(o_fp8, o_sf, self._wo_a_fused_w, self._wo_a_fused_sf)
             o, _ = self.wo_b(o.flatten(1))
             return o
@@ -3566,11 +3671,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         apply_pre: Optional[torch.Tensor],
         norm: RMSNorm,
         stats_stream: Optional[torch.cuda.Stream] = None,
-    ) -> torch.Tensor:
+        want_fp8: bool = False,
+        return_quant: bool = False,
+    ):
         """The sublayer input: x collapsed with apply_pre (None selects copy 0),
         then RMS-normalized, on the current stream. Forks ``stats_stream`` for
         :meth:`_hc_mix_stats`: after the combine for a tiny input so the two do
-        not compete for SMs, before it otherwise so they overlap."""
+        not compete for SMs, before it otherwise so they overlap.
+
+        ``return_quant`` returns ``(y, Mxfp8DeepGemmInput or None)``; the quant is
+        produced only when ``want_fp8`` and the fused combine+RMSNorm kernel serves the
+        call (it then also writes y's DeepGEMM MXFP8 cast)."""
+        y_quant = None
         from sglang.kernels.ops.layernorm.mhc import hc_combine
 
         tiny = 0 < x.shape[0] <= 8
@@ -3606,14 +3718,36 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
                 # One fused form for every row count (per-row reduction order is
                 # fixed regardless of the grid split).
-                y = hc_combine_norm(
-                    x_flat, apply_pre, norm.weight, norm.variance_epsilon
-                )
+                fused8 = None
+                if want_fp8:
+                    from sglang.kernels.ops.layernorm.hc_combine_norm import (
+                        hc_combine_norm_mxfp8,
+                    )
+
+                    fused8 = hc_combine_norm_mxfp8(
+                        x_flat, apply_pre, norm.weight, norm.variance_epsilon
+                    )
+                if fused8 is not None:
+                    from sglang.srt.utils.community_opt import log_community_opt_once
+
+                    log_community_opt_once(
+                        "fusion-opt hc_combine_norm_mxfp8",
+                        "hc_combine + RMSNorm + DeepGEMM mxfp8 cast in one launch "
+                        "(layer=%d, rows=%d)",
+                        self.layer_id,
+                        x.shape[0],
+                    )
+                    y, (yq, ys) = fused8
+                    y_quant = Mxfp8DeepGemmInput(yq, ys)
+                else:
+                    y = hc_combine_norm(
+                        x_flat, apply_pre, norm.weight, norm.variance_epsilon
+                    )
             else:
                 y = norm(hc_combine(x_flat, apply_pre, self.hc_mult, x.dtype))
         if stats_stream is not None and tiny:
             stats_stream.wait_stream(torch.cuda.current_stream())
-        return y
+        return (y, y_quant) if return_quant else y
 
     def _hc_mix_stats(
         self,
@@ -3715,6 +3849,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         attn_pre: torch.Tensor,
         attn_post: torch.Tensor,
         attn_comb: torch.Tensor,
+        fp8_out: bool = False,
     ):
         """The attn->FFN mHC boundary in one ``deep_gemm.mega_mhc`` launch.
 
@@ -3754,6 +3889,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=norm_weight,
             norm_eps=norm.variance_epsilon,
             label="attn->FFN",
+            fp8_out=fp8_out,
         )
 
     def _mega_mhc_ffn_boundary(
@@ -3812,13 +3948,98 @@ class DeepseekV4DecoderLayer(nn.Module):
             fp8_out=fp8_out,
         )
 
+    def _hc_combine_fp8_ok(self, forward_batch: ForwardBatch, attn_side: bool) -> bool:
+        """[fusion-opt] Gate of SGLANG_FUSE_HC_COMBINE_NORM_MXFP8: the unfused-mHC
+        sublayer input (fused hc_combine_norm) also comes out as DeepGEMM mxfp8 for
+        wqkv_a (attention side) or the shared expert's gate_up (FFN side)."""
+        if not envs.SGLANG_FUSE_HC_COMBINE_NORM_MXFP8.get():
+            return False
+        mode = forward_batch.forward_mode
+        if not (mode.is_decode() or mode.is_target_verify()):
+            return False
+        if attn_side:
+            return self._wqkv_a_mxfp8_route_ok()
+        return self._shared_gate_up_mxfp8_route_ok()
+
+    def _shared_gate_up_mxfp8_route_ok(self) -> bool:
+        """The separate shared expert's gate_up runs the DeepGEMM MXFP8 route."""
+        mlp = self.mlp
+        shared = getattr(mlp, "shared_experts", None)
+        if (
+            shared is None
+            or getattr(mlp, "num_fused_shared_experts", 0) != 0
+            or getattr(mlp, "mega_shared_l1_weights", None) is not None
+            or not envs.SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM.get()
+        ):
+            return False
+        gate_up = getattr(shared, "gate_up_proj", None)
+        qm = getattr(gate_up, "quant_method", None)
+        if not (
+            getattr(qm, "mxfp8_dense_backend", None) == Mxfp8DenseGemmBackend.DEEP_GEMM
+            and (
+                getattr(qm, "use_mxfp8", False)
+                or (
+                    getattr(qm, "block_fp8_as_mxfp8", False)
+                    and getattr(gate_up, "block_fp8_mxfp8_ready", False)
+                )
+            )
+        ):
+            return False
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        return bool(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)
+
+    def _mega_mhc_shared_input_fp8_ok(self, forward_batch: ForwardBatch) -> bool:
+        """[fusion-opt] Gate of SGLANG_FUSE_MEGA_MHC_FP8_SHARED_INPUT: the attn->FFN
+        mega_mhc also writes the FFN input as mxfp8 for the shared expert's gate_up
+        (separate shared expert on the DeepGEMM MXFP8 route, decode / verify only)."""
+        if not envs.SGLANG_FUSE_MEGA_MHC_FP8_SHARED_INPUT.get():
+            return False
+        mode = forward_batch.forward_mode
+        if not (mode.is_decode() or mode.is_target_verify()):
+            return False
+        return self._shared_gate_up_mxfp8_route_ok()
+
+    def _wqkv_a_mxfp8_route_ok(self) -> bool:
+        """wqkv_a (fused wq_a + wkv) runs the DeepGEMM MXFP8 ue8m0 route."""
+        if not (
+            getattr(self.self_attn, "fuse_wqa_wkv", False)
+            and envs.SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM.get()
+        ):
+            return False
+        wqkv_a = self.self_attn.wqkv_a
+        qm = wqkv_a.quant_method
+        if not (
+            getattr(qm, "mxfp8_dense_backend", None) == Mxfp8DenseGemmBackend.DEEP_GEMM
+            and (
+                getattr(qm, "use_mxfp8", False)
+                or (
+                    getattr(qm, "block_fp8_as_mxfp8", False)
+                    and getattr(wqkv_a, "block_fp8_mxfp8_ready", False)
+                )
+            )
+        ):
+            return False
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        return bool(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)
+
     def _mega_mhc_attn_input_fp8_ok(self, forward_batch: ForwardBatch) -> bool:
         """[fusion-opt] Gate of SGLANG_FUSE_MEGA_MHC_FP8_ATTN_INPUT: the FFN->attn
         mega_mhc also writes the attention input as mxfp8 for wqkv_a, which then takes
         it pre-quantized (DeepGEMM per-32 ue8m0 route only)."""
+        mode = forward_batch.forward_mode
         if not (
-            envs.SGLANG_FUSE_MEGA_MHC_FP8_ATTN_INPUT.get()
-            and forward_batch.forward_mode.is_extend_without_speculative()
+            (
+                (
+                    envs.SGLANG_FUSE_MEGA_MHC_FP8_ATTN_INPUT.get()
+                    and mode.is_extend_without_speculative()
+                )
+                or (
+                    envs.SGLANG_FUSE_MEGA_MHC_FP8_ATTN_INPUT_DECODE.get()
+                    and (mode.is_decode() or mode.is_target_verify())
+                )
+            )
             and getattr(self.self_attn, "fuse_wqa_wkv", False)
             and envs.SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM.get()
         ):
@@ -3932,12 +4153,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             residual = hidden_states
             if aux_out is not None:
                 aux_out.append(_hc_mean(hidden_states))
-            x = self._hc_combine(
-                hidden_states, prev_pre, self.input_layernorm, stats_stream
+            x, attn_x_quant = self._hc_combine(
+                hidden_states,
+                prev_pre,
+                self.input_layernorm,
+                stats_stream,
+                want_fp8=self._hc_combine_fp8_ok(forward_batch, attn_side=True),
+            return_quant=True,
             )
             with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
                 x = self.self_attn(
-                    x=x, positions=positions, forward_batch=forward_batch, x_quant=None
+                    x=x,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    x_quant=attn_x_quant,
                 )
             attn_pre, attn_post, attn_comb = self._hc_mix_stats(
                 hidden_states,
@@ -3948,17 +4177,26 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if stats_stream is not None:
                 torch.cuda.current_stream().wait_stream(stats_stream)
+        shared_fp8 = self._mega_mhc_shared_input_fp8_ok(forward_batch)
         fused = self._mega_mhc_attn_boundary(
-            x, residual, attn_pre, attn_post, attn_comb
+            x, residual, attn_pre, attn_post, attn_comb, fp8_out=shared_fp8
         )
         if fused is not None:
-            attn_residual, moe_input, ffn_pre, ffn_post, ffn_comb = fused
-            moe_out = self._run_moe_ffn_dp_sync(
-                moe_input,
-                forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
+            attn_residual, moe_input, ffn_pre, ffn_post, ffn_comb = fused[:5]
+            # The shared expert picks the prequantized input up only when it sees
+            # this very tensor (forward_mega_moe), so any other route stays stock.
+            self.mlp._mhc_shared_x_quant = (
+                (moe_input, fused[5]) if shared_fp8 and len(fused) > 5 else None
             )
+            try:
+                moe_out = self._run_moe_ffn_dp_sync(
+                    moe_input,
+                    forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                )
+            finally:
+                self.mlp._mhc_shared_x_quant = None
             return (
                 None,
                 ffn_pre,
@@ -3967,12 +4205,21 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
-        x = self._hc_combine(
-            hidden_states, attn_pre, self.post_attention_layernorm, stats_stream
+        x, ffn_x_quant = self._hc_combine(
+            hidden_states,
+            attn_pre,
+            self.post_attention_layernorm,
+            stats_stream,
+            want_fp8=self._hc_combine_fp8_ok(forward_batch, attn_side=False),
+            return_quant=True,
         )
-        x = self._run_moe_ffn_dp_sync(
-            x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
-        )
+        self.mlp._mhc_shared_x_quant = (x, ffn_x_quant) if ffn_x_quant is not None else None
+        try:
+            x = self._run_moe_ffn_dp_sync(
+                x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
+            )
+        finally:
+            self.mlp._mhc_shared_x_quant = None
         ffn_pre, ffn_post, ffn_comb = self._hc_mix_stats(
             hidden_states,
             self.hc_ffn_fn,

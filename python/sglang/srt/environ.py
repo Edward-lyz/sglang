@@ -571,6 +571,12 @@ class Envs:
     # ===================================================================
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
+    # Build and run the confidence head under SGLANG_RAGGED_VERIFY_MODE=static
+    # for observation only (info dump / calibration); the verify layout stays static.
+    SGLANG_DSPARK_STATIC_CONFIDENCE_PROBE = EnvBool(False)
+    # Compact verify: trimmed verify slots hold a point mass (not zeros) before a
+    # sampling accept's top-p/top-k renorm, whose uniform-row case is its worst.
+    SGLANG_DSPARK_COMPACT_POINT_MASS_TRIMMED = EnvBool(True)
     # Sampling verify with top-p only: build the target probs with the fused
     # softmax(logits / T) (SoftmaxTemp) instead of divide + F.softmax.
     SGLANG_OPT_DSPARK_TOPP_SOFTMAX_TEMP = EnvBool(False)
@@ -587,6 +593,11 @@ class Envs:
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
+    # [fusion-opt] Run the bf16 lm_head (target and DSpark draft) as an MXFP8 DeepGEMM
+    # GEMM: weight quantized once (per-32 ue8m0) on the first eager call, activations
+    # per call. ~1.8-2x on the GEMM; LOSSY (logits rel. err ~4% on random data), so
+    # check accuracy and acceptance on real PD before enabling.
+    SGLANG_OPT_LM_HEAD_MXFP8 = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
@@ -786,6 +797,19 @@ class Envs:
     # place (no fp32 convert copy, no repeat_interleave of the temperatures). Agrees with the
     # flashinfer path to fp32 rounding, not bit-for-bit, so it stays opt-in.
     SGLANG_OPT_DSPARK_SOFTMAX_SPLIT_TRITON = EnvBool(False)
+    # Compact verify graph epilogue: a token tier T is captured with min(T, max_bs) request
+    # slots, so the strided logits / greedy argmax ran over slots * stride rows (~6x the real
+    # rows). On: argmax runs on the compact rows and is scattered as ids; the logits / hidden
+    # scatter skips empty (padded) slots. Consumed rows are bit-identical.
+    SGLANG_OPT_DSPARK_COMPACT_EPILOGUE_LEAN = EnvBool(False)
+    # Decode DP controller: ignore an externally pinned DP rank (gateway header / body
+    # routed_dp_rank) and dispatch with --load-balance-method.
+    SGLANG_DP_IGNORE_EXTERNAL_RANK = EnvBool(False)
+    # DSpark sampling accept straight from the logits: per-row log-sum-exp instead of the full
+    # target / draft softmax, p / q read at the candidates, residual sample split over vocab
+    # tiles. Top-p rows need SGLANG_OPT_DSPARK_TOPP_ROW_SKIP (else falls back). Agrees with the
+    # softmax path to fp32 rounding (same uniforms, same vocab-order CDF).
+    SGLANG_OPT_DSPARK_ACCEPT_FROM_LOGITS = EnvBool(False)
     # Host-side scheduling scalars before the draft / verify graph replays: sampling-param staging
     # (clamp + greedy mask + rng bump) in one launch, local num_token_non_padded in one launch, and
     # the global_num_tokens fill skipped while the padded bucket is unchanged. Same values.
@@ -1442,6 +1466,10 @@ class Envs:
     # Community #39313: run the shared expert inside DeepGEMM's MegaMoE kernel
     # (locally extended to 32x32 ue8m0 block-FP8 shared weights).
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
+    # sglang#46593: BLOCK_M remap for MegaMoE calls in decode CUDA graphs, e.g.
+    # "16:64,32:64,64:96"; empty = off. Needs a DeepGEMM build with the
+    # DG_MEGA_MOE_BLOCK_M_REMAP hook (docker/patches/).
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_REMAP = EnvStr("")
     # Verification only: on the first eager fused call per process, also run the
     # unfused path and log the difference.
     SGLANG_COMMUNITY_SELFCHECK_MEGA_SHARED = EnvBool(False)
@@ -1450,6 +1478,10 @@ class Envs:
     # refilling [num_tokens, padded_max) of the dispatch topk every call
     # (DeepGEMM reads only the first num_tokens rows). Bit-exact.
     SGLANG_OPT_MEGA_MOE_STAGING_FOLD = EnvBool(True)
+    # Same fold for W4A4 (mxf4xmxf4) MegaMoE: the sglang staging kernel packs the E2M1
+    # acts itself (DeepGEMM's MXFP4 recipe, bit-exact) instead of deep_gemm's
+    # pre_dispatch, which only takes int32 ids and needs the separate cast/mask launch.
+    SGLANG_OPT_MEGA_MOE_STAGING_FOLD_FP4 = EnvBool(False)
     # vllm#60468 / #57843: before serving, run every distinct bf16_mega_gate
     # config x fp8_fp4_mega_moe BLOCK_M (DeepGEMM's own heuristics) and every
     # mega_mhc split count once, so no DeepGEMM JIT compile lands on a request.
@@ -1868,6 +1900,9 @@ class Envs:
     # [fusion-opt] shared expert: silu*up + clamp + per-32 ue8m0 quant in one kernel
     # feeding the DeepGEMM MXFP8 down_proj (block-fp8 [32,32] checkpoints).
     SGLANG_FUSE_SHARED_SILU_QUANT_DEEPGEMM = EnvBool(False)
+    # Launch overrides for that path's two kernels (empty / 0 keep the defaults).
+    SGLANG_SHARED_SILU_LAUNCH = EnvStr("")
+    SGLANG_SHARED_DOWN_NUM_SMS = EnvInt(0)
     # [fusion-opt] Prefill-CP SWA KV store: norm/RoPE/fp8 the local rows first, gather
     # the 584 B (V4) / 528 B (V4.1) cache rows instead of 1024 B bf16 kv, then copy.
     SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST = EnvBool(False)
@@ -1911,6 +1946,25 @@ class Envs:
     # pre-quantized: no per_token_group_quant before wqkv_a. Prefill + DeepGEMM MXFP8
     # route only; the kernel quantizes its own normed output, not bitwise the stock cast.
     SGLANG_FUSE_MEGA_MHC_FP8_ATTN_INPUT = EnvBool(False)
+    # [fusion-opt] Same as above for decode and target verify (the gate above is
+    # extend-only): the FFN->attn mega_mhc writes wqkv_a's mxfp8 input, so the
+    # per-32 group quant in front of wqkv_a is skipped on the decode critical path.
+    SGLANG_FUSE_MEGA_MHC_FP8_ATTN_INPUT_DECODE = EnvBool(False)
+    # [fusion-opt] The attn->FFN mega_mhc also writes the FFN input as mxfp8 and the
+    # (unfused, DeepGEMM MXFP8) shared expert's gate_up takes it pre-quantized: no
+    # per_token_group_quant before the shared expert. MegaMoE still reads the bf16
+    # copy. Decode and target verify only.
+    SGLANG_FUSE_MEGA_MHC_FP8_SHARED_INPUT = EnvBool(False)
+    # [fusion-opt] Where an mHC boundary is not served by mega_mhc (fused
+    # hc_combine_norm path, e.g. around Engram layers), the same Triton launch also
+    # writes the sublayer input as DeepGEMM mxfp8 for wqkv_a / the shared expert's
+    # gate_up. Decode and target verify only.
+    SGLANG_FUSE_HC_COMBINE_NORM_MXFP8 = EnvBool(False)
+    # [fusion-opt] FlashMLA fused-o decode: the wo_a fp8 einsum uses DeepGEMM's FP8
+    # (d, sfd) output (per-32 ue8m0 over d.flatten(1, 2)) so wo_b takes it directly,
+    # dropping the per_token_group_quant between wo_a and wo_b. The cast is taken from
+    # the fp32 accumulator, not from a bf16-rounded D, so it is not bitwise the stock path.
+    SGLANG_FUSE_WO_A_FP8_OUT_DECODE = EnvBool(False)
     # [fusion-opt] TileKernels (deepseek-ai/TileKernels, TileLang JIT) activation casts
     # for the DeepGEMM MXFP8 linear route (SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM):
     # per_token_cast replaces the per-32 ue8m0 group quant in front of every such GEMM;
@@ -1920,6 +1974,11 @@ class Envs:
     # sys.path for a source checkout (no wheel needed).
     SGLANG_OPT_TK_PER_TOKEN_CAST = EnvBool(False)
     SGLANG_OPT_TK_QNORM_CAST = EnvBool(False)
+    # [fusion-opt] The same q_norm + wq_b input cast as one Triton launch (no
+    # tile_kernels needed), DeepGEMM MXFP8 route only. FP8 + scales match the
+    # two-kernel path bitwise; the bf16 normed rows (indexer input) can differ by
+    # 1 ulp in a few elements (reduction order).
+    SGLANG_FUSE_QNORM_MXFP8_DEEPGEMM = EnvBool(False)
     SGLANG_TILE_KERNELS_PATH = EnvStr("")
     # DeepGEMM mega mHC: one `deep_gemm.mega_mhc` launch replaces the whole
     # attn->FFN mHC boundary of the DeepSeek-V4.1 predecessor-pre scheme
@@ -1961,10 +2020,22 @@ class Envs:
     # of it. Bit-identical logits, ~2.9x on the dense ratio-1 logits at 61k/bs256x6.
     # Static verify only (uniform rows per request); ragged verify keeps per-row.
     SGLANG_OPT_DSV41_INDEXER_REQUEST_GROUPED_ROWS = EnvBool(True)
+    # The same varlen grouping for compact (ragged) verify: request ids come from
+    # the per-request verify lengths instead of a fixed rows-per-request.
+    SGLANG_OPT_DSV41_INDEXER_GROUPED_ROWS_RAGGED = EnvBool(False)
     # Widening bf16 -> fp32 copy of the lm_head logits (the fp32 logits buffer fill) with
     # a Triton kernel instead of PyTorch's direct-copy kernel: ~2.8x faster on the
     # [1536, 129280] verify logits, bit-identical.
     SGLANG_OPT_LOGITS_CAST_TRITON = EnvBool(True)
+    # Smallest logits row count that takes the Triton widening copy above; decode verify
+    # at bs ~40 x 6 rows (~240) is below the 256 default and stays on direct-copy.
+    SGLANG_OPT_LOGITS_CAST_TRITON_MIN_ROWS = EnvInt(256)
+    # DSPARK draft step sampling draws its Gumbel noise with tl.rand4x (4 uniforms per
+    # philox call) instead of tl.rand: same distribution, different noise stream.
+    SGLANG_OPT_DSPARK_DRAFT_RAND4X = EnvBool(False)
+    # Per-(N, K) DeepGEMM block-size multiple overrides for the MXFP8 dense GEMM,
+    # "N:K:bm:bn,..." (see deep_gemm_wrapper.entrypoint); empty keeps the heuristic.
+    SGLANG_DG_DENSE_BLOCK_MULTIPLE = EnvStr("")
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
@@ -2015,6 +2086,9 @@ class Envs:
     # Community #41660: fused c1/c2 compressor for eager extend (non-CP and, locally, the CP
     # global-order path) instead of the torch pair-partner chain.
     SGLANG_OPT_DSV41_FUSED_EXTEND_COMPRESS = EnvBool(True)
+    # The same fused c1/c2 compressor (extend kernel, per-request offsets from the
+    # device qo_indptr) for compact ragged target-verify instead of the torch path.
+    SGLANG_OPT_DSV41_FUSED_COMPRESS_RAGGED_VERIFY = EnvBool(False)
     # vllm#59119: expand_prefill_causally kernel without bs/num_tokens/total_tokens
     # specialization and BS_P2 >= 64, so prefill steps stop compiling new variants.
     SGLANG_OPT_DSV4_EXPAND_PREFILL_NO_RESPECIALIZE = EnvBool(True)

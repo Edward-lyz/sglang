@@ -906,11 +906,14 @@ def _step_sample_partial_kernel(
     rng_num_steps,
     BLOCK_V: tl.constexpr,
     WRITE_CORRECTED: tl.constexpr,
+    RAND4X: tl.constexpr = False,
 ):
     # _build_step_local_kernel followed by _online_partial_kernel (inline-RNG branch)
     # in one pass: the fp32 step logits live in registers instead of a [bs, V] tensor
     # that the sampler would read back. Same fp32 values, same tiling, same noise key
     # (row * V + offs), so the sampled token is the one the two-kernel path returns.
+    # RAND4X (SGLANG_OPT_DSPARK_DRAFT_RAND4X) draws the noise four per philox call
+    # instead: a different (equally uniform) noise stream, ~1/4 of the philox work.
     row = tl.program_id(0)
     tile = tl.program_id(1)
     row64 = row.to(tl.int64)
@@ -939,7 +942,12 @@ def _step_sample_partial_kernel(
     else:
         base_seed = tl.load(rng_seed_ptr)
         seed = (base_seed * rng_num_steps + rng_step).to(tl.uint32)
-        u = tl.rand(seed, row * V + offs)
+        if RAND4X:
+            quad = (row * n_tiles + tile) * (BLOCK_V // 4) + tl.arange(0, BLOCK_V // 4)
+            u0, u1, u2, u3 = tl.rand4x(seed, quad)
+            u = tl.reshape(tl.join(tl.join(u0, u1), tl.join(u2, u3)), (BLOCK_V,))
+        else:
+            u = tl.rand(seed, row * V + offs)
         key = tl.exp(s - tile_max) / (-tl.log(u))
     key = tl.where(mask, key, -1.0)
     tile_best = tl.max(key, axis=0)
@@ -947,6 +955,12 @@ def _step_sample_partial_kernel(
     tl.store(tile_max_ptr + row * n_tiles + tile, tile_max)
     tl.store(partial_key_ptr + row * n_tiles + tile, tile_best)
     tl.store(partial_idx_ptr + row * n_tiles + tile, tl.min(idx, axis=0))
+
+
+def _draft_rand4x() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_DSPARK_DRAFT_RAND4X.get()
 
 
 def can_build_step_sample(
@@ -1015,6 +1029,7 @@ def build_step_sample_triton(
         int(rng_num_steps),
         BLOCK_V=_BLOCK_V,
         WRITE_CORRECTED=write_corrected,
+        RAND4X=_draft_rand4x(),
     )
     _online_combine_kernel[(bs,)](
         tile_max,

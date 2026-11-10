@@ -1,3 +1,5 @@
+"""DeepSeek-V4 attention backend: forward metadata, SWA / compressed KV stores, indexer and attention dispatch."""
+
 from __future__ import annotations
 
 import enum
@@ -126,6 +128,7 @@ from sglang.srt.speculative.ragged_verify import (
     compute_target_verify_graph_key,
     compute_uniform_extend_lengths,
     read_ragged_verify_mode,
+    resolve_compact_verify_layout,
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
@@ -1486,6 +1489,7 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         rows_per_request: int = 0,
         allow_row_chunk: bool = False,
+        ragged_request_ids: Optional[torch.Tensor] = None,
     ):
         page_table = core_attn_metadata.page_table
         index_page_size = 0
@@ -1531,6 +1535,22 @@ class DeepseekV4AttnBackend(
                 "low-ratio decode indexer logits run in DeepGEMM varlen mode "
                 "(%d rows/request, ratio=%d, rows=%d)",
                 rows_per_request,
+                compress_ratio,
+                num_rows,
+            )
+        elif (
+            ragged_request_ids is not None
+            and compress_ratio in (1, 2)
+            and num_rows > 0
+            and ragged_request_ids.shape[0] == num_rows
+        ):
+            # compact verify: a request's rows are consecutive but vary in count;
+            # the ids come from the per-request verify lengths (see caller).
+            request_ids = ragged_request_ids
+            log_community_opt_once(
+                "indexer_request_grouped_rows_ragged",
+                "low-ratio compact-verify indexer logits run in DeepGEMM varlen "
+                "mode (ratio=%d, rows=%d)",
                 compress_ratio,
                 num_rows,
             )
@@ -2283,6 +2303,28 @@ class DeepseekV4AttnBackend(
         low = core_attn_metadata.low_ratios
         # uniform static verify: every request owns exactly num_draft_tokens rows
         rows_per_request = 0 if is_ragged else num_draft_tokens
+        ragged_request_ids = None
+        if (
+            is_ragged
+            and (1 in low or 2 in low)
+            and _is_cuda
+            and not _is_xpu
+            and envs.SGLANG_OPT_DSV41_INDEXER_GROUPED_ROWS_RAGGED.get()
+        ):
+            # Row -> request from the per-request verify lengths (the same source
+            # the causal expansion uses, so graph replay sees the staged lengths);
+            # graph padding rows land on the last request (seq len 1, discarded).
+            num_rows = out_cache_loc.shape[0]
+            ends = torch.cumsum(extend_seq_lens.to(torch.int64), dim=0)
+            ragged_request_ids = (
+                torch.searchsorted(
+                    ends,
+                    torch.arange(num_rows, dtype=torch.int64, device=ends.device),
+                    right=True,
+                )
+                .clamp_(max=bs - 1)
+                .to(torch.int32)
+            )
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
@@ -2291,6 +2333,7 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata,
                     compress_ratio=1,
                     rows_per_request=rows_per_request,
+                    ragged_request_ids=ragged_request_ids,
                 )
                 if 1 in low
                 else None
@@ -2300,6 +2343,7 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata,
                     compress_ratio=2,
                     rows_per_request=rows_per_request,
+                    ragged_request_ids=ragged_request_ids,
                 )
                 if 2 in low
                 else None
@@ -3284,6 +3328,38 @@ class DeepseekV4AttnBackend(
                 layer, x, req, pos, draft_len=self.speculative_num_draft_tokens
             )
         elif (
+            forward_batch.forward_mode.is_target_verify()
+            and not self.is_dspark_draft
+            and layer.compress_ratio in (1, 2)
+            and layer.compressor.use_fused_compress
+            and envs.SGLANG_OPT_DSV41_FUSED_COMPRESS_RAGGED_VERIFY.get()
+            and (ragged := resolve_compact_verify_layout(forward_batch)) is not None
+        ):
+            # Compact verify is request-major with consecutive positions, i.e. an
+            # extend batch: the extend kernel pairs and parks rows exactly as
+            # _low_ratio_pair_partners does. Offsets come from the device qo_indptr
+            # (refreshed in place on graph replay); rows past qo_indptr[-1] are
+            # graph padding with raw_out_loc 0, which both kernels skip.
+            qo_indptr = ragged.qo_indptr_device
+            log_community_opt_once(
+                "fused_compress_ragged_verify",
+                "fused c1/c2 compress for compact ragged target-verify enabled "
+                "(ratio=%d, rows=%d, reqs=%d)",
+                layer.compress_ratio,
+                x.shape[0],
+                qo_indptr.shape[0] - 1,
+            )
+            self._low_ratio_compress_fused(
+                layer,
+                x,
+                req,
+                pos,
+                extend_offsets=(
+                    qo_indptr[:-1].to(torch.int32),
+                    (qo_indptr[1:] - qo_indptr[:-1]).to(torch.int32),
+                ),
+            )
+        elif (
             layer.compressor.use_fused_compress
             and forward_batch.forward_mode.is_extend_without_speculative()
             and forward_batch.extend_start_loc is not None
@@ -3721,7 +3797,9 @@ class DeepseekV4AttnBackend(
                 columns,
             )
             num_heads = indexer.n_local_heads
-            q, _ = indexer.wq_b(q_lora)
+            q, _ = indexer.wq_b(
+                indexer.wq_b_input(q_lora) if hasattr(indexer, "wq_b_input") else q_lora
+            )
             # One launch: RoPE, the two fp4 stages and head_weights(x).float().
             q_fp4, q_sf, weights = index_q_rope_pack_weights(
                 q.view(num_tokens, num_heads, indexer.index_head_dim),
@@ -4195,7 +4273,9 @@ class DeepseekV4AttnBackend(
                 index_q_rope_pack_weights,
             )
 
-            q, _ = indexer.wq_b(q_lora)
+            q, _ = indexer.wq_b(
+                indexer.wq_b_input(q_lora) if hasattr(indexer, "wq_b_input") else q_lora
+            )
             q = q.view(q.shape[0], indexer.n_local_heads, indexer.index_head_dim)
             # The fused query pack also computes head_weights(x).float(), preserving
             # the fp32 multiply and bf16 rounding. freqs_cis stays a real/imag view.

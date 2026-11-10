@@ -541,11 +541,18 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 read_ragged_verify_mode,
             )
 
-            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            # megamoe (MoE draft) runs compact: the draft joins the DP MoE
+            # lockstep and the verify tier is gathered across DP ranks.
+            ragged_verify_mode = read_ragged_verify_mode()
+            if ragged_verify_mode is not RaggedVerifyMode.STATIC and not (
+                ragged_verify_mode is RaggedVerifyMode.COMPACT
+                and cfg.moe_a2a_backend == "megamoe"
+            ):
                 raise ValueError(
                     "DSpark with dp attention + "
                     f"moe_a2a_backend={cfg.moe_a2a_backend!r} requires "
-                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                    "SGLANG_RAGGED_VERIFY_MODE=static (compact is allowed "
+                    "with megamoe)."
                 )
         if cfg.attn_cp_size > 1:
             from sglang.srt.speculative.ragged_verify import (

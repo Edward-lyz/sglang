@@ -994,9 +994,13 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                from sglang.srt.layers.lm_head_mxfp8 import maybe_mxfp8_lm_head
+
+                logits = maybe_mxfp8_lm_head(hidden_states, lm_head)
+                if logits is None:
+                    logits = torch.matmul(
+                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                    )
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
@@ -1167,7 +1171,10 @@ class LogitsProcessor(nn.Module):
         # on the tall [rows, vocab] speculative-verify logits.
         if not envs.SGLANG_OPT_LOGITS_CAST_TRITON.get():
             return False
-        if logits.dtype != torch.bfloat16 or logits.shape[0] < 256:
+        if (
+            logits.dtype != torch.bfloat16
+            or logits.shape[0] < envs.SGLANG_OPT_LOGITS_CAST_TRITON_MIN_ROWS.get()
+        ):
             return False
         if not can_copy_bf16_to_fp32(logits, buffer):
             return False

@@ -380,9 +380,33 @@ class DeepseekV2MLP(nn.Module):
                 silu_mul_mxfp8_deepgemm,
             )
 
+            # This pair runs on the shared-expert side stream while the routed MegaMoE
+            # holds 146 of 148 SMs; SGLANG_SHARED_SILU_LAUNCH="rows:quads:warps" and
+            # SGLANG_SHARED_DOWN_NUM_SMS retune the launches for that 2-SM window.
+            silu_launch = envs.SGLANG_SHARED_SILU_LAUNCH.get()
+            silu_kwargs = {}
+            if silu_launch:
+                rows, quads, warps = (int(v) for v in silu_launch.split(":"))
+                silu_kwargs = dict(rows_per_prog=rows, quads=quads, num_warps=warps)
             down_input_fp8, down_input_scale = silu_mul_mxfp8_deepgemm(
-                gate_up, float(self.swiglu_limit)
+                gate_up, float(self.swiglu_limit), **silu_kwargs
             )
+            down_num_sms = envs.SGLANG_SHARED_DOWN_NUM_SMS.get()
+            if down_num_sms > 0:
+                import deep_gemm
+
+                prev_num_sms = deep_gemm.get_num_sms()
+                deep_gemm.set_num_sms(down_num_sms)
+                try:
+                    return w8a8_mxfp8_matmul_deepgemm(
+                        down_input_fp8,
+                        self.down_proj.weight,
+                        down_input_scale,
+                        self.down_proj.weight_scale_inv_deepgemm,
+                        output_dtype=torch.bfloat16,
+                    )
+                finally:
+                    deep_gemm.set_num_sms(prev_num_sms)
             return w8a8_mxfp8_matmul_deepgemm(
                 down_input_fp8,
                 self.down_proj.weight,

@@ -38,10 +38,13 @@ def _jit_hash_topk_module():
 
 @cache_once
 def _jit_mega_moe_pre_dispatch_module(
-    quant_group_size: int, write_shared_sf: bool, topk_idx_dtype: torch.dtype
+    quant_group_size: int,
+    write_shared_sf: bool,
+    topk_idx_dtype: torch.dtype,
+    fp4: bool = False,
 ):
     args = make_cpp_args(
-        quant_group_size, is_arch_support_pdl(), write_shared_sf, topk_idx_dtype
+        quant_group_size, is_arch_support_pdl(), write_shared_sf, topk_idx_dtype, fp4
     )
     return load_jit(
         make_name("mega_moe_pre_dispatch"),
@@ -170,6 +173,7 @@ def mega_moe_pre_dispatch(
     num_token_non_padded: Optional[torch.Tensor] = None,
     topk_weight_scale: float = 1.0,
     fill_padded_tail: bool = True,
+    fp4: bool = False,
 ) -> None:
     # shared_x_sf / shared_block_m: also write the activation scales the in-kernel
     # shared expert reads (BLOCK_M-paged layout of the consuming MegaMoE).
@@ -180,8 +184,10 @@ def mega_moe_pre_dispatch(
     # fill_padded_tail=False writes (-1, 0) only to row 0 when there are no
     # tokens instead of the whole [num_tokens, padded_max) tail: DeepGEMM's
     # MegaMoE reads just the first max(num_tokens, 1) topk rows.
+    # fp4: packed E2M1 acts with DeepGEMM's MXFP4 recipe (buf_x is [P, hidden / 2]),
+    # byte-identical to deep_gemm.mega_moe_pre_dispatch(mma_type="mxf4xmxf4").
     module = _jit_mega_moe_pre_dispatch_module(
-        quant_group_size, shared_x_sf is not None, topk_idx.dtype
+        quant_group_size, shared_x_sf is not None, topk_idx.dtype, fp4
     )
     num_tokens = x.shape[0]
     module.run(

@@ -20,6 +20,11 @@ from sglang.srt.layers.attention.dsv4.torch_quant import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.speculative.ragged_verify import (
+    log_compact_adapt_once,
+    ragged_verify_token_rows,
+    resolve_compact_verify_layout,
+)
 from sglang.srt.utils import add_prefix
 
 
@@ -66,6 +71,21 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     if forward_batch.forward_mode.is_decode():
         return req
     if forward_batch.forward_mode.is_target_verify():
+        ragged = resolve_compact_verify_layout(forward_batch)
+        if ragged is not None:
+            # Compact verify runs vary per request; rows come from the device
+            # qo_indptr so the graph replay's staged layout is honoured.
+            if num_tokens is None:
+                num_tokens = forward_batch.positions.shape[0]
+            rows, _ = ragged_verify_token_rows(ragged.qo_indptr_device, num_tokens)
+            log_compact_adapt_once(
+                "token_req_indices_row_map",
+                "dsv41 low-ratio token_req_indices use the compact row map "
+                "(tokens=%d, rows=%d)",
+                num_tokens,
+                req.shape[0],
+            )
+            return req[rows]
         return torch.repeat_interleave(
             req, int(forward_batch.spec_info.draft_token_num), output_size=num_tokens
         )
@@ -269,10 +289,48 @@ class DeepseekV41Indexer(nn.Module):
         k = self.k_norm(self.forward_wk(latent))
         return _rope_fq4(k, freqs, self.rope_head_dim)
 
+    def wq_b_input(self, q_lora: torch.Tensor):
+        """wq_b's input for ``q_lora``. [fusion-opt] SGLANG_FUSE_QNORM_MXFP8_DEEPGEMM:
+        the attention's fused q_norm already cast this very normed q_lora to
+        DeepGEMM mxfp8 for its own wq_b (the same per-32 ue8m0 cast this wq_b would
+        do); reuse it when it is the same tensor and this wq_b runs that route."""
+        stash = getattr(self, "_q_lora_mxfp8", None)
+        if stash is not None and stash[0] is q_lora and self._wq_b_takes_mxfp8():
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "fusion-opt indexer_reuse_qnorm_mxfp8",
+                "indexer wq_b reuses the fused q_norm mxfp8 cast (tokens=%d)",
+                q_lora.shape[0],
+            )
+            return stash[1]
+        return q_lora
+
     def queries(self, q_lora: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        q, _ = self.wq_b(q_lora)
+        q, _ = self.wq_b(self.wq_b_input(q_lora))
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
         return _rope_fq4(q, freqs, self.rope_head_dim)
+
+    def _wq_b_takes_mxfp8(self) -> bool:
+        ok = getattr(self, "_wq_b_mxfp8_ok", None)
+        if ok is None:
+            from sglang.srt.layers import deep_gemm_wrapper
+            from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
+
+            qm = self.wq_b.quant_method
+            ok = bool(
+                getattr(qm, "mxfp8_dense_backend", None) == Mxfp8DenseGemmBackend.DEEP_GEMM
+                and (
+                    getattr(qm, "use_mxfp8", False)
+                    or (
+                        getattr(qm, "block_fp8_as_mxfp8", False)
+                        and getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
+                    )
+                )
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            )
+            self._wq_b_mxfp8_ok = ok
+        return ok
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""

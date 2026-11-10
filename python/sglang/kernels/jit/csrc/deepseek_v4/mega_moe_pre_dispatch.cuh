@@ -55,7 +55,27 @@ struct MegaMoEPreDispatchParams {
 // kMultiChunk covers rows too wide for one chunk per thread. It is a template
 // parameter rather than a runtime check because this kernel is issue-bound: the
 // loop bookkeeping alone costs ~10% on the rows that fit a single chunk.
-template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk, bool kWriteSharedSF, typename TopkIdxT>
+// DeepGEMM's MXFP4 act quant (impls/sm100_mega_moe_pre_dispatch.cuh, `per_token_cast_to_fp4`):
+// UE8M0 exponent of the smallest power of 2 >= raw_scale, clamped to [1, 254].
+SGL_DEVICE uint32_t dg_fp4_cast_to_ue8m0(float raw_scale) {
+  const uint32_t bits = __float_as_uint(raw_scale);
+  uint32_t exp = (bits >> 23u) & 0xFFu;
+  if ((bits & 0x7FFFFFu) != 0u) exp += 1u;
+  return exp < 1u ? 1u : (exp > 254u ? 254u : exp);
+}
+
+// E2M1 bucketize at the midpoints, ties to the even code (PTX cvt.rn.satfinite).
+SGL_DEVICE uint32_t dg_fp4_e2m1_encode(float v) {
+  float ax = fabsf(v);
+  if (ax > 6.0f) ax = 6.0f;
+  const uint32_t idx = (ax > 0.25f) + (ax >= 0.75f) + (ax > 1.25f) + (ax >= 1.75f) + (ax > 2.5f) + (ax >= 3.5f) +
+                       (ax > 5.0f);
+  return (v < 0.0f && idx != 0u) ? (idx | 0x8u) : idx;
+}
+
+// kFp4: packed E2M1 acts (row stride hidden / 2, low nibble = even column) with DeepGEMM's
+// own MXFP4 scale recipe, byte-identical to deep_gemm.mega_moe_pre_dispatch(mma_type="mxf4xmxf4").
+template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk, bool kWriteSharedSF, typename TopkIdxT, bool kFp4>
 __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams __grid_constant__ params) {
   using namespace device;
@@ -101,18 +121,33 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
       // Absmax across the kThreadsPerGroup threads that cover one group.
       local_max = warp::reduce_max<kThreadsPerGroup>(local_max);
 
-      const float absmax = fmaxf(local_max, 1e-10f);
-      const float raw_scale = absmax / math::FP8_E4M3_MAX;
-      const uint32_t ue8m0_exp = cast_to_ue8m0(raw_scale);
-      // 2^-ue8m0_exp as fp32 (equivalent to 1 / __uint_as_float(ue8m0 << 23)).
-      const float inv_scale = __uint_as_float((127u + 127u - ue8m0_exp) << 23);
-
-      OutputVec out_vec;
+      uint32_t ue8m0_exp;
+      if constexpr (kFp4) {
+        ue8m0_exp = dg_fp4_cast_to_ue8m0(fmaxf(local_max, 1e-4f) / 6.0f);
+        const float inv_scale = __uint_as_float((254u - ue8m0_exp) << 23u);
+        uint32_t packed = 0;
 #pragma unroll
-      for (uint32_t i = 0; i < kVecElems / 2; ++i) {
-        out_vec[i] = pack_fp8(vals[2 * i + 0] * inv_scale, vals[2 * i + 1] * inv_scale);
+        for (uint32_t i = 0; i < kVecElems / 2; ++i) {
+          const uint32_t lo = dg_fp4_e2m1_encode(vals[2 * i + 0] * inv_scale);
+          const uint32_t hi = dg_fp4_e2m1_encode(vals[2 * i + 1] * inv_scale);
+          packed |= ((lo & 0xFu) | ((hi & 0xFu) << 4u)) << (8u * i);
+        }
+        reinterpret_cast<uint32_t*>(params.buf_x)[static_cast<uint64_t>(token_id) * (params.hidden / 8u) + chunk] =
+            packed;
+      } else {
+        const float absmax = fmaxf(local_max, 1e-10f);
+        const float raw_scale = absmax / math::FP8_E4M3_MAX;
+        ue8m0_exp = cast_to_ue8m0(raw_scale);
+        // 2^-ue8m0_exp as fp32 (equivalent to 1 / __uint_as_float(ue8m0 << 23)).
+        const float inv_scale = __uint_as_float((127u + 127u - ue8m0_exp) << 23);
+
+        OutputVec out_vec;
+#pragma unroll
+        for (uint32_t i = 0; i < kVecElems / 2; ++i) {
+          out_vec[i] = pack_fp8(vals[2 * i + 0] * inv_scale, vals[2 * i + 1] * inv_scale);
+        }
+        out_vec.store(token_out, chunk);
       }
-      out_vec.store(token_out, chunk);
 
       // One thread per group writes its UE8M0 byte into the row-major int32-
       // packed layout. DeepGEMM may pad each row to preserve TMA alignment.
@@ -171,14 +206,15 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
 // ---- Host wrapper
 // ------------------------------------------------------------------------------------------------------------------------
 
-template <int64_t kGroupSize, bool kUsePDL, bool kWriteSharedSF, typename TopkIdxT = int32_t>
+template <int64_t kGroupSize, bool kUsePDL, bool kWriteSharedSF, typename TopkIdxT = int32_t, bool kFp4 = false>
 struct MegaMoEPreDispatchKernel {
+  static_assert(!kFp4 || (kGroupSize == 32 && !kWriteSharedSF), "fp4 acts: group 32, no shared scales");
   static_assert(kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128, "unsupported group_size");
   static_assert(std::is_same_v<TopkIdxT, int32_t> || std::is_same_v<TopkIdxT, int64_t>, "unsupported topk_idx");
   static constexpr auto kernel_one_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, kWriteSharedSF, TopkIdxT>;
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, kWriteSharedSF, TopkIdxT, kFp4>;
   static constexpr auto kernel_multi_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true, kWriteSharedSF, TopkIdxT>;
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true, kWriteSharedSF, TopkIdxT, kFp4>;
 
   // num_token_non_padded: optional scalar (CUDA int32, or CPU int32/int64);
   //   rows at or past it get expert -1, as _mask_topk_ids_padded_region does.
@@ -222,10 +258,19 @@ struct MegaMoEPreDispatchKernel {
         .verify(topk_weights);
     // DeepGEMM versions expose this fp8 dispatch buffer either as raw int8
     // storage or as torch.float8_e4m3fn; the kernel writes fp8 bytes in both.
-    TensorMatcher({P, H})  // buf.x
-        .with_dtype<int8_t, fp8_e4m3_t>()
-        .with_device(device)
-        .verify(buf_x);
+    if constexpr (kFp4) {
+      auto H2 = SymbolicSize{"hidden_div_2"};
+      TensorMatcher({P, H2})  // buf.x, packed E2M1 bytes
+          .with_dtype<int8_t, uint8_t>()
+          .with_device(device)
+          .verify(buf_x);
+      RuntimeCheck(H2.unwrap() * 2 == H.unwrap(), "fp4 buf_x must be [padded_max, hidden / 2]");
+    } else {
+      TensorMatcher({P, H})  // buf.x
+          .with_dtype<int8_t, fp8_e4m3_t>()
+          .with_device(device)
+          .verify(buf_x);
+    }
     // DeepGEMM exposes only the logical G scale bytes but may pad its physical
     // row stride to 16 bytes for TMA (for example, H=2304 is 72B -> 80B).
     TensorMatcher({P, G4})  // buf_x_sf

@@ -767,6 +767,12 @@ class DataParallelController:
         # stays consistent with the decode-side bootstrap_room % system_dp_size.
         if get_parallel().fake_dp_size > 1:
             return False
+        # PD decode: the gateway may pin a DP rank (X-Data-Parallel-Rank / routed_dp_rank)
+        # without seeing this node's per-rank load; with this on, --load-balance-method
+        # decides instead. Safe with SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1,
+        # where the decode rank does not have to match the prefill rank.
+        if envs.SGLANG_DP_IGNORE_EXTERNAL_RANK.get():
+            return False
         if req.routed_dp_rank is not None:
             rank = req.routed_dp_rank
             if (

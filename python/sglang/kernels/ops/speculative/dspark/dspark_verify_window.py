@@ -554,6 +554,40 @@ def _scatter_compact_to_strided_kernel(
     tl.store(out_ptr + o * dim + d, val, mask=dmask)
 
 
+@triton.jit
+def _scatter_compact_to_strided_skip_empty_kernel(
+    compact_ptr,
+    verify_lens_ptr,
+    start_ptr,
+    out_ptr,
+    stride,
+    dim,
+    n_src,
+    fill_value,
+    CHUNKS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # One program per (strided row, CHUNKS * BLOCK_D columns). Padded slots
+    # (verify_len 0) are never read back, so their programs exit without a
+    # store; a per-tile grid would spend most of its time launching them.
+    # Source rows are bounded by n_src: graph capture runs on stale verify lens.
+    o = tl.program_id(0).to(tl.int64)
+    part = tl.program_id(1)
+    i = o // stride
+    w = o % stride
+    vl_i = tl.load(verify_lens_ptr + i)
+    if vl_i > 0:
+        start_i = tl.load(start_ptr + i)
+        in_range = (w < vl_i) & (start_i + w < n_src)
+        src = tl.where(in_range, start_i + w, 0)
+        for c in tl.static_range(CHUNKS):
+            d = (part * CHUNKS + c) * BLOCK_D + tl.arange(0, BLOCK_D)
+            dmask = d < dim
+            val = tl.load(compact_ptr + src * dim + d, mask=dmask & in_range, other=0)
+            val = tl.where(in_range, val, fill_value)
+            tl.store(out_ptr + o * dim + d, val, mask=dmask)
+
+
 def scatter_compact_to_strided_into(
     *,
     compact: torch.Tensor,
@@ -561,6 +595,7 @@ def scatter_compact_to_strided_into(
     out: torch.Tensor,
     stride: int,
     fill_value: float,
+    skip_empty: bool = False,
 ) -> torch.Tensor:
     dim = compact.shape[1]
     fill_value = float(fill_value) if out.dtype.is_floating_point else int(fill_value)
@@ -568,6 +603,23 @@ def scatter_compact_to_strided_into(
     verify_lens = verify_lens.to(dtype=torch.int64).contiguous()
     start = (torch.cumsum(verify_lens, dim=0) - verify_lens).contiguous()
     n_out = out.shape[0]
+    if skip_empty:
+        block_d = min(1024, triton.next_power_of_2(dim))
+        chunks = min(16, triton.cdiv(dim, block_d))
+        grid = (n_out, triton.cdiv(dim, block_d * chunks))
+        _scatter_compact_to_strided_skip_empty_kernel[grid](
+            compact,
+            verify_lens,
+            start,
+            out,
+            stride,
+            dim,
+            compact.shape[0],
+            fill_value,
+            CHUNKS=chunks,
+            BLOCK_D=block_d,
+        )
+        return out
     BLOCK_D = 1024
     grid = (n_out, triton.cdiv(dim, BLOCK_D))
     _scatter_compact_to_strided_kernel[grid](
@@ -602,6 +654,92 @@ def scatter_compact_to_strided_triton(
         stride=stride,
         fill_value=fill_value,
     )
+
+
+class PointMassTrimmedVerifySlots:
+    """In place: every strided verify slot past its request's verify_len (never
+    accepted from) becomes a point mass (logit 0 at token 0, -inf elsewhere).
+    A zero-filled slot softmaxes to uniform, the worst case of top-p/top-k renorm."""
+
+    @classmethod
+    def execute(cls, *args, **kwargs) -> torch.Tensor:
+        """Execute."""
+        if inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
+
+    @classmethod
+    def torch(
+        cls, *, logits: torch.Tensor, verify_lens: torch.Tensor, stride: int
+    ) -> torch.Tensor:
+        """Torch."""
+        return point_mass_trimmed_verify_slots(
+            logits=logits, verify_lens=verify_lens, stride=stride
+        )
+
+    @classmethod
+    def triton(
+        cls, *, logits: torch.Tensor, verify_lens: torch.Tensor, stride: int
+    ) -> torch.Tensor:
+        """Triton."""
+        return point_mass_trimmed_verify_slots_triton(
+            logits=logits, verify_lens=verify_lens, stride=stride
+        )
+
+
+def point_mass_trimmed_verify_slots(
+    *, logits: torch.Tensor, verify_lens: torch.Tensor, stride: int
+) -> torch.Tensor:
+    """Point mass trimmed verify slots."""
+    bs = verify_lens.shape[0]
+    rows = logits[: bs * stride]
+    within = torch.arange(stride, device=logits.device)
+    trimmed = (within[None, :] >= verify_lens.to(logits.device).view(-1, 1)).view(-1)
+    point = torch.full_like(rows[:1], float("-inf"))
+    point[:, 0] = 0
+    rows.copy_(torch.where(trimmed[:, None], point, rows))
+    return logits
+
+
+@triton.jit
+def _point_mass_trimmed_slots_kernel(
+    logits_ptr,
+    verify_lens_ptr,
+    row_stride,
+    stride,
+    vocab,
+    BLOCK_V: tl.constexpr,
+):
+    o = tl.program_id(0).to(tl.int64)
+    vblk = tl.program_id(1)
+    vl = tl.load(verify_lens_ptr + o // stride)
+    if o % stride >= vl:
+        v = vblk * BLOCK_V + tl.arange(0, BLOCK_V)
+        val = tl.where(v == 0, 0.0, float("-inf"))
+        tl.store(logits_ptr + o * row_stride + v, val, mask=v < vocab)
+
+
+def point_mass_trimmed_verify_slots_triton(
+    *, logits: torch.Tensor, verify_lens: torch.Tensor, stride: int
+) -> torch.Tensor:
+    """Point mass trimmed verify slots triton."""
+    bs = verify_lens.shape[0]
+    vocab = logits.shape[1]
+    if bs == 0 or vocab == 0:
+        return logits
+    assert logits.stride(1) == 1 and logits.shape[0] >= bs * stride
+    verify_lens = verify_lens.to(device=logits.device, dtype=torch.int64).contiguous()
+    BLOCK_V = 4096
+    grid = (bs * stride, triton.cdiv(vocab, BLOCK_V))
+    _point_mass_trimmed_slots_kernel[grid](
+        logits,
+        verify_lens,
+        logits.stride(0),
+        stride,
+        vocab,
+        BLOCK_V=BLOCK_V,
+    )
+    return logits
 
 
 class CommitInjectLayoutResult(msgspec.Struct):

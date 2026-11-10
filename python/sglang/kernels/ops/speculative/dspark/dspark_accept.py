@@ -13,6 +13,7 @@ from sglang.kernels.ops.speculative.reject_sampling import (
 )
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    _dflash_top_p_renorm_prob,
     _get_or_create_chain_verify_buffers,
     build_dflash_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
@@ -109,6 +110,26 @@ def _accept_sampling_core(
             logits=target_logits,
             temperatures=sampling_info.temperatures,
             rows_per_request=verify_num_draft_tokens,
+        ).view(bs, verify_num_draft_tokens, -1)
+    elif (
+        sampling_info.need_top_p_sampling
+        and not sampling_info.need_top_k_sampling
+        and target_logits.is_cuda
+        and _topp_softmax_temp_enabled()
+        and getattr(draft_input, "top_p_req_rows", None) is None
+    ):
+        # top-p only: one fused softmax(logits / T) instead of the elementwise
+        # divide + F.softmax pair, then the same top-p renorm.
+        probs = SoftmaxTemp.execute(
+            logits=target_logits,
+            temperatures=sampling_info.temperatures,
+            rows_per_request=verify_num_draft_tokens,
+        )
+        target_probs = _dflash_top_p_renorm_prob(
+            probs,
+            torch.repeat_interleave(
+                sampling_info.top_ps, verify_num_draft_tokens, dim=0
+            ),
         ).view(bs, verify_num_draft_tokens, -1)
     else:
         # SGLANG_OPT_DSPARK_TOPP_SOFTMAX_TEMP: when no top-k renorm is needed, one fused
@@ -267,6 +288,118 @@ def accept_sampling_triton(
     bonus = gather_two_level_bonus_triton(
         accept_index=accept_index, predicts=predicts, correct_len=correct_len
     )
+    return correct_len, bonus, cap_trim_lens
+
+
+def fused_accept_from_logits_eligible(sampling_info, draft_input, target_logits) -> bool:
+    """SGLANG_OPT_DSPARK_ACCEPT_FROM_LOGITS: sampling accept without materializing the
+    target / draft softmax. Needs no top-k renorm on sampling rows, and top-p rows (if any)
+    listed by SGLANG_OPT_DSPARK_TOPP_ROW_SKIP."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_DSPARK_ACCEPT_FROM_LOGITS.get() or not target_logits.is_cuda:
+        return False
+    if sampling_info.need_top_k_sampling and getattr(draft_input, "need_top_k_sampling_rows", True):
+        return False
+    if sampling_info.need_top_p_sampling and getattr(draft_input, "top_p_req_rows", None) is None:
+        return False
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "dspark_accept_from_logits",
+        "DSpark sampling accept reads p / q from the logits (row log-sum-exp), no full softmax",
+    )
+    return True
+
+
+def accept_sampling_from_logits(
+    *,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    draft_logits: torch.Tensor,
+    draft_temperatures: torch.Tensor,
+    sampling_info,
+    draft_input: DFlashDraftInputV2,
+    gamma: int,
+    verify_num_draft_tokens: int,
+    cutoff_verify_lens: Optional[torch.Tensor] = None,
+    want_target_argmax: bool = False,
+):
+    """Same outputs as accept_sampling_triton; see dspark_accept_fused.py. want_target_argmax also
+    returns the target rows' argmax (for the greedy rows of a mixed batch) from the lse pass."""
+    from sglang.kernels.ops.speculative.dspark.dspark_accept_fused import (
+        fused_chain_sampling_from_logits,
+        row_lse,
+    )
+
+    bs = candidates.shape[0]
+    device = candidates.device
+    S = verify_num_draft_tokens
+    topp_probs = topp_slot = None
+    rows_req = getattr(draft_input, "top_p_req_rows", None)
+    if sampling_info.need_top_p_sampling and rows_req is not None and rows_req.numel() > 0:
+        n_tp = rows_req.numel()
+        rows = (rows_req.to(torch.long)[:, None] * S + torch.arange(S, device=device)).reshape(-1)
+        probs = SoftmaxTemp.execute(
+            logits=target_logits.index_select(0, rows),
+            temperatures=sampling_info.temperatures.reshape(-1).index_select(0, rows_req.to(torch.long)),
+            rows_per_request=S,
+        )
+        topp_probs = _dflash_top_p_renorm_prob(
+            probs,
+            torch.repeat_interleave(
+                sampling_info.top_ps.reshape(-1).index_select(0, rows_req.to(torch.long)), S, dim=0
+            ),
+        )
+        topp_slot = torch.full((bs,), -1, dtype=torch.int32, device=device)
+        topp_slot.index_copy_(0, rows_req.to(torch.long), torch.arange(n_tp, dtype=torch.int32, device=device))
+    (
+        retrieve_index,
+        _retrieve_next_token,
+        _retrieve_next_sibling,
+        predicts,
+        accept_index,
+        accept_token_num,
+    ) = _get_or_create_chain_verify_buffers(bs=bs, draft_token_num=S, device=device)
+    # one RNG launch for both coin sets (contiguous [bs, gamma] head + [bs] tail)
+    coins = torch.rand((bs * (gamma + 1),), dtype=torch.float32, device=device)
+    uniform_samples = coins[: bs * gamma].view(bs, gamma)
+    uniform_samples_final = coins[bs * gamma :]
+    target_lse = target_argmax = None
+    if want_target_argmax:
+        if target_logits.stride(-1) != 1:
+            target_logits = target_logits.contiguous()
+        target_lse, target_argmax = row_lse(
+            target_logits, sampling_info.temperatures, S, with_argmax=True
+        )
+    fused_chain_sampling_from_logits(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrieve_index,
+        uniform_samples=uniform_samples,
+        uniform_samples_final=uniform_samples_final,
+        target_logits=target_logits,
+        target_temps=sampling_info.temperatures,
+        draft_logits=draft_logits,
+        draft_temps=draft_temperatures,
+        topp_probs=topp_probs,
+        topp_slot=topp_slot,
+        target_lse=target_lse,
+    )
+    correct_len = accept_token_num
+    if cutoff_verify_lens is not None:
+        correct_len, cap_trim_lens = CapCorrectLen.execute(
+            correct_len=correct_len, verify_lens=cutoff_verify_lens
+        )
+    else:
+        cap_trim_lens = torch.zeros_like(correct_len)
+    bonus = gather_two_level_bonus_triton(
+        accept_index=accept_index, predicts=predicts, correct_len=correct_len
+    )
+    if want_target_argmax:
+        return correct_len, bonus, cap_trim_lens, target_argmax
     return correct_len, bonus, cap_trim_lens
 
 
@@ -820,11 +953,12 @@ def accept_greedy_triton(
     target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = _row_argmax(target_logits).view(
-        bs, verify_num_draft_tokens
-    )
+    if target_predict is None:
+        target_predict = _row_argmax(target_logits)
+    target_predict = target_predict.view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,

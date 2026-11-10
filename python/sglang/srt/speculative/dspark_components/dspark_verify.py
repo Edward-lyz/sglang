@@ -14,8 +14,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     FinalizeAcceptLens,
     SelectMixedAccept,
     SoftmaxTemp,
+    _row_argmax,
     accept_greedy_triton,
+    accept_sampling_from_logits,
     finalize_accept_lens_triton,
+    fused_accept_from_logits_eligible,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -56,6 +59,20 @@ _is_npu = is_npu()
 _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
 
 
+def _compact_epilogue_lean() -> bool:
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_DSPARK_COMPACT_EPILOGUE_LEAN.get():
+        return False
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "dspark_compact_epilogue_lean",
+        "DSpark compact verify epilogue: compact-row argmax + skip padded slots",
+    )
+    return True
+
+
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if sampling_info is None:
         return True
@@ -71,6 +88,18 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if getattr(sampling_info, "logit_bias", None) is not None:
         return False
     return True
+
+
+def compact_trimmed_slots_need_point_mass(sampling_info) -> bool:
+    """Compact verify leaves the strided slots past each verify_len zero-filled;
+    only the top-p/top-k renorm of a sampling accept pays for their uniform
+    softmax (greedy argmax and plain softmax do not)."""
+    if sampling_info is None or sampling_info.is_all_greedy:
+        return False
+    return bool(
+        getattr(sampling_info, "need_top_p_sampling", False)
+        or getattr(sampling_info, "need_top_k_sampling", False)
+    )
 
 
 class TargetVerifyResult(msgspec.Struct, frozen=True):
@@ -662,7 +691,32 @@ class DsparkVerifyEpilogue:
         self.strided_logits = self._ensure_out(self.strided_logits, compact_logits)
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
-        self._scatter(compact_logits, compact_hidden, verify_lens, bs)
+        lean = _compact_epilogue_lean()
+        target_predict = None
+        if lean:
+            # Argmax the compact rows (the real tier) instead of bs * stride
+            # strided rows; trimmed / padded positions get 0, which is what the
+            # argmax of their zero-filled strided rows returned. The source is
+            # padded to bs * stride rows: graph capture runs on stale verify
+            # lens whose sum can exceed the tier.
+            n_rows = compact_logits.shape[0]
+            pred_src = torch.zeros(
+                (max(n_rows, bs * self.stride), 1),
+                dtype=torch.int64,
+                device=input_ids.device,
+            )
+            pred_src[:n_rows, 0] = _row_argmax(compact_logits)
+            target_predict = torch.empty(
+                (bs * self.stride, 1), dtype=torch.int64, device=input_ids.device
+            )
+            scatter_compact_to_strided_into(
+                compact=pred_src,
+                verify_lens=verify_lens,
+                out=target_predict,
+                stride=self.stride,
+                fill_value=0,
+            )
+        self._scatter(compact_logits, compact_hidden, verify_lens, bs, skip_empty=lean)
         candidates = torch.zeros(
             (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
         )
@@ -679,19 +733,23 @@ class DsparkVerifyEpilogue:
             draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
             seq_lens=seq_lens,
             cutoff_verify_lens=verify_lens,
+            target_predict=target_predict,
         )
         if self.folds_commit:
             self._commit_inject(
                 commit_lens, verify_lens, seq_lens, req_pool_indices, bs
             )
 
-    def _scatter(self, compact_logits, compact_hidden, verify_lens, bs: int) -> None:
+    def _scatter(
+        self, compact_logits, compact_hidden, verify_lens, bs: int, skip_empty=False
+    ) -> None:
         scatter_compact_to_strided_into(
             compact=compact_logits,
             verify_lens=verify_lens,
             out=self.strided_logits[: bs * self.stride],
             stride=self.stride,
             fill_value=0.0,
+            skip_empty=skip_empty,
         )
         scatter_compact_to_strided_into(
             compact=compact_hidden,
@@ -699,10 +757,18 @@ class DsparkVerifyEpilogue:
             out=self.strided_hidden[: bs * self.stride],
             stride=self.stride,
             fill_value=0.0,
+            skip_empty=skip_empty,
         )
 
     def _accept(
-        self, *, candidates, logits, draft_tokens, seq_lens, cutoff_verify_lens=None
+        self,
+        *,
+        candidates,
+        logits,
+        draft_tokens,
+        seq_lens,
+        cutoff_verify_lens=None,
+        target_predict=None,
     ) -> torch.Tensor:
         bs = candidates.shape[0]
         correct_len, bonus, cap_trim_lens = accept_greedy_triton(
@@ -710,6 +776,7 @@ class DsparkVerifyEpilogue:
             target_logits=logits,
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
+            target_predict=target_predict,
         )
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
@@ -793,6 +860,39 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
         )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+    if fused_accept_from_logits_eligible(sampling_info, draft_input, target_logits):
+        sampling_out = accept_sampling_from_logits(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+            draft_temperatures=draft_block.temperatures,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+            want_target_argmax=sampling_info.is_any_greedy,
+        )
+        if not sampling_info.is_any_greedy:
+            return sampling_out
+        # greedy rows reuse the target argmax taken during the lse pass
+        greedy_len, greedy_bonus, greedy_trim = accept_greedy_triton(
+            candidates=candidates,
+            target_logits=target_logits,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+            target_predict=sampling_out[3],
+        )
+        selected = SelectMixedAccept.execute(
+            greedy_mask=greedy_mask,
+            greedy_len=greedy_len,
+            greedy_bonus=greedy_bonus,
+            greedy_trim=greedy_trim,
+            sampling_len=sampling_out[0],
+            sampling_bonus=sampling_out[1],
+            sampling_trim=sampling_out[2],
+        )
+        return selected.correct_len, selected.bonus, selected.cap_trim_lens
     draft_probs = SoftmaxTemp.execute(
         logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
         temperatures=draft_block.temperatures,

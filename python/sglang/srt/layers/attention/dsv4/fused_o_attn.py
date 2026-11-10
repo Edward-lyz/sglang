@@ -147,3 +147,22 @@ def wo_a_einsum(
         "bhr,hdr->bhd", (out_fp8, out_sf), (wo_a_fp8, wo_a_sf), out, recipe=(1, 1, SF_GRAN)
     )
     return out
+
+
+def wo_a_einsum_mxfp8(
+    out_fp8: torch.Tensor, out_sf: torch.Tensor, wo_a_fp8: torch.Tensor, wo_a_sf: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``wo_a_einsum`` with DeepGEMM's FP8 ``(d, sfd)`` output: the same fp8 einsum, but the
+    epilogue casts D per-32 (packed ue8m0, MN-major, TMA-aligned) over ``d.flatten(1, 2)``,
+    i.e. wo_b's MXFP8 input. Returns ``(d_fp8 [T, G*D], sfd int32 [T, G*D/128] view)``."""
+    import deep_gemm
+
+    t, g, _ = out_fp8.shape
+    n = wo_a_fp8.shape[1]
+    d_fp8 = torch.empty(t, g, n, dtype=torch.float8_e4m3fn, device=out_fp8.device)
+    m_pad = (t + 3) // 4 * 4
+    sfd = torch.empty(g * n // 128, m_pad, dtype=torch.int32, device=out_fp8.device).mT[:t]
+    deep_gemm.fp8_einsum(
+        "bhr,hdr->bhd", (out_fp8, out_sf), (wo_a_fp8, wo_a_sf), (d_fp8, sfd), recipe=(1, 1, SF_GRAN)
+    )
+    return d_fp8.view(t, g * n), sfd

@@ -59,6 +59,11 @@ from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.speculative.ragged_verify import (
+    log_compact_adapt_once,
+    ragged_verify_token_rows,
+    resolve_compact_verify_layout,
+)
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -299,9 +304,28 @@ class EngramHasher(nn.Module):
         # req_slots unless the scheduler supplied this extend's predecessors.
         num_real, block, row, starts = num_tokens, 1, None, None
         history, hist_via_slots = self.history, True
+        ragged = resolve_compact_verify_layout(forward_batch)
         if mode.is_decode():
             kmode = MODE_DECODE
             commit_rows, commit_last = req_slots, None
+        elif ragged is not None:
+            # Compact verify packs a variable run per request: the extend row map
+            # over the device qo_indptr (graph-refreshed), every token hashed (the
+            # kernel's num_real is host-static), and, like MODE_VERIFY, no history
+            # commit -- commit_after_verify does it after acceptance. Graph
+            # padding tokens map to the last row with position 0, so every
+            # look-back is PAD and nothing is written.
+            row, _ = ragged_verify_token_rows(ragged.qo_indptr_device, num_tokens)
+            starts = ragged.qo_indptr_device[:-1].to(torch.int64)
+            kmode = MODE_EXTEND
+            commit_rows = commit_last = None
+            log_compact_adapt_once(
+                "engram_ragged_verify",
+                "engram target-verify hashes the compact ragged layout "
+                "(tokens=%d, rows=%d)",
+                num_tokens,
+                bs,
+            )
         elif mode.is_target_verify():
             block = int(forward_batch.spec_info.draft_token_num)
             assert num_tokens == bs * block, (
@@ -911,6 +935,7 @@ class EngramEmbedding(nn.Module):
         return self._lookup(indices)
 
     def _peer_lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        """Look up rows from the peer-sharded table (engram_peer) and dequantize."""
         if indices.numel() == 0:
             return self._empty(indices)
         assert self.peer.ready, "engram peer table used before finish_load"
@@ -1308,6 +1333,10 @@ class EngramPeerExchange(EngramPackedExchange):
         forward_batch: ForwardBatch,
         cp_rows: Optional[int] = None,
     ) -> Optional[dict]:
+        """Gather and unpack every engram layer's rows for this rank's tokens.
+
+        Returns None until all peer tables are connected (caller falls back).
+        """
         if not all(e.embed.peer.ready for e in self.engrams):
             return None
         layers = len(self.engrams)

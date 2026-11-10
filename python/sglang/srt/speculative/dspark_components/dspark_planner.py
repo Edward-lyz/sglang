@@ -174,10 +174,23 @@ class DSparkVerifyPlanner:
                 and require_mlp_tp_gather()
                 and not get_schedule().disable_overlap_schedule
                 and not get_spec().speculative_skip_dp_mlp_sync
-                and get_disagg().disaggregation_mode == "null"
+                # PD decode runs the same run_batch -> prepare_verify_budget
+                # path (prebuilt batches merge into the running batch and never
+                # reach run_batch), so the gather stays lockstep across ranks.
+                and get_disagg().disaggregation_mode in ("null", "decode")
                 and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
+            if (
+                tp_rank == 0
+                and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+                and get_disagg().disaggregation_mode == "decode"
+            ):
+                logger.info(
+                    "[compact-adapt] dsv41 compact ragged verify enabled "
+                    "(pd-decode, dp-tier-gather=%s)",
+                    self._dp_tier_gather_enabled,
+                )
             if tp_rank == 0:
                 sps_table_source = (
                     get_spec().speculative_dspark_sps_table_path or "uninitialized"
