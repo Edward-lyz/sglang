@@ -2058,6 +2058,7 @@ class TraceType:
     SAMPLE = "sample"
     LOGPROBS = "logprobs"
     ALL = "all"
+    AS_CACHE = "as_cache"
 
 
 class TraceTrigger:
@@ -2076,6 +2077,9 @@ class TraceReq(BaseReq, kw_only=True):
     payload: Optional[Dict[str, Any]] = None
     return_logprob: bool = False
     return_online: bool = False
+    # Deterministic request id shared by normal trace and AS trace. Minted at
+    # Req init (build_trace_req); downstream (TraceManager, ASCache) reads it here.
+    unique_trace_id: Optional[str] = None
 
     def __post_init__(self):
         if self.rid is None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import time
@@ -316,7 +317,8 @@ class SchedulerProfilerManager:
 
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
-        if self.torch_profiler is not None:
+        had_torch_profiler = self.torch_profiler is not None
+        if had_torch_profiler:
             self.torch_profiler.stop()
             if not _is_npu:
                 # Build filename with only non-zero ranks to maintain backward compatibility
@@ -381,6 +383,13 @@ class SchedulerProfilerManager:
         self.torch_profiler = None
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
+
+        if had_torch_profiler:
+            # profiler 的 action_map 保存绑定方法，形成循环引用；仅置 None 不会立即释放。
+            # trace 导出后、stop_profile 返回前完成回收，避免随后一次 AS prepare
+            # 意外承担 Kineto 大对象析构。所有 rank 完成回收后再恢复普通请求。
+            gc.collect()
+            torch.distributed.barrier(self.dp_tp_cpu_group)
 
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 

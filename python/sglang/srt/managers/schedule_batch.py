@@ -797,6 +797,7 @@ class Req(ReqDllmMixin):
         routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        dispatch_to_scheduler_time: Optional[float] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
@@ -816,6 +817,7 @@ class Req(ReqDllmMixin):
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
+        trace_config: Optional[Dict[str, Any]] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -844,6 +846,31 @@ class Req(ReqDllmMixin):
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
+        self.trace_config = trace_config
+        self.to_trace_req = self.build_trace_req()
+        self.trace_info: Optional[Dict[str, Any]] = None
+
+        # AttentionStore request state. These fields are initialized even when
+        # the SDK is unavailable so the cache policy remains safe to evaluate.
+        self.as_block_hashs = None
+        self.as_kv_cache_params = None
+        self.as_max_hit_host_ip: list = []
+        self.as_max_hit_token_len: list = []
+        self.as_trace_context: Optional[Any] = None
+        if (
+            trace_config
+            and trace_config.get("enable_trace")
+            and trace_config.get("trace_type") in ("as_cache", "all")
+            and self.to_trace_req is not None
+        ):
+            from sglang.srt.mem_cache.as_trace import ASTraceContext
+
+            self.as_trace_context = ASTraceContext(
+                self, self.to_trace_req.unique_trace_id
+            )
+        self.ever_read_as: bool = False
+        self.ever_read_as: bool = False
+        self._as_cache_read_abort_reason: Optional[str] = None
 
         # For req-level memory management
         self.kv_committed_len = 0
@@ -866,11 +893,18 @@ class Req(ReqDllmMixin):
         # Require reasoning for the request
         self.require_reasoning = require_reasoning
 
+        # Grammar manager compatibility: ordinary requests have no continuation
+        # token sequence unless a constrained-generation path supplies one.
+        self.continuation_token_ids: Optional[List[int]] = None
+
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
         self._is_reasoning_over = False
         self.reasoning_tokens = 0
         self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
+        self._thinking_budget_end_ids: List[int] = []
+        self._thinking_budget_end_matcher: Optional[TokenSequenceMatcher] = None
+        self._thinking_budget_end_match_len = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -884,6 +918,12 @@ class Req(ReqDllmMixin):
         self.return_hidden_states_mode = get_return_hidden_states_mode(
             return_hidden_states
         )
+        # Mutated only by the scheduler event loop; these fields are also
+        # initialized for ordinary requests so the fast path can call the
+        # update helper without an attribute check.
+        self.thinking_budget: Optional[int] = None
+        self.thinking_inject_index: int = 0
+        self.thinking_prompt_token_ids: Optional[List[int]] = None
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -1109,6 +1149,9 @@ class Req(ReqDllmMixin):
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
 
+        # Timestamp when tokenizer dispatched the request to the scheduler.
+        self.dispatch_to_scheduler_time = dispatch_to_scheduler_time
+
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
@@ -1151,8 +1194,34 @@ class Req(ReqDllmMixin):
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
 
-        # For hisparse
-        self.hisparse_staging = False
+    def build_trace_req(self):
+        """Build TraceReq from trace_config at init time.
+
+        Parses trace_config to create a TraceReq. Returns None if tracing is
+        not enabled or trace_type is missing.
+        """
+        from sglang.srt.managers.io_struct import TraceReq, TraceType, TraceTrigger
+        from sglang.srt.content_detection.config import DETECTION_CONFIG
+        from sglang.srt.mem_cache.as_trace import build_unique_trace_id
+
+    def build_trace_req(self):
+        """Translate request trace configuration into a scheduler control object."""
+        cfg = self.trace_config or {}
+        if not cfg.get("enable_trace") or not cfg.get("trace_type"):
+            return None
+        from sglang.srt.content_detection.config import DETECTION_CONFIG
+        from sglang.srt.managers.io_struct import TraceReq, TraceTrigger
+
+        return TraceReq(
+            rid=self.rid,
+            dump_dir=cfg.get("dump_dir") or DETECTION_CONFIG.trace_dump_dir,
+            trace_type=cfg["trace_type"],
+            trigger=cfg.get("trigger", TraceTrigger.ON_FINISH),
+            payload=cfg.get("payload"),
+            return_logprob=cfg.get("return_logprob", False),
+            return_online=cfg.get("online", True),
+            unique_trace_id=build_unique_trace_id(self),
+        )
 
     @property
     def seqlen(self) -> int:
@@ -1218,6 +1287,20 @@ class Req(ReqDllmMixin):
     def finished(self) -> bool:
         # Whether request reached finished condition
         return self.finished_reason is not None
+
+    @property
+    def fill_len(self) -> int:
+        """Compatibility accessor for the end of the current extend range."""
+        if self.extend_range is None:
+            return len(self.full_untruncated_fill_ids)
+        return self.extend_range.end
+
+    @property
+    def extend_input_len(self) -> int:
+        """Compatibility accessor for the current extend length."""
+        if self.extend_range is None:
+            return max(0, len(self.full_untruncated_fill_ids) - len(self.prefix_indices))
+        return self.extend_range.length
 
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)
@@ -1443,29 +1526,37 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+    def find_stop_token_index(self, tokens: List[int]) -> int:
+        """Return the first configured stop token index, or ``-1``."""
         if self.sampling_params.ignore_eos:
+            return -1
+
+        stop_ids = self.sampling_params.stop_token_ids
+        extra_stop_ids = (
+            self.tokenizer.additional_stop_token_ids if self.tokenizer else None
+        )
+        tokenizer_eos = self.tokenizer.eos_token_id if self.tokenizer else None
+        for i, token_id in enumerate(tokens):
+            if stop_ids and token_id in stop_ids:
+                return i
+            if self.eos_token_ids and token_id in self.eos_token_ids:
+                return i
+            if tokenizer_eos is not None and token_id == tokenizer_eos:
+                return i
+            if extra_stop_ids and token_id in extra_stop_ids:
+                return i
+        return -1
+
+    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+        stop_idx = self.find_stop_token_index(new_accepted_tokens)
+        if stop_idx == -1:
             return False
-
-        # Check stop token ids
-        matched_eos = False
-
-        for i, token_id in enumerate(new_accepted_tokens):
-            if self.sampling_params.stop_token_ids:
-                matched_eos |= token_id in self.sampling_params.stop_token_ids
-            if self.eos_token_ids:
-                matched_eos |= token_id in self.eos_token_ids
-            if self.tokenizer is not None:
-                matched_eos |= token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
-            if matched_eos:
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
-                matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
-                self.finished_len = matched_pos + 1
-                return True
-
-        return False
+        self.finished_reason = FINISH_MATCHED_TOKEN(
+            matched=new_accepted_tokens[stop_idx]
+        )
+        matched_pos = len(self.output_ids) - len(new_accepted_tokens) + stop_idx
+        self.finished_len = matched_pos + 1
+        return True
 
     def _locate_str_stop_finished_len(
         self,
@@ -1768,6 +1859,121 @@ class Req(ReqDllmMixin):
 
         self._think_end_match_len = matched
         self.reasoning_tokens += len(token_id)
+
+    def init_thinking_budget(self, think_end_ids: Optional[List[int]] = None):
+        """Initialize mutable request state for scheduler-level think budgets."""
+        thinking_budget = getattr(self.sampling_params, "thinking_budget", None)
+        if thinking_budget is None:
+            return
+
+        self.thinking_budget = int(thinking_budget)
+        self.thinking_inject_index = 0
+        self._thinking_budget_end_ids = [int(token_id) for token_id in (think_end_ids or [])]
+
+        # Older tokenizer implementations expose a single think_end_id rather
+        # than the scheduler's model_config.think_end_ids list.
+        if not self._thinking_budget_end_ids and self.tokenizer is not None:
+            think_end_id = getattr(self.tokenizer, "think_end_id", None)
+            if isinstance(think_end_id, (list, tuple)):
+                self._thinking_budget_end_ids = [
+                    int(token_id) for token_id in think_end_id
+                ]
+            elif think_end_id is None:
+                # The reasoning parser normally publishes this ID through
+                # model_config. Keep the feature usable when that parser is
+                # disabled by deriving a single-token </think> encoding.
+                encode = getattr(self.tokenizer, "encode", None)
+                if encode is not None:
+                    end_ids = encode("</think>", add_special_tokens=False)
+                    if end_ids:
+                        self._thinking_budget_end_ids = [
+                            int(token_id) for token_id in end_ids
+                        ]
+                        if len(self._thinking_budget_end_ids) == 1:
+                            self.tokenizer.think_end_id = self._thinking_budget_end_ids[0]
+            elif think_end_id is not None:
+                self._thinking_budget_end_ids = [int(think_end_id)]
+
+        self._thinking_budget_end_matcher = (
+            TokenSequenceMatcher(self._thinking_budget_end_ids)
+            if self._thinking_budget_end_ids
+            else None
+        )
+        self._thinking_budget_end_match_len = 0
+
+        prompt_token_ids = getattr(
+            self.sampling_params, "thinking_prompt_token_ids", None
+        )
+        self.thinking_prompt_token_ids = [int(token_id) for token_id in (prompt_token_ids or [])]
+        # The public field intentionally excludes </think>; always append the
+        # configured model-specific end sequence on the scheduler side.
+        self.thinking_prompt_token_ids.extend(self._thinking_budget_end_ids)
+
+    def maybe_inject_thinking_token(self, token_id: int) -> int:
+        """Return the next transition token when the budget is exhausted."""
+        if self.thinking_budget != 0:
+            return token_id
+        if not self.thinking_prompt_token_ids:
+            self.thinking_budget = -1
+            return token_id
+
+        token_id = self.thinking_prompt_token_ids[self.thinking_inject_index]
+        self.thinking_inject_index += 1
+        if self.thinking_inject_index >= len(self.thinking_prompt_token_ids):
+            self.thinking_budget = -1
+        return token_id
+
+    def inject_thinking_prompt_tokens(
+        self,
+        draft_tokens: torch.Tensor,
+        start_idx: Union[int, torch.Tensor],
+        max_count: int,
+        advance: bool = True,
+    ) -> int:
+        """Overwrite a speculative token window with transition prompt ids."""
+        if self.thinking_budget != 0 or not self.thinking_prompt_token_ids:
+            return 0
+        inject_index = self.thinking_inject_index
+        remains = len(self.thinking_prompt_token_ids) - inject_index
+        if remains <= 0 or max_count <= 0:
+            return 0
+
+        count = min(max_count, remains)
+        inject_ids = self.thinking_prompt_token_ids[inject_index : inject_index + count]
+        inject_tensor = torch.tensor(
+            inject_ids, dtype=draft_tokens.dtype, device=draft_tokens.device
+        )
+        if isinstance(start_idx, torch.Tensor):
+            draft_tokens[start_idx[:count]] = inject_tensor
+        else:
+            draft_tokens[start_idx : start_idx + count] = inject_tensor
+        if advance:
+            self.thinking_inject_index += count
+            if self.thinking_inject_index >= len(self.thinking_prompt_token_ids):
+                self.thinking_budget = -1
+        return count
+
+    def update_thinking_state(self, new_token_ids: List[int]) -> None:
+        """Consume natural output tokens and stop at the think-end sequence."""
+        if self.thinking_budget is None or self.thinking_budget < 0:
+            return
+        if not isinstance(new_token_ids, list):
+            new_token_ids = [new_token_ids]
+
+        for token_id in new_token_ids:
+            if self._thinking_budget_end_matcher is not None:
+                self._thinking_budget_end_match_len = (
+                    self._thinking_budget_end_matcher.advance(
+                        self._thinking_budget_end_match_len, int(token_id)
+                    )
+                )
+                if self._thinking_budget_end_match_len == len(
+                    self._thinking_budget_end_matcher
+                ):
+                    self.thinking_budget = -1
+                    return
+            if self.thinking_budget > 0:
+                self.thinking_budget -= 1
 
     def __repr__(self):
         return (
@@ -2088,6 +2294,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    dp_global_num_tokens_for_metric: Optional[List[int]] = None
+    # Host-side duration of the DP synchronization used to prepare this batch.
+    all_gather_latency: float = 0.0
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
@@ -2097,6 +2306,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+
+    @property
+    def is_spec_v2(self) -> bool:
+        """Return whether the batch uses the supported speculative V2 path."""
+        # Keep the legacy predicate available to disaggregation overlap code.
+        # Spec V2 is only active when overlap and a speculative algorithm are
+        # both enabled, and the algorithm must advertise V2 support.
+        ret = self.enable_overlap and not self.spec_algorithm.is_none()
+        assert not ret or self.spec_algorithm.supports_spec_v2()
+        return ret
 
     @classmethod
     def init_new(
@@ -3186,6 +3405,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            dp_global_num_tokens_for_metric=self.dp_global_num_tokens_for_metric,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,

@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import TraceTrigger
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -793,6 +794,14 @@ class SchedulerDisaggregationPrefillMixin:
         ]
         for req in stream_reqs:
             req.finished_reason = FINISH_LENGTH(length=0)
+            trace_req = req.to_trace_req
+            if (
+                trace_req is not None
+                and trace_req.trigger == TraceTrigger.ON_FINISH
+                and trace_req.return_online
+            ):
+                self._run_trace(trace_req, req)
+                req.to_trace_req = None
         if stream_reqs:
             self.output_streamer.stream_output(
                 stream_reqs,
@@ -862,6 +871,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                self.batch_result_processor._fire_pending_trace(req)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
