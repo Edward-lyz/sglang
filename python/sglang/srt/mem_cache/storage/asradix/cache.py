@@ -26,10 +26,10 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from .coordinator import AttentionStoreCoordinator
 from .plans import AttentionStoreCachePlan
 from .types import (
+    AS_BLOCK_SIZE,
     AttentionStoreBinding,
     AttentionStoreInitContext,
     AttentionStoreWriteOwner,
-    AS_BLOCK_SIZE,
 )
 
 logger = logging.getLogger(__name__)
@@ -249,6 +249,46 @@ class AttentionStoreIntegrationMixin:
             )
         return matched
 
+    def _match_as_aligned_local_prefix(
+        self,
+        params: MatchPrefixParams,
+        local_result: MatchResult,
+    ) -> MatchResult:
+        """Rematch until the actual local prefix ends on an AS block boundary."""
+        block_size = self.attention_store_block_size
+        max_hit_len = len(params.key) // block_size * block_size
+        while True:
+            local_hit_len = len(local_result.device_indices)
+            aligned_len = min(local_hit_len // block_size * block_size, max_hit_len)
+            if local_hit_len == aligned_len:
+                break
+            # A capped KDA match can fall back to an earlier, unaligned state.
+            # Rematch that prefix too; slicing KV alone would keep the wrong state.
+            local_result = UnifiedRadixCache.match_prefix(
+                self,
+                MatchPrefixParams(
+                    key=RadixKey(
+                        params.key.token_ids,
+                        params.key.extra_key,
+                        is_bigram=params.key.is_bigram,
+                        limit=aligned_len + int(params.key.is_bigram),
+                    ),
+                    cow_mamba=params.cow_mamba,
+                    req=params.req,
+                ),
+            )
+            if len(local_result.device_indices) > aligned_len:
+                raise RuntimeError(
+                    "local cache match exceeded the AttentionStore prefix limit: "
+                    f"limit={aligned_len} actual={len(local_result.device_indices)}"
+                )
+        if local_hit_len == 0 and params.cow_mamba and params.req is not None:
+            # An empty rematch does not run Mamba's postprocessor, so discard
+            # any deferred COW recorded by the earlier, longer prefix match.
+            params.req.mamba_cow_src_index = None
+            params.req.mamba_needs_clear = True
+        return local_result
+
     def _match_checkpointed_page_prefix(
         self,
         params: MatchPrefixParams,
@@ -267,24 +307,10 @@ class AttentionStoreIntegrationMixin:
         block_size = self.attention_store_block_size
         max_hit_len = len(params.key) // block_size * block_size
         joint_pp_match = self.pp_world_size > 1
+        local_result = self._match_as_aligned_local_prefix(params, local_result)
         local_hit_len = len(local_result.device_indices)
-        aligned_local_hit_len = local_hit_len // block_size * block_size
-        if local_hit_len != aligned_local_hit_len:
-            local_result = super().match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(
-                        params.key.token_ids,
-                        params.key.extra_key,
-                        is_bigram=params.key.is_bigram,
-                        limit=aligned_local_hit_len,
-                    ),
-                    cow_mamba=params.cow_mamba,
-                    req=req,
-                )
-            )
-            local_hit_len = len(local_result.device_indices)
         if local_hit_len == max_hit_len and not joint_pp_match:
-            return None
+            return local_result
 
         start_block = local_hit_len // block_size
         # Every PP stage must submit the same absolute prefix to its local Agent.
@@ -297,7 +323,14 @@ class AttentionStoreIntegrationMixin:
         # Apply the request's prefix limit before matching so a later checkpoint
         # cannot be matched and then relabeled as an earlier prefix by truncation.
         if not hashes:
-            return zero_match_result(self, local_result) if joint_pp_match else None
+            return self._match_as_aligned_local_prefix(
+                params,
+                (
+                    zero_match_result(self, local_result)
+                    if joint_pp_match
+                    else local_result
+                ),
+            )
 
         requested = len(hashes)
         started = time.perf_counter()
@@ -354,7 +387,14 @@ class AttentionStoreIntegrationMixin:
                 started=started,
             )
         if match_count <= 0:
-            return zero_match_result(self, local_result) if joint_pp_match else None
+            return self._match_as_aligned_local_prefix(
+                params,
+                (
+                    zero_match_result(self, local_result)
+                    if joint_pp_match
+                    else local_result
+                ),
+            )
 
         terminal_block = match_count if joint_pp_match else start_block + match_count
         if terminal_block <= start_block:
@@ -374,7 +414,9 @@ class AttentionStoreIntegrationMixin:
             # The capped Full-KV path can still stop before the negotiated
             # endpoint when no exact local Mamba/KDA checkpoint exists there.
             # Continue through the normal AS load path for the remaining gap.
-            local_result = super().match_prefix(capped_params)
+            local_result = self._match_as_aligned_local_prefix(
+                capped_params, local_result
+            )
             local_hit_len = len(local_result.device_indices)
             start_block = local_hit_len // block_size
             if terminal_block == start_block:

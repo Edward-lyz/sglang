@@ -91,27 +91,11 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
             return None
         block_size = cache.attention_store_block_size
         max_hit_length = len(params.key) // block_size * block_size
-        local_hit_length = local_result.device_indices.numel()
-        aligned_local_hit_length = min(
-            local_hit_length // block_size * block_size, max_hit_length
-        )
-        if local_hit_length != aligned_local_hit_length:
-            local_result = UnifiedRadixCache.match_prefix(
-                cache,
-                MatchPrefixParams(
-                    key=RadixKey(
-                        params.key.token_ids,
-                        params.key.extra_key,
-                        is_bigram=params.key.is_bigram,
-                        limit=aligned_local_hit_length,
-                    ),
-                    cow_mamba=params.cow_mamba,
-                    req=req,
-                ),
-            )
-        if aligned_local_hit_length == max_hit_length:
-            return local_result if local_hit_length != aligned_local_hit_length else None
-        return self._match_remote(cache, req, local_result)
+        local_result = cache._match_as_aligned_local_prefix(params, local_result)
+        if len(local_result.device_indices) == max_hit_length:
+            return local_result
+        remote_result = self._match_remote(cache, req, local_result)
+        return remote_result if remote_result is not None else local_result
 
     def init_load_back(
         self,
@@ -142,7 +126,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
         local_result: MatchResult,
     ) -> Optional[MatchResult]:
         block_size = cache.attention_store_block_size
-        local_hit_len = len(local_result.device_indices) // block_size * block_size
+        local_hit_len = len(local_result.device_indices)
         start_block = local_hit_len // block_size
         # Router hints describe one namespace/host. Multi-node PP requests use
         # an Agent-coordinated quote before this coordinator is entered.
@@ -150,9 +134,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
         remote_len = req.as_max_hit_token_len if cache.pp_size <= 1 else []
 
         if remote_len and len(remote_len) == 1 and remote_len[0] > 0:
-            as_hit_tokens = (
-                (remote_len[0] - local_hit_len) // block_size
-            ) * block_size
+            as_hit_tokens = ((remote_len[0] - local_hit_len) // block_size) * block_size
             if as_hit_tokens <= 0:
                 return None
         else:
@@ -168,8 +150,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
 
             match_count = cache._as_min(match_count)
             max_blocks = max(
-                (len(req.full_untruncated_fill_ids) - local_hit_len - 1)
-                // block_size,
+                (len(req.full_untruncated_fill_ids) - local_hit_len - 1) // block_size,
                 0,
             )
             match_count = min(match_count, max_blocks)
