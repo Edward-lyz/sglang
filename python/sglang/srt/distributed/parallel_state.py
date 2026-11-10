@@ -1871,6 +1871,7 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
+_VOCAB_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
@@ -1900,6 +1901,25 @@ def get_attn_tp_group() -> GroupCoordinator:
         _ATTN_TP is not None
     ), "attention tensor model parallel group is not initialized"
     return _ATTN_TP
+
+
+def get_vocab_tp_group() -> GroupCoordinator:
+    """TP group the vocab-parallel weights (embedding / lm_head) shard over when
+    their scope is the model TP group. Equals the TP group unless
+    SGLANG_VOCAB_TP_SIZE narrows it to an intra-node block, in which case the
+    table is replicated once per block."""
+    if _VOCAB_TP is None:
+        return get_tp_group()
+    return _VOCAB_TP
+
+
+def get_narrowed_vocab_tp_group() -> Optional[GroupCoordinator]:
+    """The vocab shard group only when it is NARROWER than the TP group; None
+    means the vocab scope follows TP, so callers should keep using the TP
+    rank/size/group (which stay overridable in tests)."""
+    if _VOCAB_TP is None or _VOCAB_TP is _TP:
+        return None
+    return _VOCAB_TP
 
 
 def get_attn_cp_group() -> GroupCoordinator:
@@ -1995,7 +2015,7 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _MOE_EP, _MOE_TP):
+            for group in (_DCP, _MOE_EP, _MOE_TP, _VOCAB_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2441,6 +2461,45 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+    # Vocab-parallel shard group for the embedding / lm_head. Defaults to the
+    # whole TP group; SGLANG_VOCAB_TP_SIZE narrows it to contiguous blocks
+    # (global ranks are node-contiguous, so a block of the per-node GPU count is
+    # intra-node) and the vocab table is replicated once per block.
+    global _VOCAB_TP
+    assert _VOCAB_TP is None, "vocab tensor model parallel group is already initialized"
+    vocab_tp_size = envs.SGLANG_VOCAB_TP_SIZE.get() or tensor_model_parallel_size
+    if tensor_model_parallel_size % vocab_tp_size != 0:
+        raise RuntimeError(
+            f"SGLANG_VOCAB_TP_SIZE ({vocab_tp_size}) must divide "
+            f"tensor_model_parallel_size ({tensor_model_parallel_size})"
+        )
+    if vocab_tp_size == tensor_model_parallel_size:
+        _VOCAB_TP = _TP
+    else:
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            for block_idx in range(tensor_model_parallel_size // vocab_tp_size):
+                st = (
+                    tp_group_idx * tensor_model_parallel_size
+                    + block_idx * vocab_tp_size
+                )
+                group_ranks.append(list(range(st, st + vocab_tp_size)))
+        _VOCAB_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            # pynccl is what makes the vocab collectives capturable in the
+            # decode / draft cuda graphs (see graph_capture()).
+            use_pynccl=True,
+            use_mscclpp_allreduce=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_allreduce=False,
+            group_name="vocab_tp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
     moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
@@ -2779,7 +2838,13 @@ def destroy_model_parallel():
         dwdp_mgr.cleanup()
         set_global_dwdp_manager(None)
 
-    global _TP
+    global _TP, _VOCAB_TP
+    # Destroy _VOCAB_TP before _TP: only a narrowed (non-aliasing) group owns
+    # itself, and that check needs _TP to still be set.
+    if _VOCAB_TP is not None and _VOCAB_TP is not _TP:
+        _VOCAB_TP.destroy()
+    _VOCAB_TP = None
+
     if _TP:
         _TP.destroy()
     _TP = None

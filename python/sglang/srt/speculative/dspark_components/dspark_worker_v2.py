@@ -169,6 +169,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             embed_tokens=self._resolve_target_embed_tokens(target_model),
             lm_head=lm_head,
         )
+        # Set by attach_shared_modules: a shared target embed / lm_head that
+        # shards its vocab over the global TP group (dp attention without
+        # --enable-dp-lm-head, or SGLANG_ENABLE_EMBED_DP_SHARD) makes the draft
+        # gather rows across attention-DP ranks, so every rank must join.
+        self._dp_vocab_sync = bool(
+            getattr(self.draft_model, "lm_head_dp_gather", False)
+            or getattr(self.draft_model, "embed_dp_gather", False)
+        )
+        # Largest captured draft row count: the capacity every DP-gathered vocab
+        # collective pads to when the batch fits, so graph replays (which bake
+        # it) and eager / idle joins always agree on the shape.
+        self._dp_graph_rows = (
+            max(server_args.cuda_graph_config.decode.bs) * int(self.gamma)
+            if self._dp_vocab_sync and self._decode_graph_allowed
+            else None
+        )
+        self.draft_model.dp_embed_rows_capacity = self._dp_graph_rows
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -207,6 +224,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+            dp_vocab_sync=self._dp_vocab_sync,
+            dp_graph_rows=self._dp_graph_rows,
         )
         self._verify_epilogue = None
         if (
@@ -340,6 +359,25 @@ class DSparkWorkerV2(BaseSpecWorker):
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
+    def _vocab_graph_capture_context(self):
+        """Put the lm_head shard group's pynccl comm in graph mode for the draft
+        capture.
+
+        The draft graphs are captured with the ambient TP group patched to
+        attn-TP, so the module-level ``graph_capture()`` only switches THAT
+        group into graph mode (pynccl enabled). The DP-gathered lm-head
+        collectives run on the shard group (the global TP group), whose pynccl
+        comm would stay disabled and fall back to torch.distributed -- which is
+        not capturable and stalls the capture.
+        """
+        if not self._dp_vocab_sync:
+            return nullcontext()
+        group = getattr(self.draft_model, "lm_head_group", None)
+        pynccl_comm = getattr(group, "pynccl_comm", None)
+        if pynccl_comm is None:
+            return nullcontext()
+        return pynccl_comm.change_state(enable=True)
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -397,7 +435,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
-        with self._draft_context():
+        with self._draft_context(), self._vocab_graph_capture_context():
             if capture_decode_cuda_graph:
                 self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
@@ -667,8 +705,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
             if self.server_args.enable_dp_attention:
-                if self._draft_is_moe:
-                    self._proposer.run_idle_participation(batch)
+                if self._draft_is_moe or self._dp_vocab_sync:
+                    # Same TP context as the busy path's propose, so the draft
+                    # side of an idle rank issues its collectives on the same
+                    # groups.
+                    with self._draft_context():
+                        self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )

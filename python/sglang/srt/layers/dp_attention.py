@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -24,6 +24,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed.parallel_state import get_narrowed_vocab_tp_group
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_bool_env_var, is_hip
 
@@ -637,7 +638,15 @@ def dp_scatter(
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    _dp_scatter_at(local_tokens, global_tokens, local_start_pos, local_num_tokens)
 
+
+def _dp_scatter_at(
+    local_tokens: torch.Tensor,  # output
+    global_tokens: torch.Tensor,  # input
+    local_start_pos: torch.Tensor,
+    local_num_tokens: torch.Tensor,
+):
     local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
@@ -649,6 +658,110 @@ def dp_scatter(
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
+
+
+class VocabBlockDpLayout(NamedTuple):
+    """DP row layout of ONE vocab-shard block (see SGLANG_VOCAB_TP_SIZE).
+
+    ``buffer_len`` counts only the rows of the block's DP ranks, and the offsets
+    are cumsums inside the block, so a gather/scatter pair built from this
+    layout never leaves the block. Offsets stay on the GPU (per-replay counts
+    change under cuda graphs) while the length comes from the CPU counts (static
+    per graph bucket).
+    """
+
+    group: GroupCoordinator
+    buffer_len: int
+    local_start_pos: torch.Tensor
+    local_num_tokens: torch.Tensor
+
+
+def vocab_dp_block_group() -> Optional[GroupCoordinator]:
+    """The vocab shard group when the DP rows can be gathered inside it, else
+    None (keep the global DP gather). Requires a narrowed vocab scope, no
+    attention CP, and blocks that align to whole attention-TP groups."""
+    group = get_narrowed_vocab_tp_group()
+    if group is None:
+        return None
+    if get_attn_cp_group().world_size != 1:
+        return None
+    if group.world_size % get_attn_tensor_model_parallel_world_size() != 0:
+        return None
+    return group
+
+
+def vocab_dp_block_layout(
+    global_num_tokens_cpu: Optional[List[int]],
+    global_num_tokens_gpu: Optional[torch.Tensor],
+) -> Optional[VocabBlockDpLayout]:
+    """Row layout of this rank's vocab block, or None to keep the global path."""
+    group = vocab_dp_block_group()
+    if group is None or global_num_tokens_cpu is None or global_num_tokens_gpu is None:
+        return None
+    dp_per_block = group.world_size // get_attn_tensor_model_parallel_world_size()
+    dp_size = get_attention_dp_size()
+    # A block that already covers every DP rank buys nothing; a partial block
+    # would make the row set inconsistent across the group.
+    if dp_per_block < 1 or dp_per_block >= dp_size or dp_size % dp_per_block != 0:
+        return None
+    if len(global_num_tokens_cpu) != dp_size:
+        return None
+    dp_rank = get_attention_dp_rank()
+    start_rank = (dp_rank // dp_per_block) * dp_per_block
+    counts = global_num_tokens_cpu[start_rank : start_rank + dp_per_block]
+    block_gpu = global_num_tokens_gpu[start_rank : start_rank + dp_per_block]
+    idx = dp_rank - start_rank
+    if idx == 0:
+        local_start_pos = torch.zeros_like(block_gpu[0])
+    else:
+        local_start_pos = torch.cumsum(block_gpu, dim=0)[idx - 1]
+    return VocabBlockDpLayout(
+        group=group,
+        buffer_len=sum(int(c) for c in counts),
+        local_start_pos=local_start_pos,
+        local_num_tokens=block_gpu[idx],
+    )
+
+
+def vocab_block_dp_gather_replicate(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    layout: VocabBlockDpLayout,
+):
+    """Replicating DP gather restricted to one vocab block: same SUM_LEN
+    scatter-then-all-reduce shape as _dp_gather_via_all_reduce, but the
+    collective runs on the block's group, so it never leaves the node."""
+    global_tokens.fill_(0)
+    assert local_tokens.is_contiguous()
+    assert global_tokens.is_contiguous()
+
+    if local_tokens.shape[0] > 0 and get_attn_tensor_model_parallel_rank() == 0:
+        assert (
+            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+        ), "aliasing between global_tokens and local_tokens not allowed"
+        memcpy_triton(
+            global_tokens,
+            local_tokens,
+            0,
+            layout.local_start_pos,
+            layout.local_num_tokens,
+            False,
+        )
+
+    reduced = layout.group.all_reduce(global_tokens)
+    if reduced is not global_tokens:
+        global_tokens.copy_(reduced)
+
+
+def vocab_block_dp_scatter(
+    local_tokens: torch.Tensor,  # output
+    global_tokens: torch.Tensor,  # input
+    layout: VocabBlockDpLayout,
+):
+    """Inverse of vocab_block_dp_gather_replicate (a local memcpy, no comms)."""
+    _dp_scatter_at(
+        local_tokens, global_tokens, layout.local_start_pos, layout.local_num_tokens
+    )
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):

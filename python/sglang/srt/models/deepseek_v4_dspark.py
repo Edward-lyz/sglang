@@ -37,8 +37,12 @@ from sglang.srt.models.deepseek_v4 import (
 from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
     StepSampler,
-    gather_and_crop_vocab,
+    lm_head_dp_gather_enabled,
     run_markov_block,
+    shared_embed_lookup,
+    shared_lm_head_logits,
+    shared_vocab_group,
+    vocab_group_spans_dp,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -627,6 +631,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         self.embed_tokens: Optional[nn.Module] = None
         self.lm_head: Optional[nn.Module] = None
+        self.lm_head_group = None
+        self.lm_head_dp_gather = False
+        self.embed_group = None
+        self.embed_dp_gather = False
+        # Row capacity of the DP-gathered embed, published by the draft worker
+        # (fixed at graph-capture time, refreshed per step for the eager path).
+        self.dp_embed_rows_capacity: Optional[int] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
 
@@ -639,6 +650,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     ) -> None:
         self.embed_tokens = embed_tokens
         self.lm_head = lm_head
+        self.embed_group = shared_vocab_group(embed_tokens)
+        self.embed_dp_gather = vocab_group_spans_dp(self.embed_group)
+        self.lm_head_group = shared_vocab_group(lm_head)
+        self.lm_head_dp_gather = lm_head_dp_gather_enabled(self.lm_head_group)
         self.markov_head.configure_tp_shard(lm_head=lm_head)
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
@@ -678,7 +693,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
                 "(call attach_shared_modules first)."
             )
-        x = self.embed_tokens(input_ids)
+        x = shared_embed_lookup(
+            self.embed_tokens,
+            input_ids,
+            group=self.embed_group,
+            dp_gather=self.embed_dp_gather,
+            rows_capacity=self.dp_embed_rows_capacity,
+        )
         x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
         return x
 
@@ -711,12 +732,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def compute_base_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-
+    def compute_base_logits(
+        self, x: torch.Tensor, *, dp_rows_capacity: Optional[int] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """compute_base_logits"""
         x_post_hc = self.collapse_hc_head(x)
-        return self._logits_from_x_post_hc(x_post_hc), x_post_hc
+        return (
+            self._logits_from_x_post_hc(x_post_hc, dp_rows_capacity=dp_rows_capacity),
+            x_post_hc,
+        )
 
-    def _logits_from_x_post_hc(self, x_post_hc: torch.Tensor) -> torch.Tensor:
+    def _logits_from_x_post_hc(
+        self, x_post_hc: torch.Tensor, *, dp_rows_capacity: Optional[int] = None
+    ) -> torch.Tensor:
         if self.lm_head is None:
             raise ValueError(
                 "DeepseekV4ForCausalLMDSpark requires the target lm_head "
@@ -726,12 +754,35 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         x = last.norm(x_post_hc)
         weight = self.lm_head.weight
         if self._use_fp32_lm_head:
-            local_logits = F.linear(x.float(), weight.float())
+            compute_shard = lambda h: F.linear(h.float(), weight.float())
         else:
-            local_logits = torch.matmul(x.to(weight.dtype), weight.T)
+            compute_shard = lambda h: torch.matmul(h.to(weight.dtype), weight.T)
         if self._opt_markov_w2_tp_shard:
-            return local_logits
-        return gather_and_crop_vocab(local_logits, self.lm_head)
+            # The markov head owns the vocab collective in this mode (it gathers
+            # the corrected per-step logits over the lm_head shard group), so the
+            # base logits stay sharded here.
+            return compute_shard(x)
+        return shared_lm_head_logits(
+            x,
+            self.lm_head,
+            compute_shard,
+            group=self.lm_head_group,
+            dp_gather=self.lm_head_dp_gather,
+            rows_capacity=dp_rows_capacity,
+        )
+
+    def join_dp_vocab_idle(self, *, rows_capacity: int) -> None:
+        """Idle-rank counterpart of the DP-gathered lm-head collectives: run
+        the same sequence with zero local rows so the ranks that do have draft
+        work are not left waiting. Only needed on the eager path -- a graph
+        replay already brings every DP rank through the folded sampler."""
+        if not self.lm_head_dp_gather:
+            return
+        weight = self.lm_head.weight
+        x_post_hc = torch.zeros(
+            (0, int(weight.shape[1])), dtype=weight.dtype, device=weight.device
+        )
+        self._logits_from_x_post_hc(x_post_hc, dp_rows_capacity=rows_capacity)
 
     def compute_confidence(
         self,

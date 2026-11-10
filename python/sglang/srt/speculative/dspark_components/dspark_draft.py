@@ -101,6 +101,16 @@ class DsparkDraftSampler:
             if confidence_fn is not None
             else None
         )
+        # DP-gathered lm head: pad to the LARGEST captured row count instead of
+        # this graph's bucket, so every DP rank enters the row gather with the
+        # same shape whether it replays a graph, runs eager, or joins idle. A
+        # per-bucket capacity would desync the moment two ranks take different
+        # paths in the same step (which is what an uneven request burst does).
+        self.dp_rows_capacity = (
+            max_bs * self.gamma
+            if getattr(model, "lm_head_dp_gather", False)
+            else None
+        )
         vocab = int(model.lm_head.org_vocab_size)
         self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
         self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
@@ -129,7 +139,9 @@ class DsparkDraftSampler:
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.gamma
-        base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
+        base_logits, confidence_tap = self.model.compute_base_logits(
+            hidden_states, dp_rows_capacity=self.dp_rows_capacity
+        )
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.gamma)[:, 0]
 
@@ -296,6 +308,8 @@ class DraftBlockProposer:
         mask_token_id: int,
         draft_block_spec_info,
         dp_moe_sync: bool = False,
+        dp_vocab_sync: bool = False,
+        dp_graph_rows: Optional[int] = None,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -304,6 +318,16 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        # The shared target lm_head shards its vocab over the global TP group
+        # (dp attention without --enable-dp-lm-head): the base-logits path then
+        # runs cross-DP collectives, so every DP rank has to join and the draft
+        # batch needs the DP sync metadata.
+        self._dp_vocab_sync = dp_vocab_sync
+        self._dp_sync = dp_moe_sync or dp_vocab_sync
+        # Largest captured row count: the capacity every DP-gathered vocab
+        # collective pads to whenever the batch fits it, so a graph replay (which
+        # bakes it) and an eager/idle join always agree.
+        self._dp_graph_rows = dp_graph_rows
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -361,9 +385,20 @@ class DraftBlockProposer:
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
         else:
+            rows_capacity = self._dp_rows_capacity(batch)
+            if (
+                getattr(self.draft_model, "lm_head_dp_gather", False)
+                and rows_capacity is None
+            ):
+                raise RuntimeError(
+                    "DSpark's DP-gathered lm head needs batch.global_num_tokens to "
+                    "agree on a per-rank row capacity; without it the ranks would "
+                    "enter the row gather with different shapes and deadlock."
+                )
             with self._base_logits_context():
                 base_logits, confidence_tap = self.draft_model.compute_base_logits(
-                    fwd.raw_hidden
+                    fwd.raw_hidden,
+                    dp_rows_capacity=rows_capacity,
                 )
                 base_logits = base_logits.view(bs, self.gamma, -1)
             draft_block = sample_draft_block(
@@ -384,7 +419,7 @@ class DraftBlockProposer:
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:
-        if not self._dp_moe_sync or batch.global_num_tokens is None:
+        if not self._dp_sync or batch.global_num_tokens is None:
             return
         device = self.draft_model_runner.device
         empty_long = torch.empty((0,), dtype=torch.int64, device=device)
@@ -403,8 +438,54 @@ class DraftBlockProposer:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
+        self._publish_dp_embed_rows_capacity(batch)
         with torch.inference_mode():
-            self.draft_model_runner.forward(idle_batch)
+            draft_out = self.draft_model_runner.forward(idle_batch)
+        if self._dp_vocab_sync and not draft_out.can_run_graph:
+            # A graph replay already ran the folded sampler (hence the
+            # base-logits collectives) on this rank; the eager path did not.
+            with torch.inference_mode(), self._base_logits_context():
+                self.draft_model.join_dp_vocab_idle(
+                    rows_capacity=self._dp_rows_capacity(batch)
+                )
+
+    def _publish_dp_embed_rows_capacity(self, batch: ScheduleBatch) -> None:
+        """The draft's embed runs INSIDE the model forward (and inside the draft
+        graph), so it reads its row capacity off the model. A graph replay baked
+        the capture-time value; refresh it for the eager path from the same
+        DP-synced rule the lm-head path uses."""
+        if not getattr(self.draft_model, "embed_dp_gather", False):
+            return
+        capacity = self._dp_rows_capacity(batch)
+        if capacity is not None:
+            self.draft_model.dp_embed_rows_capacity = capacity
+
+    def _dp_rows_capacity(self, batch: ScheduleBatch) -> Optional[int]:
+        """Per-rank row capacity of the DP-gathered vocab collectives (embed and
+        lm head).
+
+        Must be identical on every attention-DP rank in a step, including the
+        idle ones, or the ranks enter the row gather with different shapes and
+        NCCL deadlocks. So it is derived only from the DP-synced sync values and
+        prefers the largest captured row count -- that is what a graph replay
+        bakes, so eager and idle joins have to match it. Above that capacity no
+        rank can be on the graph path, and the raw DP max is agreed on by
+        everyone.
+        """
+        if not self._dp_vocab_sync or batch.global_num_tokens is None:
+            return None
+        gnt, _ = spec_scale_global_num_tokens(
+            self._draft_block_spec_info,
+            batch.global_num_tokens,
+            batch.global_num_tokens_for_logprob,
+        )
+        rows = max(gnt)
+        graph_rows = self._dp_graph_rows
+        if graph_rows is None:
+            graph_rows = getattr(self._draft_sampler, "dp_rows_capacity", None)
+        if graph_rows is not None and rows <= graph_rows:
+            return int(graph_rows)
+        return rows
 
     def _run_forward(
         self,
@@ -461,15 +542,18 @@ class DraftBlockProposer:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
+        self._publish_dp_embed_rows_capacity(batch)
         if not self._dp_moe_sync:
             # Dense (dp-local) draft: under --enable-dp-attention the draft's
             # graph runner keeps require_mlp_sync, so replay admission reads
             # can_run_dp_cuda_graph off this hand-built batch; without it the
-            # captured draft graphs never replay. The dense draft has no
-            # cross-DP collective, so the scheduler's global decode-sync flag
-            # is a safe gate. num_token_non_padded mirrors
-            # ForwardBatch.init_new; the replay hook localizes it per attn-TP
-            # rank when the gathered-buffer path is active.
+            # captured draft graphs never replay. The dense draft's only
+            # cross-DP collective is the DP-gathered lm head (dp_vocab_sync),
+            # which pads to the same captured bucket on every rank, so the
+            # scheduler's global decode-sync flag is a safe gate.
+            # num_token_non_padded mirrors ForwardBatch.init_new; the replay
+            # hook localizes it per attn-TP rank when the gathered-buffer path
+            # is active.
             draft_forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
             if enable_num_token_non_padded():
                 num_tokens = int(draft_forward_batch.input_ids.numel())
@@ -501,7 +585,7 @@ class DraftBlockProposer:
     def _fill_dp_moe_sync_metadata(
         self, forward_batch: ForwardBatch, batch: ScheduleBatch
     ) -> None:
-        if not self._dp_moe_sync or batch.global_num_tokens is None:
+        if not self._dp_sync or batch.global_num_tokens is None:
             return
         gnt, gnt_logprob = spec_scale_global_num_tokens(
             self._draft_block_spec_info,

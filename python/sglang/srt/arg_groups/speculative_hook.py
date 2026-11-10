@@ -282,7 +282,26 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     view = resolved_view(server_args)
     if view.enable_dp_attention:
         if not view.enable_dp_lm_head:
-            raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
+            from sglang.srt.environ import envs
+
+            if not envs.SGLANG_ENABLE_DSPARK_LM_HEAD_DP_SHARD.get():
+                raise ValueError(
+                    "DSpark with dp attention requires --enable-dp-lm-head, or "
+                    "SGLANG_ENABLE_DSPARK_LM_HEAD_DP_SHARD=1 to share a "
+                    "TP-sharded lm head with the draft (pure DP only)."
+                )
+            if view.tp_size != view.dp_size:
+                raise ValueError(
+                    "DSpark with dp attention and a TP-sharded lm head "
+                    "(SGLANG_ENABLE_DSPARK_LM_HEAD_DP_SHARD=1, no "
+                    "--enable-dp-lm-head) requires pure DP (--dp-size == "
+                    "--tp-size): the draft shares the target lm_head, whose "
+                    "vocab shards then span the whole TP group, so the draft's "
+                    "base-logits collectives assume one attention-DP group per "
+                    f"rank. Got tp_size={view.tp_size}, dp_size={view.dp_size}; "
+                    "either pass --enable-dp-lm-head or set --dp-size == "
+                    "--tp-size."
+                )
         supports_dspark_dp_moe = view.moe_a2a_backend == "none" or (
             view.moe_a2a_backend in ("deepep", "megamoe")
             and view.moe_runner_backend == "deep_gemm"
