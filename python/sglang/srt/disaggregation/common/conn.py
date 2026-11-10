@@ -173,6 +173,7 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
+        self._zmq_ctx.set(zmq.MAX_SOCKETS, server_args.disaggregation_zmq_max_sockets)
         zmq_port: Union[int, Tuple[int, int], None] = None
         if server_args.disaggregation_zmq_ports is not None:
             port_index = self.kv_args.gpu_id
@@ -324,9 +325,7 @@ class CommonKVManager(BaseKVManager):
         entries of its own layers while the decode peer registers the whole
         model's. So the two boundaries are resolved independently and the entries
         are paired by model layer id, not by position."""
-        src_boundary = self.kv_args.num_mla_kv_entries or len(
-            self.kv_args.kv_item_lens
-        )
+        src_boundary = self.kv_args.num_mla_kv_entries or len(self.kv_args.kv_item_lens)
         # Older decode peers do not report their boundary. Without PP both sides
         # register the same entry layout, so the local boundary describes them too.
         dst_boundary = dst_num_mla_kv_entries or src_boundary
