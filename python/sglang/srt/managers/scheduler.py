@@ -4140,6 +4140,19 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        # A lone request (nothing else waiting) is split into ~pp_size chunks
+        # so it occupies every PP stage at once. PP0 only: replay ranks follow
+        # the plan.
+        pp_tail_split = None
+        tail_min_chunk = envs.SGLANG_PP_TAIL_SPLIT_MIN_CHUNK.get()
+        if (
+            tail_min_chunk > 0
+            and self.ps.pp_size > 1
+            and authoritative_admissions is None
+            and len(self.waiting_queue) + (self.chunked_req is not None) == 1
+        ):
+            pp_tail_split = (self.ps.pp_size, tail_min_chunk)
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -4161,6 +4174,7 @@ class Scheduler(
             rem_cost=rem_cost,
             cost_chunk_cap=self.chunked_prefill_size if use_cost_model else None,
             checkpoint_end_align_size=self._get_prefill_checkpoint_end_align_size(),
+            pp_tail_split=pp_tail_split,
         )
 
         cache_read_aborted_reqs = set()
