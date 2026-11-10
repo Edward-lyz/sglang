@@ -1,4 +1,4 @@
-FROM iregistry.baidu-int.com/zhangyanzhe/sglang-test:v0.5.15.post1-cu130
+FROM iregistry.baidu-int.com/hac_test/aiak-inference-sglang:v0.5.15.post1-cu130-flashinfer-0.6.14
 
 ## ===========================================================================================
 # 这个是base是在社区这个commit v0.5.8 基础上打的镜像，作了如下修改：
