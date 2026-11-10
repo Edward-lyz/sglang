@@ -302,7 +302,7 @@ class AsRadixCache(RadixCache):
         Called by schedule_policy when host_hit_length > 0.
         The last_host_node here is the node with _as_load_info attached by _as_match().
         """
-        last_host_node = params.last_host_node
+        last_host_node = params.best_match_node
         host_hit_length = params.host_hit_length
 
         empty = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -576,6 +576,7 @@ class AsRadixCache(RadixCache):
             device_indices=local_result.device_indices,
             last_device_node=local_result.last_device_node,
             last_host_node=last_node,  # used as load_back anchor
+            best_match_node=last_node,
             host_hit_length=as_hit_tokens,
         )
 
