@@ -24,6 +24,7 @@ import hashlib
 import logging
 from array import array
 from collections import deque
+from contextlib import contextmanager
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
@@ -152,6 +153,30 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+
+
+@contextmanager
+def _batched_kv_release(allocator):
+    """Defer the KV frees of one inflight-queue pass into a single free group (and one
+    SWA segment batch), so releasing N finished requests costs a few kernels instead of
+    a few per request on the scheduler thread. Gated by
+    SGLANG_OPT_DISAGG_PREFILL_RELEASE_BATCH; a no-op inside an already open group."""
+    if (
+        not envs.SGLANG_OPT_DISAGG_PREFILL_RELEASE_BATCH.get()
+        or getattr(allocator, "free_group", True) is not None
+    ):
+        yield
+        return
+    batch_swa = hasattr(allocator, "begin_swa_segment_batch")
+    allocator.free_group_begin()
+    if batch_swa:
+        allocator.begin_swa_segment_batch()
+    try:
+        yield
+    finally:
+        if batch_swa:
+            allocator.end_swa_segment_batch()
+        allocator.free_group_end()
 
 
 class PrefillBootstrapQueue:
@@ -830,11 +855,16 @@ class SchedulerDisaggregationPrefillMixin:
                 return
             batch, early_send_prefix, extend_input_len_per_req = item
             try:
-                result = self.run_batch(
-                    batch,
-                    early_send_prefix=early_send_prefix,
-                    extend_input_len_per_req=extend_input_len_per_req,
-                )
+                # inference_mode skips autograd version/view bookkeeping per op; the
+                # eager prefill body is host launch bound at small chunks.
+                with torch.inference_mode(
+                    envs.SGLANG_OPT_PREFILL_FWD_INFERENCE_MODE.get()
+                ):
+                    result = self.run_batch(
+                        batch,
+                        early_send_prefix=early_send_prefix,
+                        extend_input_len_per_req=extend_input_len_per_req,
+                    )
                 self._apply_war_barrier()
                 # Snapshot on the worker, after the forward's in-place SB edits
                 # and while only this thread owns the batch (the scheduler has
@@ -1342,78 +1372,79 @@ class SchedulerDisaggregationPrefillMixin:
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if self._prefill_fake_free_kv(req):
-                # Synthetic single-press: no decode peer pulls this KV; free it now.
-                if not isinstance(req.finished_reason, FINISH_ABORT):
-                    req.finished_reason = FINISH_LENGTH(length=0)
-                release_kv_cache(req, self.tree_cache, is_insert=False)
-                try:
-                    req.disagg_kv_sender.clear()
-                except Exception:
-                    pass
-                done_reqs.append(req)
-                continue
-            if rids_to_check is not None:
-                if req.rid not in rids_to_check:
-                    undone_reqs.append(req)
+        with _batched_kv_release(self.token_to_kv_pool_allocator):
+            for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+                if self._prefill_fake_free_kv(req):
+                    # Synthetic single-press: no decode peer pulls this KV; free it now.
+                    if not isinstance(req.finished_reason, FINISH_ABORT):
+                        req.finished_reason = FINISH_LENGTH(length=0)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    try:
+                        req.disagg_kv_sender.clear()
+                    except Exception:
+                        pass
+                    done_reqs.append(req)
                     continue
+                if rids_to_check is not None:
+                    if req.rid not in rids_to_check:
+                        undone_reqs.append(req)
+                        continue
 
-                # In PP mode, the previous rank may have reached a terminal
-                # state (Success/Failed) while this rank's local poll is still
-                # in a transient state due to clock skew or propagation delay.
-                # Treat non-terminal states as undone instead of crashing.
-                if poll not in (
-                    KVPoll.Success,
-                    KVPoll.Failed,
-                ):
-                    logger.warning_once(
-                        f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone",
-                    )
-                    undone_reqs.append(req)
-                    continue
-
-            if req.pending_bootstrap:
-                # Parked: prefill finished before bootstrap completed.
-                if self.handle_pending_bootstrap(req, poll):
-                    self.send_kv_chunk(req, last_chunk=True)
-                    undone_reqs.append(req)
-                elif poll != KVPoll.Failed:
-                    undone_reqs.append(req)
-                continue
-
-            if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
-                # todo: set Transferring correctly in backend
-                undone_reqs.append(req)
-            elif poll == KVPoll.Success:  # transfer done
-                if not isinstance(req.finished_reason, FINISH_ABORT):
-                    req.finished_reason = FINISH_LENGTH(length=0)
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
-                # FIXME: clean up req's data in transfer engine
-                req.disagg_kv_sender.clear()
-                done_reqs.append(req)
-                req.time_stats.set_prefill_kv_transfer_finish_time()
-                if self.metrics_reporter.enable_metrics:
-                    self.metrics_collector.observe_kvcache_transfer_time(
-                        max(
-                            0.0,
-                            req.time_stats.prefill_kv_transfer_finish_time
-                            - req.time_stats.prefill_transfer_queue_entry_time,
+                    # In PP mode, the previous rank may have reached a terminal
+                    # state (Success/Failed) while this rank's local poll is still
+                    # in a transient state due to clock skew or propagation delay.
+                    # Treat non-terminal states as undone instead of crashing.
+                    if poll not in (
+                        KVPoll.Success,
+                        KVPoll.Failed,
+                    ):
+                        logger.warning_once(
+                            f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
+                            f"from consensus; treating as undone",
                         )
+                        undone_reqs.append(req)
+                        continue
+
+                if req.pending_bootstrap:
+                    # Parked: prefill finished before bootstrap completed.
+                    if self.handle_pending_bootstrap(req, poll):
+                        self.send_kv_chunk(req, last_chunk=True)
+                        undone_reqs.append(req)
+                    elif poll != KVPoll.Failed:
+                        undone_reqs.append(req)
+                    continue
+
+                if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
+                    # todo: set Transferring correctly in backend
+                    undone_reqs.append(req)
+                elif poll == KVPoll.Success:  # transfer done
+                    if not isinstance(req.finished_reason, FINISH_ABORT):
+                        req.finished_reason = FINISH_LENGTH(length=0)
+                    release_kv_cache(req, self.tree_cache)  # unlock the tree
+                    # FIXME: clean up req's data in transfer engine
+                    req.disagg_kv_sender.clear()
+                    done_reqs.append(req)
+                    req.time_stats.set_prefill_kv_transfer_finish_time()
+                    if self.metrics_reporter.enable_metrics:
+                        self.metrics_collector.observe_kvcache_transfer_time(
+                            max(
+                                0.0,
+                                req.time_stats.prefill_kv_transfer_finish_time
+                                - req.time_stats.prefill_transfer_queue_entry_time,
+                            )
+                        )
+                    if self.metrics_reporter.enable_metrics:
+                        self.metrics_collector.observe_time_to_first_token(
+                            req.time_stats.prefill_kv_transfer_finish_time
+                            - req.time_stats.prefill_bootstrap_queue_entry_time
+                        )
+                elif poll == KVPoll.Failed:
+                    self.handle_inflight_transfer_failure(req)
+                    done_reqs.append(req)
+                else:
+                    raise RuntimeError(
+                        f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
                     )
-                if self.metrics_reporter.enable_metrics:
-                    self.metrics_collector.observe_time_to_first_token(
-                        req.time_stats.prefill_kv_transfer_finish_time
-                        - req.time_stats.prefill_bootstrap_queue_entry_time
-                    )
-            elif poll == KVPoll.Failed:
-                self.handle_inflight_transfer_failure(req)
-                done_reqs.append(req)
-            else:
-                raise RuntimeError(
-                    f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
-                )
 
         for req in done_reqs:
             req.time_stats.set_completion_time()

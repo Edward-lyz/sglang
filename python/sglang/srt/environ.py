@@ -735,6 +735,12 @@ class Envs:
     # Batch the per-request SWA window evictions of one scheduler step into a single
     # page free (~5 kernels instead of ~5 per evicting request). Same slots freed.
     SGLANG_OPT_SWA_EVICT_BATCH = EnvBool(False)
+    # Disagg prefill: free the KV of all requests finished in one inflight-queue pass
+    # as one free group + one SWA segment batch instead of per request. Same slots.
+    SGLANG_OPT_DISAGG_PREFILL_RELEASE_BATCH = EnvBool(False)
+    # Disagg prefill worker thread: run the forward under torch.inference_mode instead
+    # of no_grad only (less per-op host overhead). Off by default.
+    SGLANG_OPT_PREFILL_FWD_INFERENCE_MODE = EnvBool(False)
     # DSpark draft Markov step: build the step logits (base + w2 bias) and draw the
     # in-graph inline-RNG token in one kernel, so the fp32 [bs, vocab] step logits are
     # never written and re-read. Same tokens and block logits as the two-kernel path.
