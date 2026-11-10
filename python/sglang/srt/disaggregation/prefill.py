@@ -24,10 +24,10 @@ import hashlib
 import logging
 from array import array
 from collections import deque
-from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
+import msgspec
 import numpy as np
 import torch
 
@@ -89,6 +89,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import Range
 from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 if TYPE_CHECKING:
@@ -100,6 +101,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+class _DeferredChunkFinalize(msgspec.Struct, frozen=True):
+    """A chunked req's chunk whose finalize the threaded AHEAD loop deferred
+    (see SchedulerDisaggregationPrefillMixin.process_prefill_chunk)."""
+
+    req: Req
+    chunk_range: Range
+
+
+# Deferred work queued by AHEAD admission: chunk finalizes, plus plain
+# callables (a chunked abort's KV release) that always run in the serial window.
+DeferredFinalize = List[Union[_DeferredChunkFinalize, Callable[[], None]]]
 
 
 def should_force_retry(req: Req) -> bool:
@@ -586,7 +600,7 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
         *,
-        deferred_finalize: Optional[List[Callable[[], None]]] = None,
+        deferred_finalize: Optional[DeferredFinalize] = None,
     ) -> NextBatchPlan:
         """``deferred_finalize``: see process_prefill_chunk (threaded AHEAD loop)."""
         self.process_pending_chunked_abort(deferred_release=deferred_finalize)
@@ -841,7 +855,7 @@ class SchedulerDisaggregationPrefillMixin:
             # the work that reads / frees that forward's in-flight KV (the
             # chunked req's chunk finalize, a chunked abort's KV release) is
             # queued here and run once the forward is collected.
-            deferred_finalize: Optional[List[Callable[[], None]]] = (
+            deferred_finalize: Optional[DeferredFinalize] = (
                 [] if ahead else None
             )
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -899,13 +913,13 @@ class SchedulerDisaggregationPrefillMixin:
 
             # The previous forward is now fully enqueued and its WAR barrier is
             # on schedule_stream (the worker applies it before handing back the
-            # result), and the worker is idle until the submit below. That is
-            # exactly where the base loop runs this work (its admission follows
-            # run_batch + barrier), so it is ordered after the previous forward
-            # on the GPU, and its req_to_token repoints land before the next
-            # forward reads them.
-            for finalize in deferred_finalize:
-                finalize()
+            # result), and the worker is idle until the submit below. Work run
+            # here is ordered after the previous forward on the GPU and lands
+            # before the next forward reads req_to_token -- what the base loop
+            # gets from running admission after run_batch + barrier. Only a
+            # chunk finalize that would dedup-repoint the chunked req's row needs
+            # that last property; the rest overlaps the next forward's launch.
+            overlap_finalize = self._run_serial_deferred_finalize(deferred_finalize)
 
             if batch:
                 if self.enable_staging:
@@ -926,6 +940,11 @@ class SchedulerDisaggregationPrefillMixin:
                 new_inflight = snap
             else:
                 new_inflight = None
+
+            # Overlaps the forward just submitted; before process(prev) as in the
+            # base loop, whose admission finalizes the chunk first.
+            for item in overlap_finalize:
+                self._finalize_prefill_chunk(item.req, chunk_range=item.chunk_range)
 
             if prev_result is not None:
                 # Worker's post-forward copy of the snapshot; finished reqs are
@@ -1485,7 +1504,7 @@ class SchedulerDisaggregationPrefillMixin:
         last_batch: Optional[ScheduleBatch],
         running_batch: ScheduleBatch,
         *,
-        deferred_finalize: Optional[List[Callable[[], None]]] = None,
+        deferred_finalize: Optional[DeferredFinalize] = None,
     ) -> None:
         """``deferred_finalize`` (threaded AHEAD loop only): instead of
         finalizing the chunk the previous forward computed (SWA checkpoint
@@ -1498,11 +1517,7 @@ class SchedulerDisaggregationPrefillMixin:
             chunked_req_to_exclude.add(req)
             if deferred_finalize is not None:
                 deferred_finalize.append(
-                    partial(
-                        self._finalize_prefill_chunk,
-                        req,
-                        chunk_range=req.extend_range,
-                    )
+                    _DeferredChunkFinalize(req=req, chunk_range=req.extend_range)
                 )
                 # The next chunk's admission needs the full computed prefix;
                 # take it from the req's own row (the tree insert that would
@@ -1547,6 +1562,64 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
+    def _run_serial_deferred_finalize(
+        self: Scheduler, deferred_finalize: DeferredFinalize
+    ) -> List[_DeferredChunkFinalize]:
+        """Run the deferred work that must land before the next forward is
+        submitted; return the chunk finalizes that may instead overlap it."""
+        overlap_finalize: List[_DeferredChunkFinalize] = []
+        for item in deferred_finalize:
+            if not isinstance(item, _DeferredChunkFinalize):
+                item()
+            elif self._chunk_finalize_keeps_row(
+                item.req, chunk_range=item.chunk_range
+            ):
+                overlap_finalize.append(item)
+            else:
+                self._finalize_prefill_chunk(item.req, chunk_range=item.chunk_range)
+        return overlap_finalize
+
+    def _chunk_finalize_keeps_row(self: Scheduler, req: Req, *, chunk_range) -> bool:
+        """Whether finalizing this chunk provably leaves the req's req_to_token
+        row and every slot in it in place, so it may run after the next forward
+        (which reads that row as its prefix) is submitted.
+
+        The only part of a chunk finalize that touches what the next forward
+        reads is the tree insert's dedup: where the inserted key overlaps
+        existing nodes past ``cache_protected_len``, the insert frees the req's
+        duplicate slots and the caller repoints its row at the tree's. So: walk
+        the tree read-only and require no overlap past ``cache_protected_len``
+        (an evicted node counts as overlap -- conservative). The rest of the
+        finalize is safe to overlap: SWA staging and the AttentionStore write
+        only read this chunk; the out-of-window SWA free stops a page below the
+        sliding window the next chunk attends. Nothing else mutates the tree
+        between this check and the finalize (scheduler thread only).
+
+        The unfiltered chunk key is a superset of what the insert uses (an SWA
+        branch insert only shortens it), so the check stays conservative.
+        """
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if req.skip_radix_cache_insert:
+            return True  # maybe_cache_unfinished_req inserts nothing
+        tree = self.tree_cache
+        if not isinstance(tree, UnifiedRadixCache):
+            return False
+        if tree.disable:
+            return True  # cache_unfinished_req only snapshots prefix_indices
+        if tree.tree_core.is_eagle or req.session is not None:
+            # Bigram keys / streaming-session commits: not mirrored here.
+            return False
+        key = RadixKey(
+            req.full_untruncated_fill_ids,
+            req.extra_key,
+            limit=chunk_range.end,
+            cache_salt=req.cache_salt,
+        ).page_aligned(tree.page_size)
+        overlap_len = tree.tree_core.peek_insert_overlap_len(key)
+        return overlap_len <= req.kv.cache_protected_len
+
     def _finalize_prefill_chunk(self: Scheduler, req: Req, *, chunk_range) -> None:
         """Commit the chunk of ``req`` ending at ``chunk_range.end``: stage its
         SWA checkpoints, then insert it into the tree (which also submits the
@@ -1555,8 +1628,10 @@ class SchedulerDisaggregationPrefillMixin:
         Deferred (threaded AHEAD loop), this runs after the next chunk was
         already admitted, so ``req.extend_range`` points one chunk ahead; both
         callees size the committed prefix by ``get_fill_ids()``, so rewind the
-        range to the computed chunk for the duration. The forward thread is idle
-        at this point, so nothing else observes the rewind.
+        range to the computed chunk for the duration. Safe even while the next
+        forward runs on the worker: the forward path reads no req's
+        extend_range (its per-req lengths are batch-level, and
+        extend_input_len_per_req is precomputed before submit).
         """
         live_range = req.extend_range
         req.extend_range = chunk_range
