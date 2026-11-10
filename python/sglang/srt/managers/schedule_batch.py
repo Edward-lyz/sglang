@@ -1951,7 +1951,7 @@ class Req(ReqDllmMixin):
 
 class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_mask: bool
-    track_index: int
+    track_index: Union[int, torch.Tensor]
     track_seqlen: int
 
 
@@ -2723,21 +2723,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if server_args.enable_mamba_extra_buffer():
-            self.mamba_track_indices = torch.tensor(
-                mamba_track_indices_cpu,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            self.mamba_track_mask = torch.tensor(
-                mamba_track_mask_cpu,
-                dtype=torch.bool,
-                device=self.device,
-            )
-            self.mamba_track_seqlens = torch.tensor(
-                mamba_track_seqlens_cpu,
-                dtype=torch.int64,
-                device=self.device,
-            )
+            if mamba_track_indices_cpu and isinstance(
+                mamba_track_indices_cpu[0], torch.Tensor
+            ):
+                # KDA AS tracking uses the same device slot snapshots. Flags and
+                # lengths are already CPU values; pinned uploads preserve stream
+                # order without draining prior GPU work on the scheduler thread.
+                self.mamba_track_indices = torch.stack(mamba_track_indices_cpu).to(
+                    device=self.device, dtype=torch.int64
+                )
+                self.mamba_track_mask = torch.tensor(
+                    mamba_track_mask_cpu, dtype=torch.bool, pin_memory=_pin
+                ).to(device=self.device, non_blocking=True)
+                self.mamba_track_seqlens = torch.tensor(
+                    mamba_track_seqlens_cpu, dtype=torch.int64, pin_memory=_pin
+                ).to(device=self.device, non_blocking=True)
+            else:
+                self.mamba_track_indices = torch.tensor(
+                    mamba_track_indices_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self.mamba_track_mask = torch.tensor(
+                    mamba_track_mask_cpu,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                self.mamba_track_seqlens = torch.tensor(
+                    mamba_track_seqlens_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.mamba_pool_idx is not None for req in reqs):
@@ -2794,7 +2810,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             checkpoint_target = None
             mask = req.extend_range.length >= checkpoint_chunk_size
 
-        track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+        track_slot = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+        # Snapshot the existing device slot on this stream. Keep it on device
+        # through batch construction; no new slot or checkpoint is published.
+        track_index = track_slot.clone() if is_kda_attentionstore else track_slot.item()
         mamba_track_seqlen = -1
         if mask:
             if is_kda_attentionstore:
