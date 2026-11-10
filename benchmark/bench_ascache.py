@@ -42,7 +42,6 @@ import os
 import random
 import subprocess
 import time
-from contextlib import contextmanager
 from typing import List, Tuple
 
 import aiohttp
@@ -83,20 +82,6 @@ def _run_nsys(cmd_args: List[str]) -> None:
         )
     else:
         print(f"  [nsys] {' '.join(cmd_args)} ok")
-
-
-@contextmanager
-def nsys_capture(session):
-    """Context manager that starts/stops an nsys capture for the given session."""
-    if not session:
-        yield
-        return
-
-    _run_nsys(["start", f"--session={session}"])
-    try:
-        yield
-    finally:
-        _run_nsys(["stop", f"--session={session}"])
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +279,7 @@ def build_batch(
     rng: random.Random,
     first_token_base: int = FIRST_TOKEN_BASE,
     arange_offset: int = ARANGE_OFFSET,
+    total_lens: List[int] = None,
 ) -> Tuple[List[List[int]], List[int]]:
     """Build one batch of ``batch_size`` prompts.
 
@@ -311,11 +297,20 @@ def build_batch(
     hc = sample_hit_chunks(total_chunks, target_hit_rate, rng)
 
     for i in range(batch_size):
+        req_len = (
+            total_lens[(req_id_offset + i) % len(total_lens)]
+            if total_lens
+            else total_len
+        )
         prompt = build_request_prompt(
-            req_id_offset + i, total_len, vocab_size, first_token_base, arange_offset
+            req_id_offset + i, req_len, vocab_size, first_token_base, arange_offset
         )
         prompts.append(prompt)
-        per_req_hit_chunks.append(hc)
+        per_req_hit_chunks.append(
+            sample_hit_chunks(req_len // page_size, target_hit_rate, rng)
+            if total_lens
+            else hc
+        )
 
     return prompts, per_req_hit_chunks
 
@@ -354,6 +349,7 @@ async def send_request(
         "stream": True,
         "stream_options": {"include_usage": True},
         "ignore_eos": True,
+        "return_cached_tokens_details": True,
         "bootstrap_host": bootstrap_host,
         "bootstrap_port": bootstrap_port,
         "bootstrap_room": req_id,
@@ -361,6 +357,7 @@ async def send_request(
     }
 
     result = {
+        "rid": payload["rid"],
         "success": False,
         "prompt_tokens": 0,
         "cached_tokens": 0,
@@ -396,6 +393,9 @@ async def send_request(
                 if choices and not first_token and choices[0].get("text"):
                     result["ttft"] = now - st
                     first_token = True
+                cache_details = (data.get("sglext") or {}).get("cached_tokens_details")
+                if cache_details is not None:
+                    result["cached_tokens_details"] = cache_details
 
                 usage = data.get("usage")
                 if usage:
@@ -408,7 +408,16 @@ async def send_request(
                         result["_no_cache_report"] = True
 
             result["latency"] = time.perf_counter() - st
-            result["success"] = True
+            result["success"] = (
+                result["prompt_tokens"] == len(prompt_ids)
+                and result["completion_tokens"] >= output_len
+            )
+            if not result["success"]:
+                result["error"] = (
+                    "incomplete response usage: "
+                    f"prompt={result['prompt_tokens']}/{len(prompt_ids)}, "
+                    f"completion={result['completion_tokens']}/{output_len}"
+                )
 
     except Exception as e:
         result["error"] = str(e)
@@ -570,6 +579,7 @@ async def run_one_hit_rate(
     duration: float = 60.0,
     fill_block_size: int = None,
     nsys_session: str = None,
+    total_lens: List[int] = None,
 ) -> dict:
     """针对一个目标命中率执行一次完整、彼此隔离的 cache 压测。
 
@@ -598,6 +608,20 @@ async def run_one_hit_rate(
     # is what the fill wave actually committed (fill_block aligned) and cannot
     # exceed the store's own match cap on the measured prompt.
     expected_hit_pages = min(warmup_len, fill_blocks * fill_block) // page_size
+    warmup_lens = None
+    if total_lens:
+        if qps is not None:
+            raise ValueError("--total-lens currently requires batch mode")
+        warmup_lens = [
+            (
+                n
+                if target_hit_rate >= 1
+                else sample_hit_chunks(n // fill_block, target_hit_rate, rng)
+                * fill_block
+            )
+            for n in total_lens
+        ]
+        warmup_len = max(warmup_lens)
 
     # 两层 cache 分开清理：内存层必须走 clear_all_cache 的 memory_only
     # 模式，确保接口会遍历该实例的所有节点，而非只清理入口所在节点。
@@ -685,7 +709,10 @@ async def run_one_hit_rate(
         await asyncio.sleep(0.5)
 
         print(f"  Full-length wave: prompt_len={total_len} ...")
-        with nsys_capture(nsys_session):
+        if nsys_session:
+            _run_nsys(["start", f"--session={nsys_session}"])
+        try:
+            measurement_started_at_unix = time.time()
             bench_start = time.perf_counter()
             all_results = await send_requests_qps(
                 api_url=api_url,
@@ -708,6 +735,10 @@ async def run_one_hit_rate(
                 dp_size=dp_size,
             )
             bench_elapsed = time.perf_counter() - bench_start
+            measurement_finished_at_unix = time.time()
+        finally:
+            if nsys_session:
+                _run_nsys(["stop", f"--session={nsys_session}"])
 
         successful_all = [r for r in all_results if r["success"]]
         failed = len(all_results) - len(successful_all)
@@ -794,6 +825,8 @@ async def run_one_hit_rate(
             "p90_latency_ms": p90_latency,
             "p99_latency_ms": p99_latency,
             "total_time_s": bench_elapsed,
+            "measurement_started_at_unix": measurement_started_at_unix,
+            "measurement_finished_at_unix": measurement_finished_at_unix,
             "num_successful": len(successful_all),
             "num_failed": failed,
             "hit_chunks_histogram": hit_chunks_hist,
@@ -820,6 +853,7 @@ async def run_one_hit_rate(
                 rng=rng,
                 first_token_base=first_token_base,
                 arange_offset=arange_offset,
+                total_lens=warmup_lens,
             )
             results = await send_batch(
                 api_url,
@@ -860,9 +894,12 @@ async def run_one_hit_rate(
         }
     await asyncio.sleep(0.5)
 
-    print(f"  Full-length wave: prompt_len={total_len} ...")
+    print(f"  Full-length wave: prompt_len={total_lens or total_len} ...")
     global_req_id = 0
-    with nsys_capture(nsys_session):
+    if nsys_session:
+        _run_nsys(["start", f"--session={nsys_session}"])
+    try:
+        measurement_started_at_unix = time.time()
         bench_start = time.perf_counter()
 
         for round_idx in range(num_rounds):
@@ -876,6 +913,7 @@ async def run_one_hit_rate(
                 rng=rng,
                 first_token_base=first_token_base,
                 arange_offset=arange_offset,
+                total_lens=total_lens,
             )
 
             round_start = time.perf_counter()
@@ -927,10 +965,22 @@ async def run_one_hit_rate(
 
             # Tag each result with its expected hit_chunks
             for i, r in enumerate(results):
-                r["expected_hit_chunks"] = expected_hit_pages
+                req_index = round_idx * batch_size + i
+                r["expected_prompt_tokens"] = (
+                    total_lens[req_index % len(total_lens)] if total_lens else total_len
+                )
+                r["expected_hit_chunks"] = (
+                    warmup_lens[req_index % len(warmup_lens)] // page_size
+                    if warmup_lens
+                    else expected_hit_pages
+                )
             all_results.extend(results)
 
         bench_elapsed = time.perf_counter() - bench_start
+        measurement_finished_at_unix = time.time()
+    finally:
+        if nsys_session:
+            _run_nsys(["stop", f"--session={nsys_session}"])
 
     # 4. Aggregate
     successful_all = [r for r in all_results if r["success"]]
@@ -984,6 +1034,7 @@ async def run_one_hit_rate(
         "num_rounds": num_rounds,
         "batch_size": batch_size,
         "total_len": total_len,
+        "total_lens": total_lens,
         "total_tokens": total_prompt_tokens,
         "cached_tokens": total_cached_tokens,
         "uncached_tokens": uncached_tokens,
@@ -995,6 +1046,8 @@ async def run_one_hit_rate(
         "p90_ttft_ms": p90_ttft,
         "p99_ttft_ms": p99_ttft,
         "total_time_s": bench_elapsed,
+        "measurement_started_at_unix": measurement_started_at_unix,
+        "measurement_finished_at_unix": measurement_finished_at_unix,
         "num_successful": len(successful_all),
         "num_failed": failed,
         "hit_chunks_histogram": hit_chunks_hist,
@@ -1081,6 +1134,9 @@ async def main(args):
     """解析运行配置，依次执行各命中率和 QPS 组合的压测。"""
     base_url = f"http://{args.host}:{args.port}"
     api_url = f"{base_url}/v1/completions"
+    info_response = requests.get(f"{base_url}/get_server_info", timeout=30)
+    info_response.raise_for_status()
+    server_info = info_response.json()
 
     model = args.model
     if model is None:
@@ -1143,6 +1199,23 @@ async def main(args):
         )
 
     target_hit_rates = [float(x.strip()) for x in args.target_hit_rates.split(",")]
+    total_lens = (
+        [int(x.strip()) for x in args.total_lens.split(",")]
+        if args.total_lens
+        else None
+    )
+    if total_lens:
+        if args.qps is not None:
+            raise ValueError("--total-lens currently requires batch mode")
+        if any(n < fill_block_size for n in total_lens):
+            raise ValueError("Every --total-lens entry must fit a cache-fill block")
+        if any(
+            0 < hr < 1
+            and any(round(n // fill_block_size * hr) == 0 for n in total_lens)
+            for hr in target_hit_rates
+        ):
+            raise ValueError("Every nonzero target must fill at least one block")
+        print(f"  mixed prompt length pattern = {total_lens}")
 
     qps_list = (
         [float(x.strip()) for x in args.qps.split(",")]
@@ -1236,6 +1309,7 @@ async def main(args):
                 duration=args.duration,
                 fill_block_size=fill_block_size,
                 nsys_session=args.nsys_session,
+                total_lens=total_lens,
             )
             all_stats.append(stats)
             if "error" not in stats:
@@ -1260,10 +1334,13 @@ async def main(args):
         "page_size": page_size,
         "summary": summary,
         "details": all_stats,
+        "server_info": server_info,
     }
     with open(output_path, "w") as f:
         json.dump(output_data, f, indent=2)
     print(f"\nResults saved to {output_path}")
+    if any(s.get("error") or s.get("num_failed", 0) for s in all_stats):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
@@ -1299,6 +1376,12 @@ if __name__ == "__main__":
         type=int,
         default=59000,
         help="Fixed prompt token length for every request.",
+    )
+    parser.add_argument(
+        "--total-lens",
+        default=None,
+        help="Comma-separated prompt length pattern, repeated per request in "
+        "batch mode. Fill and measurement use the same per-request lengths.",
     )
     parser.add_argument(
         "--page-size",
