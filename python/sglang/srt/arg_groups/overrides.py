@@ -2300,6 +2300,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 @register_post_process
 def _a2a_backend_overrides(view: Any) -> dict:
 
+    overrides: dict = {}
     moe_a2a_backend = view.moe_a2a_backend
     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(
@@ -2313,9 +2314,20 @@ def _a2a_backend_overrides(view: Any) -> dict:
             "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
             "auto-configuring --moe-a2a-backend megamoe."
         )
+        # DSpark + dp-attention validator (speculative_hook._handle_dspark)
+        # requires moe_runner_backend == 'deep_gemm' when moe_a2a_backend is
+        # 'megamoe'/'deepep'. If the user didn't pin the runner explicitly and
+        # only asked for mega-MoE via env, mirror that intent to the runner side
+        # so the validator passes.
+        if view.moe_runner_backend == "auto":
+            overrides["moe_runner_backend"] = "deep_gemm"
+            logger.info(
+                "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE also "
+                "auto-configuring --moe-runner-backend deep_gemm."
+            )
     if moe_a2a_backend != view.moe_a2a_backend:
-        return {"moe_a2a_backend": moe_a2a_backend}
-    return {}
+        overrides["moe_a2a_backend"] = moe_a2a_backend
+    return overrides
 
 
 @register_post_process

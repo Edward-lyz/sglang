@@ -274,16 +274,26 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 
 
 def _handle_dspark(server_args: ServerArgs) -> None:
+    from sglang.srt.arg_groups.overrides import resolved_view
+
     if not server_args.device.startswith("cuda"):
         raise ValueError("DSpark speculative decoding only supports CUDA device.")
 
-    if server_args.enable_dp_attention:
-        if not server_args.enable_dp_lm_head:
+    view = resolved_view(server_args)
+    if view.enable_dp_attention:
+        if not view.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if server_args.moe_a2a_backend != "none":
+        supports_dspark_dp_moe = view.moe_a2a_backend == "none" or (
+            view.moe_a2a_backend in ("deepep", "megamoe")
+            and view.moe_runner_backend == "deep_gemm"
+        )
+        if not supports_dspark_dp_moe:
             raise ValueError(
-                "DSpark with dp attention only supports the built-in TP MoE "
-                f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
+                "DSpark with dp attention only supports moe_a2a_backend='none' "
+                "or moe_a2a_backend in ('deepep', 'megamoe') with "
+                "moe_runner_backend='deep_gemm'; "
+                f"got moe_a2a_backend={view.moe_a2a_backend!r}, "
+                f"moe_runner_backend={view.moe_runner_backend!r}."
             )
         if server_args.attn_cp_size > 1:
             raise ValueError(
@@ -292,11 +302,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
         if (
             server_args.speculative_moe_a2a_backend is not None
-            and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
+            and server_args.speculative_moe_a2a_backend != view.moe_a2a_backend
         ):
             raise ValueError(
                 "DSpark ignores --speculative-moe-a2a-backend; with dp attention it "
-                f"must match the target moe_a2a_backend={server_args.moe_a2a_backend!r} "
+                f"must match the target moe_a2a_backend={view.moe_a2a_backend!r} "
                 f"(got {server_args.speculative_moe_a2a_backend!r})."
             )
 
