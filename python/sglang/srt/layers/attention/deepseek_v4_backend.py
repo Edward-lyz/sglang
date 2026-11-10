@@ -1365,6 +1365,7 @@ class DeepseekV4AttnBackend(
         compress_ratio: int = 4,
         use_prefill_cuda_graph: bool = False,
         rows_per_request: int = 0,
+        allow_row_chunk: bool = False,
     ):
         page_table = core_attn_metadata.page_table
         index_page_size = 0
@@ -1427,6 +1428,7 @@ class DeepseekV4AttnBackend(
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
+            allow_row_chunk=allow_row_chunk,
         )
 
     def init_forward_metadata_decode(
@@ -1517,6 +1519,10 @@ class DeepseekV4AttnBackend(
             self.init_forward_metadata_indexer(
                 core_attn_metadata,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                # Eager prefill only: bounds the [rows, align256(max_seqlen_k)]
+                # fp32 logits by query-row chunks. Decode/verify/graph paths keep
+                # the single schedule tensor fp4_paged_mqa_logits expects.
+                allow_row_chunk=not use_prefill_cuda_graph,
             )
             if need_compress and self.has_c4
             else None
@@ -1798,9 +1804,12 @@ class DeepseekV4AttnBackend(
         )
         local_tok = token_indices[local_tail_rows]
         n_g, n_m, n_t = total, local_metadata_rows.shape[0], local_tok.shape[0]
-        packed = torch.from_numpy(
-            np.concatenate([gather_index, local_metadata_rows, local_tok])
-        ).to(device, non_blocking=True)
+        # Pinned: a pageable non_blocking H2D silently synchronizes the host.
+        packed = (
+            torch.from_numpy(np.concatenate([gather_index, local_metadata_rows, local_tok]))
+            .pin_memory()
+            .to(device, non_blocking=True)
+        )
         gather_index_t = packed[:n_g]
         local_metadata_rows_t = packed[n_g : n_g + n_m]
         local_tok_t = packed[n_g + n_m : n_g + n_m + n_t]
@@ -3638,11 +3647,10 @@ class DeepseekV4AttnBackend(
         )
         first_row = 0
         loop_reqs = list(zip(lc_per_req, q_lens_cpu))
-        if (
-            envs.SGLANG_FUSE_INDEXER_BATCH_REQUESTS.get()
-            and len(lc_per_req) > 1
-            and all(lc > 0 and t > 0 for lc, t in loop_reqs)
-        ):
+        # Score every request of the batch per tile: rows are independent, so this
+        # selects what the per-request loop below would, with a launch count that no
+        # longer grows with the request count (the loop stays for empty requests).
+        if len(lc_per_req) > 1 and all(lc > 0 and t > 0 for lc, t in loop_reqs):
             self._low_ratio_index_score_batched(
                 indexer=indexer,
                 q_fp4=q_fp4,
@@ -3808,8 +3816,8 @@ class DeepseekV4AttnBackend(
         publish,
         consume,
     ) -> None:
-        """[fusion-opt] SGLANG_FUSE_INDEXER_BATCH_REQUESTS: the per-request score loop of
-        _low_ratio_index_topk_dense over all requests at once. Row t's score column j is
+        """The per-request score loop of _low_ratio_index_topk_dense over all requests
+        at once. Row t's score column j is
         k[ks_t + j] whatever the tile width, and the top-k reads a row up to its own
         compress length only, so scoring every row at the batch's widest request gives the
         same scores, masks and selection as one request at a time -- with one logits / top-k

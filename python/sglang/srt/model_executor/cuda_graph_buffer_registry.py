@@ -710,23 +710,46 @@ def build_decode_registry(
     # global_num_tokens_* on the batch pass register_global_num_tokens=False.
     if register_global_num_tokens:
 
-        _global_fill_cache: Dict[int, int] = {}
+        # data_ptr -> (padded_num_tokens, buf._version right after our fill).
+        _global_fill_cache: Dict[int, Tuple[int, int]] = {}
+
+        def _write_version(buf) -> Optional[int]:
+            """Version counter of buf, or None if torch does not track it."""
+            # share_input_buffer hands every runner an as_strided alias of one
+            # canonical tensor; aliases share its version counter, so an in-place
+            # torch write through another runner's alias (e.g. the eagle draft /
+            # frozen-kv-mtp replay fill_) bumps it. Inference tensors track no
+            # version: return None -> never skip.
+            try:
+                return buf._version
+            except RuntimeError:
+                return None
 
         def _global_num_tokens_post_fill(buf, fb, ctx):
             # Only the gathered (DP) path writes a value; otherwise left as init.
             if require_gathered_buffer:
                 if envs.SGLANG_OPT_HOST_SCHED_FUSE.get():
-                    # The value is a pure function of the padded bucket and nothing else
-                    # writes this buffer: skip the fill kernel while the bucket is unchanged.
-                    # Never skip (or trust the cache) while a graph is being captured.
+                    # The value is a pure function of the padded bucket: skip the fill
+                    # kernel while the bucket is unchanged AND nobody else (runners
+                    # sharing this buffer via share_input_buffer) wrote it since our
+                    # last fill. Never skip (or trust the cache) while capturing.
+                    key = buf.data_ptr()
                     if torch.cuda.is_current_stream_capturing():
-                        _global_fill_cache.pop(buf.data_ptr(), None)
+                        _global_fill_cache.pop(key, None)
                         buf.fill_(ctx.padded_num_tokens)
                         return
-                    if _global_fill_cache.get(buf.data_ptr()) == ctx.padded_num_tokens:
+                    version = _write_version(buf)
+                    if version is not None and _global_fill_cache.get(key) == (
+                        ctx.padded_num_tokens,
+                        version,
+                    ):
                         return
                     buf.fill_(ctx.padded_num_tokens)
-                    _global_fill_cache[buf.data_ptr()] = ctx.padded_num_tokens
+                    version = _write_version(buf)
+                    if version is None:
+                        _global_fill_cache.pop(key, None)
+                    else:
+                        _global_fill_cache[key] = (ctx.padded_num_tokens, version)
                     return
                 buf.fill_(ctx.padded_num_tokens)
 

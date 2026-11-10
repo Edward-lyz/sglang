@@ -24,7 +24,8 @@ def _hc_mean_kernel(
     HC: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    # int64: row * x_stride_m overflows int32 past 104857 rows at hc=4, hidden=5120.
+    row = tl.program_id(0).to(tl.int64)
     offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offs < H
     acc = tl.zeros([BLOCK_H], dtype=tl.float32)

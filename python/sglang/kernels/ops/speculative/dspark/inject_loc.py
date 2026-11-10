@@ -29,6 +29,7 @@ def _commit_swa_loc_kernel(
     row_valid_ptr,
     out_ptr,
     n,
+    n_mapping,
     verify_len,
     HAS_COMMIT: tl.constexpr,
     HAS_ROW_VALID: tl.constexpr,
@@ -37,6 +38,9 @@ def _commit_swa_loc_kernel(
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     in_range = offs < n
     loc = tl.load(cache_loc_ptr + offs, mask=in_range, other=0).to(tl.int64)
+    # Negative locs (-1 padding) index from the end, as mapping[cache_loc] does in torch;
+    # without this the load reads before the start of mapping.
+    loc = tl.where(loc < 0, loc + n_mapping, loc)
     swa = tl.load(mapping_ptr + loc, mask=in_range, other=0).to(tl.int32)
     if HAS_COMMIT:
         row = offs // verify_len
@@ -104,6 +108,7 @@ def commit_swa_loc(
         row_valid if row_valid is not None else cache_loc,
         out,
         n,
+        mapping.numel(),
         verify_len if verify_len is not None else 1,
         HAS_COMMIT=commit_lens is not None,
         HAS_ROW_VALID=row_valid is not None,

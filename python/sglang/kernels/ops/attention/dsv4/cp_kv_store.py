@@ -58,6 +58,7 @@ def _scatter_kv_rows_kernel(
     SCALE_P2: tl.constexpr,
     BLOCK_T: tl.constexpr,  # tokens per program
 ):
+    """Scatter all-gathered staging rows (data + scale words) into SWA cache slots."""
     t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     tm = t < total
     dst = tl.load(swa_loc_ptr + t, mask=tm, other=-1).to(tl.int64)
@@ -98,14 +99,23 @@ _ARANGE_CACHE = {}
 
 
 def _arange_i32(n: int, dev) -> torch.Tensor:
-    # read-only staging slots 0..n-1, shared by every layer of a forward
-    key = (n, dev)
-    t = _ARANGE_CACHE.get(key)
-    if t is None:
-        if len(_ARANGE_CACHE) > 64:
-            _ARANGE_CACHE.clear()
-        t = _ARANGE_CACHE[key] = torch.arange(n, dtype=torch.int32, device=dev)
-    return t
+    """Return a cached int32 arange(n) on dev (read-only staging slots 0..n-1).
+
+    Shared by every layer of a forward, so callers must not modify it. One
+    buffer per device, grown on demand; callers on the SWA store side stream
+    and the main stream share it, so each use records its stream, otherwise a
+    buffer dropped on growth could be reused while the other stream still
+    reads it.
+    """
+    t = _ARANGE_CACHE.get(dev)
+    if t is None or t.numel() < n:
+        t = _ARANGE_CACHE[dev] = torch.arange(
+            max(n, 2 * (t.numel() if t is not None else 0)),
+            dtype=torch.int32,
+            device=dev,
+        )
+    t.record_stream(torch.cuda.current_stream(t.device))
+    return t[:n]
 
 
 def cp_store_swa_kv_local_first(
@@ -123,6 +133,12 @@ def cp_store_swa_kv_local_first(
     cp_rank: int,
     cp_size: int,
 ) -> None:
+    """Store prefill-CP SWA KV local-first: quantize local rows, all-gather pages.
+
+    Each CP rank norm + RoPE + quantizes only its local tokens into staging pages,
+    all-gathers the pages (rank-major) and scatters every global token into its
+    SWA cache slot, instead of all-gathering the raw bf16 KV.
+    """
     from sglang.srt.layers.dp_attention import attn_cp_all_gather_into_tensor
 
     meta = forward_batch.attn_cp_metadata

@@ -1800,11 +1800,6 @@ class Envs:
     # non-blocking H2D, host-sized repeat_interleave) so the next batch's host prep
     # overlaps the previous forward instead of waiting for it to drain.
     SGLANG_FUSE_TAIL_META_NO_SYNC = EnvBool(False)
-    # [fusion-opt] Prefill dense low-ratio indexer (CP layout): score / mask / top-k all
-    # requests of a batch per tile instead of one request at a time. Same selection
-    # (rows are independent); the launch count no longer grows with the batch's request
-    # count, which on the bounded-replay tail layers is what made them host-bound.
-    SGLANG_FUSE_INDEXER_BATCH_REQUESTS = EnvBool(False)
     # [fusion-opt] Prefill-CP local-first SWA store (SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST)
     # on a side stream, so its CP all-gather runs under q_norm + wq_b (DeepInfer's
     # V4Attention issues the CP gathers before the q projection the same way).

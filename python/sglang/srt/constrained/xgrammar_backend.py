@@ -211,13 +211,6 @@ class TokenizerNotSupportedError(Exception):
 
 
 class XGrammarGrammarBackend(BaseGrammarBackend):
-    """Grammar backend on xgrammar's GrammarCompiler (bounded by SGLANG_XGRAMMAR_CACHE_LIMIT_GB)."""
-
-    # xgrammar's compiler cache (bounded by SGLANG_XGRAMMAR_CACHE_LIMIT_GB) is
-    # the only cache for compiled grammars; a hit there costs <1ms, and the
-    # engine dict would be unbounded.
-    _cache_compiled_grammars = False
-
     def __init__(
         self,
         tokenizer,
@@ -225,7 +218,6 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         model_eos_token_ids: Optional[List[int]] = None,
         any_whitespace: bool = True,
     ):
-        """Build the xgrammar tokenizer info and the bounded GrammarCompiler."""
         super().__init__()
 
         if hasattr(tokenizer, "init_xgrammar"):
@@ -250,9 +242,14 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     f"Failed to create XGrammar TokenizerInfo from tokenizer: {e}"
                 )
 
+        # The engine cache (synchronous hit, no grammar-queue round) shares
+        # SGLANG_XGRAMMAR_CACHE_LIMIT_GB and CompiledGrammar.memory_size_bytes
+        # accounting with xgrammar's compiler cache, so it cannot pin compiled
+        # grammars past the budget that bounds the compiler cache.
+        self.cache_limit_bytes = _xgrammar_cache_limit_bytes()
         self.grammar_compiler = GrammarCompiler(
             tokenizer_info=tokenizer_info,
-            cache_limit_bytes=_xgrammar_cache_limit_bytes(),
+            cache_limit_bytes=self.cache_limit_bytes,
         )
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
@@ -332,6 +329,12 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         for structure in structural_tag.get("structures", []):
             if structure.get("schema") is None:
                 structure["schema"] = {}
+
+    def grammar_size_bytes(self, value: BaseGrammarObject) -> int:
+        """Compiled grammar size reported by xgrammar, charged against cache_limit_bytes."""
+        if isinstance(value, XGrammarGrammar):
+            return value.ctx.memory_size_bytes
+        return 0
 
     def _from_context(
         self, ctx: CompiledGrammar, key_string: str, grammar_stats: GrammarStats

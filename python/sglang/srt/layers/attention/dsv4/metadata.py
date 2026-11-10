@@ -392,6 +392,7 @@ class PagedIndexerMetadata:
                 "compressed_page_size",
                 "compress_ratio",
                 "row_chunk",
+                "allow_row_chunk",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",
