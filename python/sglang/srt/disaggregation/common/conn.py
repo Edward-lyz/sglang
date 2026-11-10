@@ -317,6 +317,16 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+    def prefill_routing_dp(self) -> Tuple[int, int]:
+        """(dp width, dp rank) the decode uses to find this prefill rank.
+
+        Matches the bootstrap server's dp_group: the fake_dp replica index, or
+        the attention DP rank under real DP attention (system_dp_size == 1).
+        """
+        if self.system_dp_size > 1:
+            return self.system_dp_size, self.system_dp_rank
+        return self.attn_dp_size, self.attn_dp_rank
+
     def _should_skip_cp_replicated_state_transfer(self) -> bool:
         """Whether this prefill rank should omit CP-replicated state.
 
@@ -1478,8 +1488,8 @@ class CommonKVSender(BaseKVSender):
         # fake_dp: real dp_size==1 but there are system_dp_size independent
         # replicas; route by the replica index (system_dp_rank) so the decode
         # can locate the replica that actually ran the prefill.
-        _routing_dp_size = self.kv_mgr.system_dp_size
-        _routing_dp_rank = self.kv_mgr.system_dp_rank
+        # Real DP attention keeps system_dp_size == 1, so it routes by attn_dp_rank.
+        _routing_dp_size, _routing_dp_rank = self.kv_mgr.prefill_routing_dp()
         if _routing_dp_size > 1 and not req_has_disagg_prefill_dp_rank:
             if get_parallel().load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
@@ -1505,7 +1515,7 @@ class CommonKVSender(BaseKVSender):
         url = f"http://{self.bootstrap_server_url}/register_dp_rank"
         payload = {
             "bootstrap_room": self.bootstrap_room,
-            "dp_rank": self.kv_mgr.system_dp_rank,
+            "dp_rank": self.kv_mgr.prefill_routing_dp()[1],
         }
         try:
             response = requests.post(url, json=payload, timeout=5)
