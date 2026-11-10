@@ -2,6 +2,7 @@ import functools
 import importlib
 import logging
 import math
+import os
 import threading
 from typing import Tuple
 
@@ -2171,31 +2172,83 @@ def _num_slices_for(k: int) -> int:
     return 1
 
 
-def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch.Tensor:
-    """Batch-invariant F.linear(x_flat.float(), hc_fn) * rsqrt(mean(x_flat^2) + eps).
+# --- deepgemm split-K prenorm GEMM producer -------------------------------
+# `deep_gemm.tf32_hc_prenorm_gemm` computes the exact split-K partials
+# (gemm_out [splits, M, N] fp32, sqr_sum [splits, M] fp32) that
+# `_hc_mix_stats_partial_kernel` produces, but ~6-9x faster on sm100. We keep
+# the Triton reduce/sinkhorn stages unchanged. `num_splits` depends only on K,
+# so a row stays batch-invariant. Enabled by default on Blackwell; set
+# SGLANG_MHC_USE_DEEPGEMM=0 to force the Triton split-K producer.
+_MHC_USE_DEEPGEMM = os.environ.get("SGLANG_MHC_USE_DEEPGEMM", "1") == "1"
+_MHC_DEEPGEMM_SPLITS = int(os.environ.get("SGLANG_MHC_DEEPGEMM_SPLITS", "16"))
+_mhc_deepgemm_warned = False
 
-    x_flat is [M, K] in any float dtype; hc_fn is [MIX, K] fp32; returns [M, MIX] fp32.
-    K slicing and reduction order are independent of M, so each row is bitwise
-    identical whether computed alone or in a batch.
-    """
-    assert x_flat.dim() == 2 and hc_fn.dim() == 2
-    assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
-    assert hc_fn.dtype == torch.float32
-    m, k = x_flat.shape
-    mix = hc_fn.shape[0]
-    assert hc_fn.shape[1] == k
-    num_slices = _num_slices_for(k)
-    mix_pad = max(16, triton.next_power_of_2(mix))
-    part_mix = torch.empty(
-        (num_slices, m, mix), dtype=torch.float32, device=x_flat.device
+
+@functools.lru_cache(maxsize=1)
+def _deep_gemm():
+    try:
+        import deep_gemm
+
+        return deep_gemm if hasattr(deep_gemm, "tf32_hc_prenorm_gemm") else None
+    except Exception:  # pragma: no cover - deep_gemm optional
+        return None
+
+
+def _mhc_deepgemm_eligible(x_flat: torch.Tensor, hc_fn: torch.Tensor) -> bool:
+    if not _MHC_USE_DEEPGEMM or _deep_gemm() is None:
+        return False
+    ns = _MHC_DEEPGEMM_SPLITS
+    k = hc_fn.shape[1]
+    return (
+        x_flat.is_cuda
+        and get_platform().is_blackwell
+        and x_flat.dtype == torch.bfloat16
+        and hc_fn.dtype == torch.float32
+        and x_flat.stride(1) == 1
+        and hc_fn.stride(1) == 1
+        and ns >= 1
+        and k % ns == 0
+        and (k // ns) % _HC_MIX_BLOCK_K == 0
     )
-    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=x_flat.device)
-    mixes = torch.empty((m, mix), dtype=torch.float32, device=x_flat.device)
-    if m == 0:
-        return mixes
-    block_m = _block_m_for(m)
-    grid_m = triton.cdiv(m, block_m)
-    _hc_mix_stats_partial_kernel[(grid_m, num_slices)](
+
+
+def _hc_mix_partials(
+    x_flat: torch.Tensor,
+    hc_fn: torch.Tensor,
+    m: int,
+    k: int,
+    mix: int,
+    mix_pad: int,
+    block_m: int,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Produce split-K partials (part_mix, part_sq) and the slice count.
+
+    Prefers deep_gemm.tf32_hc_prenorm_gemm on Blackwell; falls back to the
+    Triton split-K kernel. The slice count is a function of K only, keeping a
+    row's fp32 reduction order independent of the batch size."""
+    global _mhc_deepgemm_warned
+    dev = x_flat.device
+    if _mhc_deepgemm_eligible(x_flat, hc_fn):
+        num_slices = _MHC_DEEPGEMM_SPLITS
+        part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
+        part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
+        try:
+            _deep_gemm().tf32_hc_prenorm_gemm(
+                x_flat, hc_fn, part_mix, part_sq, num_splits=num_slices
+            )
+            return part_mix, part_sq, num_slices
+        except Exception as exc:  # pragma: no cover - fall back to Triton
+            if not _mhc_deepgemm_warned:
+                logger.warning(
+                    "deep_gemm.tf32_hc_prenorm_gemm failed (%s); "
+                    "falling back to the Triton mhc split-K producer.",
+                    exc,
+                )
+                _mhc_deepgemm_warned = True
+    num_slices = _num_slices_for(k)
+    part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
+    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
+    _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
         x_flat,
         hc_fn,
         part_mix,
@@ -2212,6 +2265,31 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
         num_stages=_num_stages_for(m, k),
+    )
+    return part_mix, part_sq, num_slices
+
+
+def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch.Tensor:
+    """Batch-invariant F.linear(x_flat.float(), hc_fn) * rsqrt(mean(x_flat^2) + eps).
+
+    x_flat is [M, K] in any float dtype; hc_fn is [MIX, K] fp32; returns [M, MIX] fp32.
+    K slicing and reduction order are independent of M, so each row is bitwise
+    identical whether computed alone or in a batch.
+    """
+    assert x_flat.dim() == 2 and hc_fn.dim() == 2
+    assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
+    assert hc_fn.dtype == torch.float32
+    m, k = x_flat.shape
+    mix = hc_fn.shape[0]
+    assert hc_fn.shape[1] == k
+    mix_pad = max(16, triton.next_power_of_2(mix))
+    mixes = torch.empty((m, mix), dtype=torch.float32, device=x_flat.device)
+    if m == 0:
+        return mixes
+    block_m = _block_m_for(m)
+    grid_m = triton.cdiv(m, block_m)
+    part_mix, part_sq, num_slices = _hc_mix_partials(
+        x_flat, hc_fn, m, k, mix, mix_pad, block_m
     )
     _hc_mix_stats_reduce_kernel[(grid_m,)](
         part_mix,
@@ -2316,28 +2394,10 @@ def hc_mix_stats_sinkhorn(
     if m == 0:
         return pre, post, comb
 
-    num_slices = _num_slices_for(k)
     mix_pad = max(16, triton.next_power_of_2(mix))
-    part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
-    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
     block_m = _block_m_for(m)
-    _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
-        x_flat,
-        hc_fn,
-        part_mix,
-        part_sq,
-        m,
-        k,
-        x_flat.stride(0),
-        hc_fn.stride(0),
-        MIX=mix,
-        MIX_PAD=mix_pad,
-        NUM_SLICES=num_slices,
-        BLOCK_M=block_m,
-        BLOCK_K=_HC_MIX_BLOCK_K,
-        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
-        num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_num_stages_for(m, k),
+    part_mix, part_sq, num_slices = _hc_mix_partials(
+        x_flat, hc_fn, m, k, mix, mix_pad, block_m
     )
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         part_mix,
