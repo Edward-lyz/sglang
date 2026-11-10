@@ -233,6 +233,7 @@ class DeepGemmCandidateIndexer:
             metadata.page_table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            request_ids=metadata.request_ids,
         )
         if self.alt_stream is not None:
             self.alt_stream.wait_stream(torch.cuda.current_stream())

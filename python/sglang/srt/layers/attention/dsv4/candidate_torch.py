@@ -226,6 +226,7 @@ class TorchCandidateIndexer:
             metadata.page_table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            request_ids=metadata.request_ids,
         )
         logits, mask = two_level_decode_logits(
             logits,
@@ -260,6 +261,7 @@ class TorchCandidateIndexer:
             metadata.page_table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            request_ids=metadata.request_ids,
         )
         logits, _ = two_level_decode_logits(
             logits,

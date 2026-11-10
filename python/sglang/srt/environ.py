@@ -593,6 +593,13 @@ class Envs:
     # only (target verify guards correctness), so the fused path is distribution-
     # equivalent, not bit-exact. OFF keeps the exact precomputed-noise path.
     SGLANG_FUSE_DSPARK_INLINE_RNG = EnvBool(False)
+    # Folded draft sampling keeps a static [max_bs * gamma, vocab] block-logits buffer
+    # (read only by the sampling accept path). ON: every markov step writes its
+    # corrected logits straight into the buffer slot from the step-logits kernel
+    # (bit-identical values, the base-logits slice is read in place), instead of
+    # appending each step, torch.cat-ing them and convert-copying the cat into the
+    # buffer -- about 0.75 ms/step at bs256 (fp32 [bs, gamma, vocab]).
+    SGLANG_OPT_DSPARK_CORRECTED_INPLACE = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -1802,6 +1809,16 @@ class Envs:
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER = EnvBool(False)
     # use multistream to overlap the publish-side with other computation
     SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP = EnvBool(True)
+    # DeepSeek-V4.1 decode-verify low-ratio indexer: hand DeepGEMM the request id of
+    # every query row (varlen mode of paged_mqa_logits) so the draft rows of one
+    # request share one pass over its index-K cache instead of each re-reading all
+    # of it. Bit-identical logits, ~2.9x on the dense ratio-1 logits at 61k/bs256x6.
+    # Static verify only (uniform rows per request); ragged verify keeps per-row.
+    SGLANG_OPT_DSV41_INDEXER_REQUEST_GROUPED_ROWS = EnvBool(False)
+    # Widening bf16 -> fp32 copy of the lm_head logits (the fp32 logits buffer fill) with
+    # a Triton kernel instead of PyTorch's direct-copy kernel: ~2.8x faster on the
+    # [1536, 129280] verify logits, bit-identical.
+    SGLANG_OPT_LOGITS_CAST_TRITON = EnvBool(False)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)

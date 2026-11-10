@@ -195,6 +195,10 @@ class PagedIndexerMetadata:
     # list: its decode/verify/draft consumers (fp4_paged_mqa_logits) take a single
     # schedule tensor, so budget row-chunking stays off unless the caller opts in.
     allow_row_chunk: bool = False
+    # [rows] int32, one request id per query row with a request's rows consecutive
+    # (verify: its draft tokens). Set: DeepGEMM plans the logits in varlen mode so
+    # a request's rows share one K pass; fp4_paged_mqa_logits must get the same ids.
+    request_ids: Optional[torch.Tensor] = None
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
@@ -233,6 +237,13 @@ class PagedIndexerMetadata:
             if compressed_seq_lens.dim() == 1:
                 compressed_seq_lens = compressed_seq_lens.unsqueeze(-1)
             num_rows = compressed_seq_lens.shape[0]
+            if self.request_ids is not None and (
+                self.row_chunk > 0
+                or self.request_ids.shape[0] != num_rows
+                or self.allow_row_chunk
+            ):
+                # the varlen plan is one schedule over all rows
+                self.request_ids = None
             self.mqa_logits_budget_bytes = self._mqa_logits_budget(num_rows=num_rows)
             self.rows_per_chunk = plan_indexer_row_chunks(
                 num_rows=num_rows,
@@ -273,11 +284,20 @@ class PagedIndexerMetadata:
                     )
                 ]
             else:
-                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                    compressed_seq_lens,
-                    self.compressed_page_size,
-                    deep_gemm.get_num_sms(),
-                )
+                if self.request_ids is not None:
+                    # varlen plan; the JIT planner has no request-id mode
+                    self.deep_gemm_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                        compressed_seq_lens,
+                        self.compressed_page_size,
+                        deep_gemm.get_num_sms(),
+                        self.request_ids,
+                    )
+                else:
+                    self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                        compressed_seq_lens,
+                        self.compressed_page_size,
+                        deep_gemm.get_num_sms(),
+                    )
 
             assert isinstance(self.deep_gemm_metadata, (torch.Tensor, list))
 
@@ -358,7 +378,7 @@ class PagedIndexerMetadata:
         else:
             copy_fields = ["page_table", "compressed_seq_lens", "deep_gemm_metadata"]
             assign_fields = ["nonpaged_plan"]
-        copy_fields += ["topk_metadata"]
+        copy_fields += ["topk_metadata", "request_ids"]
         assign_fields += [
             "rows_per_chunk",
             "mqa_logits_budget_bytes",

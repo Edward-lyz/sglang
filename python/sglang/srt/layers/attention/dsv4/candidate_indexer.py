@@ -262,6 +262,15 @@ def make_candidate_indexer(topk_blocks: int, block_size: int) -> CandidateIndexe
     if get_parallel().attn_cp_size > 1:
         prefill_dense = DenseCandidateIndexer(topk_blocks, block_size)
     if envs.SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER.get():
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "deep_gemm_candidate_indexer",
+            "decode candidate consumers score only the published blocks with DeepGEMM "
+            "paged sparse MQA logits (topk_blocks=%d, block_size=%d)",
+            topk_blocks,
+            block_size,
+        )
         return DeepGemmCandidateIndexer(
             topk_blocks, block_size, prefill_dense=prefill_dense
         )

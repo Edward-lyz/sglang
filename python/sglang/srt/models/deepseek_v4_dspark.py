@@ -18,7 +18,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     CommitKvProj,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
+from sglang.srt.distributed.device_communicators.vocab_gather import (
+    LocalVocabGather,
+    make_vocab_gather,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -480,21 +483,34 @@ class DSparkV4MarkovHead(nn.Module):
         del hidden_states
         return self.project_bias(self.get_prev_embeddings(token_ids))
 
+    # run_markov_block hands this head the block-logits slot of each step
+    supports_corrected_dst = True
+
     def apply_step_logits(
         self,
         logits: torch.Tensor,
         *,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
+        corrected_dst: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``corrected_dst``: [bs, vocab] slot of the caller's block-logits buffer that
+        receives these step logits (rounded once to its dtype)."""
         if self._tp_shard is not None:
             return self._apply_step_logits_sharded(
-                base_local=logits, token_ids=token_ids
+                base_local=logits, token_ids=token_ids, corrected_dst=corrected_dst
             )
-        return logits + self.compute_step_bias(token_ids, hidden_states)
+        out = logits + self.compute_step_bias(token_ids, hidden_states)
+        if corrected_dst is not None:
+            corrected_dst.copy_(out)
+        return out
 
     def _apply_step_logits_sharded(
-        self, *, base_local: torch.Tensor, token_ids: torch.Tensor
+        self,
+        *,
+        base_local: torch.Tensor,
+        token_ids: torch.Tensor,
+        corrected_dst: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shard = self._tp_shard
         latent = self.get_prev_embeddings(token_ids)
@@ -505,9 +521,20 @@ class DSparkV4MarkovHead(nn.Module):
             bias = F.linear(latent.to(weight_local.dtype), weight_local)
         else:
             bias = F.linear(latent.float(), weight_local)
-        step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
-        full = self._vocab_gather(step_local)
-        return full[..., : self.vocab_size]
+        # A group of one gathers nothing, so the step logits are final in step_local
+        # and the block-logits slot can be filled by the same kernel.
+        fuse_dst = corrected_dst is not None and isinstance(
+            self._vocab_gather, LocalVocabGather
+        )
+        step_local = BuildStepLocal.execute(
+            bias=bias,
+            base_local=base_local,
+            corrected_dst=corrected_dst if fuse_dst else None,
+        )
+        full = self._vocab_gather(step_local)[..., : self.vocab_size]
+        if corrected_dst is not None and not fuse_dst:
+            corrected_dst.copy_(full)
+        return full
 
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
@@ -522,6 +549,7 @@ class DSparkV4MarkovHead(nn.Module):
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
         collect_corrected: bool = True,
+        corrected_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
@@ -530,6 +558,7 @@ class DSparkV4MarkovHead(nn.Module):
             hidden_states=hidden_states,
             sampler=sampler,
             collect_corrected=collect_corrected,
+            corrected_out=corrected_out,
         )
 
 

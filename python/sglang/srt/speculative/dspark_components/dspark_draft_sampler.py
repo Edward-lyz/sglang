@@ -15,6 +15,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.utils.community_opt import log_community_opt_once
 
 logger = logging.getLogger(__name__)
 
@@ -207,14 +208,29 @@ class DsparkDraftSampler:
                         greedy_step_sampler(step_logits, step_idx),
                     )
 
+            # Each step writes its corrected logits straight into the static
+            # block-logits buffer (no per-step list + cat + convert-copy pass).
+            corrected_view = None
+            if self.folded_sampling and envs.SGLANG_OPT_DSPARK_CORRECTED_INPLACE.get():
+                corrected_view = self.corrected_out[: bs * self.gamma].view(
+                    bs, self.gamma, -1
+                )
+                log_community_opt_once(
+                    "dspark_corrected_inplace",
+                    "DSpark draft block logits written in place per step "
+                    "(bs=%d, gamma=%d)",
+                    bs,
+                    self.gamma,
+                )
             draft_tokens, corrected_logits = self.markov_head.sample_block(
                 base_logits,
                 first_prev_tokens=anchor,
                 hidden_states=sample_hidden,
                 sampler=sampler,
                 collect_corrected=self.folded_sampling,
+                corrected_out=corrected_view,
             )
-            if self.folded_sampling:
+            if self.folded_sampling and corrected_view is None:
                 self.corrected_out[: bs * self.gamma].copy_(
                     corrected_logits.reshape(bs * self.gamma, -1)
                 )

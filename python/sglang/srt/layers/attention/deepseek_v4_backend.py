@@ -1364,6 +1364,7 @@ class DeepseekV4AttnBackend(
         *,
         compress_ratio: int = 4,
         use_prefill_cuda_graph: bool = False,
+        rows_per_request: int = 0,
     ):
         page_table = core_attn_metadata.page_table
         index_page_size = 0
@@ -1388,11 +1389,36 @@ class DeepseekV4AttnBackend(
             )
         else:
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
+        request_ids = None
+        num_rows = c_seq_lens.shape[0]
+        if (
+            rows_per_request > 1
+            and compress_ratio in (1, 2)
+            and num_rows > 0
+            and num_rows % rows_per_request == 0
+            and _is_cuda
+            and not _is_xpu
+            and envs.SGLANG_OPT_DSV41_INDEXER_REQUEST_GROUPED_ROWS.get()
+        ):
+            # uniform verify rows: row i belongs to request i // rows_per_request
+            request_ids = (
+                torch.arange(num_rows, dtype=torch.int32, device=c_seq_lens.device)
+                // rows_per_request
+            )
+            log_community_opt_once(
+                "indexer_request_grouped_rows",
+                "low-ratio decode indexer logits run in DeepGEMM varlen mode "
+                "(%d rows/request, ratio=%d, rows=%d)",
+                rows_per_request,
+                compress_ratio,
+                num_rows,
+            )
         return PagedIndexerMetadata(
             page_size=self.page_size,
             compressed_page_size=index_page_size or self.page_size // compress_ratio,
             page_table=page_table,
             compressed_seq_lens=c_seq_lens,
+            request_ids=request_ids,
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
@@ -2126,16 +2152,26 @@ class DeepseekV4AttnBackend(
         if c128_compress_metadata is None and self.has_c128:
             c128_compress_metadata = create(compress_ratio=128)
         low = core_attn_metadata.low_ratios
+        # uniform static verify: every request owns exactly num_draft_tokens rows
+        rows_per_request = 0 if is_ragged else num_draft_tokens
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c1_indexer_metadata=(
-                self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=1)
+                self.init_forward_metadata_indexer(
+                    core_attn_metadata,
+                    compress_ratio=1,
+                    rows_per_request=rows_per_request,
+                )
                 if 1 in low
                 else None
             ),
             c2_indexer_metadata=(
-                self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=2)
+                self.init_forward_metadata_indexer(
+                    core_attn_metadata,
+                    compress_ratio=2,
+                    rows_per_request=rows_per_request,
+                )
                 if 2 in low
                 else None
             ),
@@ -3892,6 +3928,7 @@ class DeepseekV4AttnBackend(
             metadata.page_table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            request_ids=metadata.request_ids,
         )
         # TODO(dark): add bf16 topk
         fp32_jit_paged_topk(logits, metadata, page_indices, raw_indices)
