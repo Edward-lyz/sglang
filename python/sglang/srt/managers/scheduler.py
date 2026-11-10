@@ -5330,7 +5330,20 @@ class Scheduler(
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                # A waiting-queue req here already went through `pop_preallocated`,
+                # so besides the target KV it also holds a draft SWA window mapping
+                # (DSpark's DraftWindowSlotMap, mapped in `map_slots`). Free only the
+                # target KV and its ~window draft pages leak until the draft pool
+                # exhausts and the scheduler crashes -- release both, mirroring the
+                # normal finish path (batch_result_processor) and retract path.
+                draft_req_pool_idx = req.req_pool_idx
                 release_kv_cache(req, self.tree_cache)
+                if draft_req_pool_idx is not None and isinstance(
+                    self.draft_worker, BaseSpecWorker
+                ):
+                    self.draft_worker.release_draft_kv(
+                        req_pool_idx=int(draft_req_pool_idx)
+                    )
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 bootstrap_pending = req.pending_bootstrap
