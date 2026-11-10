@@ -85,6 +85,7 @@ from sglang.srt.managers.io_struct import (
     TokenizeReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TraceReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     async_sock_recv,
@@ -350,12 +351,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init request dispatcher
         self.init_request_dispatcher()
-        if envs.AIAK_ENABLE_TRACE.get():
-            from msit_llm.sglang import encoder_tracer
-
-            self.msit_request_logger = encoder_tracer.RequestTracer(
-                self.tokenizer, envs.AIAK_MSIT_TRACE_DIR.get(), self.server_args
-            )
 
     def init_model_config(self):
         server_args = self.server_args
@@ -622,6 +617,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
                 bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
             )
+            # Last time a real (non-health-check) request updated latency
+            # metrics; the idle heartbeat loop uses it to detect a traffic stop.
+            self._last_real_request_ts = time.monotonic()
 
             start_cpu_monitor_thread("tokenizer")
 
@@ -1503,12 +1501,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 as_kv_cache_params=obj.as_kv_cache_params,
                 as_max_hit_host_ip=obj.as_max_hit_host_ip,
                 as_max_hit_token_len=obj.as_max_hit_token_len,
-                is_warmup=obj.is_warmup,
-                trace_config=obj.trace_config,
                 continuation_token_ids=obj.continuation_token_ids,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 mm_data_mooncake=obj.mm_data_mooncake,
                 encoder_urls=obj.encoder_urls,
+                trace_config=obj.trace_config
             )
 
             # Generate as_block_hashs from input_ids
@@ -2053,24 +2050,44 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     except StopAsyncIteration:
                         pass
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, *, only_if_pending: bool = False
+    ):
+        """Ask the scheduler to abort a request.
+
+        ``only_if_pending`` drops the abort when this process holds no live state
+        for ``rid``, i.e. the request already finished. Callers that own the
+        request must set it: their own ``rid_to_state`` is authoritative for the
+        requests they served, so a missing entry means "already done, nothing to
+        abort". Cross-process callers (``/abort_request``) must not, because with
+        several tokenizer workers the rid may live in a sibling process.
+
+        Aborts are counted where they take effect (``_handle_abort_req`` and
+        ``collect_metrics``), not here — this call only expresses the intent, and
+        the scheduler may find nothing to abort.
+        """
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
         if (
             not abort_all
-            and self.server_args.tokenizer_worker_num == 1
             and rid not in self.rid_to_state
+            # A single-worker deployment serves every request, so a missing entry
+            # always means already-finished. With several tokenizer workers only
+            # a caller that owns the request can draw that conclusion.
+            and (only_if_pending or self.server_args.tokenizer_worker_num == 1)
         ):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self._dispatch_to_scheduler(req)
-        if self.enable_metrics:
-            # TODO: also use custom_labels from the request
-            self.metrics_collector.observe_one_aborted_request(
-                self.metrics_collector.labels
-            )
+
+    def trace_request(self, rid: str = ""):
+        """Send a trace request to scheduler. Scheduler will parse trace_config from Req."""
+        if not rid:
+            return
+        req = TraceReq(rid=rid)
+        self.send_to_scheduler.send_pyobj(req)
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
@@ -2188,14 +2205,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return None
 
     def create_abort_task(self, obj: GenerateReqInput):
-        # Abort the request if the client is disconnected.
+        # Abort the request if the client is disconnected. This runs as a
+        # background task after the response is sent, so it also fires for
+        # requests that completed normally: only_if_pending keeps those from
+        # reaching the scheduler (and from being counted as aborts).
         async def abort_request():
             await asyncio.sleep(2)
             if obj.is_single:
-                self.abort_request(obj.rid)
+                self.abort_request(obj.rid, only_if_pending=True)
             else:
                 for rid in obj.rid:
-                    self.abort_request(rid)
+                    self.abort_request(rid, only_if_pending=True)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
@@ -2225,6 +2245,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+
+        if self.enable_metrics:
+            self.asyncio_tasks.add(
+                loop.create_task(
+                    print_exception_wrapper(self._idle_metric_heartbeat_loop)
+                )
+            )
+
+    async def _idle_metric_heartbeat_loop(self):
+        """Emit idle histogram heartbeats on a timer.
+
+        Decode-latency panels are plotted as rate(_sum)/rate(_count); after
+        traffic stops both rates hit 0 and the panel goes 0/0 = NaN (breaks
+        off). The tokenizer is request-driven and -- unlike the scheduler whose
+        idle batch drives it -- never wakes on its own while idle, so a timer
+        must drive the heartbeat. Throttle and env gating live in the
+        collector's emit method; this only fires once decode has been quiet
+        past the staleness window.
+        """
+        while True:
+            await asyncio.sleep(30.0)
+            try:
+                if time.monotonic() - self._last_real_request_ts >= 30.0:
+                    self.metrics_collector.emit_idle_histogram_heartbeat()
+            except Exception:
+                pass
 
     async def handle_loop(self):
         """The event loop that handles requests"""
@@ -2347,6 +2393,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["audio_tokens"] = audio_tokens_list[i]
                 if video_tokens_list and video_tokens_list[i]:
                     meta_info["video_tokens"] = video_tokens_list[i]
+
+            # Add trace_info from scheduler trace if available
+            if (
+                hasattr(recv_obj, "trace_infos")
+                and recv_obj.trace_infos
+                and i < len(recv_obj.trace_infos)
+                and recv_obj.trace_infos[i] is not None
+            ):
+                meta_info["trace_info"] = recv_obj.trace_infos[i]
 
             if getattr(recv_obj, "output_hidden_states", None):
                 hidden_states = recv_obj.output_hidden_states[i]
@@ -2831,21 +2886,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or obj.sampling_params.get("structural_tag", None)
         )
 
+    def _build_metrics_labels(self, state: ReqState) -> Dict[str, str]:
+        """Per-request metric labels: collector defaults plus request overrides."""
+        labels = dict(self.metrics_collector.labels)
+        if isinstance(state.obj, GenerateReqInput) and state.obj.custom_labels:
+            labels.update(state.obj.custom_labels)
+        if self.enable_priority_scheduling and state.obj.priority is not None:
+            labels["priority"] = str(state.obj.priority)
+        return labels
+
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
+        # Mark real traffic so the idle heartbeat loop knows decode is active
+        # (health-check rids are filtered out before reaching here).
+        self._last_real_request_ts = time.monotonic()
         completion_tokens = (
             recv_obj.completion_tokens[i]
             if getattr(recv_obj, "completion_tokens", None)
             else 0
         )
 
-        custom_labels = getattr(state.obj, "custom_labels", None)
-        labels = dict(self.metrics_collector.labels)
-        if custom_labels:
-            labels.update(custom_labels)
-        if self.enable_priority_scheduling:
-            priority = getattr(state.obj, "priority", None)
-            if priority is not None:
-                labels["priority"] = str(priority)
+        labels = self._build_metrics_labels(state)
         if not state.ttft_observed:
             state.ttft_observed = True
             state.last_completion_tokens = completion_tokens
@@ -3201,6 +3261,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "meta_info": meta_info,
         }
         del self.rid_to_state[recv_obj.rid]
+
+        # This request really was aborted, and it ends here: the scheduler
+        # dropped it before it could produce a batch output, so collect_metrics
+        # will never see it.
+        if self.enable_metrics and state.obj.log_metrics:
+            self.metrics_collector.observe_one_aborted_request(
+                self._build_metrics_labels(state)
+            )
 
         state.out_list.append(out)
         state.event.set()

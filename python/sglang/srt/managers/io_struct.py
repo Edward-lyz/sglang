@@ -275,8 +275,6 @@ class GenerateReqInput:
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
-    # Whether this is a warmup request (used to control trace behavior)
-    is_warmup: bool = False
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
     # For custom metric labels
@@ -315,7 +313,7 @@ class GenerateReqInput:
     as_kv_cache_params: Optional[Union[List[dict], dict]] = None
     as_max_hit_host_ip: Optional[Union[List[List[str]], List[str]]] = None
     as_max_hit_token_len: Optional[Union[List[List[int]], List[int]]] = None
-
+    # for trace
     trace_config: Optional[Dict[str, Any]] = None
     # Function call continuation: token IDs to replay for grammar state recovery
     continuation_token_ids: Optional[List[int]] = None
@@ -874,13 +872,12 @@ class GenerateReqInput:
                 if self.as_max_hit_token_len is not None
                 else None
             ),
-            is_warmup=self.is_warmup,
-            trace_config=self.trace_config,
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            trace_config=self.trace_config,
         )
         cache[i] = sub
         return sub
@@ -958,9 +955,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
-
-    # Whether this is a warmup request (used to control trace behavior)
-    is_warmup: bool = False
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
@@ -1435,6 +1429,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
+    # Trace info for each request (populated by TraceManager for online return)
+    trace_infos: Optional[List[Optional[Dict[str, Any]]]] = None
 
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
@@ -1520,6 +1516,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
     # Timestamp when detokenization completed, used to measure ZMQ transit latency
     detokenize_completed_time: Optional[float] = None
+    # Trace info for each request (populated by TraceManager for online return)
+    trace_infos: Optional[List[Optional[Dict[str, Any]]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
@@ -1958,6 +1956,42 @@ class AbortReq(BaseReq, kw_only=True):
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
 
+class TraceType:
+    """Trace action types.
+    """
+
+    KV = "kv"
+    METADATA = "metadata"
+    PROMPT = "prompt"
+    SAMPLE = "sample"
+    LOGPROBS = "logprobs"
+    ALL = "all"
+
+class TraceTrigger:
+    """When to trigger a trace action."""
+
+    IMMEDIATE = "immediate"
+    ON_FINISH = "on_finish"
+
+class TraceReq(BaseReq):
+    """Request to trigger KV cache or metadata tracing."""
+
+    # Directory to dump KV metadata to. If None, use default path.
+    dump_dir: Optional[str] = None
+    # Which trace mode to execute; see TraceType for valid values.
+    trace_type: str = TraceType.KV
+    # When to trigger the trace; see TraceTrigger for valid values.
+    trigger: str = TraceTrigger.IMMEDIATE
+    # Optional JSON-serializable payload for prompt/sample trace data.
+    payload: Optional[Dict[str, Any]] = None
+    # Whether to include logprobs data in the trace output.
+    return_logprob: bool = False
+    # Whether to return trace data online via the response
+    return_online: bool = False
+
+    def __post_init__(self):
+        if self.rid is None:
+            self.rid = ""
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     """Report asynchronous Elastic EP scale completion or failure."""

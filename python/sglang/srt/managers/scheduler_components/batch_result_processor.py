@@ -79,6 +79,7 @@ class SchedulerBatchResultProcessor:
     model_worker: BaseTpWorker
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
+    fire_pending_trace: Callable[[Req], None]
     abort_request: Callable
     future_map: Optional[Any] = None
 
@@ -94,6 +95,7 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                self.fire_pending_trace(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -247,6 +249,7 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
+                        self.fire_pending_trace(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                         if self.server_args.enable_metrics:
@@ -335,6 +338,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
+                        self.fire_pending_trace(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
@@ -874,6 +878,7 @@ class SchedulerBatchResultProcessor:
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
+                    self.fire_pending_trace(req)
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
                 if self.server_args.enable_hisparse:
@@ -888,6 +893,7 @@ class SchedulerBatchResultProcessor:
                     if get_global_server_args().enable_mamba_extra_buffer_lazy()
                     else True
                 )
+                self.fire_pending_trace(req)
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()

@@ -126,6 +126,10 @@ class EncoderAddr(BaseModel):
     embedding_dim: int
     embedding_dtype: str
     img_grid_thw: Optional[List[List[int]]] = None
+    # Original [width, height] per media item, before any resize. Prefill and
+    # decode both need it to rebuild Kimi-K3's resolution-carrying media
+    # framing; other models leave it unset.
+    original_image_sizes: Optional[List[List[int]]] = None
     rdma_port: int = 0
     item_addr: int = 0
     cache_size: int = 0
@@ -170,10 +174,22 @@ class FetchResult:
 
 @dataclass
 class PendingTaskTokenStat:
-    """Pending count and token size for one task_id."""
+    """Per-copy reserved token amounts for one task_id (one list entry per
+    in-flight fetch/copy).
 
-    tokens: int
-    count: int = 1
+    Accounting is strictly per copy — each copy is added on fetch, corrected once
+    when its actual size is known, and subtracted on its own completion — so the
+    invariant ``_pipeline_pending_tokens == sum(all entries across all tasks)``
+    always holds. Duplicates and any interleaving of fetch/correct/done stay
+    balanced without scaling a shared price by an outstanding count.
+    """
+
+    reserved: list = field(default_factory=list)
+
+    @property
+    def count(self) -> int:
+        """Number of in-flight copies (reserved entries) for this task_id."""
+        return len(self.reserved)
 
 
 class VitServerClient:
@@ -304,7 +320,7 @@ class TaskProcessor:
         image_url = mm_items[0] if mm_items else ""
 
         logger.info(f"[Task] fetched task: req_id={request_id} task_id={task_id} "
-                    f"type={modality} tokens={task.get('tokens', 0)} "
+                    f"type={modality} budget_tokens={task.get('tokens', 0)} "
                     f"sample_fps={sample_fps} ")
 
         session_id = task.get("session_id", "")
@@ -322,6 +338,7 @@ class TaskProcessor:
                 from_workflow=True,
                 modality=modality,
                 sample_fps=sample_fps,
+                source="workflow",
             )
             update_encoder_output_timestamp()
 
@@ -335,6 +352,12 @@ class TaskProcessor:
                 img_grid_thw = embed_res.image_grid_dim.tolist()
 
             elapsed = time.monotonic() - start
+            logger.info(
+                f"[Task] done req_id={request_id} task_id={task_id} "
+                f"type={modality} out_tokens={embedding_len} "
+                f"shape=[{embedding_len},{embedding_dim}] compute_e2e={elapsed:.3f}s"
+            )
+            self._encoder.metrics_collector.observe_one_finished_request()
 
             return TaskResult(
                 model_id=model_id,
@@ -355,6 +378,7 @@ class TaskProcessor:
                     embedding_dim=embedding_dim,
                     embedding_dtype=embedding_dtype,
                     img_grid_thw=img_grid_thw,
+                    original_image_sizes=embed_res.original_image_sizes,
                     rdma_port=rdma_port,
                     item_addr=buffer_address,
                     header_size=header_size,
@@ -375,9 +399,11 @@ class TaskProcessor:
             elapsed = time.monotonic() - start
             error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
             logger.error(
-                f"[Task] req_id={request_id} task_id={task_id} "
-                f"error={e} time={elapsed:.3f}s"
+                f"[Task] error req_id={request_id} task_id={task_id} "
+                f"type={modality} url={str(image_url).split('?')[0]} "
+                f"code={error_code} error={e} time={elapsed:.3f}s"
             )
+            self._encoder.metrics_collector.observe_one_failed_request()
             return TaskResult(
                 model_id=model_id,
                 task_id=task_id,
@@ -443,6 +469,17 @@ class VitTaskImpl:
     by running coroutines on a dedicated asyncio event loop in a background thread.
     """
 
+    # Hard per-task timeout. A hung task (never completes, never errors — e.g. a
+    # decode/embed stalled on a saturated GPU) would otherwise hold its pending
+    # tokens and pipeline slot forever, so a few of them would permanently wedge
+    # the encoder (free_tokens never recovers -> fetch loop stops). On timeout the
+    # future completes with TimeoutError, which fires _on_task_done (releasing the
+    # pending tokens) and frees the slot. Aligned to the 30s upstream link timeout:
+    # a task that can't finish within it produces a result the link has already
+    # abandoned, so waiting longer is pointless — fail fast and reclaim resources.
+    # Tune via SGLANG_ENCODER_TASK_TIMEOUT_S.
+    TASK_TIMEOUT_S: float = float(os.environ.get("SGLANG_ENCODER_TASK_TIMEOUT_S", "30"))
+
     def __init__(self, encoder, process_fn, collector: BatchExecutorCollector = None):
         """Initialize VitTaskImpl.
 
@@ -453,6 +490,7 @@ class VitTaskImpl:
             collector: Optional metrics collector. If None, a default one is created.
         """
         self.name = "vit_task"
+        self._encoder = encoder
         if collector is not None:
             self.collector = collector
         else:
@@ -478,8 +516,21 @@ class VitTaskImpl:
         )
 
     async def _do_process(self, req: VitTaskReq) -> VitTaskResult:
-        """Run process_fn and wrap result."""
-        task_result = await self._process_fn(req.task)
+        """Run process_fn (bounded by a hard timeout) and wrap result."""
+        try:
+            task_result = await asyncio.wait_for(
+                self._process_fn(req.task), timeout=self.TASK_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            tid = req.task.get("task_id") if isinstance(req.task, dict) else "?"
+            logger.error(
+                "[vit_task] task timed out after %.0fs (task_id=%s); treated as "
+                "failed so its pending tokens/slot are released (avoids wedging "
+                "the encoder). Likely a stalled decode/embed on a saturated GPU.",
+                self.TASK_TIMEOUT_S, tid,
+            )
+            self._encoder.metrics_collector.observe_one_aborted_request()
+            raise
         return VitTaskResult(task_result=task_result)
 
     def shutdown(self):
@@ -584,17 +635,24 @@ class EncodeWorkflow:
             stat = self._task_token_map.get(task_id)
             if stat is None:
                 return  # task already completed or not known
-            old = stat.tokens
-            delta = actual_tokens - old
-            if delta == 0:
-                return
-            stat.tokens = actual_tokens
-            self._pipeline_pending_tokens += delta
-            if delta != 0:
-                logger.debug(
-                    f"[workflow] task_id={task_id} token estimate corrected: "
-                    f"{old} -> {actual_tokens} (delta={delta:+d})"
-                )
+            # Correct exactly ONE not-yet-corrected copy (a reserved entry still at
+            # its estimate) to the precise value, compensating pending by only that
+            # copy's diff. One diff per call (this method is invoked once per
+            # processed copy) — never scaled by an outstanding count — so a
+            # duplicate that arrives later is just another independent entry,
+            # corrected by its own later call. This keeps the invariant
+            # pending == sum(reserved) balanced under any fetch/correct/done order.
+            for i, r in enumerate(stat.reserved):
+                if r != actual_tokens:
+                    delta = actual_tokens - r
+                    stat.reserved[i] = actual_tokens
+                    self._pipeline_pending_tokens += delta
+                    logger.debug(
+                        f"[workflow] task_id={task_id} token estimate corrected: "
+                        f"{r} -> {actual_tokens} (delta={delta:+d}, one copy)"
+                    )
+                    return
+            # every in-flight copy is already at the actual value: nothing to do
 
     @property
     def active_task_count(self) -> int:
@@ -619,11 +677,10 @@ class EncodeWorkflow:
         with self._lock:
             stat = self._task_token_map.get(task_id)
             before = self._pipeline_pending_tokens
-            if stat and stat.count > 0:
-                tokens = stat.tokens
-                stat.count -= 1
+            if stat and stat.reserved:
+                tokens = stat.reserved.pop()   # subtract exactly this copy's reserve
                 count_after = stat.count
-                if stat.count == 0:
+                if not stat.reserved:
                     self._task_token_map.pop(task_id, None)
             else:
                 tokens = 0
@@ -740,12 +797,24 @@ class EncodeWorkflow:
                                     before = self._pipeline_pending_tokens
                                     stat = self._task_token_map.get(task_id)
                                     if stat is None:
-                                        self._task_token_map[task_id] = PendingTaskTokenStat(tokens)
-                                        count_after = 1
-                                    else:
-                                        stat.count += 1
-                                        count_after = stat.count
+                                        stat = PendingTaskTokenStat()
+                                        self._task_token_map[task_id] = stat
+                                    # One reserved entry per copy (the estimate);
+                                    # corrected/subtracted independently later.
+                                    stat.reserved.append(tokens)
+                                    count_after = stat.count
                                     self._pipeline_pending_tokens += tokens
+                                    after = self._pipeline_pending_tokens
+                                    active_after = len(self._task_token_map)
+                                logger.info(
+                                    f"[Quota] fetched task_id={task_id} "
+                                    f"task_tokens={tokens} "
+                                    f"pending_tokens={before}->{after} "
+                                    f"free_tokens={self._encoder.free_tokens} "
+                                    f"active_tasks={active_after} dup_count={count_after} "
+                                    f"(admit_threshold={self.FETCH_ADMIT_THRESHOLD}, "
+                                    f"max_pipeline={self.MAX_PIPELINE_TASKS})"
+                                )
                                 fut = self._executor(req)
                                 fut.add_done_callback(
                                     lambda f, tid=task_id: self._on_task_done(f, tid)

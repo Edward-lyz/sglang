@@ -22,7 +22,6 @@ import dataclasses
 import logging
 import os
 import re
-import ssl
 import subprocess
 import tempfile
 import threading
@@ -42,9 +41,7 @@ from typing import (
     Union,
 )
 
-import aiohttp
 import numpy as np
-import orjson
 import requests
 import uvicorn
 import uvloop
@@ -63,7 +60,6 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-from fastapi.routing import APIRoute
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -112,15 +108,6 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
-from sglang.srt.entrypoints.warmup_sweep import (
-    claim_sweep_election,
-    mark_sweep_done,
-    reset_sweep_election,
-    resolve_sweep_lens,
-    run_prefill_sweep,
-    sweep_is_enabled,
-    wait_for_sweep_done,
-)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -161,10 +148,10 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
-    get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
+from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer, time_func_latency
 from sglang.srt.observability.trace import (
@@ -173,7 +160,6 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -186,7 +172,6 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
-from sglang.srt.utils.common import node_pp_rank_range
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -251,7 +236,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 
     # Configure logger to align with other sglang subprocess entry points;
     # uvicorn spawns this worker via multiprocessing.get_context("spawn"),
-    # so without this call the worker inherits whatever misconfiguration
+    # so without this call the worker inherits whatever (mis)configuration
     # the parent left on the root logger after re-import.
     configure_logger(server_args, f" Tokenizer {os.getpid()}")
 
@@ -261,8 +246,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch multi-tokenizer manager process
-    tokenizer_worker_class = get_tokenizer_worker_class(server_args)
-    tokenizer_manager = tokenizer_worker_class(server_args, port_args)
+    tokenizer_manager = TokenizerWorker(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
@@ -286,9 +270,6 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    grpc_handle = None
-    sidecar = None
-    warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -339,9 +320,7 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager,
-        fast_api_app.state.openai_serving_chat,
-        fast_api_app.state.openai_serving_completion,
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
@@ -406,79 +385,27 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    # Start the native gRPC server and warmup inside the try so a failure in
-    # either still runs the finally cleanup below. Native gRPC is enabled via
-    # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
-    # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
+    # Execute the general warmup
+    warmup_thread = threading.Thread(
+        target=_wait_and_warmup,
+        kwargs=warmup_thread_kwargs,
+    )
+    warmup_thread.start()
+
+    # Start the HTTP server
     try:
-        if (
-            getattr(fast_api_app, "is_single_tokenizer_mode", False)
-            and server_args.grpc_port is not None
-            and not (server_args.smg_grpc_mode or server_args.grpc_mode)
-        ):
-            grpc_handle = _start_native_grpc_server_for_runtime(
-                server_args=server_args,
-                tokenizer_manager=_global_state.tokenizer_manager,
-                template_manager=_global_state.template_manager,
-                scheduler_info=_global_state.scheduler_info,
-            )
-            if server_args.sidecar is not None:
-                from sglang.srt.entrypoints.sidecar import start_sidecar
-
-                sidecar = start_sidecar(server_args)
-
-        # Execute the general warmup
-        warmup_thread = threading.Thread(
-            target=_wait_and_warmup,
-            kwargs=warmup_thread_kwargs,
-        )
-        warmup_thread.start()
-
-        # Start the HTTP server
         yield
     finally:
-        if sidecar is not None:
-            try:
-                sidecar.stop()
-            except Exception:
-                logger.exception("Failed to stop sidecar")
-        _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
-        if warmup_thread is not None:
-            warmup_thread.join()
+        warmup_thread.join()
 
 
 # Fast API
-class ORJSONRequest(Request):
-    """Request whose ``json()`` uses orjson.
-
-    Large multimodal chat bodies (data-URL images are tens of MB) otherwise
-    pay stdlib ``json.loads`` inside FastAPI's dependency resolution; orjson
-    parses the same bytes several times faster with identical semantics.
-    """
-
-    async def json(self) -> Any:
-        if not hasattr(self, "_json"):
-            self._json = orjson.loads(await self.body())
-        return self._json
-
-
-class ORJSONRoute(APIRoute):
-    def get_route_handler(self):
-        original_handler = super().get_route_handler()
-
-        async def custom_handler(request: Request):
-            return await original_handler(ORJSONRequest(request.scope, request.receive))
-
-        return custom_handler
-
-
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
-app.router.route_class = ORJSONRoute
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -498,10 +425,6 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
 app.include_router(v1_loads_router)
-
-from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
-
-app.include_router(elastic_ep_router)
 
 
 def _anthropic_validation_message(raw_errors) -> str:
@@ -661,7 +584,6 @@ async def validate_json_request(raw_request: Request):
 
 ##### Native API endpoints #####
 
-
 def stopped_by_external():
     """
     Check if the stop signal is triggered by reading a signal file.
@@ -672,7 +594,7 @@ def stopped_by_external():
 
     try:
         if os.path.exists(signal_path):
-            with open(signal_path, "r") as file:
+            with open(signal_path, 'r') as file:
                 return file.read().strip().lower() == "stop"
     except Exception as e:
         logger.info(f"Error reading stop signal file: {e}")
@@ -726,7 +648,6 @@ async def health_generate(request: Request) -> Response:
         ):
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
-            gri.skip_radix_cache_insert = True
     else:
         gri = EmbeddingReqInput(
             rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
@@ -782,23 +703,12 @@ async def get_instance_info():
             * _global_state.tokenizer_manager.server_args.dp_size
         )
 
-    dp_size = _global_state.tokenizer_manager.server_args.dp_size
-    nnodes = _global_state.tokenizer_manager.server_args.nnodes
-    node_rank = _global_state.tokenizer_manager.server_args.node_rank
-    dp_per_node = dp_size // nnodes
-    start = node_rank * dp_per_node
-    pp_size = _global_state.tokenizer_manager.server_args.pp_size
-    pp_rank_range = node_pp_rank_range(pp_size, nnodes, node_rank)
-
     return {
         "kv_role": _global_state.tokenizer_manager.server_args.disaggregation_mode,
-        "node_rank": node_rank,
-        "dp_ranks": list(range(start, start + dp_per_node)),
-        "pp_ranks": list(pp_rank_range),
-        "dp_size": dp_size,
+        "dp_ranks": list(range(_global_state.tokenizer_manager.server_args.dp_size)),
+        "dp_size": _global_state.tokenizer_manager.server_args.dp_size,
         "tp_size": _global_state.tokenizer_manager.server_args.tp_size,
-        "pp_size": pp_size,
-        "nnodes": nnodes,
+        "nnodes": _global_state.tokenizer_manager.server_args.nnodes,
         "chunked_prefill_enabled": chunked_prefill_enabled,
         "chunked_prefill_size": _global_state.tokenizer_manager.server_args.chunked_prefill_size,
         "active_request_count": len(_global_state.tokenizer_manager.rid_to_state),
@@ -886,7 +796,7 @@ async def server_info():
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).
 
-    Legacy shim backed by /v1/loads. Projects the load snapshot down to the
+    Legacy shim backed by /v1/loads. Projects GetLoadsReqOutput down to the
     historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
     num_pending_tokens, ts_tic) so existing clients keep working.
     """
@@ -928,11 +838,6 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
     async def _dumper_control_handler(method: str, request: Request):
         body_bytes = await request.body()
         body = await request.json() if body_bytes else {}
-        if not isinstance(body, dict):
-            return ORJSONResponse(
-                status_code=400,
-                content={"error": "Request body must be a JSON object."},
-            )
         obj = DumperControlReqInput(method=method, body=body)
         results = await _global_state.tokenizer_manager.dumper_control(obj)
         if any(not r.success for r in results):
@@ -953,34 +858,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
-        generator = _global_state.tokenizer_manager.generate_request(obj, request)
-
-        # Kick-start the generator before the StreamingResponse is returned:
-        # afterwards HTTP 200 is committed and failures can only be reported
-        # in-band. Pre-generation failures (validation errors, scheduler
-        # aborts) must surface as a real HTTP status, same as the non-stream
-        # branch below.
-        first_out = None
-        try:
-            first_out = await generator.__anext__()
-            _raise_stream_abort(first_out)
-        except StopAsyncIteration:
-            pass
-        except ValueError as e:
-            # A client disconnect also surfaces here. It's a client-side
-            # cancellation, not a server error or bad input -- log it and
-            # return an empty stream instead of a 400.
-            if request is not None and await request.is_disconnected():
-                logger.info(f"[http_server] Client disconnected: {e}")
-            else:
-                logger.error(f"[http_server] Error: {e}")
-                return _create_error_response(e)
 
         async def stream_results() -> AsyncIterator[bytes]:
-            if first_out is not None:
-                yield b"data: " + dumps_json(first_out) + b"\n\n"
             try:
-                async for out in generator:
+                async for out in _global_state.tokenizer_manager.generate_request(
+                    obj, request
+                ):
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
@@ -1208,7 +1091,8 @@ async def clear_all_cache():
 
         def _parse_index_size(text: str) -> dict:
             return {
-                m.group(1): int(m.group(2)) for m in _SIZE_LINE.finditer(text or "")
+                m.group(1): int(m.group(2))
+                for m in _SIZE_LINE.finditer(text or "")
             }
 
         # BEFORE sizes.
@@ -1226,7 +1110,9 @@ async def clear_all_cache():
 
         namespaces = list(sizes_before.keys())
         lines.append(f"[host] before: {sizes_before}")
-        logger.info(f"[/clear_all_cache] host cache sizes BEFORE evict: {sizes_before}")
+        logger.info(
+            f"[/clear_all_cache] host cache sizes BEFORE evict: {sizes_before}"
+        )
         if not namespaces:
             lines.append("[host] no namespace found, skip evictBlocks")
 
@@ -1650,9 +1536,7 @@ async def update_weight_version(
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
         # Update the weight version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.override(
-            "http.update_weight_version", weight_version=obj.new_version
-        )
+        _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
 
         return ORJSONResponse(
             {
@@ -1965,34 +1849,6 @@ async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
     """OpenAI-compatible classification endpoint."""
     return await raw_request.app.state.openai_serving_classify.handle_request(
         request, raw_request
-    )
-
-
-@app.post(
-    "/v1/chat/tokenize",
-    response_class=ORJSONResponse,
-    dependencies=[Depends(validate_json_request)],
-)
-async def openai_v1_chat_tokenize(request: ChatCompletionRequest, raw_request: Request):
-    """Return the prompt token IDs used by the matching chat request."""
-    return await raw_request.app.state.openai_serving_tokenize.handle_chat_request(
-        request, raw_request
-    )
-
-
-@app.post(
-    "/v1/completions/tokenize",
-    response_class=ORJSONResponse,
-    dependencies=[Depends(validate_json_request)],
-)
-async def openai_v1_completions_tokenize(
-    request: CompletionRequest, raw_request: Request
-):
-    """Return the prompt token IDs used by the matching completion request."""
-    return (
-        await raw_request.app.state.openai_serving_tokenize.handle_completions_request(
-            request, raw_request
-        )
     )
 
 
@@ -2315,27 +2171,6 @@ def _create_error_response(e):
     )
 
 
-def _raise_stream_abort(out: dict) -> None:
-    """Raise if `out` is a scheduler abort carrying an explicit HTTP status code.
-
-    TokenizerManager._handle_abort_finish_reason only raises for non-stream
-    requests; streaming aborts are yielded as ordinary outputs. Callers that
-    have not committed HTTP 200 yet use this to get the same exception -- and
-    therefore the same HTTP status -- as the non-stream path.
-    """
-    finish_reason = out["meta_info"].get("finish_reason")
-    if not isinstance(finish_reason, dict) or finish_reason.get("type") != "abort":
-        return
-    status_code = finish_reason.get("status_code")
-    if not isinstance(status_code, HTTPStatus):
-        return
-
-    message = finish_reason.get("message", "Generation aborted.")
-    if status_code == HTTPStatus.BAD_REQUEST:
-        raise ValueError(message)
-    raise HTTPException(status_code=int(status_code), detail=message)
-
-
 # FIXME: In theory we should configure ADMIN_FORCE for some entrypoints, but doing so
 # would currently cause all endpoints to go through add_api_key_middleware
 # (even when neither api-key nor admin-api-key is configured).
@@ -2359,86 +2194,6 @@ def _admin_api_key_missing_response(
 
 # Minimal 32x32 black PNG (base64, GLM4v requires at least 32x32 sized image)
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
-
-# Kimi K2.5/K2.7 runs its MoonViT position interpolation through torch.compile.
-# The minimal image above does not exercise a representative image shape and
-# leaves the first client request paying the compilation cost. Keep this
-# narrowly scoped: a larger default warmup image would unnecessarily lengthen
-# startup for VLMs whose encoders do not have this behavior.
-KIMI_VLM_WARMUP_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAADEUlEQVR42u3BgQAAAADDoPlTX+EAVQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMBvArQAAf/YBFAAAAAASUVORK5CYII="
-
-# Kimi K3's native vision preprocessing uses a 14x14 spatial patch size. A
-# 448x448 image exercises a representative 32x32 patch grid without padding.
-KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAcAAAAHACAIAAAC6Ry8kAAACX0lEQVR42u3BMQEAAADCoPVPbQwfoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAtwEyRwAB32QPDQAAAABJRU5ErkJggg=="
-
-
-def _get_vlm_warmup_image_base64(model_info: dict) -> str:
-    """Choose the VLM image used by the startup warmup request.
-
-    A 512x512 image triggers Kimi K2.5/K2.7's representative compiled
-    position-interpolation path during startup. Kimi K3 uses a 448x448 image
-    matching its native vision patch grid. This keeps one-time vision setup
-    work out of the first external image request.
-    Other VLMs retain the minimal image to avoid changing their startup cost.
-    """
-
-    architectures = model_info.get("architectures") or []
-    if (
-        "KimiK3ForConditionalGeneration" in architectures
-        or model_info.get("model_type") == "kimi_k3"
-    ):
-        logger.info(
-            "Using a 448x448 image for Kimi K3 VLM startup warmup to exercise "
-            "its native 32x32 vision patch grid."
-        )
-        return KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64
-    if "KimiK25ForConditionalGeneration" in architectures:
-        logger.info(
-            "Using a 512x512 image for Kimi VLM startup warmup to compile "
-            "MoonViT position interpolation."
-        )
-        return KIMI_VLM_WARMUP_PNG_PICTURE_BASE64
-    return MINIMUM_PNG_PICTURE_BASE64
-
-
-async def _send_disaggregation_warmup_requests(
-    server_args: ServerArgs,
-    url: str,
-    headers: Dict[str, str],
-    ssl_verify: Union[bool, str],
-    timeout: int,
-) -> List[int]:
-    ssl_context = (
-        ssl_verify
-        if isinstance(ssl_verify, bool)
-        else ssl.create_default_context(cafile=ssl_verify)
-    )
-
-    async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
-        json_data = {
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": 8,
-                "ignore_eos": True,
-            },
-            "bootstrap_host": FAKE_BOOTSTRAP_HOST,
-            "bootstrap_room": dp_rank,
-            "input_ids": [10, 11, 12, 13],
-            "routed_dp_rank": dp_rank,
-        }
-        async with session.post(
-            url + "/generate", json=json_data, ssl=ssl_context
-        ) as response:
-            await response.read()
-            return response.status
-
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=timeout),
-        headers=headers,
-    ) as session:
-        return await asyncio.gather(
-            *(send_request(session, dp_rank) for dp_rank in range(server_args.dp_size))
-        )
 
 
 def _execute_server_warmup(server_args: ServerArgs):
@@ -2472,13 +2227,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     model_info = res.json()
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
-    # A language-only worker may advertise VLM capability for encoder
-    # disaggregation, but its local warmup must stay on the text path.
-    is_vlm = (
-        bool(model_info.get("has_image_understanding", False))
-        and not server_args.language_only
-        and not is_mps()
-    )
+    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
@@ -2515,8 +2264,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": "data:image/png;base64,"
-                                f"{_get_vlm_warmup_image_base64(model_info)}"
+                                "url": f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"
                             },
                         },
                         {
@@ -2557,49 +2305,47 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            # Sweep the real prefill shapes before announcing readiness, so a
-            # load balancer watching /health does not send the first client
-            # request into the JIT/autotune window.
-            _maybe_run_prefill_sweep(
-                server_args=server_args,
-                url=url,
-                headers=headers,
-                ssl_verify=ssl_verify,
-                model_info=model_info,
-            )
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
-            status_codes = asyncio.run(
-                _send_disaggregation_warmup_requests(
-                    server_args=server_args,
-                    url=url,
-                    headers=headers,
-                    ssl_verify=ssl_verify,
-                    timeout=warmup_timeout if warmup_timeout > 0 else 1800,
-                )
+            request_name = "/generate"
+            json_data = {
+                "sampling_params": {
+                    "temperature": 0.0,
+                    "max_new_tokens": 8,
+                    "ignore_eos": True,
+                },
+                "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
+                # This is a hack to ensure fake transfer is enabled during prefill warmup
+                # ensure each dp rank has a unique bootstrap_room during prefill warmup
+                "bootstrap_room": [
+                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                    for i in range(server_args.dp_size)
+                ],
+                "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
+                "is_warmup": True,
+            }
+            res = requests.post(
+                url + request_name,
+                json=json_data,
+                headers=headers,
+                timeout=(
+                    warmup_timeout if warmup_timeout > 0 else 1800
+                ),  # because of deep gemm precache is very long if not precache.
+                verify=ssl_verify,
             )
-            failed_status_codes = [code for code in status_codes if code != 200]
-            if not failed_status_codes:
+            if res.status_code == 200:
                 logger.info(
-                    "Disaggregation warmup requests completed for all %s DP ranks",
-                    server_args.dp_size,
+                    f"Disaggregation warmup request completed with status {res.status_code}, resp: {res.json()}"
                 )
                 logger.info("End of disaggregation warmup")
-                _maybe_run_prefill_sweep(
-                    server_args=server_args,
-                    url=url,
-                    headers=headers,
-                    ssl_verify=ssl_verify,
-                    model_info=model_info,
-                )
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
-                    "Disaggregation warmup failed (mode=%s), status codes: %s",
+                    "Disaggregation warmup failed (mode=%s), status code: %s",
                     server_args.disaggregation_mode,
-                    failed_status_codes,
+                    res.status_code,
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
 
@@ -2609,68 +2355,9 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return False
 
+    # Debug print
+    # logger.info(f"warmup request returns: {res.json()=}")
     return success
-
-
-def _maybe_run_prefill_sweep(
-    *,
-    server_args: ServerArgs,
-    url: str,
-    headers: Dict[str, str],
-    ssl_verify: Union[bool, str],
-    model_info: dict,
-) -> None:
-    """Extend the startup warmup with a sweep over realistic prefill lengths.
-
-    The minimal warmup above only proves liveness; the first real requests still
-    pay DeepGEMM JIT, attention-plan and MoE-buffer setup for their own shapes.
-    Opt in with SGLANG_WARMUP_PREFILL_LENS (see warmup_sweep.py).
-    """
-
-    if not model_info["is_generation"] or not sweep_is_enabled():
-        return
-
-    lens = resolve_sweep_lens(
-        chunked_prefill_size=server_args.chunked_prefill_size,
-        max_prefill_tokens=server_args.max_prefill_tokens,
-        page_size=server_args.page_size,
-        max_req_input_len=_global_state.tokenizer_manager.max_req_input_len,
-    )
-    if not lens:
-        return
-
-    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
-    timeout = warmup_timeout if warmup_timeout > 0 else 1800
-
-    # One sweep per server, even though every HTTP worker runs a warmup thread.
-    election_key = _sweep_election_key(server_args)
-    if election_key is not None and not claim_sweep_election(election_key):
-        wait_for_sweep_done(election_key, timeout=timeout)
-        return
-
-    try:
-        run_prefill_sweep(
-            url=url,
-            headers=headers,
-            ssl_verify=ssl_verify,
-            timeout=timeout,
-            dp_size=server_args.dp_size,
-            disaggregation_mode=server_args.disaggregation_mode,
-            lens=lens,
-            batch_size=max(envs.SGLANG_WARMUP_BATCH_SIZE.get(), 1),
-            vocab_size=_global_state.tokenizer_manager.model_config.vocab_size,
-        )
-    finally:
-        if election_key is not None:
-            mark_sweep_done(election_key)
-
-
-def _sweep_election_key(server_args: ServerArgs) -> Optional[str]:
-    """Key shared by every HTTP worker of this server, or None when alone."""
-
-    if server_args.tokenizer_worker_num == 1:
-        return None
-    return f"{get_main_process_id()}_{server_args.port}"
 
 
 def _wait_and_warmup(
@@ -2678,25 +2365,19 @@ def _wait_and_warmup(
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
 ):
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_and_warmup start")
     if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
 
-    # Joiner schedulers are served through the primary after adoption.
-    skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
-    if skip_elastic_joiner_warmup:
-        logger.debug(
-            "[Elastic EP] Skipping server warmup for elastic joiner "
-            "(ep_join_mode=%s)",
-            server_args.ep_join_mode,
-        )
-
-    if not server_args.skip_server_warmup and not skip_elastic_joiner_warmup:
+    # Send a warmup request
+    if not server_args.skip_server_warmup:
         if not execute_warmup_func(server_args):
             return
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     # The server is ready for requests
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_and_warmup done")
     logger.info("The server is fired up and ready to roll!")
 
     if server_args.delete_ckpt_after_loading:
@@ -2871,9 +2552,6 @@ def _setup_and_run_http_server(
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
             port_args, server_args, scheduler_infos[0]
         )
-        # The workers elect one sweeper among themselves via a marker file keyed
-        # by this pid; clear a stale marker in case the pid was recycled.
-        reset_sweep_election(f"{os.getpid()}_{server_args.port}")
 
     try:
         # Update logging configs
@@ -3010,51 +2688,6 @@ def _setup_and_run_http_server(
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
-def _start_native_grpc_server_for_runtime(
-    server_args,
-    tokenizer_manager,
-    template_manager,
-    scheduler_info,
-):
-    try:
-        from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-        from sglang.srt.grpc import _core as grpc_native
-    except ImportError as e:
-        raise RuntimeError(
-            "Native gRPC extension (sglang.srt.grpc._core) not found in this wheel, "
-            "but --grpc-port was set. The extension is built from "
-            "rust/sglang-grpc/ via setuptools-rust during wheel build. Either "
-            "install a wheel that includes the extension or unset --grpc-port."
-        ) from e
-
-    runtime_handle = RuntimeHandle(
-        tokenizer_manager=tokenizer_manager,
-        template_manager=template_manager,
-        server_args=server_args,
-        scheduler_info=scheduler_info or {},
-    )
-
-    grpc_handle = grpc_native.start_server(
-        host=server_args.host,
-        port=server_args.grpc_port,
-        runtime_handle=runtime_handle,
-        worker_threads=server_args.grpc_worker_threads,
-    )
-    logger.info(
-        f"Native gRPC server started on {server_args.host}:{server_args.grpc_port}"
-    )
-    return grpc_handle
-
-
-def _shutdown_native_grpc_server(grpc_handle) -> None:
-    if grpc_handle is None:
-        return
-    try:
-        grpc_handle.shutdown()
-    except Exception as e:
-        logger.warning(f"Failed to shut down native gRPC server: {e}")
-
-
 def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
@@ -3079,13 +2712,14 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     # Launch subprocesses
+    configure_logger(server_args)
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] launch_server start")
     (
         tokenizer_manager,
         template_manager,
         port_args,
         scheduler_init_result,
         subprocess_watchdog,
-        _weight_cache_daemon_procs,
     ) = Engine._launch_subprocesses(
         server_args=server_args,
         init_tokenizer_manager_func=init_tokenizer_manager_func,

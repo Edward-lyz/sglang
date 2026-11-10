@@ -138,6 +138,7 @@ def init_tokenizer_manager(
     port_args: PortArgs,
     TokenizerManagerClass: Optional[TokenizerManager] = None,
 ) -> Tuple[TokenizerManager, TemplateManager]:
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_tokenizer_manager start")
     # Launch tokenizer process
     TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
     tokenizer_manager = TokenizerManagerClass(server_args, port_args)
@@ -150,6 +151,7 @@ def init_tokenizer_manager(
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_tokenizer_manager done")
 
     # Resolve any remaining auto parsers using template manager's detection results
     for attr, suggested, label in (
@@ -603,6 +605,9 @@ class Engine(EngineScoreMixin, EngineBase):
             Tuple of (SchedulerInitResult, scheduler_procs).
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _launch_scheduler_processes start"
+        )
         scheduler_procs = []
 
         if server_args.dp_size == 1:
@@ -693,6 +698,9 @@ class Engine(EngineScoreMixin, EngineBase):
                     f"terminated with {proc.exitcode}"
                 )
 
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _launch_scheduler_processes done"
+        )
         return (
             SchedulerInitResult(
                 scheduler_infos=scheduler_infos,
@@ -780,6 +788,7 @@ class Engine(EngineScoreMixin, EngineBase):
         Returns:
             Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result, subprocess_watchdog).
         """
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _launch_subprocesses start")
         # Configure global environment
         configure_logger(server_args)
         _set_envs_and_config(server_args)
@@ -903,6 +912,7 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         subprocess_watchdog.start()
 
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _launch_subprocesses done")
         return (
             tokenizer_manager,
             template_manager,
@@ -1378,6 +1388,7 @@ def _wait_for_scheduler_ready(
     Uses poll() with timeout instead of blocking recv(), so that child process
     death (e.g. OOM SIGKILL) is detected promptly instead of hanging forever.
     """
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_for_scheduler_ready start")
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
         while True:
@@ -1398,6 +1409,7 @@ def _wait_for_scheduler_ready(
                 if not scheduler_procs[j].is_alive():
                     raise _scheduler_died_error(j, scheduler_procs[j])
 
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_for_scheduler_ready done")
     return scheduler_infos
 
 

@@ -259,6 +259,9 @@ def _handle_output_by_index(output, i):
                 output, "customized_info", i, check_length=False
             ),
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
+            trace_infos=_extract_field_by_index(
+                output, "trace_infos", i, check_length=False
+            ),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
@@ -370,6 +373,9 @@ def _handle_output_by_index(output, i):
                 output, "token_steps", i, check_length=False
             ),
             detokenize_completed_time=output.detokenize_completed_time,
+            trace_infos=_extract_field_by_index(
+                output, "trace_infos", i, check_length=False
+            ),
         )
     else:
         new_output = output
@@ -658,11 +664,6 @@ class TokenizerWorker(TokenizerManager):
             self.server_args.disaggregation_transfer_backend
         )
 
-        if envs.AIAK_ENABLE_TRACE.get():
-            from msit_llm.sglang import encoder_tracer
-            self.msit_request_logger = encoder_tracer.RequestTracer(
-                self.tokenizer, envs.AIAK_MSIT_TRACE_DIR.get(), self.server_args
-            )
         # Register this worker with the router for pause/continue broadcasting
         reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
         self._dispatch_to_scheduler(reg)

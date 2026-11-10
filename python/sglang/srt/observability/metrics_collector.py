@@ -128,6 +128,8 @@ class SchedulerStats:
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
+    spec_cap_length: float = 0.0
+    spec_block_accept_length: float = 0.0
     # Adaptive speculative decoding (currently active tier).
     spec_num_steps: int = 0
     spec_num_draft_tokens: int = 0
@@ -144,6 +146,7 @@ class SchedulerStats:
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
+    prealloc_token_usage: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -175,6 +178,20 @@ class SchedulerStats:
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
+
+# Min gap between idle histogram heartbeat emissions (see
+# emit_idle_histogram_heartbeat). Keep below the dashboards' rate() window (1m)
+# so rate(_count) stays non-zero while idle; one per 30s is enough.
+IDLE_HEARTBEAT_MIN_INTERVAL = 30.0
+
+# Last idle-heartbeat emission time, kept at module scope so the throttle is
+# per-process (each spawned scheduler imports its own module copy) and does not
+# depend on the collector instance's identity.
+_LAST_IDLE_HEARTBEAT_TS = 0.0
+
+# Whether idle histogram heartbeats are enabled (read once at import). The
+# tokenizer idle heartbeat coroutine gates on this flag.
+IDLE_METRIC_HEARTBEAT = envs.SGLANG_IDLE_METRIC_HEARTBEAT.get()
 
 
 def compute_routing_key_stats(routing_keys: List[Optional[str]]) -> tuple:
@@ -515,6 +532,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.spec_cap_length = Gauge(
+            name="sglang:spec_cap_length",
+            documentation="Mean DSpark confidence-scheduled verify window per verify step, incl the bonus slot (0 when no cap is scheduled).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_block_accept_length = Gauge(
+            name="sglang:spec_block_accept_length",
+            documentation="Mean uncapped full-block accept length per verify step (accept + cap-trimmed drafts; exact only in DSpark cap-accept mode).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.spec_num_steps = Gauge(
             name="sglang:spec_num_steps",
             documentation="Currently active speculative_num_steps.",
@@ -601,6 +630,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.pending_prealloc_token_usage = Gauge(
             name="sglang:pending_prealloc_token_usage",
             documentation="The token usage for pending preallocated tokens (not preallocated yet).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.prealloc_token_usage = Gauge(
+            name="sglang:prealloc_token_usage",
+            documentation="The token usage percentage (0-100) of preallocated tokens in the decode prealloc queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1405,6 +1440,33 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         """observe_request_waiting_time"""
         self._log_histogram(self.request_waiting_time, latency)
 
+    def emit_idle_histogram_heartbeat(self) -> None:
+        """Keep decode-latency histograms' _count advancing while idle.
+
+        These panels are plotted as rate(_sum)/rate(_count). After traffic
+        stops both rates fall to 0, so the panel evaluates 0/0 = NaN and the
+        curve breaks off (a gap, not a drop to 0). Emitting a single zero
+        observation keeps _count advancing while _sum stays flat, so the ratio
+        is 0/positive = 0 and the panels fall back to 0 instead.
+
+        Self-throttled to one emission per IDLE_HEARTBEAT_MIN_INTERVAL: the idle
+        caller can fire far more often than 30s (its gauge_stale path bypasses
+        its own limiter), and we don't want to flood the histogram with zero
+        samples. Gated by SGLANG_IDLE_METRIC_HEARTBEAT.
+        """
+        now = time.monotonic()
+        global _LAST_IDLE_HEARTBEAT_TS
+        if now - _LAST_IDLE_HEARTBEAT_TS < IDLE_HEARTBEAT_MIN_INTERVAL:
+            return
+        _LAST_IDLE_HEARTBEAT_TS = now
+        # queue_time is heartbeat'd together with request_waiting_time on
+        # purpose: panels subtract their averages (e.g. bootstrap time =
+        # avg(request_waiting_time) - avg(queue_time)). Zeroing only one side
+        # drags that difference negative, so both sides must move together.
+        self._log_histogram(self.request_waiting_time, 0.0)
+        self._log_histogram(self.queue_time, 0.0)
+        self._log_histogram(self.histogram_kvcache_transfer_time, 0.0)
+
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
@@ -1575,6 +1637,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
+        self._log_gauge(self.spec_cap_length, stats.spec_cap_length)
+        self._log_gauge(self.spec_block_accept_length, stats.spec_block_accept_length)
         self._log_gauge(self.spec_num_steps, stats.spec_num_steps)
         self._log_gauge(self.spec_num_draft_tokens, stats.spec_num_draft_tokens)
 
@@ -1599,6 +1663,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
+        self._log_gauge(self.prealloc_token_usage, stats.prealloc_token_usage)
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
@@ -1912,7 +1977,8 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
-            labelnames=labels.keys(),
+            # "stream" splits streaming vs non-streaming requests.
+            labelnames=[*labels.keys(), "stream"],
             buckets=bucket_time_to_first_token,
         )
 
@@ -2055,11 +2121,15 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             float(generation_tokens)
         )
 
-    def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
-        self.histogram_time_to_first_token.labels(**labels).observe(value)
+    def observe_time_to_first_token(
+        self, labels: Dict[str, str], value: float, *, stream: bool
+    ):
+        self.histogram_time_to_first_token.labels(
+            **labels, stream="true" if stream else "false"
+        ).observe(value)
 
     def check_time_to_first_token_straggler(self, value: float) -> bool:
-        his = self.histogram_time_to_first_token.labels(**self.labels)
+        his = self.histogram_time_to_first_token.labels(**self.labels, stream="true")
         total_observations = sum(bucket._value for bucket in his._buckets)
         if total_observations < 100:
             return False
@@ -2098,6 +2168,40 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
     def observe_detokenizer_to_tokenizer_time(self, value: Union[float, int]):
         """Observe the time it took to send a batchStrOut from detokenizer to tokenizer."""
         self.histogram_detokenizer_to_tokenizer_time.labels(**self.labels).observe(value)
+
+    def emit_idle_histogram_heartbeat(self) -> None:
+        """Keep decode-latency histograms' _count advancing while idle so their
+        rate(_sum)/rate(_count) panels fall back to 0 instead of breaking off
+        (0/0 = NaN). Unlike the scheduler (whose idle batch drives it), the
+        tokenizer is request-driven and never wakes on its own while idle, so a
+        background coroutine must call this on a timer. Re-observes 0 only into
+        label children that real traffic already created, module-scope
+        throttled, gated by SGLANG_IDLE_METRIC_HEARTBEAT.
+        """
+        global _LAST_IDLE_HEARTBEAT_TS
+        if not IDLE_METRIC_HEARTBEAT:
+            return
+        now = time.monotonic()
+        if now - _LAST_IDLE_HEARTBEAT_TS < IDLE_HEARTBEAT_MIN_INTERVAL:
+            return
+        _LAST_IDLE_HEARTBEAT_TS = now
+        # Re-observe 0 only into the label-children that real traffic already
+        # created, so each series' _count keeps advancing (panels fall back to
+        # 0 instead of NaN) WITHOUT inventing new series. This matters because
+        # time_to_first_token carries an extra "stream" label whose value we
+        # must not guess, and because histograms this deployment never
+        # populates (e.g. inter_token_latency) should stay absent rather than
+        # sprout a spurious flat-0 line. Reaching into _metrics mirrors how the
+        # observe_* helpers above already touch prometheus internals.
+        for hist in (
+            self.histogram_e2e_request_latency,
+            self.histogram_time_to_first_token,
+            self.histogram_inter_token_latency,
+            self.generation_tokens_histogram,
+            self.histogram_detokenizer_to_tokenizer_time,
+        ):
+            for child in list(hist._metrics.values()):
+                child.observe(0.0)
 
 
 @dataclass
@@ -2298,7 +2402,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
-            documentation="Time taken to load memory from CPU to GPU in seconds.",
+            documentation="Time taken to load KV cache from CPU back to GPU in seconds.",
             labelnames=labels.keys(),
             buckets=bucket_load_back_duration,
         )

@@ -11,8 +11,14 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.content_detection.config import DETECTION_CONFIG
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
-from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    ErrorResponse,
+    OpenAIServingRequest,
+)
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
@@ -97,11 +103,20 @@ class OpenAIServingBase(ABC):
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 request_logger.log_openai_received_request(request, request=raw_request)
 
-            if not envs.AIAK_ENABLE_TRACE.get():
-                if hasattr(request, 'trace_config') and request.trace_config is not None:
-                    logger.info(f"AIAK_ENABLE_TRACE environment variable is not set, the trace config "
-                                f"of req {request.rid} will not take effect")
-                    request.trace_config = None
+            if not DETECTION_CONFIG.enable_trace:
+                if hasattr(request, "trace_config") and request.trace_config is not None:
+                    logger.info(
+                        f"CD_ENABLE_TRACE environment variable is not set, the trace config "
+                        f"of req {request.rid} will not take effect"
+                    )
+                    request.trace_config["enable_trace"] = False
+
+            # trigger by content detection
+            if DETECTION_CONFIG.enable_detection and DETECTION_CONFIG.enable_trace:
+                if request.trace_config is None:
+                    request.trace_config = {}
+                request.trace_config["enable_trace"] = False
+
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
@@ -110,6 +125,8 @@ class OpenAIServingBase(ABC):
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
+            
+            self._process_trace_config(request, adapted_request)
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
@@ -340,3 +357,49 @@ class OpenAIServingBase(ABC):
                 )
 
         return body_routed_dp_rank
+    
+    @staticmethod
+    def _serialize_trace_value(value: Any) -> Any:
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json")
+        if isinstance(value, list):
+            return [OpenAIServingBase._serialize_trace_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: OpenAIServingBase._serialize_trace_value(item) for key, item in value.items()}
+        return value
+
+    def _build_trace_info(
+        self,
+        request: OpenAIServingRequest,
+        meta_info: Optional[Dict[str, Any]] = None,
+    ) -> Optional[dict]:
+        """Build trace_info from scheduler trace data (TraceManager).
+
+        Scheduler trace data (from TraceManager) is returned via meta_info
+        for all trace types (kv, metadata, logprobs, payload, prompt, all).
+        """
+        if not DETECTION_CONFIG.enable_trace or not request.trace_config:
+            return None
+
+        trace_info = None
+        if meta_info and "trace_info" in meta_info:
+            trace_info = dict(meta_info["trace_info"])
+
+        return trace_info
+
+    def _process_trace_config(self, request, adapted_request):
+        trace_config = request.trace_config
+        if not trace_config:
+            return
+        trace_type = trace_config.get("trace_type")
+        if trace_type in ("prompt", "all"):
+            if hasattr(request, "messages"):
+                trace_config["payload"] = {"messages": self._serialize_trace_value(request.messages)}
+            elif hasattr(request, "prompt"):
+                trace_config["payload"] = {"prompt": self._serialize_trace_value(request.prompt)}
+        if trace_type in ("logprobs", "all"):
+            adapted_request.return_logprob = True
+            if "top_logprobs" in trace_config:
+                adapted_request.top_logprobs_num = trace_config.get("top_logprobs")
+
+        adapted_request.trace_config = trace_config

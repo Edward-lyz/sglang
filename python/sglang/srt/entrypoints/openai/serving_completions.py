@@ -465,8 +465,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     choices=[],
                     model=request.model,
                     usage=usage,
-                    trace_info={"prompt": request.prompt} if (envs.AIAK_ENABLE_TRACE.get() and request.trace_config \
-                                    and request.trace_config.get('trace_prompt')) else None
+                    trace_info=self._build_trace_info(request, content["meta_info"]),
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
@@ -597,8 +596,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
             sglext=response_sglext,
-            trace_info={"prompt": request.prompt} if (envs.AIAK_ENABLE_TRACE.get() and request.trace_config \
-                            and request.trace_config.get('trace_prompt')) else None
+            trace_info=self._build_trace_info(request, ret[0]["meta_info"]),
         )
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:

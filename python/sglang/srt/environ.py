@@ -216,6 +216,10 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Log an MD5 digest of every AttentionStore page/state buffer at write and
+    # read time, so a cache read can be matched byte-for-byte against the write
+    # that produced it. Costs a D2H copy plus a hash per page — diagnostic only.
+    SGLANG_LOG_AS_CACHE_DIGEST = EnvBool(False)
 
     # IPC
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
@@ -828,6 +832,11 @@ class Envs:
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+    SGLANG_BLOCK_METRICS_K3 = EnvBool(False)
+    # Keep decode latency histograms' _count advancing with throttled zero
+    # observations while idle, so rate(_sum)/rate(_count) panels fall back to 0
+    # instead of going NaN (a gap) after traffic stops. Off by default.
+    SGLANG_IDLE_METRIC_HEARTBEAT = EnvBool(False)
 
     # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
@@ -995,9 +1004,6 @@ class Envs:
     # nsa
     SGLANG_NSA_THRESHOLD_MIN_KVLEN = EnvInt(0)
 
-    # msit
-    AIAK_MSIT_TRACE_DIR = EnvStr("/workspace/wdump/")
-    AIAK_ENABLE_TRACE = EnvBool(False)
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
@@ -1025,6 +1031,9 @@ class Envs:
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
+    # msit
+    AIAK_ENABLE_MSIT_TRACE = EnvBool(False)
+    AIAK_MSIT_TRACE_DIR = EnvStr("/workspace/wdump/")
 
 envs = Envs()
 EnvField._allow_set_name = False

@@ -52,9 +52,6 @@ RUN pip install distro
 RUN pip install decord
 RUN pip install PyNvVideoCodec
 
-# Disable msit: numpy collision
-# RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/msit_llm-8.3.2-py3-none-any.whl
-
 # Warmup flashinfer trtllm-gen fused MoE module to pre-create cubin symlinks.
 # Avoids a FileExistsError race in ensure_symlink() when multiple TP workers
 # trigger the JIT module load concurrently on the first container start.
@@ -65,5 +62,7 @@ RUN python3 -c "from flashinfer.fused_moe.core import get_trtllm_moe_sm100_modul
 # SETUPTOOLS_SCM_PRETEND_VERSION keeps the version aligned with the base image.
 RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.5.15.post1 \
     pip install -e /sgl-workspace/sglang/python --no-deps --no-build-isolation
+
+RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/msit_llm-8.3.2-py3-none-any.whl onnx --no-deps
 
 WORKDIR /sgl-workspace/sglang

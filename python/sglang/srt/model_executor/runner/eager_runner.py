@@ -248,7 +248,7 @@ class EagerRunner(BaseRunner):
         )
 
         with ctx, pdmux_ctx:
-            return model_runner.model.forward(
+            return model_runner.model_forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
@@ -380,7 +380,7 @@ class EagerRunner(BaseRunner):
                 else:
                     ret = hidden_states
             else:
-                ret = model_runner.model.forward(
+                ret = model_runner.model_forward(
                     forward_batch.input_ids,
                     forward_positions,
                     forward_batch,

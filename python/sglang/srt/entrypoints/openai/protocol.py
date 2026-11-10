@@ -436,9 +436,6 @@ class CompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
-    # Whether this is a warmup request (used to control trace behavior)
-    is_warmup: bool = False
-
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
@@ -461,9 +458,8 @@ class CompletionRequest(BaseModel):
     data_parallel_rank: Optional[int] = None
     peer_data_parallel_rank: Optional[int] = None
 
-    # mist trace
+    # For tracing
     trace_config: Optional[Dict[str, Any]] = None
-
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -925,9 +921,6 @@ class ChatCompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
-    # Whether this is a warmup request (used to control trace behavior)
-    is_warmup: bool = False
-
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
@@ -946,10 +939,8 @@ class ChatCompletionRequest(BaseModel):
     # For AttentionStore (AS) secondary cache
     kv_transfer_params: Optional[KVTransferParams] = None
     kv_cache_params: Optional[KVCacheParams] = None
-
-    # mist trace
+    # For tracing
     trace_config: Optional[Dict[str, Any]] = None
-
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
     # Deprecated: use disagg_prefill_dp_rank instead

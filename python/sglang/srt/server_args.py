@@ -3726,19 +3726,6 @@ class ServerArgs:
         """Resolve model/tokenizer paths backed by remote object stores."""
         if is_runai_obj_uri(self.model_path):
             ObjectStorageModel.download_and_get_path(self.model_path)
-        # Check msit trace setting
-        self._handle_msit_trace_settting()
-
-    def _handle_msit_trace_settting(self):
-        if envs.AIAK_ENABLE_TRACE.get():
-            if self.speculative_algorithm is not None:
-                raise RuntimeError(
-                    "AIAK_ENABLE_TRACE is not enabled with speculative decoding."
-                )
-            if not self.disable_cuda_graph:
-                raise RuntimeError(
-                    "AIAK_ENABLE_TRACE is not enabled with CUDA graph."
-                )
 
     def _handle_pd_disaggregation(self):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (

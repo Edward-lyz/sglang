@@ -803,8 +803,12 @@ class DefaultModelLoader(BaseModelLoader):
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
-    @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(self, model, weights, target_device):
+        """Load weights into the model and postprocess them if necessary."""
+        _role = getattr(self, "_role", "target")
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} "
+            "load_model.weights.load_weights_and_postprocess start")
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -850,6 +854,9 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} "
+            "load_model.weights.load_weights_and_postprocess done")
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -4059,7 +4066,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 )
 
             DefaultModelLoader.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                self, model, self._get_all_weights(model_config, model), target_device
             )
 
         return model.eval()
