@@ -54,7 +54,6 @@ export SGLANG_MOONCAKE_SEND_AUX_TCP=1
 export SGLANG_TOOL_STRICT_LEVEL=2
 export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=50
 export SGLANG_DISAGGREGATION_QUEUE_SIZE=50
-export SGLANG_K3_ONLY_LANGUAGE=1
 export SGLANG_FLASHKDA_MIN_SEQ_LEN=64
 export SGLANG_FLASHKDA_MAX_SEQ_LEN=32768
 export SGLANG_PP_LAYER_PARTITION="48,45"
@@ -68,6 +67,7 @@ export HTTP_PORT=8000
 export PD_SEPARATE_STAGE=prefill
 
 export EMBEDDING_IB_DEVICE=mlx5_13
+export SGLANG_MC_POOL_GB=24
 IB_DEVICE=$(nvidia-smi topo -m | grep -v bond_0 | grep -oP '^\s*NIC\d+:\s+\K\S+' | paste -sd,)
 export IB_DEVICE
 
@@ -75,7 +75,6 @@ export DEEPEP_CONFIG_JSON='{"normal_dispatch": {"num_sms": 32, "num_max_nvl_chun
 
 export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}/sgl-workspace/sglang/python"
 
-LOG_TO_FILE="${LOG_TO_FILE:-false}"
 LOG_FILE="${LOG_FILE:-/sgl-workspace/prefill.log}"
 
 PARALLEL_ARGS=(
@@ -102,10 +101,6 @@ CACHE_OPT=(
     --disable-radix-cache
 )
 
-if [[ "$LOG_TO_FILE" == "true" ]]; then
-    exec >"$LOG_FILE" 2>&1
-fi
-
 sglang serve \
     --host 0.0.0.0 \
     --port 8000 \
@@ -130,7 +125,6 @@ sglang serve \
     "${MM_ARG[@]}" \
     --moe-a2a-backend megamoe \
     --moe-runner-backend deep_gemm \
-    --deepep-config "$DEEPEP_CONFIG_JSON" \
     --attention-backend trtllm_mla \
     --linear-attn-prefill-backend flashkda \
     --mamba-full-memory-ratio 0.25 \

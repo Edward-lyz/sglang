@@ -79,7 +79,6 @@ export IB_DEVICE
 
 export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}/sgl-workspace/sglang/python"
 
-LOG_TO_FILE="${LOG_TO_FILE:-false}"
 LOG_FILE="${LOG_FILE:-/sgl-workspace/decode.log}"
 
 PARALLEL_ARGS=(
@@ -97,10 +96,6 @@ MTP_OPT=(
     --speculative-dspark-block-size 3
     --enable-linear-replayssm-spec
 )
-
-if [[ "$LOG_TO_FILE" == "true" ]]; then
-    exec >"$LOG_FILE" 2>&1
-fi
 
 sglang serve \
     --host 0.0.0.0 \

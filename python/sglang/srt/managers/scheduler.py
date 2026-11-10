@@ -1327,11 +1327,14 @@ class Scheduler(
                             member_chunk_counts = (total_chunk_count, 0)
                         else:
                             member_chunk_counts = (0, total_chunk_count)
+                        endpoint_tp_size = self.ps.attn_tp_size
+                        if endpoint_name == "kda-page" and kv_cache.use_mla:
+                            endpoint_tp_size = 1
                         endpoint_bytes_per_block = (
                             attention_store_endpoint_bytes_per_block(
                                 [manifest[layer_key] for manifest in member_manifests],
                                 per_layer_sizes.pop(),
-                                self.ps.attn_tp_size,
+                                endpoint_tp_size,
                             )
                         )
                         members.append(
@@ -1412,8 +1415,6 @@ class Scheduler(
                     pod_name=pod_name,
                     model_version="v1",
                     page_size=self.page_size,
-                    # A namespace shard is one (node-local PP stage, attention-TP)
-                    # pair, so every stage writes its block exactly once.
                     tp_rank=self.ps.attn_tp_rank,
                     tp_size=self.ps.attn_tp_size,
                     pp_rank=pp_rank,

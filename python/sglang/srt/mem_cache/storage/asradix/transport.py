@@ -36,6 +36,7 @@ def _sdk_pod_config(
     endpoint_name: Optional[str] = None,
     model_version: Optional[str] = None,
     gpu_count: Optional[int] = None,
+    pod_name: Optional[str] = None,
 ):
     from attentionstore_sdk.sdk import PodConfig
     from attentionstore_sdk.types import (
@@ -76,7 +77,7 @@ def _sdk_pod_config(
 
     return PodConfig(
         namespace=namespace,
-        pod_name=ctx.pod_name,
+        pod_name=pod_name or ctx.pod_name,
         model_version=model_version or ctx.model_version,
         device_id=ctx.device_id,
         dp_id=ctx.dp_rank,
