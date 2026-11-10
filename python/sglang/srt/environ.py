@@ -457,6 +457,14 @@ class Envs:
     # admitted only when every PP rank acknowledged it. Kill-switch: set to 0 to
     # restore the byte-identical two-pass (pre-consensus + consensus ring) path.
     SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS = EnvBool(False)
+    # Cap on the tokens whose KV one transfer chunk ships, i.e. one synchronous
+    # RDMA batch. Only requests whose cached prefix exceeds this ever split:
+    # chunked prefill already bounds every other send to chunked_prefill_size,
+    # while a fully cached prefix has no boundary left and goes out in a single
+    # call that occupies one transfer queue shard for its whole duration. Rounded
+    # down to a page multiple so intermediate boundaries stay on the page grid.
+    # 0 disables the cap.
+    SGLANG_DISAGG_MAX_SEND_CHUNK_TOKENS = EnvInt(256 * 1024)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)

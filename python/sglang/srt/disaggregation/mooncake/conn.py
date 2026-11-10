@@ -726,8 +726,81 @@ class MooncakeKVManager(CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+        lengths = list(lengths)
+        start_ts = time.perf_counter()
+        ret = self.engine.batch_transfer_sync(
+            mooncake_session_id, list(src_addrs), list(dst_addrs), lengths
+        )
+        if ret != 0:
+            self._log_batch_transfer_failure(
+                mooncake_session_id=mooncake_session_id,
+                num_blocks=len(lengths),
+                total_bytes=sum(lengths),
+                elapsed=time.perf_counter() - start_ts,
+                ret=ret,
+            )
+        return ret
+
+    def _log_batch_transfer_failure(
+        self,
+        *,
+        mooncake_session_id: str,
+        num_blocks: int,
+        total_bytes: int,
+        elapsed: float,
+        ret: int,
+    ) -> None:
+        """Report the shape of the RDMA batch that failed.
+
+        Block count, byte size and how long the call ran before failing are the
+        things the engine's return code does not carry, and they decide whether
+        the failure tracks transfer size or is independent of it -- i.e. whether
+        capping the chunk size can help at all.
+        """
+        logger.error(
+            "batch_transfer_sync failed: ret=%s session=%s blocks=%d "
+            "bytes=%.1fMB elapsed=%.3fs",
+            ret,
+            mooncake_session_id,
+            num_blocks,
+            total_bytes / 1024**2,
+            elapsed,
+        )
+
+    def _log_send_chunk_failure(
+        self,
+        *,
+        kv_chunk: TransferKVChunk,
+        req: TransferInfo,
+        ret: int,
+        elapsed: float,
+        is_dcp_transfer: bool,
+    ) -> None:
+        """Report the shape of the chunk whose transfer failed.
+
+        The failure record kept for the peer only names the room and the
+        endpoint, so the chunk size, the transfer path taken and how long the
+        call ran before failing are otherwise unrecoverable from the logs -- and
+        those are exactly what tells us whether a size cap changes anything.
+        """
+        num_pages = len(kv_chunk.prefill_kv_indices)
+        logger.error(
+            "Failed to send kv chunk: room=%s ret=%s dst=%s session=%s "
+            "pages=%d tokens=%s bytes=%.1fMB index_slice=[%s, %s) "
+            "last_chunk=%s dcp=%s staging=%s elapsed=%.3fs",
+            kv_chunk.room,
+            ret,
+            NetworkAddress(req.endpoint, req.dst_port).to_host_port_str(),
+            req.mooncake_session_id,
+            num_pages,
+            kv_chunk.num_kv_tokens,
+            num_pages * self.kv_item_lens_sum / 1024**2,
+            kv_chunk.index_slice.start,
+            kv_chunk.index_slice.stop,
+            kv_chunk.is_last_chunk,
+            is_dcp_transfer,
+            self.enable_staging,
+            elapsed,
         )
 
     def _transfer_data_arrays(
@@ -747,12 +820,22 @@ class MooncakeKVManager(CommonKVManager):
         if src_addrs.size == 0:
             return 0
 
-        return self.engine.batch_transfer_sync(
+        start_ts = time.perf_counter()
+        ret = self.engine.batch_transfer_sync(
             mooncake_session_id,
             src_addrs.tolist(),
             dst_addrs.tolist(),
             lengths.tolist(),
         )
+        if ret != 0:
+            self._log_batch_transfer_failure(
+                mooncake_session_id=mooncake_session_id,
+                num_blocks=int(lengths.size),
+                total_bytes=int(lengths.sum()),
+                elapsed=time.perf_counter() - start_ts,
+                ret=ret,
+            )
+        return ret
 
     def _send_kvcache_generic(
         self,
@@ -2153,6 +2236,13 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                             )
                         if ret != 0:
+                            self._log_send_chunk_failure(
+                                kv_chunk=kv_chunk,
+                                req=req,
+                                ret=ret,
+                                elapsed=time.perf_counter() - start_ts,
+                                is_dcp_transfer=is_dcp_transfer,
+                            )
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed

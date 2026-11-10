@@ -122,6 +122,27 @@ def maybe_release_metadata_buffer(
         req.metadata_buffer_index = -1
 
 
+def bounded_send_chunk_ends(
+    start_idx: int, end_idx: int, max_tokens_per_chunk: int
+) -> List[int]:
+    """Split ``[start_idx, end_idx)`` into sub-chunk end offsets.
+
+    The last element is always ``end_idx``, so a range that already fits (or is
+    empty, which a last chunk carrying only aux/state data is) yields a single
+    boundary and the send path behaves exactly as it did unchunked.
+    """
+    if max_tokens_per_chunk <= 0:
+        return [end_idx]
+
+    ends = []
+    cursor = start_idx
+    while cursor + max_tokens_per_chunk < end_idx:
+        cursor += max_tokens_per_chunk
+        ends.append(cursor)
+    ends.append(end_idx)
+    return ends
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
@@ -191,6 +212,36 @@ class PrefillBootstrapQueue:
                     "prefill context parallelism."
                 )
         self.kv_manager = self._init_kv_manager()
+        self.max_tokens_per_send_chunk = self._resolve_max_tokens_per_send_chunk()
+
+    def _resolve_max_tokens_per_send_chunk(self) -> int:
+        """Token budget for one transfer chunk, i.e. for one RDMA batch.
+
+        Rounded down to a whole number of pages: the split only preserves page
+        accounting (``sum(ceil(len_i / P)) == ceil((end - start) / P)``) while
+        every intermediate boundary lands on the page grid. Returns 0 when
+        unbounded.
+        """
+        max_tokens = envs.SGLANG_DISAGG_MAX_SEND_CHUNK_TOKENS.get()
+        if max_tokens <= 0:
+            return 0
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+            # Staging pins every send onto a chunked_prefill_size grid; an extra
+            # split would land off that grid and break its writer accounting.
+            return 0
+
+        page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+        pages_per_chunk = max(1, max_tokens // page_size)
+        max_tokens_per_chunk = pages_per_chunk * page_size
+        logger.info(
+            "Prefill KV send chunk cap: %d tokens (%d pages of %d), "
+            "%.1f MB per chunk",
+            max_tokens_per_chunk,
+            pages_per_chunk,
+            page_size,
+            pages_per_chunk * sum(self.kv_manager.kv_args.kv_item_lens) / 1024**2,
+        )
+        return max_tokens_per_chunk
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -877,7 +928,7 @@ class SchedulerDisaggregationPrefillMixin:
                         prepare_abort(
                             req,
                             error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                            status_code=HTTPStatus.REQUEST_TIMEOUT,
                         )
                     req.grammar.finished = req.finished()
             else:
@@ -1091,9 +1142,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
-            prepare_abort(
-                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-            )
+            prepare_abort(req, error_message, status_code=HTTPStatus.REQUEST_TIMEOUT)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
@@ -1146,7 +1195,7 @@ class SchedulerDisaggregationPrefillMixin:
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        prepare_abort(req, error_message, status_code=HTTPStatus.REQUEST_TIMEOUT)
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
@@ -1508,19 +1557,46 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     state_indices.append(None)
 
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, start_idx:end_idx
-        ]
-        page_indices = kv_to_page_indices(kv_indices, page_size)
-        if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
-            return
-        req.disagg_kv_sender.send(
-            page_indices,
-            state_indices,
-            num_kv_tokens=end_idx - start_idx,
-            send_aux=send_aux,
+        chunk_ends = bounded_send_chunk_ends(
+            start_idx,
+            end_idx,
+            self.disagg_prefill_bootstrap_queue.max_tokens_per_send_chunk,
         )
-        req.start_send_idx = end_idx
+        if len(chunk_ends) > 1:
+            # Rare by construction (only an oversized cached prefix splits), so
+            # log at info: this is how we tell a split request apart in the logs.
+            logger.info(
+                "send_kv_chunk split: rid=%s range=[%s, %s) into %d sub-chunks",
+                req.rid,
+                start_idx,
+                end_idx,
+                len(chunk_ends),
+            )
+
+        chunk_start = start_idx
+        for chunk_end in chunk_ends:
+            # Only the final sub-chunk concludes the request: aux/state payloads
+            # and the decode-side last-chunk bookkeeping ride along with it.
+            is_final_chunk = chunk_end == end_idx
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, chunk_start:chunk_end
+            ]
+            page_indices = kv_to_page_indices(kv_indices, page_size)
+            if req.disagg_kv_sender.should_send_kv_chunk(
+                len(page_indices), last_chunk and is_final_chunk
+            ):
+                req.disagg_kv_sender.send(
+                    page_indices,
+                    state_indices if is_final_chunk else None,
+                    num_kv_tokens=chunk_end - chunk_start,
+                    # The sender derives last-chunk-ness from its own page
+                    # cursor, so a non-final sub-chunk ignores this; passing it
+                    # through unconditionally keeps aux ownership with the
+                    # caller (PP0 only, under the early-last-chunk path).
+                    send_aux=send_aux,
+                )
+            chunk_start = chunk_end
+            req.start_send_idx = chunk_end
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""

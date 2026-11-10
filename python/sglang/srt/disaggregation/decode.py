@@ -619,7 +619,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.kv_manager.required_prefill_response_num_table.pop(
                 req.bootstrap_room, None
             )
-            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            prepare_abort(req, message, status_code=HTTPStatus.REQUEST_TIMEOUT)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return None
 
@@ -1826,7 +1826,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             prepare_abort(
                 decode_req.req,
                 "Metadata corruption detected - bootstrap_room mismatch",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                status_code=HTTPStatus.REQUEST_TIMEOUT,
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
@@ -2010,7 +2010,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 prepare_abort(
                     decode_req.req,
                     error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status_code=HTTPStatus.REQUEST_TIMEOUT,
                 )
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req],
