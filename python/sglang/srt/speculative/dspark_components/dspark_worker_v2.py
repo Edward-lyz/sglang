@@ -485,11 +485,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         logits_output = batch_output.logits_output
         output_pp_proxy_tensors = batch_output.pp_hidden_states_proxy_tensors
+        # The target aux hidden is consumed locally on this rank only: it feeds
+        # this rank's context projection (dspark_ctx_acc), which is the sole
+        # DSpark tensor the next PP rank reads. Pop it from the outgoing proxy
+        # so it is not redundantly shipped across the PP wire (the downstream
+        # rank reads hidden_states / residual / dspark_ctx_acc, never this).
         target_hidden = (
             logits_output.hidden_states
             if logits_output is not None
             else (
-                output_pp_proxy_tensors.tensors.get("dspark_aux_hidden_states")
+                output_pp_proxy_tensors.tensors.pop("dspark_aux_hidden_states", None)
                 if output_pp_proxy_tensors is not None
                 else None
             )
