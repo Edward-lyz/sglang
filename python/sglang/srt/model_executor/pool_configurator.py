@@ -318,8 +318,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     indexer_size_per_token * effective_num_layers * element_size
                 )
                 # DCP: index-K is replicated over the widened allocator slots,
-                # so each physical token carries dcp_size index rows.
-                if not kvc.is_draft_worker:
+                # so each physical token carries dcp_size index rows (striped
+                # like the MLA KV under SGLANG_K31_INDEXER_DCP: one row).
+                if (
+                    not kvc.is_draft_worker
+                    and not envs.SGLANG_K31_INDEXER_DCP.get()
+                ):
                     indexer_cell_size *= kvc.server_args.dcp_size
                 cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):

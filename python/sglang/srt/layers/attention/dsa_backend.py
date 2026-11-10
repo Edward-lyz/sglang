@@ -213,6 +213,15 @@ class DSAMetadata:
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
     # decode top-k transform. None unless SGLANG_OPT_USE_TOPK_V2 and decode.
     topk_v2_plan: Optional[torch.Tensor] = None
+    # SGLANG_K31_INDEXER_DCP (decode / target verify): this rank's view of the
+    # striped index-K -- local 64-row page table (one local page per virtual
+    # page of the DCP allocator), per-row local lengths, local 2D context lens,
+    # and the DeepGEMM schedule / top-k v2 plan built from them.
+    dcp_index_page_table: Optional[torch.Tensor] = None
+    dcp_index_lens: Optional[torch.Tensor] = None
+    dcp_index_ctx_lens_2d: Optional[torch.Tensor] = None
+    dcp_index_schedule: Optional[torch.Tensor] = None
+    dcp_index_topk_plan: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -381,6 +390,9 @@ class DeepseekSparseAttnBackend(
             self.dcp_size = get_parallel().attn_dcp_size
             self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_dcp_q_heads = self.num_q_heads * self.dcp_size
+        self.dcp_index_striped = (
+            self.dcp_size > 1 and envs.SGLANG_K31_INDEXER_DCP.get()
+        )
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
@@ -732,6 +744,42 @@ class DeepseekSparseAttnBackend(
 
         metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
 
+    def _refresh_dcp_index_metadata(self, metadata: DSAMetadata) -> None:
+        """SGLANG_K31_INDEXER_DCP: build (or, under graph replay, refresh in
+        place) this rank's view of the striped index-K from the widened
+        metadata. Virtual page v of the DCP allocator (page_size * dcp slots)
+        holds the rank's local rows v * page_size .. +page_size, and position t
+        of a request lands on rank t % dcp at local position t // dcp."""
+        if not (self.dcp_index_striped and metadata.real_page_table is not None):
+            return
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+        from sglang.srt.layers.dcp.layout import get_dcp_lens
+
+        dcp, rank = self.dcp_size, self.dcp_rank
+        values = {
+            "dcp_index_page_table": metadata.real_page_table[:, ::dcp] // dcp,
+            "dcp_index_lens": get_dcp_lens(
+                metadata.dsa_seqlens_expanded, dcp, rank
+            ).to(torch.int32),
+        }
+        if metadata.paged_mqa_ctx_lens_2d is not None:
+            ctx_2d = get_dcp_lens(metadata.paged_mqa_ctx_lens_2d, dcp, rank).to(
+                torch.int32
+            )
+        else:
+            ctx_2d = values["dcp_index_lens"].unsqueeze(-1)
+        values["dcp_index_ctx_lens_2d"] = ctx_2d
+        values["dcp_index_schedule"] = deep_gemm.get_paged_mqa_logits_metadata(
+            ctx_2d, 64, deep_gemm.get_num_sms()
+        )
+        values["dcp_index_topk_plan"] = plan_topk_v2(values["dcp_index_lens"])
+        for name, value in values.items():
+            current = getattr(metadata, name)
+            if current is None:
+                object.__setattr__(metadata, name, value.contiguous())
+            else:
+                current.copy_(value)
+
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
             self.dsa_topk_backend.is_sgl_kernel()
@@ -1078,6 +1126,11 @@ class DeepseekSparseAttnBackend(
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            self._refresh_dcp_index_metadata(metadata)
         self.forward_metadata = metadata
 
     def _cal_indexer_k_start_end(
@@ -1402,6 +1455,7 @@ class DeepseekSparseAttnBackend(
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
         self.decode_cuda_graph_metadata[bs] = metadata
+        self._refresh_dcp_index_metadata(metadata)
         self.forward_metadata = metadata
 
     def _apply_cuda_graph_metadata(
@@ -1708,6 +1762,7 @@ class DeepseekSparseAttnBackend(
                 )
             )
 
+        self._refresh_dcp_index_metadata(metadata)
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph_from_precomputed(
@@ -1870,6 +1925,7 @@ class DeepseekSparseAttnBackend(
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
 
+        self._refresh_dcp_index_metadata(metadata)
         self.forward_metadata = metadata
 
     def forward_extend(

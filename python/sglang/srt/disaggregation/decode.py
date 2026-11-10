@@ -1316,6 +1316,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
+                dcp_size = get_parallel().attn_dcp_size
+                if dcp_size > 1 and envs.SGLANG_K31_INDEXER_DCP.get():
+                    # Striped index-K: one local page per virtual DCP page
+                    # (the MLA KV transfer's page ids); prefill relayouts tokens.
+                    device_page_size *= dcp_size
                 return (
                     kv_indices_full[::device_page_size] // device_page_size
                 ).to(dtype=torch.int32)

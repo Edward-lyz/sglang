@@ -450,6 +450,21 @@ class Envs:
     # Routed SiTU+quant varlen kernel: persistent grid striding over the packed
     # (expert, token) rows instead of one CTA per padded row.
     SGLANG_K3_SITU_QUANT_PERSISTENT_GRID = EnvBool(False)
+    # K3.1 DSA under DCP (decode): stripe the indexer K cache like the MLA KV
+    # (rank slot % dcp stores row slot // dcp) instead of replicating it; each
+    # rank scores only its own tokens and the DCP group agrees on the global
+    # top-k by a distributed radix select over the local top-k candidates.
+    SGLANG_K31_INDEXER_DCP = EnvBool(False)
+    # Radix rounds (8 bits each) of that select; the remaining low bits of the
+    # boundary score are tie-broken by DCP rank order (3 -> scores within
+    # ~2^-15 relative of the k-th one may swap).
+    SGLANG_K31_INDEXER_DCP_RADIX_ROUNDS = EnvInt(3)
+    # With SGLANG_K31_INDEXER_DCP: run that select as one exact kernel whose
+    # CTAs exchange their rows' histograms through peer (symmetric) memory --
+    # radix (<= 4 rounds, early exit) + rank-order tie split -- instead of 5
+    # kernels + 4 collectives. Up to 4 rows per SM per call; larger calls use
+    # the multi-kernel path.
+    SGLANG_K31_INDEXER_DCP_FUSED_TOPK = EnvBool(False)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
@@ -698,6 +713,11 @@ class Envs:
     # on the transfer thread only, against the ~10 ms this path saves per call, so
     # the default trades it for a peak footprint of ~1/5 of the GPU.
     SGLANG_DISAGG_DRAFT_GATHER_MAX_CTAS = EnvInt(32)
+    # Prefill side of PD DCP (K3.1): gather each decode rank's strided tokens of
+    # the MLA KV and the striped DSA index-K into registered GPU staging before
+    # the RDMA, so the relayout sends ~one descriptor per destination page per
+    # layer instead of one per token (reuses the draft gather slots / CTA cap).
+    SGLANG_K31_PD_DCP_GATHER = EnvBool(False)
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)

@@ -172,6 +172,9 @@ class KVArgsRegisterInfo:
     # prefix takes token relayout and the draft tail takes a replicated
     # head-slice transfer. 0 when unknown/no draft pool.
     dst_num_mla_kv_entries: int = 0
+    # SGLANG_K31_INDEXER_DCP on the decode side: its DSA index-K is striped by
+    # DCP rank (local rows only), so the DSA state takes a token relayout.
+    dst_dsa_index_dcp_striped: bool = False
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -225,6 +228,7 @@ class KVArgsRegisterInfo:
                 if len(msg) > 19 and msg[19] != b""
                 else 0
             ),
+            dst_dsa_index_dcp_striped=len(msg) > 20 and msg[20] == b"1",
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
@@ -262,6 +266,10 @@ class MooncakeKVManager(CommonKVManager):
         self.allow_last_chunk_without_aux = (
             envs.SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK.get()
         )
+        # SGLANG_K31_PD_DCP_GATHER state (see set_dcp_relayout_tensors).
+        self._dcp_gather_pool = None
+        self._dcp_gather_mla = None
+        self._dcp_gather_dsa = None
         # Speculative draft KV gather staging. These stay unset until
         # set_draft_kv_entry_tensors() is called with the draft pool this rank
         # registered for transfer (last PP stage only, prefill side only).
@@ -491,6 +499,68 @@ class MooncakeKVManager(CommonKVManager):
         logger.info(
             f"PD draft KV gather staging enabled for {len(entry_tensors)} draft "
             f"entries on gpu {self.kv_args.gpu_id}"
+        )
+
+    def set_dcp_relayout_tensors(
+        self, mla_tensors: list, dsa_tensors: list
+    ) -> None:
+        """SGLANG_K31_PD_DCP_GATHER: hand over the target MLA KV (token-major)
+        and DSA index-K (paged) buffers backing the registered pointers, so the
+        PD DCP token relayout gathers each decode rank's strided tokens into
+        staging and sends ~one descriptor per destination page instead of one
+        per token. Tensors whose pointer is not registered are ignored."""
+        if (
+            self.disaggregation_mode != DisaggregationMode.PREFILL
+            or not envs.SGLANG_K31_PD_DCP_GATHER.get()
+            or not is_cuda()
+        ):
+            return
+        from sglang.srt.disaggregation.common.dcp_relayout_gather import (
+            entry_ptr_tensor,
+        )
+        from sglang.srt.disaggregation.common.draft_kv_gather import DraftKVGatherPool
+        from sglang.srt.disaggregation.common.staging_handler import (
+            _get_custom_mem_pool,
+        )
+
+        def match(ptrs, tensors):
+            by_ptr = {t.data_ptr(): t for t in tensors if t.is_contiguous()}
+            picked = [by_ptr.get(p) for p in ptrs]
+            return picked if picked and all(t is not None for t in picked) else None
+
+        gpu = self.kv_args.gpu_id
+        self._dcp_gather_mla = match(
+            list(self.kv_args.kv_data_ptrs[: self.kv_args.num_mla_kv_entries]),
+            mla_tensors,
+        )
+        self._dcp_gather_dsa = None
+        state_types = getattr(self.kv_args, "state_types", [])
+        if StateType.DSA in state_types:
+            self._dcp_gather_dsa = match(
+                list(self.kv_args.state_data_ptrs[state_types.index(StateType.DSA)]),
+                dsa_tensors,
+            )
+        if self._dcp_gather_mla is None and self._dcp_gather_dsa is None:
+            logger.info("PD DCP relayout gather: no matching pool tensors, disabled")
+            return
+        self._dcp_gather_mla_ptrs = (
+            entry_ptr_tensor(self._dcp_gather_mla, gpu) if self._dcp_gather_mla else None
+        )
+        self._dcp_gather_dsa_ptrs = (
+            entry_ptr_tensor(self._dcp_gather_dsa, gpu) if self._dcp_gather_dsa else None
+        )
+        custom_mem_pool, _ = _get_custom_mem_pool(f"cuda:{gpu}")
+        self._dcp_gather_pool = DraftKVGatherPool(
+            gpu_id=gpu,
+            num_slots=max(1, envs.SGLANG_DISAGG_DRAFT_GATHER_BUFFERS.get()),
+            register=lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            deregister=lambda ptr: self.engine.batch_deregister([ptr]),
+            custom_mem_pool=custom_mem_pool,
+        )
+        logger.info(
+            "PD DCP relayout gather enabled: %d MLA entries, %d DSA entries",
+            len(self._dcp_gather_mla or []),
+            len(self._dcp_gather_dsa or []),
         )
 
     def _init_staging_buffers(self, count: int):
@@ -1312,6 +1382,15 @@ class MooncakeKVManager(CommonKVManager):
                 dst_kv_ptrs,
             )
         layers_current_pp_stage = len(src_kv_ptrs)
+        gathered = self._send_dcp_mla_via_gather(
+            mooncake_session_id,
+            plan=plan,
+            src_kv_ptrs=src_kv_ptrs,
+            dst_kv_ptrs=dst_kv_ptrs,
+            item_lens=dcp_token_item_lens[:layers_current_pp_stage],
+        )
+        if gathered is not None:
+            return gathered
         # Run-length form, not materialised groups: a DCP relayout strides the
         # source by dcp_size, so every run is a single token and the per-group
         # Python lists would be as long as the token count -- per layer.
@@ -1367,6 +1446,196 @@ class MooncakeKVManager(CommonKVManager):
             np.concatenate([addrs[0] for addrs in per_layer]),
             np.concatenate([addrs[1] for addrs in per_layer]),
             np.concatenate([addrs[2] for addrs in per_layer]),
+        )
+
+    def _send_dcp_mla_via_gather(
+        self,
+        mooncake_session_id: str,
+        *,
+        plan,
+        src_kv_ptrs: list[int],
+        dst_kv_ptrs: list[int],
+        item_lens: list[int],
+    ) -> Optional[int]:
+        """SGLANG_K31_PD_DCP_GATHER for the MLA KV relayout: gather the decode
+        rank's strided tokens of every layer into staging, then one descriptor
+        per run of consecutive destination tokens. None = not applicable (the
+        caller sends per token)."""
+        from sglang.srt.disaggregation.common import dcp_relayout_gather as g
+
+        tensors = self._dcp_gather_mla
+        if (
+            self._dcp_gather_pool is None
+            or tensors is None
+            or [t.data_ptr() for t in tensors] != list(src_kv_ptrs)
+            or len(set(item_lens)) != 1
+        ):
+            return None
+        row_bytes = item_lens[0]
+        if any(t[0].numel() * t.element_size() != row_bytes for t in tensors):
+            return None
+        num_rows = plan.src_token_indices.size
+        starts, lengths = g.row_runs(plan.dst_token_indices)
+        with self._dcp_gather_pool.borrow(len(tensors) * num_rows * row_bytes) as buf:
+            g.gather_rows(
+                entry_ptrs_gpu=self._dcp_gather_mla_ptrs,
+                src_offsets=plan.src_token_indices.astype(np.int64) * row_bytes,
+                row_bytes=row_bytes,
+                staging_buffer=buf,
+                gpu_id=self.kv_args.gpu_id,
+                max_ctas=envs.SGLANG_DISAGG_DRAFT_GATHER_MAX_CTAS.get(),
+            )
+            src, dst, lens = g.gathered_descriptors(
+                staging_ptr=buf.get_ptr(),
+                staging_offset=0,
+                num_rows=num_rows,
+                row_bytes=row_bytes,
+                dst_entry_ptrs=dst_kv_ptrs,
+                dst_run_offsets=plan.dst_token_indices[starts] * row_bytes,
+                run_starts=starts,
+                run_lengths=lengths,
+            )
+            return self._transfer_data_arrays(mooncake_session_id, src, dst, lens)
+
+    def _send_dsa_index_via_gather(
+        self,
+        mooncake_session_id: str,
+        *,
+        plan,
+        pairs,
+        src_data_ptrs: list[int],
+        dst_data_ptrs: list[int],
+        item_lens: list[int],
+    ) -> Optional[int]:
+        """SGLANG_K31_PD_DCP_GATHER for the striped DSA index-K: gather the
+        decode rank's tokens' fp8 K rows and fp32 scales into two staging
+        regions; each run of consecutive destination rows inside one page
+        then takes one K and one scale descriptor."""
+        from sglang.srt.disaggregation.common import dcp_relayout_gather as g
+
+        tensors = self._dcp_gather_dsa
+        page_size = self.kv_args.page_size
+        if (
+            self._dcp_gather_pool is None
+            or tensors is None
+            or [t.data_ptr() for t in tensors] != list(src_data_ptrs)
+            or [i for i, _ in pairs] != list(range(len(src_data_ptrs)))
+            or len(set(item_lens)) != 1
+        ):
+            return None
+        page_bytes = item_lens[0]
+        k_bytes = page_bytes // page_size - 4
+        num_rows = plan.src_token_indices.size
+        n = len(tensors)
+        src_page, src_off = np.divmod(plan.src_token_indices.astype(np.int64), page_size)
+        dst_rows = plan.dst_token_indices.astype(np.int64)
+        dst_page, dst_off = np.divmod(dst_rows, page_size)
+        starts, lengths = g.row_runs(dst_rows, rows_per_page=page_size)
+        dst_ptrs = [dst_data_ptrs[j] for _, j in pairs]
+        scale_region = n * num_rows * k_bytes
+        with self._dcp_gather_pool.borrow(n * num_rows * (k_bytes + 4)) as buf:
+            descs = []
+            for row_bytes, base, offset in (
+                (k_bytes, 0, 0),
+                (4, page_size * k_bytes, scale_region),
+            ):
+                g.gather_rows(
+                    entry_ptrs_gpu=self._dcp_gather_dsa_ptrs,
+                    src_offsets=src_page * page_bytes + base + src_off * row_bytes,
+                    row_bytes=row_bytes,
+                    staging_buffer=buf,
+                    gpu_id=self.kv_args.gpu_id,
+                    max_ctas=envs.SGLANG_DISAGG_DRAFT_GATHER_MAX_CTAS.get(),
+                    staging_offset=offset,
+                )
+                descs.append(
+                    g.gathered_descriptors(
+                        staging_ptr=buf.get_ptr(),
+                        staging_offset=offset,
+                        num_rows=num_rows,
+                        row_bytes=row_bytes,
+                        dst_entry_ptrs=dst_ptrs,
+                        dst_run_offsets=dst_page[starts] * page_bytes
+                        + base
+                        + dst_off[starts] * row_bytes,
+                        run_starts=starts,
+                        run_lengths=lengths,
+                    )
+                )
+            return self._transfer_data_arrays(
+                mooncake_session_id,
+                *(np.concatenate([d[k] for d in descs]) for k in range(3)),
+            )
+
+    def send_dsa_index_dcp(
+        self,
+        mooncake_session_id: str,
+        src_data_ptrs: list[int],
+        dst_data_ptrs: list[int],
+        item_lens: list[int],
+        prefill_page_indices: npt.NDArray[np.int32],
+        dst_page_indices: npt.NDArray[np.int32],
+        *,
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+        decode_prefix_len: int,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
+    ) -> int:
+        """DSA index-K to a decode rank that stripes it by DCP rank
+        (SGLANG_K31_INDEXER_DCP there): the rank's tokens (position % dcp ==
+        rank) go to local row position // dcp of its pages, like the MLA KV
+        relayout. A page holds the fp8 K rows (page_size * head_dim bytes)
+        followed by their fp32 scales, so each token moves as two pieces."""
+        page_size = self.kv_args.page_size
+        plan = build_dcp_token_transfer_plan(
+            np.asarray(prefill_page_indices, dtype=np.int32),
+            np.asarray(dst_page_indices, dtype=np.int32),
+            physical_page_size=page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            decode_prefix_len=decode_prefix_len,
+        )
+        if plan.src_token_indices.size == 0:
+            return 0
+        pairs = build_transfer_entry_pairs(
+            src_layer_ids or [],
+            dst_layer_ids or [],
+            len(src_data_ptrs),
+            len(dst_data_ptrs),
+            allow_positional_fallback=self.pp_size == 1,
+        )
+        gathered = self._send_dsa_index_via_gather(
+            mooncake_session_id,
+            plan=plan,
+            pairs=pairs,
+            src_data_ptrs=src_data_ptrs,
+            dst_data_ptrs=dst_data_ptrs,
+            item_lens=item_lens,
+        )
+        if gathered is not None:
+            return gathered
+        src_page, src_off = np.divmod(plan.src_token_indices, page_size)
+        dst_page, dst_off = np.divmod(plan.dst_token_indices, page_size)
+        src_addrs, dst_addrs, lengths = [], [], []
+        for i, j in pairs:
+            page_bytes = item_lens[i]
+            k_bytes = page_bytes // page_size - 4  # fp8 K row; 4 B fp32 scale
+            for row_bytes, base in ((k_bytes, 0), (4, page_size * k_bytes)):
+                src_addrs.append(
+                    src_data_ptrs[i] + src_page * page_bytes + base + src_off * row_bytes
+                )
+                dst_addrs.append(
+                    dst_data_ptrs[j] + dst_page * page_bytes + base + dst_off * row_bytes
+                )
+                lengths.append(np.full(src_page.shape, row_bytes, dtype=np.int64))
+        if not src_addrs:
+            return 0
+        return self._transfer_data_arrays(
+            mooncake_session_id,
+            np.concatenate(src_addrs).astype(np.int64),
+            np.concatenate(dst_addrs).astype(np.int64),
+            np.concatenate(lengths),
         )
 
     def _send_draft_slice_via_gather(
@@ -2123,6 +2392,28 @@ class MooncakeKVManager(CommonKVManager):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
+                if (
+                    st == StateType.DSA
+                    and target_rank_registration_info is not None
+                    and target_rank_registration_info.dst_dsa_index_dcp_striped
+                ):
+                    rc = (
+                        self.send_dsa_index_dcp(
+                            req.mooncake_session_id,
+                            src_data_ptrs,
+                            dst_data_ptrs,
+                            src_item_lens,
+                            indices,
+                            dst_indices,
+                            dst_dcp_size=target_rank_registration_info.dst_dcp_size,
+                            dst_dcp_rank=target_rank_registration_info.dst_dcp_rank,
+                            decode_prefix_len=req.decode_prefix_len or 0,
+                            src_layer_ids=src_state_layer_ids,
+                            dst_layer_ids=dst_state_layer_ids,
+                        )
+                        or rc
+                    )
+                    continue
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if (
@@ -3933,6 +4224,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_num_mla_kv_entries = str(
                 self.kv_mgr.kv_args.num_mla_kv_entries
             ).encode("ascii")
+            dst_dsa_index_dcp_striped = (
+                b"1"
+                if self.kv_mgr.dcp_size > 1 and envs.SGLANG_K31_INDEXER_DCP.get()
+                else b""
+            )
             if (
                 self.kv_mgr.enable_staging
                 and self.kv_mgr._staging_ctx.allocator is not None
@@ -3969,6 +4265,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             dst_dcp_rank,
                             packed_kv_item_lens,
                             dst_num_mla_kv_entries,
+                            dst_dsa_index_dcp_striped,
                         ]
                     )
             except zmq.ZMQError:

@@ -4429,9 +4429,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_buf_size is None:
             # DCP: MLA KV is striped (loc // dcp_size), but index-K is replicated
             # and addressed by the widened allocator loc, so every rank can score
-            # the whole sequence and pick the global top-k.
+            # the whole sequence and pick the global top-k. SGLANG_K31_INDEXER_DCP
+            # stripes index-K like the MLA KV (local rows only).
             dcp_size = get_parallel().attn_dcp_size
-            index_buf_size = (size + page_size) * dcp_size - page_size
+            if dcp_size > 1 and envs.SGLANG_K31_INDEXER_DCP.get():
+                index_buf_size = size
+            else:
+                index_buf_size = (size + page_size) * dcp_size - page_size
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128

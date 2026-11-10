@@ -399,6 +399,14 @@ class Indexer(MultiPlatformOp):
             and rope_head_dim > 0
         )
         self.alt_stream = alt_stream
+        self.dcp_index_striped = (
+            _is_cuda
+            and envs.SGLANG_K31_INDEXER_DCP.get()
+            and get_parallel().dcp_enabled
+        )
+        # Each DCP rank selects its own slots of the shared top-k, so the
+        # results must not be overwritten by rank 0's.
+        assert not (self.dcp_index_striped and envs.SGLANG_DSA_TOPK_BROADCAST.get())
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -880,6 +888,122 @@ class Indexer(MultiPlatformOp):
             local_idxs.clamp_min_(0)
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
+
+    def _get_topk_paged_dcp(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        """SGLANG_K31_INDEXER_DCP: paged top-k over the DCP-striped index-K.
+
+        Scores only this rank's tokens (local page table / lengths built by
+        the DSA backend), keeps the local top-k, and agrees with the DCP group
+        on the global top-k (dcp_global_topk). Returns the selected slots in
+        the widened encoding the replicated path produces, so the sparse MLA
+        side (transform_index_page_table_dcp) is unchanged.
+        """
+        from sglang.kernels.ops.attention.dsa.dcp_topk import dcp_global_topk
+        from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512_v2
+
+        mode = forward_batch.forward_mode
+        assert mode.is_decode_or_idle() or mode.is_target_verify(), (
+            f"SGLANG_K31_INDEXER_DCP supports decode / target verify, got {mode}"
+        )
+        assert self.num_init_tokens == 0 and self.num_local_tokens == 0
+        attn = metadata.attn_metadata
+        page_table = attn.dcp_index_page_table
+        assert page_table is not None, "DCP index metadata was not built"
+        page_size = get_token_to_kv_pool().page_size
+        kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
+        kv_cache_fp8 = kv_cache_fp8.view(kv_cache_fp8.shape[0], page_size, 1, 132)
+        weights = weights.squeeze(2)
+        max_seq_len = page_table.shape[1] * page_size
+
+        q_offset = sum(metadata.get_dsa_extend_len_cpu())
+        B = metadata.get_seqlens_int32().shape[0]
+        next_n = q_offset // B if B > 0 else 0
+        ctx_2d = attn.dcp_index_ctx_lens_2d
+        if mode.is_target_verify() and next_n >= 2 and ctx_2d.shape == (B, next_n):
+            logits = deepgemm_paged_mqa_logits_native(
+                deep_gemm.fp8_paged_mqa_logits,
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                ctx_2d,
+                page_table,
+                attn.dcp_index_schedule,
+                max_seq_len,
+                q_offset=q_offset,
+                B=B,
+                next_n=next_n,
+            )
+        else:
+            logits = deepgemm_paged_mqa_logits_split(
+                deep_gemm.fp8_paged_mqa_logits,
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                ctx_2d,
+                page_table,
+                attn.dcp_index_schedule,
+                max_seq_len,
+                q_offset=q_offset,
+            )
+
+        num_rows = logits.shape[0]
+        local_rows = logits.new_full((num_rows, self.index_topk), -1, dtype=torch.int32)
+        raw = torch.full_like(local_rows, -1)
+        topk_transform_512_v2(
+            logits,
+            attn.dcp_index_lens[:num_rows],
+            page_table[:num_rows],
+            local_rows,
+            page_size,
+            attn.dcp_index_topk_plan,
+            raw,
+        )
+        parallel = get_parallel()
+        global_lens = metadata.get_seqlens_expanded()[:num_rows]
+        if envs.SGLANG_K31_INDEXER_DCP_FUSED_TOPK.get() and self.index_topk == 2048:
+            from sglang.kernels.ops.attention.dsa.dcp_topk_fused import (
+                dcp_global_topk_fused,
+                max_fused_rows,
+            )
+
+            use_fused = num_rows <= max_fused_rows(logits.device)
+        else:
+            use_fused = False
+        if use_fused:
+            topk_result, _ = dcp_global_topk_fused(
+                logits,
+                raw,
+                local_rows,
+                global_lens,
+                parallel.dcp_group,
+                parallel.attn_dcp_rank,
+                num_ctas=self.sm_count,
+            )
+        else:
+            topk_result, _ = dcp_global_topk(
+                logits,
+                raw,
+                local_rows,
+                global_lens,
+                self.index_topk,
+                parallel.dcp_group,
+                parallel.attn_dcp_rank,
+                parallel.attn_dcp_size,
+                rounds=envs.SGLANG_K31_INDEXER_DCP_RADIX_ROUNDS.get(),
+            )
+        if q_offset < q_fp8.shape[0]:
+            padding = topk_result.new_full(
+                (q_fp8.shape[0] - q_offset, topk_result.shape[1]), -1
+            )
+            topk_result = torch.cat([topk_result, padding], dim=0)
+        return topk_result
 
     def _get_topk_paged(
         self,
@@ -1658,6 +1782,16 @@ class Indexer(MultiPlatformOp):
 
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
+        if self.dcp_index_striped:
+            # SGLANG_K31_INDEXER_DCP: this rank keeps only the tokens it owns
+            # (slot % dcp == rank) at local row slot // dcp; the others go to
+            # local row 0 (the reserved padding page) so the store stays dense.
+            dcp_size = get_parallel().attn_dcp_size
+            out_cache_loc = torch.where(
+                out_cache_loc % dcp_size == get_parallel().attn_dcp_rank,
+                out_cache_loc // dcp_size,
+                0,
+            )
 
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
@@ -2002,10 +2136,18 @@ class Indexer(MultiPlatformOp):
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
-                topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
-                )
+                topk_result = (
+                    self._get_topk_paged_dcp
+                    if self.dcp_index_striped
+                    else self._get_topk_paged
+                )(forward_batch, layer_id, q_fp8, weights, metadata)
             else:
+                if self.dcp_index_striped:
+                    raise NotImplementedError(
+                        "SGLANG_K31_INDEXER_DCP stripes index-K by DCP rank; the "
+                        f"{forward_batch.forward_mode} (ragged) indexer path "
+                        "reads it unsharded"
+                    )
                 if (
                     forward_batch.attn_cp_metadata is not None
                     and is_dsa_prefill_cp_in_seq_split()
