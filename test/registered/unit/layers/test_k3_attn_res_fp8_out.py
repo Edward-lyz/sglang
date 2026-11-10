@@ -76,9 +76,11 @@ class TestK3AttnResFp8Out(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertIs(hit[0], q)
         self.assertIs(hit[1], s)
-        # A same-layout view (the MoE reshapes to 2D) still matches; a copy,
-        # a slice or a different layout of x does not.
+        # A contiguous reshape keeping the last dim (the MoE's 2D view, the
+        # KDA [1, T, H, D] -> [T, H * D] flatten) still matches; a copy, a
+        # slice or a different last dim does not.
         self.assertIsNotNone(fp8_utils._lookup_prequantized_input(x.view(-1, H)))
+        self.assertIsNotNone(fp8_utils._lookup_prequantized_input(x.view(1, 4, H)))
         self.assertIsNone(fp8_utils._lookup_prequantized_input(x.clone()))
         self.assertIsNone(fp8_utils._lookup_prequantized_input(x[:2]))
         self.assertIsNone(fp8_utils._lookup_prequantized_input(x.view(8, H // 2)))

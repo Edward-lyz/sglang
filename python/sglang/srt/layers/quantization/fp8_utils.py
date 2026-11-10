@@ -818,10 +818,11 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
 # the exact DeepGEMM input quant of a bf16 tensor (group 128, UE8M0,
 # column-major TMA-aligned scale; e.g. the K3 attention-residual kernel)
 # registers it, and every DeepGEMM block-FP8 linear that is handed that
-# tensor (or a same-layout view of it, e.g. a reshape to 2D) reuses the pair
-# instead of re-quantizing it. The slot keeps the tensor alive, so a matching
-# pointer cannot belong to unrelated memory. One slot: the next registration
-# replaces it.
+# tensor (or a contiguous reshape of it with the same last dim, e.g. the
+# [1, T, H, D] -> [T, H * D] flatten before an o_proj) reuses the pair instead
+# of re-quantizing it. The slot keeps the tensor alive, so a matching pointer
+# cannot belong to unrelated memory. One slot: the next registration replaces
+# it.
 _PREQUANTIZED_INPUT: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
 
@@ -864,14 +865,16 @@ def _lookup_prequantized_input(
     slot = _PREQUANTIZED_INPUT
     if slot is None:
         return None
-    src = slot[0]
+    src, q, scale = slot
     if src is x or (
         x.data_ptr() == src.data_ptr()
         and x.dtype == src.dtype
-        and x.shape == src.shape
-        and x.stride() == src.stride()
+        and x.numel() == src.numel()
+        and x.shape[-1] == q.shape[-1]
+        and x.is_contiguous()
+        and src.is_contiguous()
     ):
-        return slot[1], slot[2]
+        return q, scale
     return None
 
 

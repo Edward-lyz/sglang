@@ -429,6 +429,9 @@ class Envs:
     # MLA output gate kernel also emits the DeepGEMM block-FP8 input quant
     # that o_proj consumes.
     SGLANG_K3_MLA_GATE_QUANT = EnvBool(False)
+    # KDA fused verify kernel (output norm) also emits the DeepGEMM block-FP8
+    # input quant that o_proj consumes.
+    SGLANG_K3_KDA_ONORM_QUANT = EnvBool(False)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)

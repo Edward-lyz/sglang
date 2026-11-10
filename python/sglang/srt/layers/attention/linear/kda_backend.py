@@ -116,6 +116,16 @@ class KDAKernelDispatcher:
                 "KDA verify supports 'triton', 'nv_cutedsl', or 'flashinfer'."
             )
 
+        # target_verify (MTP / speculative decode) kernel: each decode backend
+        # verifies with its own kernel. FlashInfer decode uses recurrent_kda (SM100,
+        # chain only); Triton -- and CuTe DSL, which has no verify of its own -- use
+        # the Triton fused KDA verify, which handles chain + tree
+        # (retrieve_parent_token) and per-step checkpointing and is the reference the
+        # KDA backend correctness tests assert against.
+        self.verify_kernel = (
+            self.decode_kernel if decode_backend.is_flashinfer() else triton_kernel
+        )
+
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_flashkda():
@@ -1223,6 +1233,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_weight = None
             onorm_eps = None
             onorm_gate = None
+        # Set by the model when its o_proj consumes a pre-quantized input.
+        quant_out = (
+            apply_onorm and getattr(layer, "_k3_onorm_quant", False) and h % 4 == 0
+        )
 
         out = fused_kda_decode_mtp_dspark(
             x_q=x_q,
@@ -1255,7 +1269,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_gate=onorm_gate,
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
+            quant_out=quant_out,
         )
+        if quant_out:
+            # The DeepGEMM o_proj is handed this output (flattened to
+            # [T, H * 128]) and picks the fused quant up.
+            from sglang.srt.layers.quantization.fp8_utils import (
+                set_prequantized_input,
+            )
+
+            out, q, q_scale = out
+            set_prequantized_input(out, q, q_scale)
         if apply_onorm:
             layer._k3_onorm_consumed = True
         return out
