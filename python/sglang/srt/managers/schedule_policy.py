@@ -64,6 +64,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.common import (
+    MAMBA_STATE_PER_REQ_NO_CACHE,
+    MAMBA_STATE_PER_REQ_PREFIX_CACHE,
+    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
+)
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
@@ -635,6 +641,18 @@ class PrefillAdder:
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
 
+        self._mamba_slot_alloc_factor = 1
+        req_pool = getattr(self.tree_cache, "req_to_token_pool", None)
+        if isinstance(req_pool, HybridReqToTokenPool):
+            if self.tree_cache.supports_mamba():
+                self._mamba_slot_alloc_factor = (
+                    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+                    if req_pool.enable_mamba_extra_buffer_lazy
+                    else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+                )
+            else:
+                self._mamba_slot_alloc_factor = MAMBA_STATE_PER_REQ_NO_CACHE
+
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
@@ -932,7 +950,10 @@ class PrefillAdder:
         # The new mamba slot also consumes one mamba-recoverable slot (gated
         # separately so full_evictable can't cover it — see __init__).
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= 1
+            # `alloc_req_slots` needs MAMBA_STATE_PER_REQ_* mamba slots per
+            # request, not one. Charge the same factor here or admission can
+            # over-commit and hit the fail-loud RuntimeError.
+            self.rem_mamba_slots -= self._mamba_slot_alloc_factor
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
@@ -1110,11 +1131,13 @@ class PrefillAdder:
             )
             new_len = end - start
             if new_len > _rem_tokens:
-                raise RuntimeError(
-                    "PP authoritative resumed chunk exceeds the local token budget: "
+                req._pp_replay_local_abort = True
+                req._as_cache_read_abort_reason = (
+                    "PP replay resumed chunk exceeds the local token budget: "
                     f"rid={req.rid} planned={planned_admission.extend_range} "
                     f"available={_rem_tokens}"
                 )
+                return None
             truncated = end < len(req.full_untruncated_fill_ids)
         req.set_extend_range(prefix_len, prefix_len + new_len)
         self.can_run_list.append(req)
@@ -1438,9 +1461,7 @@ class PrefillAdder:
                     f"prefix: local={current_prefix_len} "
                     f"planned={authoritative_start}"
                 )
-                return self._sync_attention_store_read_abort(
-                    req, AddReqResult.ABORT
-                )
+                return self._sync_attention_store_read_abort(req, AddReqResult.ABORT)
             # Include any host-hit prefix still awaiting load-back, but reserve
             # and schedule no token beyond PP0's committed end position.
             cand_extend_input_len = authoritative_end - current_prefix_len
@@ -1701,10 +1722,13 @@ class PrefillAdder:
                     available_chunk_tokens is not None
                     and input_tokens > available_chunk_tokens
                 ):
-                    raise RuntimeError(
+                    req._as_cache_read_abort_reason = (
                         "PP authoritative request exceeds the local chunk budget: "
                         f"rid={req.rid} planned={planned_admission.extend_range} "
                         f"available={available_chunk_tokens}"
+                    )
+                    return self._sync_attention_store_read_abort(
+                        req, AddReqResult.ABORT
                     )
 
                 truncated = authoritative_end < len(req.full_untruncated_fill_ids)

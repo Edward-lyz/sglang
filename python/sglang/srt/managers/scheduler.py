@@ -2447,13 +2447,28 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
-            ):
-                self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
-                )
-                continue
+            if is_health_check_generate_req(recv_req):
+                if recv_req._pp_admission_decision is None:
+                    if self.ps.pp_size > 1:
+                        if self.pp_group.is_first_rank:
+                            # PP0 owns the decision; downstream ranks follow
+                            # the decision carried by the relayed request.
+                            recv_req._pp_admission_decision = self.is_fully_idle(
+                                for_health_check=True
+                            )
+                        else:
+                            # No PP0 decision available on a downstream rank:
+                            # skip deterministically instead of diverging.
+                            recv_req._pp_admission_decision = False
+                    else:
+                        recv_req._pp_admission_decision = self.is_fully_idle(
+                            for_health_check=True
+                        )
+                if not recv_req._pp_admission_decision:
+                    self.return_health_check_ipcs.append(
+                        getattr(recv_req, "http_worker_ipc", None)
+                    )
+                    continue
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -3503,16 +3518,17 @@ class Scheduler(
                 req for req in self.waiting_queue if req not in deleted_reqs
             ]
 
-    def _abort_failed_cache_read(self, req: Req) -> Dict[str, Any]:
-        """Remove a waiting request whose AttentionStore read was incomplete."""
-        message = getattr(req, "_as_cache_read_abort_reason", None) or (
-            "AttentionStore cache read failed"
-        )
-        finish_reason = FINISH_ABORT(
-            message,
-            HTTPStatus.INTERNAL_SERVER_ERROR,
-            "InternalServerError",
-        )
+    def _abort_local_request(
+        self,
+        req: Req,
+        *,
+        reason_code: str,
+        message: str,
+        status_code,
+        err_type: str,
+    ) -> Dict[str, Any]:
+        """Release local resources and notify the tokenizer that a request is aborted."""
+        finish_reason = FINISH_ABORT(message, status_code, err_type)
         req.to_finish = finish_reason
         req.time_stats.trace_ctx.abort(abort_info=finish_reason.to_json())
 
@@ -3535,13 +3551,62 @@ class Scheduler(
             AbortReq(finished_reason=finish_reason.to_json(), rid=req.rid),
             req,
         )
-        logger.error("Aborted request after incomplete AS read: rid=%s", req.rid)
+        logger.error("Aborted request (%s): rid=%s", reason_code, req.rid)
         return {
             "rid": req.rid,
             "origin_pp_rank": int(self.ps.pp_rank),
-            "reason_code": "AS_CACHE_READ_FAILED",
+            "reason_code": reason_code,
             "reason": message,
         }
+
+    def _abort_failed_cache_read(self, req: Req) -> Dict[str, Any]:
+        """Remove a waiting request whose AttentionStore read was incomplete."""
+        message = req._as_cache_read_abort_reason or "AttentionStore cache read failed"
+        return self._abort_local_request(
+            req,
+            reason_code="AS_CACHE_READ_FAILED",
+            message=message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            err_type="InternalServerError",
+        )
+
+    def _abort_failed_replay(self, req: Req, result: AddReqResult) -> Dict[str, Any]:
+        """Abort a request that cannot be admitted during PP replay."""
+        if result == AddReqResult.NO_TOKEN:
+            reason_code = "PP_REPLAY_NO_TOKEN"
+            message = (
+                "PP replay NO_TOKEN: local rem_total_tokens insufficient, "
+                f"rid={req.rid}"
+            )
+        else:
+            reason_code = "PP_REPLAY_OTHER"
+            message = (
+                f"PP replay could not admit request locally: result={result}, "
+                f"rid={req.rid}"
+            )
+        return self._abort_local_request(
+            req,
+            reason_code=reason_code,
+            message=message,
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            err_type="ServiceUnavailable",
+        )
+
+    def _abort_failed_replay_record(
+        self, req: Req, record: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Abort a request from a propagated PP replay abort record."""
+        reason_code = str(record.get("reason_code", "PP_REPLAY_OTHER"))
+        message = record.get("reason") or (
+            f"PP replay could not admit request locally, rid={req.rid}"
+        )
+        return self._abort_local_request(
+            req,
+            reason_code=reason_code,
+            message=message,
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            err_type="ServiceUnavailable",
+        )
 
     def handle_embedding_request(
         self,
@@ -4038,6 +4103,8 @@ class Scheduler(
             cost_chunk_cap=self.chunked_prefill_size if use_cost_model else None,
         )
 
+        cache_read_aborted_reqs = set()
+        pp_local_aborts = []
         skip_waiting_admission = False
         resumed_chunked_req = self.chunked_req
         if resumed_chunked_req is not None:
@@ -4052,10 +4119,28 @@ class Scheduler(
             )
             if authoritative_chunk_admitted:
                 resumed_chunked_req.init_next_round_input()
-                self.chunked_req = adder.add_chunked_req(
+                new_chunked_req = adder.add_chunked_req(
                     resumed_chunked_req,
                     planned_admission=planned_chunk_admission,
                 )
+                if resumed_chunked_req._pp_replay_local_abort:
+                    reason = resumed_chunked_req._as_cache_read_abort_reason or (
+                        "PP replay resumed chunk exceeds local token budget, "
+                        f"rid={resumed_chunked_req.rid}"
+                    )
+                    record = {
+                        "rid": resumed_chunked_req.rid,
+                        "origin_pp_rank": int(self.ps.pp_rank),
+                        "reason_code": "PP_REPLAY_OTHER",
+                        "reason": reason,
+                    }
+                    pp_local_aborts.append(
+                        self._abort_failed_replay_record(resumed_chunked_req, record)
+                    )
+                    cache_read_aborted_reqs.add(resumed_chunked_req)
+                    self.chunked_req = None
+                else:
+                    self.chunked_req = new_chunked_req
             if authoritative_admissions is None:
                 post_chunk_budget_state = adder.budget_state()
                 # NO_TOKEN takes precedence over chunk exhaustion in
@@ -4107,8 +4192,6 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(candidate_reqs))
-        cache_read_aborted_reqs = set()
-        pp_local_aborts = []
         # Get requests from the waiting queue to a new prefill batch
         for req in candidate_reqs:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -4124,9 +4207,14 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
+                if authoritative_plan is not None:
+                    pp_local_aborts.append(
+                        self._abort_failed_replay(req, AddReqResult.OTHER)
+                    )
+                    cache_read_aborted_reqs.add(req)
+                    continue
                 if (
-                    authoritative_plan is not None
-                    or not self.enable_priority_preemption
+                    not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
@@ -4159,6 +4247,15 @@ class Scheduler(
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.ABORT:
                     pp_local_aborts.append(self._abort_failed_cache_read(req))
+                    cache_read_aborted_reqs.add(req)
+                    # Preserve the fixed PP candidate sequence after a local abort.
+                    continue
+                if (
+                    authoritative_admissions is not None
+                    and authoritative_admissions_by_rid is not None
+                    and req.rid in authoritative_admissions_by_rid
+                ):
+                    pp_local_aborts.append(self._abort_failed_replay(req, res))
                     cache_read_aborted_reqs.add(req)
                     # Preserve the fixed PP candidate sequence after a local abort.
                     continue

@@ -22,58 +22,60 @@ export PP_SIZE
 TP_SIZE=1
 export TP_SIZE
 
-export MC_TE_METRIC=true
-export MC_IB_PCI_RELAXED_ORDERING=1
-export MC_NUM_QP_PER_EP=4
 export MC_HANDSHAKE_MAX_LENGTH=10485760
+export MC_IB_PCI_RELAXED_ORDERING=1
 export MC_MAX_EP_PER_CTX=3200
+export MC_NUM_QP_PER_EP=4
+export MC_TE_METRIC=true
 
+export NCCL_DEBUG=INFO
 export NCCL_IB_ADAPTIVE_ROUTING=1
 export NCCL_IB_GID_INDEX=3
 export NCCL_IB_QPS_PER_CONNECTION=2
 export NCCL_IB_TIMEOUT=22
 export NCCL_SOCKET_IFNAME="bond0"
-export NCCL_DEBUG=INFO
 
-export TORCH_NCCL_BLOCKING_WAIT=0
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_BLOCKING_WAIT=0
 export TRITON_CACHE_DIR=/root/.triton/cache
 
-export NVSHMEM_HCA_LIST="mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1,mlx5_10:1,mlx5_11:1,mlx5_12:1,mlx5_13:1"
+export NVSHMEM_BOOTSTRAP=UID
 export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=bond0
+export NVSHMEM_HCA_LIST="mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1,mlx5_10:1,mlx5_11:1,mlx5_12:1,mlx5_13:1"
 export NVSHMEM_IB_GID_INDEX=3
 export NVSHMEM_IB_TRAFFIC_CLASS=130
-export NVSHMEM_BOOTSTRAP=UID
 
-export SGLANG_TBO_DEBUG=0
-export SGLANG_K3_ATTN_MOE_FP8=1
-export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
-export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
-export SGLANG_MOONCAKE_SEND_AUX_TCP=1
-export SGLANG_TOOL_STRICT_LEVEL=2
-export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=50
 export SGLANG_DISAGGREGATION_QUEUE_SIZE=50
-export SGLANG_FLASHKDA_MIN_SEQ_LEN=64
-export SGLANG_FLASHKDA_MAX_SEQ_LEN=24576
+export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=50
 export SGLANG_DYNAMIC_CHUNKING_COST_MODEL=1
+export SGLANG_ENABLE_PP_WEIGHT_FILTER=1
+export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
+export SGLANG_FLASHKDA_MAX_SEQ_LEN=24576
+export SGLANG_FLASHKDA_MIN_SEQ_LEN=64
+export SGLANG_HEALTH_CHECK_TIMEOUT=20
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
+export SGLANG_K3_ATTN_MOE_FP8=1
+export SGLANG_K3_KDA_SHORT_CONV=1
+export SGLANG_MAX_KV_CHUNK_CAPACITY=65536
+export SGLANG_MOONCAKE_SEND_AUX_TCP=1
+export SGLANG_OPT_USE_FLATROW_CONCAT_MHA_K=1
+export SGLANG_OPT_USE_K3_KDA_FUSED_BETA_SIGMOID=1
+export SGLANG_OPT_USE_K3_KDA_FUSED_TRACK_CONV_STATE=1
+export SGLANG_OPT_USE_KDA_STRIDED_ONORM=1
+export SGLANG_OPT_USE_TRITON_MLA_QKV_FP8_CAST=1
+export SGLANG_PARALLEL_SCHEDULER_LAUNCH=1
 export SGLANG_PP_EAGER_BANK_FORWARD=1
 export SGLANG_PP_EAGER_BANK_RANKS="7"
 export SGLANG_PP_LAYER_PARTITION="7,5,7,5,7,5,7,5,7,5,7,5,7,5,6,3"
-export SGLANG_ENABLE_PP_WEIGHT_FILTER=1
-export SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS=1
-export SGLANG_WARMUP_PREFILL_LENS="512,2048,8192,32768,65536"
-export SGLANG_WARMUP_BATCH_SIZE=1
-export SGLANG_WARMUP_TIMEOUT=600
-export SGLANG_HEALTH_CHECK_TIMEOUT=20
-export SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK=1
 export SGLANG_PP_PD_KV_TRANSFER_TARGET_PARALLEL=1
-export SGLANG_OPT_USE_KDA_STRIDED_ONORM=1
-export SGLANG_K3_KDA_SHORT_CONV=1
-export SGLANG_OPT_USE_K3_KDA_FUSED_BETA_SIGMOID=1
-export SGLANG_OPT_USE_K3_KDA_FUSED_TRACK_CONV_STATE=1
-export SGLANG_OPT_USE_FLATROW_CONCAT_MHA_K=1
-export SGLANG_OPT_USE_TRITON_MLA_QKV_FP8_CAST=1
+export SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK=1
+export SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS=1
+export SGLANG_TBO_DEBUG=0
+export SGLANG_TOOL_STRICT_LEVEL=2
+export SGLANG_WARMUP_BATCH_SIZE=1
+export SGLANG_WARMUP_PREFILL_LENS="512,2048,8192,32768,65536"
+export SGLANG_WARMUP_TIMEOUT=600
 
 export HTTP_PORT=8000
 export PD_SEPARATE_STAGE=prefill
@@ -85,12 +87,12 @@ export IB_DEVICE
 
 export DEEPEP_CONFIG_JSON='{"normal_dispatch": {"num_sms": 32, "num_max_nvl_chunked_send_tokens": 36, "num_max_nvl_chunked_recv_tokens": 288, "num_max_rdma_chunked_send_tokens": 20, "num_max_rdma_chunked_recv_tokens": 128}, "normal_combine": {"num_sms": 32, "num_max_nvl_chunked_send_tokens": 4, "num_max_nvl_chunked_recv_tokens": 288, "num_max_rdma_chunked_send_tokens": 12, "num_max_rdma_chunked_recv_tokens": 128}}'
 
-export AS_READ_MAX_BLOCKS=0
-export AS_WRITE_MAX_BLOCKS=16
-export AS_KDA_CHECKPOINT_GPU_COUNT=4
-export AS_AGENT_ADDRESS="${HOST_IP}:7070"
-export AS_SHARED_MEMORY_SIZE_BYTES=429496729600 # 400GiB
 export AIAK_HOST_CACHE_PORT=7070
+export AS_AGENT_ADDRESS="${HOST_IP}:7070"
+export AS_KDA_CHECKPOINT_GPU_COUNT=4
+export AS_READ_MAX_BLOCKS=0
+export AS_SHARED_MEMORY_SIZE_BYTES=429496729600 # 400GiB
+export AS_WRITE_MAX_BLOCKS=16
 
 export PYTHONPATH="/sgl-workspace/sglang/python:${PYTHONPATH:-}"
 # LOG_FILE="/sgl-workspace/prefill.log"
@@ -118,7 +120,7 @@ MM_ARG=(
 CACHE_OPT=(
     --per-node-gpu-num 8
     --enable-asradix-cache
-    # --disable-asradix-cache
+    # --disable-radix-cache
 )
 
 if [[ "${PROFILE_NSYS:-0}" == "1" ]]; then
@@ -141,7 +143,7 @@ $NSYS_PREFIX sglang serve \
     --tokenizer-worker-num 8 \
     --reasoning-parser kimi_k3 \
     --tool-call-parser kimi_k3 \
-    --enable-strict-thinking \
+    --grammar-backend llguidance \
     --allow-auto-truncate \
     "${PARALLEL_ARGS[@]}" \
     --nnodes "$NUM_NODES" \
@@ -153,6 +155,7 @@ $NSYS_PREFIX sglang serve \
     --disaggregation-ib-device mlx5_bond_0 \
     --disaggregation-bootstrap-port 8200 \
     --disaggregation-zmq-ports 7000-7007 \
+    --disaggregation-zmq-max-sockets 3000 \
     "${MM_ARG[@]}" \
     --attention-backend trtllm_mla \
     --moe-runner-backend flashinfer_mxfp4 \

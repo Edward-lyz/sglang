@@ -46,6 +46,7 @@ from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
+    is_health_check_generate_req,
 )
 from sglang.srt.mem_cache.storage.asradix.types import AttentionStoreWriteOwner
 from sglang.srt.model_executor.forward_batch_info import (
@@ -305,6 +306,37 @@ class SchedulerPPMixin:
             )
         return work_reqs, message.plan
 
+    def _pp_filter_health_check_reqs_by_plan(
+        self, recv_reqs: List[Any], authoritative_plan: Optional[Dict[str, Any]]
+    ) -> List[Any]:
+        """Relay PP0's admission decision for HEALTH_CHECK requests downstream.
+
+        PP0 decides whether a HEALTH_CHECK request enters this microbatch.
+        Downstream ranks must make the same decision instead of recomputing it
+        locally. The plan's ``requests`` list carries that decision: admit rids
+        present in the plan, drop rids absent from it.
+        """
+        if authoritative_plan is None:
+            return recv_reqs
+
+        planned_rids = {
+            entry.get("rid") for entry in authoritative_plan.get("requests", ())
+        }
+        kept: List[Any] = []
+        for recv_req in recv_reqs:
+            if not is_health_check_generate_req(recv_req):
+                kept.append(recv_req)
+                continue
+            rid = getattr(recv_req, "rid", None)
+            if rid in planned_rids:
+                recv_req._pp_admission_decision = True
+                kept.append(recv_req)
+            else:
+                self.return_health_check_ipcs.append(
+                    getattr(recv_req, "http_worker_ipc", None)
+                )
+        return kept
+
     @staticmethod
     def _pp_batch_contract(
         batch: Optional[ScheduleBatch], mb_id: int
@@ -508,7 +540,10 @@ class SchedulerPPMixin:
                 continue
             if not req.finished():
                 req._as_cache_read_abort_reason = record.get("reason")
-                self._abort_failed_cache_read(req)
+                if str(record.get("reason_code", "")).startswith("PP_REPLAY_"):
+                    self._abort_failed_replay_record(req, record)
+                else:
+                    self._abort_failed_cache_read(req)
         self.waiting_queue = kept_waiting
 
         if self.chunked_req is not None:
@@ -521,7 +556,10 @@ class SchedulerPPMixin:
             if record is not None:
                 if not self.chunked_req.finished():
                     self.chunked_req._as_cache_read_abort_reason = record.get("reason")
-                    self._abort_failed_cache_read(self.chunked_req)
+                    if str(record.get("reason_code", "")).startswith("PP_REPLAY_"):
+                        self._abort_failed_replay_record(self.chunked_req, record)
+                    else:
+                        self._abort_failed_cache_read(self.chunked_req)
                 self.chunked_req = None
 
     def _pp_apply_local_aborts_to_plan(
@@ -1259,6 +1297,9 @@ class SchedulerPPMixin:
                         self._pp_extract_authoritative_batch_plan(mb_id, recv_reqs)
                     )
                     upstream_plan = authoritative_plan
+                recv_reqs = self._pp_filter_health_check_reqs_by_plan(
+                    recv_reqs, authoritative_plan
+                )
                 self.process_input_requests(recv_reqs)
                 recv_reqs = self._pp_pd_get_mm_ready_reqs(recv_reqs)
 
@@ -1379,9 +1420,7 @@ class SchedulerPPMixin:
                     # Reassemble before the row filter below: it drops token
                     # rows (dim 0) for cache-read aborts and must see the whole
                     # residual, not the tail that survived the eager split.
-                    pp_proxy_tensors = self._pp_eager_bank_recv(
-                        mb_id, pp_proxy_tensors
-                    )
+                    pp_proxy_tensors = self._pp_eager_bank_recv(mb_id, pp_proxy_tensors)
                     if (
                         self._pp_batch_contract_guard_enabled
                         and not self.pp_group.is_first_rank
@@ -1395,9 +1434,7 @@ class SchedulerPPMixin:
                 else:
                     # No proxy this iteration, but the bank rows still have to be
                     # retired or the next iteration's take trips the mb_id check.
-                    pp_proxy_tensors = self._pp_eager_bank_recv(
-                        mb_id, pp_proxy_tensors
-                    )
+                    pp_proxy_tensors = self._pp_eager_bank_recv(mb_id, pp_proxy_tensors)
                 # After the row filter: what goes on the wire must have the same
                 # row count as what this rank's forward will produce.
                 self._pp_eager_bank_forward(mb_id, pp_proxy_tensors)
@@ -1533,9 +1570,7 @@ class SchedulerPPMixin:
                                 mb_id
                             ]
                         self._pp_bank_digest("send", mb_id, proxy_tensors)
-                        proxy_tensors = self._pp_eager_bank_strip(
-                            mb_id, proxy_tensors
-                        )
+                        proxy_tensors = self._pp_eager_bank_strip(mb_id, proxy_tensors)
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             proxy_tensors,
                             async_send=True,
@@ -1995,7 +2030,10 @@ class SchedulerPPMixin:
                     batch.prepare_for_extend()
 
                     # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
-                    if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+                    if (
+                        batch.input_ids is None
+                        and batch.prefill_input_ids_cpu is not None
+                    ):
                         batch.input_ids = batch.prefill_input_ids_cpu.to(
                             self.device, non_blocking=True
                         )
@@ -2106,9 +2144,7 @@ class SchedulerPPMixin:
             num_heads = getattr(hf_cfg, "num_attention_heads", 0)
             try:
                 if not stage_flops_buckets:
-                    raise ValueError(
-                        "weight-walk FLOPs unavailable on every PP stage"
-                    )
+                    raise ValueError("weight-walk FLOPs unavailable on every PP stage")
                 # MHA core per (q, kv) pair plus the kv_b_proj re-expansion of
                 # the whole latent prefix, both only on full-attention (MLA)
                 # layers -- counted per layer here, scaled by each stage's own
@@ -2120,9 +2156,7 @@ class SchedulerPPMixin:
                 v_head = getattr(hf_cfg, "v_head_dim", 0) or 0
                 kv_lora = getattr(hf_cfg, "kv_lora_rank", 0) or 0
                 local_heads = num_heads // max(self.ps.attn_tp_size, 1)
-                if not (
-                    kv_lora > 0 and qk_nope > 0 and v_head > 0 and local_heads > 0
-                ):
+                if not (kv_lora > 0 and qk_nope > 0 and v_head > 0 and local_heads > 0):
                     # Fail loudly rather than silently zeroing the k_a/k_e
                     # terms: a model without them degenerates to the static
                     # token budget while pretending to price history.
@@ -2758,7 +2792,6 @@ class SchedulerPPMixin:
             pp_proxy_tensors.tensors["residual"] = bank
         return pp_proxy_tensors
 
-
     def _pp_eager_bank_forward(self: Scheduler, mb_id: int, pp_proxy_tensors):
         """Forward this stage's inherited rows and prefetch the next bank.
 
@@ -3276,15 +3309,11 @@ class SchedulerPPMixin:
             ):
                 return
             if (
-                
-                (
-                    target is not None
-                    and _pp_can_skip_output_comm(target)
-                    and not _pp_control_has_current_aborts(target_control)
-                ) or (
-                    self._pp_pd_early_last_chunk_enabled
-                    and not self.pp_group.is_first_rank
-                )
+                target is not None
+                and _pp_can_skip_output_comm(target)
+                and not _pp_control_has_current_aborts(target_control)
+            ) or (
+                self._pp_pd_early_last_chunk_enabled and not self.pp_group.is_first_rank
             ):
                 next_pp_outputs, batch_result, d2h_event = (
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])

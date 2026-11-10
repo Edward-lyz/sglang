@@ -989,6 +989,9 @@ class Req(ReqDllmMixin):
         # A short/failed AttentionStore read is fatal for this request under PP;
         # allowing forward with a different prefix would desynchronize stages.
         self._as_cache_read_abort_reason: Optional[str] = None
+        # Set when a PP replay's authoritative resumed-chunk range exceeds this
+        # rank's local token budget — the chunk can't be admitted here.
+        self._pp_replay_local_abort: bool = False
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is

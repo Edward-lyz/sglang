@@ -965,6 +965,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Skip inserting this request's KV into the radix cache (warmup / health-check fake-transfer reqs).
     skip_radix_cache_insert: bool = False
 
+    # PP admission decision relay: PP0 decides, downstream ranks follow via this
+    # field instead of recomputing (avoids cross-rank divergence). None=undecided.
+    _pp_admission_decision: Optional[bool] = None
+
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
     # Whether to return entropy
