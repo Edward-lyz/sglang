@@ -8,7 +8,7 @@
 
 import logging
 from collections.abc import Iterable
-from functools import cached_property
+from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -555,6 +555,14 @@ _EP_FRONT_LOGGED = False
 _EP_FRONT_OVERLAP_LOGGED = False
 
 
+@lru_cache(maxsize=None)
+def _combine_send_stream() -> torch.cuda.Stream:
+    """Highest-priority stream shared by all MoE layers for the combine send
+    (see SGLANG_K3_COMBINE_SEND_PRIORITY)."""
+    logger.info("K3 DeepEP combine send on a high-priority stream")
+    return torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])
+
+
 class KimiK3MoE(nn.Module):
     def __init__(
         self,
@@ -788,6 +796,16 @@ class KimiK3MoE(nn.Module):
                 "register_deepep_combine_hook",
             )
         )
+        # SGLANG_K3_COMBINE_SEND_PRIORITY: the combine send runs on a
+        # high-priority stream so its CTAs are scheduled before the shared
+        # GEMM's when both become ready at the end of the routed GEMMs.
+        self._combine_send_stream = (
+            _combine_send_stream()
+            if self._shared_in_combine_hook
+            and envs.SGLANG_K3_COMBINE_SEND_PRIORITY.get()
+            else None
+        )
+        self._shared_gate: Optional[torch.Tensor] = None
 
         # Latent MoE projections
         if self.use_latent_moe:
@@ -1245,6 +1263,7 @@ class KimiK3MoE(nn.Module):
             topk_output = self.topk(hidden_states, router_logits)
 
         combine_hook_handles = None
+        combine_main_stream = None
         if (
             self._shared_in_combine_hook
             and self.shared_experts is not None
@@ -1253,19 +1272,36 @@ class KimiK3MoE(nn.Module):
             pre_combine_event = None
 
             def _pre_combine_hook(dispatcher, combine_input):
-                nonlocal pre_combine_event
+                nonlocal pre_combine_event, combine_main_stream
                 # Routed GEMMs are enqueued, combine send is not yet.
                 pre_combine_event = torch.cuda.current_stream().record_event()
+                if self._combine_send_stream is not None:
+                    # Combine send + recv on the high-priority stream (DeepEP's
+                    # recv hook launches on the stream current at send time);
+                    # finish_combine_hook joins it back after the experts.
+                    combine_main_stream = torch.cuda.current_stream()
+                    self._combine_send_stream.wait_stream(combine_main_stream)
+                    torch.cuda.set_stream(self._combine_send_stream)
                 pre_combine_handle.remove()
 
             def _combine_hook(dispatcher):
                 nonlocal shared_output, shared_event
-                # Combine send is enqueued on the main stream ahead of the
-                # shared experts, so its blocks are scheduled first; the shared
+                # Combine send is enqueued ahead of the shared experts (and, with
+                # SGLANG_K3_COMBINE_SEND_PRIORITY, at higher priority), so its
+                # blocks are scheduled first; the shared
                 # experts fill the remaining SMs on alt_stream and only wait for
                 # the routed GEMMs, not for the send. Joined at the tail.
                 self.alt_stream.wait_event(pre_combine_event)
                 with torch.cuda.stream(self.alt_stream):
+                    if self._combine_send_stream is not None:
+                        # The shared GEMM is a PDL launch: in the graph its edge
+                        # from the routed GEMM2 becomes programmatic, so it would
+                        # start at GEMM2's trigger, ahead of the (non-PDL)
+                        # combine send. A plain kernel first makes it wait for
+                        # GEMM2 to finish, where stream priority decides.
+                        if self._shared_gate is None:
+                            self._shared_gate = hidden_states.new_zeros(1)
+                        self._shared_gate.zero_()
                     shared_output = self.shared_experts(hidden_states)
                     shared_event = self.alt_stream.record_event()
                 for h in combine_hook_handles:
@@ -1283,6 +1319,9 @@ class KimiK3MoE(nn.Module):
         def finish_combine_hook():
             # Fallback if the experts path never reached dispatcher.combine.
             nonlocal shared_output
+            if combine_main_stream is not None:
+                combine_main_stream.wait_stream(self._combine_send_stream)
+                torch.cuda.set_stream(combine_main_stream)
             if combine_hook_handles is not None and shared_output is None:
                 pre_combine_handle.remove()
                 for h in combine_hook_handles:
