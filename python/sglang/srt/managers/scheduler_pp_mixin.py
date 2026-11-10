@@ -946,8 +946,16 @@ class SchedulerPPMixin:
         unsupported = []
         if self.enable_priority_preemption:
             unsupported.append("priority preemption")
-        if self.enable_dynamic_chunking:
-            unsupported.append("dynamic chunking")
+        if self.enable_dynamic_chunking and not (
+            self.chunk_cost_model is not None and self.chunk_cost_model.is_ready
+        ):
+            # The quadratic predictor is fit on each rank's own measured
+            # latencies, so chunk boundaries diverge across stages. The FLOPs
+            # cost model has no such dependence: its coefficients are walked
+            # from the weights and all-gathered (identical on every rank), and
+            # replay ranks take each request's extend_range from PP0's plan
+            # rather than solving for it locally.
+            unsupported.append("dynamic chunking without the FLOPs cost model")
         if self.prefill_delayer is not None:
             unsupported.append("prefill delayer")
         if unsupported:
@@ -1262,10 +1270,20 @@ class SchedulerPPMixin:
                 )
                 if cur_batch or transport_expected:
                     server_is_idle = False
+                # Before any proxy recv: the sender ships the bank ahead of its
+                # forward, so the bank has to be taken ahead of the proxy or the
+                # two halves of the hop wait on each other.
+                self._pp_eager_bank_take(mb_id)
                 if cur_batch or (
                     transport_expected and not self.pp_group.is_first_rank
                 ):
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    # Reassemble before the row filter below: it drops token
+                    # rows (dim 0) for cache-read aborts and must see the whole
+                    # residual, not the tail that survived the eager split.
+                    pp_proxy_tensors = self._pp_eager_bank_recv(
+                        mb_id, pp_proxy_tensors
+                    )
                     if (
                         self._pp_batch_contract_guard_enabled
                         and not self.pp_group.is_first_rank
@@ -1276,11 +1294,15 @@ class SchedulerPPMixin:
                             pp_proxy_tensors,
                             upstream_plan,
                         )
-                # Unconditional: both peers must exchange the same number of
-                # bank messages every iteration, batch or no batch.
-                pp_proxy_tensors = self._pp_eager_bank_exchange(
-                    mb_id, pp_proxy_tensors
-                )
+                else:
+                    # No proxy this iteration, but the bank rows still have to be
+                    # retired or the next iteration's take trips the mb_id check.
+                    pp_proxy_tensors = self._pp_eager_bank_recv(
+                        mb_id, pp_proxy_tensors
+                    )
+                # After the row filter: what goes on the wire must have the same
+                # row count as what this rank's forward will produce.
+                self._pp_eager_bank_forward(mb_id, pp_proxy_tensors)
                 self._pp_bank_digest("recv", mb_id, pp_proxy_tensors)
 
                 if self.server_args.pp_async_batch_depth > 0:
@@ -1676,6 +1698,8 @@ class SchedulerPPMixin:
         self._pp_bank_send_work: List[P2PWork] = []
         self._pp_bank_rows_sent: Dict[int, Tuple[int, int]] = {}
         self._pp_bank_recv_stream = None
+        # (mb_id, bank) taken ahead of this iteration's proxy recv
+        self._pp_bank_taken: Optional[Tuple[int, Any]] = None
         self._pp_eager_bank_cfg_cache = None
         self._pp_resolve_eager_bank_cfg()
 
@@ -1694,7 +1718,72 @@ class SchedulerPPMixin:
         # layers 7/6/5 and spreads MLA layers unevenly across them.
         stage_flops_buckets = None
 
-        if self.pp_group.is_first_rank:
+        # Mode first, profiling second. The quadratic predictor is fit on each
+        # rank's own measured latencies, and under a warm prefix cache those
+        # measurements do not describe the batches that will actually run: the
+        # profiling forwards carry no cached prefix at all, while the cost model
+        # prices the prefix re-expansion analytically (k_e term). So when the
+        # cost model is in play, skip the 128 profiling forwards entirely rather
+        # than fitting a curve nothing reads.
+        #
+        # The weight walk is local, but the gather below must NOT be gated on
+        # the env flag: it is per-container, and a pod whose yaml disagrees
+        # would leave its ranks out of the collective and hang startup with no
+        # diagnostic. Always gather (flag, buckets) and let PP0's flag decide.
+        local_enabled = envs.SGLANG_DYNAMIC_CHUNKING_COST_MODEL.get()
+        local_buckets = None
+        if local_enabled:
+            try:
+                local_buckets = estimate_stage_flops_per_token(
+                    self.tp_worker.model_runner.model,
+                    self.model_config.hf_config,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[PP Dynamic Chunk] Weight-walk FLOPs estimation failed: "
+                    f"{e}. Falling back to the quadratic predictor."
+                )
+        use_cost_model = local_enabled
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            gathered = [None] * torch.distributed.get_world_size(
+                self.pp_group.cpu_group
+            )
+            torch.distributed.all_gather_object(
+                gathered, (local_enabled, local_buckets), group=self.pp_group.cpu_group
+            )
+            flags = [g[0] for g in gathered]
+            use_cost_model = flags[0]
+            if any(f != use_cost_model for f in flags):
+                logger.warning(
+                    "[PP Dynamic Chunk] SGLANG_DYNAMIC_CHUNKING_COST_MODEL "
+                    "disagrees across PP ranks (%s); following PP0 (%s). Fix "
+                    "the launch config so every pod sets the same value.",
+                    flags,
+                    use_cost_model,
+                )
+            buckets = [g[1] for g in gathered]
+            missing = [i for i, b in enumerate(buckets) if not b]
+            if use_cost_model and missing:
+                # Dropping a stage would silently stop enforcing its
+                # constraint, which is exactly how a straggler appears.
+                logger.warning(
+                    "[PP Dynamic Chunk] Weight walk produced no FLOPs on PP "
+                    "ranks %s; disabling the cost model rather than modelling "
+                    "%d of %d stages. Falling back to the quadratic predictor.",
+                    missing,
+                    len(buckets) - len(missing),
+                    len(buckets),
+                )
+                use_cost_model = False
+            # Keep every stage's buckets; the cost model evaluates all of them
+            # because the binding stage moves with the operating point. The
+            # gathered list is identical on every rank, so schedulers stay in
+            # lockstep.
+            stage_flops_buckets = buckets if use_cost_model else None
+        elif use_cost_model:
+            stage_flops_buckets = [local_buckets] if local_buckets else None
+
+        if self.pp_group.is_first_rank and not use_cost_model:
             model_runner = self.tp_worker.model_runner
             model_config = model_runner.model_config
             input_ids_list: List[array[int]] = []
@@ -1855,73 +1944,23 @@ class SchedulerPPMixin:
                 )
 
         # Broadcast data to all ranks
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if (
+            not use_cost_model
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
             data_to_sync = [seq_lens, latencies]
             self.pp_group.broadcast_object_list(data_to_sync, src=0)
             seq_lens, latencies = data_to_sync
 
-        # The weight walk is local, but the gather below must NOT be gated on
-        # the env flag: it is per-container, and a pod whose yaml disagrees
-        # would leave its ranks out of the collective and hang startup with no
-        # diagnostic. Always gather (flag, buckets) and let PP0's flag decide.
-        local_enabled = envs.SGLANG_DYNAMIC_CHUNKING_COST_MODEL.get()
-        local_buckets = None
-        if local_enabled:
-            try:
-                local_buckets = estimate_stage_flops_per_token(
-                    self.tp_worker.model_runner.model,
-                    self.model_config.hf_config,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[PP Dynamic Chunk] Weight-walk FLOPs estimation failed: "
-                    f"{e}. Falling back to the quadratic predictor."
-                )
-        use_cost_model = local_enabled
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            gathered = [None] * torch.distributed.get_world_size(
-                self.pp_group.cpu_group
-            )
-            torch.distributed.all_gather_object(
-                gathered, (local_enabled, local_buckets), group=self.pp_group.cpu_group
-            )
-            flags = [g[0] for g in gathered]
-            use_cost_model = flags[0]
-            if any(f != use_cost_model for f in flags):
-                logger.warning(
-                    "[PP Dynamic Chunk] SGLANG_DYNAMIC_CHUNKING_COST_MODEL "
-                    "disagrees across PP ranks (%s); following PP0 (%s). Fix "
-                    "the launch config so every pod sets the same value.",
-                    flags,
-                    use_cost_model,
-                )
-            buckets = [g[1] for g in gathered]
-            missing = [i for i, b in enumerate(buckets) if not b]
-            if use_cost_model and missing:
-                # Dropping a stage would silently stop enforcing its
-                # constraint, which is exactly how a straggler appears.
-                logger.warning(
-                    "[PP Dynamic Chunk] Weight walk produced no FLOPs on PP "
-                    "ranks %s; disabling the cost model rather than modelling "
-                    "%d of %d stages. Falling back to the quadratic predictor.",
-                    missing,
-                    len(buckets) - len(missing),
-                    len(buckets),
-                )
-                use_cost_model = False
-            # Keep every stage's buckets; the cost model evaluates all of them
-            # because the binding stage moves with the operating point. The
-            # gathered list is identical on every rank, so schedulers stay in
-            # lockstep.
-            stage_flops_buckets = buckets if use_cost_model else None
-        elif use_cost_model:
-            stage_flops_buckets = [local_buckets] if local_buckets else None
-
-        # Quadratic model: f(l) = al^2 + bl + c
-        self.length_predictor = ChunkSizePredictor()
-        self.length_predictor.fit(seq_lens, latencies)
-        self.length_predictor.set_target_latency(self.chunked_prefill_size)
-        self.length_predictor.is_ready = True
+        # Quadratic model: f(l) = al^2 + bl + c. Only the fallback path fits it;
+        # in cost-model mode there is nothing to fit and nothing reads it.
+        self.length_predictor = None
+        if not use_cost_model:
+            self.length_predictor = ChunkSizePredictor()
+            self.length_predictor.fit(seq_lens, latencies)
+            self.length_predictor.set_target_latency(self.chunked_prefill_size)
+            self.length_predictor.is_ready = True
 
         # Per-stage compute cost model (batch-composition-aware budgets).
         # Coefficients come from the walked per-token FLOPs plus the config's
@@ -1974,14 +2013,24 @@ class SchedulerPPMixin:
                 cost_model.is_ready = True
                 self.chunk_cost_model = cost_model
             except Exception as e:
+                # The latency profiling was skipped for this mode, so there is
+                # no fitted curve to fall back to; chunking degrades to the
+                # static --chunked-prefill-size.
                 logger.warning(
                     f"[PP Dynamic Chunk] Cost model init failed: {e}. "
-                    "Falling back to the quadratic predictor."
+                    "Falling back to the static chunked_prefill_size."
                 )
-        logger.info(
-            f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predictor ready (quadratic). "
-            f"Target latency: {self.length_predictor.target_latency:.2f}ms"
-        )
+        if self.length_predictor is not None:
+            logger.info(
+                f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predictor ready (quadratic). "
+                f"Target latency: {self.length_predictor.target_latency:.2f}ms"
+            )
+        else:
+            logger.info(
+                "[PP Dynamic Chunk] [PP%d] Predictor ready (per-stage FLOPs cost "
+                "model); latency profiling skipped.",
+                self.ps.pp_rank,
+            )
 
     def predict_next_chunk_size(self: Scheduler, history_len: int) -> Optional[int]:
         """
@@ -2507,44 +2556,93 @@ class SchedulerPPMixin:
             payload, async_send=True, msg_type=self._PP_BANK_KIND
         )
 
-    def _pp_eager_bank_exchange(self: Scheduler, mb_id: int, pp_proxy_tensors):
-        """Rebuild `residual` from the eagerly forwarded rows, then forward this
-        stage's own inherited rows on to the next stage."""
+    def _pp_eager_bank_take(self: Scheduler, mb_id: int) -> None:
+        """Consume this iteration's bank message, before any proxy recv.
+
+        Ordering is load-bearing.  The sender puts the bank on the wire *before*
+        its forward, and therefore before its proxy send; a receiver that waits
+        for the proxy first closes a cycle -- the sender blocks in a bank send
+        nobody is receiving and never reaches the proxy send the receiver is
+        waiting for.  Taking the bank first makes the receive order match the
+        send order on both halves of the hop.
+
+        SGLANG_PP_EAGER_BANK_PREFETCH used to hide this by consuming the message
+        one iteration early.  Prefetch is a throughput option, not the thing
+        that keeps the ring live, so the order has to be correct without it.
+        """
+        _, recv_on, _ = self._pp_eager_bank_cfg()
+        if not recv_on:
+            return
+        ag = self.attn_tp_group if self.require_attn_tp_allgather else None
+        bank, sent_mb_id = self._pp_bank_take(ag)
+        if sent_mb_id is not None and sent_mb_id != mb_id:
+            raise RuntimeError(
+                f"[PPEagerBank] rank={self.ps.pp_rank}: bank message was "
+                f"sent for mb={sent_mb_id} but is being consumed by "
+                f"mb={mb_id}; the eager-bank stream is out of step with "
+                f"the proxy stream"
+            )
+        self._pp_bank_taken = (mb_id, bank)
+
+    def _pp_eager_bank_recv(self: Scheduler, mb_id: int, pp_proxy_tensors):
+        """Rebuild `residual` from the rows `_pp_eager_bank_take` already took.
+
+        Must run before `_pp_prepare_received_proxy`: that filter drops token
+        rows (dim 0) for cache-read aborts, and the rows it drops have to be
+        dropped from the reassembled residual too.  Filtering first would either
+        raise in the `torch.cat` below on the dim-0 mismatch or -- when the
+        filter keeps no rows at all and `new_rows.numel()` is 0 -- silently
+        replace the filtered residual with the unfiltered bank and feed the
+        model a residual whose row count disagrees with `hidden_states`.
+        """
+        _, recv_on, _ = self._pp_eager_bank_cfg()
+        if not recv_on:
+            return pp_proxy_tensors
+        taken = self._pp_bank_taken
+        if taken is None or taken[0] != mb_id:
+            raise RuntimeError(
+                f"[PPEagerBank] rank={self.ps.pp_rank} mb={mb_id}: no bank "
+                f"message was taken for this micro-batch (have "
+                f"{None if taken is None else taken[0]}); _pp_eager_bank_take "
+                f"must run once per loop iteration, before the proxy recv"
+            )
+        self._pp_bank_taken = None
+        bank = taken[1]
+        rows = None
+        if pp_proxy_tensors is not None:
+            rows = pp_proxy_tensors.tensors.pop("__eager_bank_rows__", None)
+        if rows:
+            if not isinstance(bank, torch.Tensor):
+                raise RuntimeError(
+                    f"[PPEagerBank] rank={self.ps.pp_rank} mb={mb_id}: proxy "
+                    f"declares {rows} eagerly forwarded bank rows but no "
+                    f"bank message arrived"
+                )
+            new_rows = pp_proxy_tensors.tensors.get("residual")
+            if isinstance(new_rows, torch.Tensor) and new_rows.numel():
+                bank = torch.cat([bank, new_rows], dim=1)
+            pp_proxy_tensors.tensors["residual"] = bank
+        return pp_proxy_tensors
+
+
+    def _pp_eager_bank_forward(self: Scheduler, mb_id: int, pp_proxy_tensors):
+        """Forward this stage's inherited rows and prefetch the next bank.
+
+        Must run after `_pp_prepare_received_proxy`, so the rows put on the wire
+        have the same dim-0 extent as the batch this rank is about to run; still
+        before the forward, so the transfer overlaps the previous micro-batch.
+        """
         send_on, recv_on, prefetch = self._pp_eager_bank_cfg()
         if not (send_on or recv_on):
-            return pp_proxy_tensors
-        ag = self.attn_tp_group if self.require_attn_tp_allgather else None
-        if recv_on:
-            bank, sent_mb_id = self._pp_bank_take(ag)
-            if sent_mb_id is not None and sent_mb_id != mb_id:
-                raise RuntimeError(
-                    f"[PPEagerBank] rank={self.ps.pp_rank}: bank message was "
-                    f"sent for mb={sent_mb_id} but is being consumed by "
-                    f"mb={mb_id}; the eager-bank stream is out of step with "
-                    f"the proxy stream"
-                )
-            rows = None
-            if pp_proxy_tensors is not None:
-                rows = pp_proxy_tensors.tensors.pop("__eager_bank_rows__", None)
-            if rows:
-                if not isinstance(bank, torch.Tensor):
-                    raise RuntimeError(
-                        f"[PPEagerBank] rank={self.ps.pp_rank} mb={mb_id}: proxy "
-                        f"declares {rows} eagerly forwarded bank rows but no "
-                        f"bank message arrived"
-                    )
-                new_rows = pp_proxy_tensors.tensors.get("residual")
-                if isinstance(new_rows, torch.Tensor) and new_rows.numel():
-                    bank = torch.cat([bank, new_rows], dim=1)
-                pp_proxy_tensors.tensors["residual"] = bank
+            return
         if send_on:
             self._pp_bank_send(mb_id, pp_proxy_tensors)
         if recv_on and prefetch and not self.gracefully_exit:
             # skipped on the last iteration: nobody would consume the extra
             # message, and this is a receiver-local decision, so it cannot
             # desync the peers' message counts.
+            ag = self.attn_tp_group if self.require_attn_tp_allgather else None
             self._pp_bank_prefetch_one(ag)
-        return pp_proxy_tensors
 
     def _pp_eager_bank_strip(self: Scheduler, mb_id: int, proxy_tensors):
         """Remove the eagerly forwarded rows from the tail proxy message."""
@@ -2654,10 +2752,16 @@ class SchedulerPPMixin:
 
     def _pp_make_skip_output_result(
         self: Scheduler,
-        batch: ScheduleBatch,
+        batch: Optional[ScheduleBatch],
         mb_metadata: Optional[PPBatchMetadata],
     ):
-        bs = len(batch.reqs)
+        # `batch` is None for a cancellation-only microbatch: every request the
+        # plan admitted was aborted locally, but the control message still has to
+        # be accounted for. The consumer skips process_batch_result in that case
+        # (`if self.mbs[next_mb_id] is not None`), so an empty placeholder is
+        # exactly what it needs -- and the early-last-chunk path must not fall
+        # through to a recv nobody posts a send for.
+        bs = len(batch.reqs) if batch is not None else 0
         placeholder = torch.zeros(bs, dtype=torch.int64, device=self.device)
         # next_pp_outputs = None so non-last ranks skip forwarding
         # (pp_outputs is None gate). Placeholder carried in

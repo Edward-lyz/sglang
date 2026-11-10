@@ -1068,9 +1068,16 @@ class PrefillAdder:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
-        if self.cost_model is not None and self.rem_cost is not None:
+        if (
+            planned_admission is None
+            and self.cost_model is not None
+            and self.rem_cost is not None
+        ):
             # A resumed chunked request must make progress, so there is no
-            # defer option here: take the largest chunk that fits.
+            # defer option here: take the largest chunk that fits. Skipped on
+            # replay ranks: `prefix_indices` is a local cache-hit length, so a
+            # rank whose hit is shorter would compute a smaller limit than the
+            # range PP0 already committed to and reject it below.
             cost_tokens = self._cost_chunk_limit(len(req.prefix_indices))
             _rem_tokens = min(_rem_tokens, cost_tokens)
             logger.debug(
@@ -1125,7 +1132,13 @@ class PrefillAdder:
             req.retracted_stain,
             host_hit_len=0,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-            cost=self._req_cost(len(req.prefix_indices), req.extend_range.length),
+            # Decision-side only: charging the replay ranks would let their
+            # rem_cost hit zero and abort an admission PP0 already promised.
+            cost=(
+                self._req_cost(len(req.prefix_indices), req.extend_range.length)
+                if planned_admission is None
+                else None
+            ),
         )
 
         # Return if chunked prefill not finished
@@ -1407,15 +1420,55 @@ class PrefillAdder:
                 )
             )
             if current_prefix_len > authoritative_start:
-                raise RuntimeError(
-                    "PP authoritative prefix is shorter than the local device prefix: "
-                    f"rid={req.rid} local={current_prefix_len} "
+                # Per-stage eviction diverges once the AS cache is on, so this
+                # stage can hold more of the prefix in HBM than PP0 did when it
+                # committed the range. The plan cannot be renegotiated here, and
+                # running a longer prefix would make this batch disagree with
+                # PP0's, so fail this one request through the cache-read abort
+                # path rather than killing the scheduler.
+                logger.error(
+                    "[PPPlanReplay] rid=%s local device prefix exceeds the planned "
+                    "start: local=%d planned=%d; aborting this request locally",
+                    req.rid,
+                    current_prefix_len,
+                    authoritative_start,
+                )
+                req._as_cache_read_abort_reason = (
+                    "PP authoritative prefix is shorter than the local device "
+                    f"prefix: local={current_prefix_len} "
                     f"planned={authoritative_start}"
+                )
+                return self._sync_attention_store_read_abort(
+                    req, AddReqResult.ABORT
                 )
             # Include any host-hit prefix still awaiting load-back, but reserve
             # and schedule no token beyond PP0's committed end position.
             cand_extend_input_len = authoritative_end - current_prefix_len
             budgeted_max_new = max_new if authoritative_end == full_input_len else 0
+            # `host_hit_length` comes from this stage's AttentionStore match, and
+            # a replay rank can reach the admission holding a match PP0 did not
+            # have when it committed the range. Loading the whole host hit back
+            # would push the local prefix past `authoritative_start` and make the
+            # batch disagree with PP0's. Load only what the plan counts as
+            # prefix. The tail is not reloaded later: `ever_read_as` is a
+            # one-shot latch (see the guards in
+            # mem_cache/storage/asradix/cache.py::_match_checkpointed_page_prefix
+            # and page_coordinator.py::extend_match), so this request never
+            # matches the store again and a later chunk recomputes those
+            # tokens. That costs compute, never correctness.
+            max_load_back = max(authoritative_start - current_prefix_len, 0)
+            if req.host_hit_length > max_load_back:
+                logger.info(
+                    "[PPPlanReplay] rid=%s capping host load-back to the planned "
+                    "prefix: host_hit=%d local_prefix=%d planned_start=%d",
+                    req.rid,
+                    req.host_hit_length,
+                    current_prefix_len,
+                    authoritative_start,
+                )
+                req.host_hit_length = max_load_back
+                if getattr(req, "swa_host_hit_length", 0) > max_load_back:
+                    req.swa_host_hit_length = max_load_back
         total_tokens = cand_extend_input_len + budgeted_max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
@@ -1527,9 +1580,10 @@ class PrefillAdder:
                 # token count suggests. Gated on the projected post-load-back
                 # shape and kept ahead of init_load_back: a rejected admission
                 # reserves nothing, so KV pulled first is left evictable and the
-                # H2D is wasted. An authoritative admission replays PP0's range
-                # and is not re-gated here; it is still charged at admission so
-                # the remaining budget stays in sync.
+                # H2D is wasted. An authoritative admission is neither gated nor
+                # charged here: `budget_state` ends the admission loop once
+                # `rem_cost` reaches zero, so a replay rank that charged would
+                # drop requests PP0 had already planned into this batch.
                 projected_prefix_len = current_prefix_len + req.host_hit_length
                 verdict, cost_limit = self._cost_admit(
                     projected_prefix_len,
@@ -1598,9 +1652,32 @@ class PrefillAdder:
                     self._validate_authoritative_extend_range(
                         req,
                         planned_admission.extend_range,
-                        prefix_len=len(req.prefix_indices),
+                        prefix_len=None,
                     )
                 )
+                if len(req.prefix_indices) != authoritative_start:
+                    # The load-back cap above keeps this stage from overshooting,
+                    # so a disagreement here means it could not reach PP0's start
+                    # (a short load-back, or a device prefix PP0 did not have).
+                    # Fail this one request through the existing cache-read abort
+                    # path instead of killing the scheduler: the plan is already
+                    # committed, so this rank cannot renegotiate the range.
+                    logger.error(
+                        "[PPPlanReplay] rid=%s cannot honour the planned range: "
+                        "planned=%s local_prefix=%d host_hit=%d full=%d; "
+                        "aborting this request locally",
+                        req.rid,
+                        (authoritative_start, authoritative_end),
+                        len(req.prefix_indices),
+                        req.host_hit_length,
+                        len(req.full_untruncated_fill_ids),
+                    )
+                    req._as_cache_read_abort_reason = (
+                        "PP authoritative prefix unreachable on this stage: "
+                        f"planned_start={authoritative_start} "
+                        f"local_prefix={len(req.prefix_indices)}"
+                    )
+                    return AddReqResult.ABORT
                 input_tokens = self.ceil_paged_tokens(
                     authoritative_end - authoritative_start
                 )
@@ -1650,9 +1727,6 @@ class PrefillAdder:
                     req.retracted_stain,
                     req.host_hit_length,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                    cost=self._req_cost(
-                        prefix_len, authoritative_end - authoritative_start
-                    ),
                 )
             elif self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:

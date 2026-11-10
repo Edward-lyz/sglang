@@ -68,7 +68,7 @@ class _KDAWriteTask:
     node: UnifiedTreeNode
     block_hash_ids: Sequence[int]
     page_ids: Any
-    checkpoint_slot: int
+    checkpoint_slot: Any
     params: dict
     request: Any = None
     write_key: Optional[tuple[int, int]] = None
@@ -579,7 +579,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             if getattr(req, "_as_kda_last_submitted_write", None) == write_key:
                 self.enqueue_dummy(cache, req.rid)
                 return
-            checkpoint_slot = int(mamba_data.value.item())
+            checkpoint_slot = self.prepare_checkpoint_slot(mamba_data.value)
             page_ids = self.prepare_page_ids(cache, snapshot[:cache_len])
             task = _KDAWriteTask(
                 rid=req.rid,
@@ -622,7 +622,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             written = cache.ascli.write(
                 task.block_hash_ids,
                 page_ids,
-                {"checkpoint": task.checkpoint_slot},
+                {"checkpoint": task.checkpoint_slot.materialize()},
                 timeout=1.0,
                 params=task.params,
             )
@@ -876,7 +876,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
                 node=cache.root_node,
                 block_hash_ids=(),
                 page_ids=(),
-                checkpoint_slot=0,
+                checkpoint_slot=self.prepare_checkpoint_slot(0),
                 params={},
             )
         )

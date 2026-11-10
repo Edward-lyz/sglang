@@ -90,6 +90,34 @@ class _PreparedPageIds:
             self.ready_event.synchronize()
 
 
+@dataclass
+class _PreparedSlot:
+    """A recurrent-state slot index staged for reading off the scheduler thread.
+
+    `.item()` on a device tensor drains the calling thread's stream, and the
+    PP disaggregated prefill loop enqueues this write *before* it posts the
+    iteration's proxy sends and recvs.  A blocking read here therefore couples
+    AS write latency into the pipeline: this rank waits for its own GPU queue,
+    whose NCCL work waits on peers that are in turn waiting for the sends this
+    rank has not posted yet.  Stage the copy instead and resolve it on the
+    writer thread, exactly as `_PreparedPageIds` does for page metadata.
+    """
+
+    host: Any = None
+    ready_event: Any = None
+    source: Optional[torch.Tensor] = None
+    value: Optional[int] = None
+
+    def materialize(self) -> int:
+        """Wait for the staged copy and return the slot index."""
+        if self.value is None:
+            if self.ready_event is not None:
+                self.ready_event.synchronize()
+            self.value = int(self.host.item())
+        return self.value
+
+
+
 def _request_block_hash_ids(
     req, token_ids: Sequence[int], page_size: int, page_count: int
 ) -> tuple[int, ...]:
@@ -169,6 +197,27 @@ class AttentionStoreCoordinator:
             source_ready_event=source_ready,
             source_metadata=metadata,
         )
+
+    def prepare_checkpoint_slot(self, slot: Any) -> _PreparedSlot:
+        """Stage a recurrent-state slot index without blocking the scheduler."""
+        if not isinstance(slot, torch.Tensor):
+            return _PreparedSlot(value=int(slot))
+        if slot.device.type != "cuda" or slot.numel() != 1:
+            return _PreparedSlot(value=int(slot.item()))
+        if self._page_id_copy_stream is None:
+            self._page_id_copy_stream = torch.cuda.Stream(device=slot.device)
+        source_ready = torch.cuda.Event()
+        source_ready.record(torch.cuda.current_stream(slot.device))
+        host_slot = torch.empty(
+            slot.shape, dtype=slot.dtype, device="cpu", pin_memory=True
+        )
+        with torch.cuda.stream(self._page_id_copy_stream):
+            self._page_id_copy_stream.wait_event(source_ready)
+            host_slot.copy_(slot, non_blocking=True)
+            copy_ready = torch.cuda.Event()
+            copy_ready.record(self._page_id_copy_stream)
+        # `source` keeps the device tensor alive until the copy is consumed.
+        return _PreparedSlot(host=host_slot, ready_event=copy_ready, source=slot)
 
     def capture_finished(
         self, _cache, _req, _is_insert: bool
