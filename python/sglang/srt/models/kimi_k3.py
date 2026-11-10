@@ -3738,6 +3738,9 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer, PPMissingLayer):
                 continue
             self_attn = layer.self_attn
+            indexer = getattr(self_attn, "indexer", None)
+            if indexer is not None and envs.SGLANG_K31_INDEXER_KW_MERGE.get():
+                indexer.merge_k_weights_proj()
             # FlashInfer bmm_fp8 accepts a per-tensor B scale, while the v3
             # ModelOpt checkpoint stores kv_b_proj with per-output-channel
             # scales. Normalize the weight before constructing MLA absorb

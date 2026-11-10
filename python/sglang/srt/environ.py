@@ -469,6 +469,19 @@ class Envs:
     # live column blocks instead of one program per block of the full context
     # width (0 = original grid). Decode-only path (target verify).
     SGLANG_K31_DSA_VERIFY_META_ROW_PROGS = EnvInt(0)
+    # K3.1 DSA indexer (unfused, rope-less) in captured decode/verify graphs:
+    # run its q (wq_b), k (wk + k_norm + index-K store) and head-gate
+    # (weights_proj) paths on separate streams, concurrent with the MLA q_b_proj
+    # on the MLA alt stream.
+    SGLANG_K31_INDEXER_QKW_OVERLAP = EnvBool(False)
+    # K3.1 DSA indexer: back wk and weights_proj (both read x) with one merged
+    # [head_dim + n_heads, hidden] weight so the k side is one fp32-out GEMM.
+    SGLANG_K31_INDEXER_KW_MERGE = EnvBool(False)
+    # K3.1 DSA indexer in captured decode/verify graphs: launch the whole k side
+    # (wk -> k_norm -> rotate -> index-K store + head gates) on its own stream
+    # right after the attention input exists, ahead of q_a/kv_a, q_a norm and
+    # q_b_proj. Implies the SGLANG_K31_INDEXER_QKW_OVERLAP path.
+    SGLANG_K31_INDEXER_EARLY_K = EnvBool(False)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)

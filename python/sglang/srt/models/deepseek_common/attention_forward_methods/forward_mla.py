@@ -385,6 +385,12 @@ class DeepseekMLAForwardMixin:
         k_pe = None
         fusion_plan: Optional[MlaBmmFusionPlan] = None
         if self.q_lora_rank is not None:
+            if self.use_dsa and self.should_run_indexer(prev_topk_indices):
+                # SGLANG_K31_INDEXER_EARLY_K: fork the indexer k side (reads
+                # only hidden_states) before the q_a/kv_a GEMM below.
+                self.indexer.launch_k_side_early(
+                    hidden_states, forward_batch, self.layer_id
+                )
             q, latent_cache = (
                 get_attn_tp_context()
                 .fetch_qkv_latent()
@@ -502,12 +508,15 @@ class DeepseekMLAForwardMixin:
                     )
                 current_stream.wait_stream(self.alt_stream)
             else:
-                k_nope = k_nope.unsqueeze(1)
-                if q_replicate_active:
-                    # full-head Q from the gathered weight (skips Q all-gather)
-                    q = _project_q_replicated(self, q)
-                else:
-                    q = self.q_b_proj_forward(q)
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    k_nope = k_nope.unsqueeze(1)
+                    if q_replicate_active:
+                        # full-head Q from the gathered weight (skips Q all-gather)
+                        q = _project_q_replicated(self, q)
+                    else:
+                        q = self.q_b_proj_forward(q)
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.
@@ -528,6 +537,7 @@ class DeepseekMLAForwardMixin:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
                         )
+                current_stream.wait_stream(self.alt_stream)
         else:
             if q_replicate_active:
                 q = _project_q_replicated(self, hidden_states)

@@ -130,6 +130,19 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+# SGLANG_K31_INDEXER_QKW_OVERLAP: two side streams shared by every indexer
+# layer (the k and head-gate paths), distinct from the MLA alt stream that runs
+# q_b_proj, so the four independent paths can run concurrently.
+_QKW_OVERLAP_STREAMS: Optional[Tuple[torch.cuda.Stream, torch.cuda.Stream]] = None
+
+
+def _qkw_overlap_streams() -> Tuple[torch.cuda.Stream, torch.cuda.Stream]:
+    global _QKW_OVERLAP_STREAMS
+    if _QKW_OVERLAP_STREAMS is None:
+        _QKW_OVERLAP_STREAMS = (torch.cuda.Stream(), torch.cuda.Stream())
+    return _QKW_OVERLAP_STREAMS
+
+
 GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
     "DSA indexer weights_proj LoRA is incompatible with "
     "piecewise/breakable CUDA graph; remove the explicit "
@@ -407,6 +420,9 @@ class Indexer(MultiPlatformOp):
         # Each DCP rank selects its own slots of the shared top-k, so the
         # results must not be overwritten by rank 0's.
         assert not (self.dcp_index_striped and envs.SGLANG_DSA_TOPK_BROADCAST.get())
+        # SGLANG_K31_INDEXER_KW_MERGE / SGLANG_K31_INDEXER_EARLY_K state.
+        self._kw_weight: Optional[torch.Tensor] = None
+        self._early_k_weights: Optional[torch.Tensor] = None
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -568,6 +584,145 @@ class Indexer(MultiPlatformOp):
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
             return max_kv_len <= self.index_topk
         return False
+
+    def _qkw_overlap_supported(self, x, forward_batch: ForwardBatch) -> bool:
+        """SGLANG_K31_INDEXER_QKW_OVERLAP applies to the unfused rope-less
+        indexer (Kimi-K3.1) in captured decode / target-verify graphs."""
+        mode = forward_batch.forward_mode
+        return (
+            (
+                envs.SGLANG_K31_INDEXER_QKW_OVERLAP.get()
+                or envs.SGLANG_K31_INDEXER_EARLY_K.get()
+            )
+            and not self.use_dsa_indexer_fusion
+            and self.rotary_emb is None
+            and not isinstance(x, tuple)
+            and not getattr(self.weights_proj, "set_lora", False)
+            and forward_batch.attn_cp_metadata is None
+            and (mode.is_decode_or_idle() or mode.is_target_verify())
+        )
+
+    def merge_k_weights_proj(self) -> None:
+        """SGLANG_K31_INDEXER_KW_MERGE: back wk and weights_proj with one
+        [head_dim + n_heads, hidden] BF16 buffer (both read x), so the k side
+        runs one GEMM. The two weights become row views of it (no extra
+        memory). Call once after weights are loaded, before graph capture."""
+        if self.use_dsa_indexer_fusion or self._kw_weight is not None:
+            return
+        wk, wp = self.wk.weight, self.weights_proj.weight
+        if (
+            wk.dtype != torch.bfloat16
+            or wp.dtype != torch.bfloat16
+            or wk.shape[1] != wp.shape[1]
+            or getattr(self.weights_proj, "set_lora", False)
+        ):
+            return
+        merged = torch.cat([wk.data, wp.data], dim=0)
+        wk.data = merged[: self.head_dim]
+        wp.data = merged[self.head_dim :]
+        self._kw_weight = merged
+
+    def _k_and_head_gates(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(bf16 key, fp32 head gates * n_heads^-0.5) from x; one GEMM when
+        wk and weights_proj are merged."""
+        if self._kw_weight is not None:
+            kw = torch.mm(x, self._kw_weight.t(), out_dtype=torch.float32)
+            key = kw[:, : self.head_dim].to(torch.bfloat16)
+            weights = kw[:, self.head_dim :] * self.n_heads**-0.5
+            return key, weights
+        key, _ = self.wk(x)
+        return key, self._project_and_scale_head_gates(x)
+
+    def _store_k_side(self, key, forward_batch: ForwardBatch, layer_id: int, act_quant):
+        key = self.k_norm(key)
+        key = self._maybe_rotate(key)
+        self._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key,
+            act_quant=act_quant,
+        )
+
+    def launch_k_side_early(
+        self, x: torch.Tensor, forward_batch: ForwardBatch, layer_id: int
+    ) -> None:
+        """SGLANG_K31_INDEXER_EARLY_K: start the whole k side (wk -> k_norm ->
+        rotate -> index-K store, plus the head gates) on its own stream as soon
+        as the attention input x exists, ahead of the fused q_a/kv_a GEMM, the
+        q_a norm and q_b_proj. forward_cuda joins it and reuses the gates."""
+        if not (
+            envs.SGLANG_K31_INDEXER_EARLY_K.get()
+            and self.alt_stream is not None
+            and get_is_capture_mode()
+            and 0 < x.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            and self._qkw_overlap_supported(x, forward_batch)
+        ):
+            return
+        from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+
+        k_stream, _ = _qkw_overlap_streams()
+        k_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(k_stream):
+            key, weights = self._k_and_head_gates(x)
+            self._store_k_side(key, forward_batch, layer_id, act_quant)
+        self._early_k_weights = weights
+
+    def _take_early_k(self) -> Optional[torch.Tensor]:
+        weights = self._early_k_weights
+        self._early_k_weights = None
+        return weights
+
+    @staticmethod
+    def _join_early_k(early_weights: Optional[torch.Tensor]) -> None:
+        if early_weights is not None:
+            torch.cuda.current_stream().wait_stream(_qkw_overlap_streams()[0])
+
+    def _qkw_overlapped(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        act_quant,
+        early_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """q, k and head-gate paths of the indexer on separate streams.
+
+        The paths only share their inputs (q_lora for q, x for k and the head
+        gate): k (wk -> k_norm -> rotate -> index-K store) and the head gate
+        (weights_proj) run on side streams -- already launched by
+        launch_k_side_early when early_weights is given -- while q (wq_b ->
+        rotate -> act_quant) runs on the current stream; the MLA q_b_proj
+        runs on the MLA alt stream.
+        """
+        k_stream, w_stream = _qkw_overlap_streams()
+        current_stream = torch.cuda.current_stream()
+        weights = early_weights
+        if weights is None:
+            k_stream.wait_stream(current_stream)
+            if self._kw_weight is not None:
+                with torch.cuda.stream(k_stream):
+                    key, weights = self._k_and_head_gates(x)
+                    self._store_k_side(key, forward_batch, layer_id, act_quant)
+            else:
+                w_stream.wait_stream(current_stream)
+                with torch.cuda.stream(k_stream):
+                    key, _ = self.wk(x)
+                    self._store_k_side(key, forward_batch, layer_id, act_quant)
+                with torch.cuda.stream(w_stream):
+                    weights = self._project_and_scale_head_gates(x)
+
+        query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+        query = self._maybe_rotate(query)
+        q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+
+        if early_weights is None and self._kw_weight is None:
+            current_stream.wait_stream(w_stream)
+        # The logits read this step's index-K rows (and the gates on k_stream).
+        current_stream.wait_stream(k_stream)
+        weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
+        return q_fp8, weights
 
     def _get_q_k_bf16(
         self,
@@ -1887,6 +2042,7 @@ class Indexer(MultiPlatformOp):
         # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
+        early_k_weights = self._take_early_k()
 
         in_piecewise_or_breakable_cuda_graph = (
             _is_in_piecewise_or_breakable_cuda_graph()
@@ -1899,6 +2055,7 @@ class Indexer(MultiPlatformOp):
         if not in_piecewise_or_breakable_cuda_graph:
             metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
             if metadata is None:
+                self._join_early_k(early_k_weights)
                 return None
         else:
             metadata = None
@@ -1919,6 +2076,17 @@ class Indexer(MultiPlatformOp):
             )
 
         # Optimization: fast path when skipping topk computation
+        use_qkw_overlap = enable_dual_stream and self._qkw_overlap_supported(
+            x, forward_batch
+        )
+        if early_k_weights is not None and (
+            not use_qkw_overlap or early_k_weights.shape[0] != q_lora.shape[0]
+        ):
+            # Not consumed below: join the early k side (its index-K store is
+            # the same one the path taken repeats).
+            self._join_early_k(early_k_weights)
+            early_k_weights = None
+
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):
             topk_result = self._forward_cuda_k_only(
                 x,
@@ -1987,6 +2155,15 @@ class Indexer(MultiPlatformOp):
             )
             return maybe_capture_indexer_topk(layer_id, result)
 
+        elif use_qkw_overlap:
+            q_fp8, weights = self._qkw_overlapped(
+                x,
+                q_lora,
+                forward_batch,
+                layer_id,
+                act_quant,
+                early_weights=early_k_weights,
+            )
         elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
