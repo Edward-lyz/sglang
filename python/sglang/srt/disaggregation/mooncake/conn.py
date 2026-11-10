@@ -69,6 +69,7 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import is_cuda
 from sglang.srt.utils.network import NetworkAddress
 
@@ -2634,227 +2635,286 @@ class MooncakeKVManager(CommonKVManager):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
-            while True:
-                waiting_req_bytes = self.server_socket.recv_multipart()
-                room = waiting_req_bytes[0].decode("ascii")
-                # Staging: decode reports consumption watermark back to prefill
-                if room == "WATERMARK":
-                    from sglang.srt.disaggregation.common.staging_handler import (
-                        handle_watermark_msg,
-                    )
-
-                    handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
-                    continue
-                # Staging: decode replies with allocated staging offset
-                if room == "STAGING_RSP":
-                    from sglang.srt.disaggregation.common.staging_handler import (
-                        handle_staging_rsp,
-                    )
-
-                    handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
-                    continue
-                # PP + PD prefill sideband consensus: a peer prefill PP rank
-                # reports that it finished this room's local handshake.
-                if room == "PP_READY":
-                    self.handle_pp_ready(waiting_req_bytes)
-                    continue
-                # Decode-side abort notification: mark room as failed and ACK
-                if room == "ABORT":
-                    room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
-                    decode_ip = waiting_req_bytes[2].decode("ascii")
-                    decode_port = int(waiting_req_bytes[3].decode("ascii"))
-                    self.clear_pp_ready(room_to_be_aborted)
-                    # No need to abort the room if it has already succeeded
-                    if (
-                        room_to_be_aborted in self.request_status
-                        and self.check_status(room_to_be_aborted) != KVPoll.Success
-                    ):
-                        self.update_status(room_to_be_aborted, KVPoll.Failed)
-                        logger.debug(
-                            f"Received abort notification for room {room_to_be_aborted}, "
-                            f"marked as Failed"
-                        )
-                    else:
-                        logger.debug(
-                            f"Received abort notification for room {room_to_be_aborted}, "
-                            f"ignoring (already completed or unknown)"
-                        )
-                    # Send ACK back to decode endpoint
+            # Fail-fast circuit breaker (aligned with the glm/community
+            # branches, luno-3962): a single malformed frame -- a wrong frame
+            # count, a non-numeric int() field, a from_zmq unpack failure --
+            # only costs this one message and the loop continues. But ten
+            # consecutive failures means the peer is emitting systematically
+            # bad frames (e.g. P/D protocol mismatch during a rolling
+            # upgrade), the handshake can never recover, and every PD request
+            # would silently abort -- so kill the process and let the
+            # deployment restart cleanly. Before this guard, a single bad
+            # packet killed the thread permanently and the whole rank started
+            # aborting every PD request (incident: qianfan-vl-v1
+            # bootstrap_thread struct.error).
+            consecutive_failures = 0
+            MAX_CONSECUTIVE_FAILURES = 10
+            try:
+                while True:
+                    waiting_req_bytes = self.server_socket.recv_multipart()
                     try:
-                        na = NetworkAddress(decode_ip, decode_port)
-                        self._send_multipart_locked(
-                            na.to_tcp(),
-                            [
-                                b"ABORT_ACK",
-                                str(room_to_be_aborted).encode("ascii"),
-                            ],
-                            is_ipv6=na.is_ipv6,
-                        )
-                        logger.debug(
-                            f"Sent ABORT_ACK for room {room_to_be_aborted} to "
-                            f"{decode_ip}:{decode_port}"
-                        )
+                        room = waiting_req_bytes[0].decode("ascii")
+                        # Staging: decode reports consumption watermark back to
+                        # prefill. Recognize the frame type unconditionally and
+                        # gate only the handler, so a WATERMARK frame with
+                        # staging disabled is dropped instead of being
+                        # mis-parsed as a TransferInfo.
+                        if room == "WATERMARK":
+                            if self.enable_staging:
+                                from sglang.srt.disaggregation.common.staging_handler import (
+                                    handle_watermark_msg,
+                                )
+
+                                handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+                        # Staging: decode replies with allocated staging offset
+                        elif room == "STAGING_RSP":
+                            from sglang.srt.disaggregation.common.staging_handler import (
+                                handle_staging_rsp,
+                            )
+
+                            handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                        # PP + PD prefill sideband consensus: a peer prefill PP
+                        # rank reports that it finished this room's local
+                        # handshake.
+                        elif room == "PP_READY":
+                            self.handle_pp_ready(waiting_req_bytes)
+                        # Decode-side abort notification: mark room as failed and ACK
+                        elif room == "ABORT":
+                            room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
+                            decode_ip = waiting_req_bytes[2].decode("ascii")
+                            decode_port = int(waiting_req_bytes[3].decode("ascii"))
+                            self.clear_pp_ready(room_to_be_aborted)
+                            # No need to abort the room if it has already succeeded
+                            if (
+                                room_to_be_aborted in self.request_status
+                                and self.check_status(room_to_be_aborted) != KVPoll.Success
+                            ):
+                                self.update_status(room_to_be_aborted, KVPoll.Failed)
+                                logger.debug(
+                                    f"Received abort notification for room {room_to_be_aborted}, "
+                                    f"marked as Failed"
+                                )
+                            else:
+                                logger.debug(
+                                    f"Received abort notification for room {room_to_be_aborted}, "
+                                    f"ignoring (already completed or unknown)"
+                                )
+                            # Send ACK back to decode endpoint
+                            try:
+                                na = NetworkAddress(decode_ip, decode_port)
+                                self._send_multipart_locked(
+                                    na.to_tcp(),
+                                    [
+                                        b"ABORT_ACK",
+                                        str(room_to_be_aborted).encode("ascii"),
+                                    ],
+                                    is_ipv6=na.is_ipv6,
+                                )
+                                logger.debug(
+                                    f"Sent ABORT_ACK for room {room_to_be_aborted} to "
+                                    f"{decode_ip}:{decode_port}"
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
+                                )
+                        else:
+                            mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                            if room == "None":
+                                decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                                decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+                                    decode_kv_args.dst_dcp_size,
+                                    decode_kv_args.dst_dcp_rank,
+                                )
+                                if decode_kv_args.requires_dcp_relayout:
+                                    # Prefer the full per-entry list from the decode side so
+                                    # heterogeneous geometry (e.g. the head-sharded draft
+                                    # pool) survives; fall back to broadcasting the scalar
+                                    # for older peers that only sent dst_kv_item_len.
+                                    if decode_kv_args.dst_kv_item_lens:
+                                        dst_page_item_lens = decode_kv_args.dst_kv_item_lens
+                                    else:
+                                        dst_page_item_lens = [
+                                            decode_kv_args.dst_kv_item_len
+                                        ] * len(decode_kv_args.dst_kv_ptrs)
+                                    # Boundary before the head-sharded draft tail: validate
+                                    # only the MLA prefix for exact geometry match.
+                                    src_num_mla_kv_entries, dst_num_mla_kv_entries = (
+                                        self._resolve_mla_entry_boundaries(
+                                            decode_kv_args.dst_num_mla_kv_entries
+                                        )
+                                    )
+                                    # Persist the reconciled boundary for the transfer
+                                    # dispatch to split MLA vs draft entries.
+                                    decode_kv_args.dst_num_mla_kv_entries = dst_num_mla_kv_entries
+                                    # A PP prefill stage registers only its own layers, so
+                                    # pair the decode entries by model layer id before
+                                    # comparing geometry.
+                                    paired_dst_page_item_lens = [
+                                        dst_page_item_lens[j]
+                                        for j in resolve_dcp_dst_entry_indices(
+                                            self.kv_args.kv_layer_ids,
+                                            decode_kv_args.dst_kv_layer_ids,
+                                            len(self.kv_args.kv_item_lens),
+                                            len(dst_page_item_lens),
+                                        )
+                                    ]
+                                    decode_kv_args.dcp_token_item_lens = (
+                                        self.prepare_dcp_token_item_lens(
+                                            paired_dst_page_item_lens,
+                                            num_mla_kv_entries=src_num_mla_kv_entries,
+                                        )
+                                    )
+                                self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
+                                with self.session_lock:
+                                    if mooncake_session_id in self.failed_sessions:
+                                        self.failed_sessions.remove(mooncake_session_id)
+                                    if mooncake_session_id in self.session_cooldowns:
+                                        del self.session_cooldowns[mooncake_session_id]
+                                    if mooncake_session_id in self.session_failures:
+                                        del self.session_failures[mooncake_session_id]
+                                logger.debug(
+                                    f"Register KVArgs from {mooncake_session_id} successfully"
+                                )
+                            else:
+                                required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
+                                room = int(room)
+                                if room not in self.transfer_infos:
+                                    self.transfer_infos[room] = {}
+
+                                self.transfer_infos[room][mooncake_session_id] = (
+                                    TransferInfo.from_zmq(waiting_req_bytes)
+                                )
+                                # NOTE: after bootstrapping we can mark the req as waiting for input
+                                if len(self.transfer_infos[room]) == required_dst_info_num:
+                                    self.resolve_kv_replica_factor(self.transfer_infos[room])
+                                    self.req_to_decode_prefix_len[room] = next(
+                                        (
+                                            info.decode_prefix_len
+                                            for info in self.transfer_infos[room].values()
+                                            if info.decode_prefix_len is not None
+                                        ),
+                                        0,
+                                    )
+                                    if self._pp_pd_sideband_bootstrap:
+                                        # The "all PP ranks are ready" AND moves off the PP
+                                        # ring and onto this socket; see
+                                        # CommonKVManager.on_local_pp_bootstrap_ready.
+                                        self.on_local_pp_bootstrap_ready(room)
+                                    else:
+                                        self.update_status(room, KVPoll.WaitingForInput)
+                        consecutive_failures = 0
                     except Exception as e:
-                        logger.debug(
-                            f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
+                        consecutive_failures += 1
+                        logger.error(
+                            f"Error processing bootstrap message: {e}",
+                            exc_info=True,
                         )
-                    continue
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
-                    )
-                    if decode_kv_args.requires_dcp_relayout:
-                        # Prefer the full per-entry list from the decode side so
-                        # heterogeneous geometry (e.g. the head-sharded draft
-                        # pool) survives; fall back to broadcasting the scalar
-                        # for older peers that only sent dst_kv_item_len.
-                        if decode_kv_args.dst_kv_item_lens:
-                            dst_page_item_lens = decode_kv_args.dst_kv_item_lens
-                        else:
-                            dst_page_item_lens = [
-                                decode_kv_args.dst_kv_item_len
-                            ] * len(decode_kv_args.dst_kv_ptrs)
-                        # Boundary before the head-sharded draft tail: validate
-                        # only the MLA prefix for exact geometry match.
-                        src_num_mla_kv_entries, dst_num_mla_kv_entries = (
-                            self._resolve_mla_entry_boundaries(
-                                decode_kv_args.dst_num_mla_kv_entries
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            logger.critical(
+                                f"bootstrap_thread: {consecutive_failures} consecutive "
+                                f"failures, terminating process"
                             )
-                        )
-                        # Persist the reconciled boundary for the transfer
-                        # dispatch to split MLA vs draft entries.
-                        decode_kv_args.dst_num_mla_kv_entries = dst_num_mla_kv_entries
-                        # A PP prefill stage registers only its own layers, so
-                        # pair the decode entries by model layer id before
-                        # comparing geometry.
-                        paired_dst_page_item_lens = [
-                            dst_page_item_lens[j]
-                            for j in resolve_dcp_dst_entry_indices(
-                                self.kv_args.kv_layer_ids,
-                                decode_kv_args.dst_kv_layer_ids,
-                                len(self.kv_args.kv_item_lens),
-                                len(dst_page_item_lens),
-                            )
-                        ]
-                        decode_kv_args.dcp_token_item_lens = (
-                            self.prepare_dcp_token_item_lens(
-                                paired_dst_page_item_lens,
-                                num_mla_kv_entries=src_num_mla_kv_entries,
-                            )
-                        )
-                    self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
-                    with self.session_lock:
-                        if mooncake_session_id in self.failed_sessions:
-                            self.failed_sessions.remove(mooncake_session_id)
-                        if mooncake_session_id in self.session_cooldowns:
-                            del self.session_cooldowns[mooncake_session_id]
-                        if mooncake_session_id in self.session_failures:
-                            del self.session_failures[mooncake_session_id]
-                    logger.debug(
-                        f"Register KVArgs from {mooncake_session_id} successfully"
-                    )
-                    continue
-                else:
-                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
-                    room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
+                            kill_process_tree(os.getpid())
+                        continue
+            except Exception as e:
+                logger.critical(
+                    f"bootstrap_thread crashed with unrecoverable error: {e}",
+                    exc_info=True,
+                )
+                kill_process_tree(os.getpid())
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
-                        self.req_to_decode_prefix_len[room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
-                        )
-                        if self._pp_pd_sideband_bootstrap:
-                            # The "all PP ranks are ready" AND moves off the PP
-                            # ring and onto this socket; see
-                            # CommonKVManager.on_local_pp_bootstrap_ready.
-                            self.on_local_pp_bootstrap_ready(room)
-                        else:
-                            self.update_status(room, KVPoll.WaitingForInput)
-
-        threading.Thread(target=bootstrap_thread).start()
+        threading.Thread(
+            target=bootstrap_thread, name="MooncakeBootstrapThread", daemon=True
+        ).start()
 
     def start_decode_thread(self):
         def decode_thread():
-            while True:
-                msg = self.server_socket.recv_multipart()
-                if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
-                    self._handle_aux_data(msg)
-                    continue
+            # Fail-fast circuit breaker (aligned with the glm/community
+            # branches, luno-3962): see bootstrap_thread for the rationale.
+            consecutive_failures = 0
+            MAX_CONSECUTIVE_FAILURES = 10
+            try:
+                while True:
+                    msg = self.server_socket.recv_multipart()
+                    try:
+                        if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
+                            self._handle_aux_data(msg)
+                        # Staging: prefill notifies a chunk written to staging buffer
+                        elif msg[0] == b"CHUNK_READY":
+                            room = int(msg[1].decode("ascii"))
+                            chunk_idx = int(msg[2].decode("ascii"))
+                            page_start = int(msg[3].decode("ascii"))
+                            num_pages = int(msg[4].decode("ascii"))
+                            session_id = msg[5].decode("ascii")
+                            handler = self._staging_handler
+                            assert (
+                                handler is not None
+                            ), "CHUNK_READY received before staging handler initialized"
+                            handler.handle_chunk_arrived(
+                                room,
+                                chunk_idx,
+                                page_start,
+                                num_pages,
+                                session_id,
+                                self._chunk_writer_counts,
+                            )
+                        # Staging: prefill pre-requests staging allocation before forward
+                        elif msg[0] == b"STAGING_REQ":
+                            self._handle_staging_req(msg)
+                        # Prefill acknowledges abort notification
+                        elif msg[0] == b"ABORT_ACK":
+                            # TODO(shangming): use this info to implement the deferred release mechanism if needed
+                            ack_aborted_room = int(msg[1].decode("ascii"))
+                            logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
+                        else:
+                            bootstrap_room, status, prefill_rank = msg
+                            status = int(status.decode("ascii"))
+                            bootstrap_room = int(bootstrap_room.decode("ascii"))
+                            prefill_rank = int(prefill_rank.decode("ascii"))
 
-                # Staging: prefill notifies a chunk written to staging buffer
-                if msg[0] == b"CHUNK_READY":
-                    room = int(msg[1].decode("ascii"))
-                    chunk_idx = int(msg[2].decode("ascii"))
-                    page_start = int(msg[3].decode("ascii"))
-                    num_pages = int(msg[4].decode("ascii"))
-                    session_id = msg[5].decode("ascii")
-                    handler = self._staging_handler
-                    assert (
-                        handler is not None
-                    ), "CHUNK_READY received before staging handler initialized"
-                    handler.handle_chunk_arrived(
-                        room,
-                        chunk_idx,
-                        page_start,
-                        num_pages,
-                        session_id,
-                        self._chunk_writer_counts,
-                    )
-                    continue
-
-                # Staging: prefill pre-requests staging allocation before forward
-                if msg[0] == b"STAGING_REQ":
-                    self._handle_staging_req(msg)
-                    continue
-
-                # Prefill acknowledges abort notification
-                if msg[0] == b"ABORT_ACK":
-                    # TODO(shangming): use this info to implement the deferred release mechanism if needed
-                    ack_aborted_room = int(msg[1].decode("ascii"))
-                    logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
-                    continue
-
-                bootstrap_room, status, prefill_rank = msg
-                status = int(status.decode("ascii"))
-                bootstrap_room = int(bootstrap_room.decode("ascii"))
-                prefill_rank = int(prefill_rank.decode("ascii"))
-
-                if status == KVPoll.Success:
-                    if bootstrap_room in self.request_status:
-                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
-                        expected_response_num = (
-                            self.required_prefill_response_num_table[bootstrap_room]
+                            if status == KVPoll.Success:
+                                if bootstrap_room in self.request_status:
+                                    self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+                                    expected_response_num = (
+                                        self.required_prefill_response_num_table[bootstrap_room]
+                                    )
+                                    arrived_response_num = len(
+                                        self.prefill_response_tracker[bootstrap_room]
+                                    )
+                                    if arrived_response_num == expected_response_num:
+                                        if self.enable_staging:
+                                            handler = self._staging_handler
+                                            if handler.is_staging_room(bootstrap_room):
+                                                handler.submit_last_scatter_async(bootstrap_room)
+                                            self._chunk_writer_counts.pop(bootstrap_room, None)
+                                        self.update_status(bootstrap_room, KVPoll.Success)
+                            elif status == KVPoll.Failed:
+                                self.record_failure(
+                                    bootstrap_room,
+                                    "Failed to get kvcache from prefill instance, it might be dead",
+                                )
+                                self.update_status(bootstrap_room, status)
+                        consecutive_failures = 0
+                    except Exception as e:
+                        consecutive_failures += 1
+                        logger.error(
+                            f"Error processing decode message: {e}",
+                            exc_info=True,
                         )
-                        arrived_response_num = len(
-                            self.prefill_response_tracker[bootstrap_room]
-                        )
-                        if arrived_response_num == expected_response_num:
-                            if self.enable_staging:
-                                handler = self._staging_handler
-                                if handler.is_staging_room(bootstrap_room):
-                                    handler.submit_last_scatter_async(bootstrap_room)
-                                self._chunk_writer_counts.pop(bootstrap_room, None)
-                            self.update_status(bootstrap_room, KVPoll.Success)
-                elif status == KVPoll.Failed:
-                    self.record_failure(
-                        bootstrap_room,
-                        "Failed to get kvcache from prefill instance, it might be dead",
-                    )
-                    self.update_status(bootstrap_room, status)
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            logger.critical(
+                                f"decode_thread: {consecutive_failures} consecutive "
+                                f"failures, terminating process"
+                            )
+                            kill_process_tree(os.getpid())
+                        continue
+            except Exception as e:
+                logger.critical(
+                    f"decode_thread crashed with unrecoverable error: {e}",
+                    exc_info=True,
+                )
+                kill_process_tree(os.getpid())
 
         def heartbeat_checker():
             while True:
