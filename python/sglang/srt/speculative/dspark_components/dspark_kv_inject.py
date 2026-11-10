@@ -10,6 +10,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
     build_unified_commit_inject_layout,
 )
+from sglang.kernels.ops.speculative.dspark.inject_loc import (
+    can_commit_swa_loc,
+    commit_swa_loc,
+)
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
@@ -136,16 +141,28 @@ class TargetHiddenKvInjector:
                 final_pos=final_pos,
             )
         else:
-            swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
-            if commit_lens is not None and cache_loc_2d is not None:
-                bs, verify_len = cache_loc_2d.shape
-                col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
-                committed_mask = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(
-                    -1
+            gate_lens = commit_lens if cache_loc_2d is not None else None
+            gate_len = cache_loc_2d.shape[1] if gate_lens is not None else None
+            swa_mapping = getattr(pool, "full_to_swa_index_mapping", None)
+            if envs.SGLANG_OPT_DSPARK_INJECT_LOC_FUSE.get() and can_commit_swa_loc(
+                swa_mapping, cache_loc, gate_lens, gate_len, row_valid
+            ):
+                # translate + commit gate + row_valid gate in one launch (identical ints)
+                swa_loc = commit_swa_loc(
+                    swa_mapping, cache_loc, gate_lens, gate_len, row_valid
                 )
-                swa_loc = torch.where(
-                    committed_mask, swa_loc, torch.full_like(swa_loc, -1)
-                )
+                row_valid = None
+            else:
+                swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+                if commit_lens is not None and cache_loc_2d is not None:
+                    bs, verify_len = cache_loc_2d.shape
+                    col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
+                    committed_mask = (
+                        col < commit_lens.to(torch.long).view(-1, 1)
+                    ).reshape(-1)
+                    swa_loc = torch.where(
+                        committed_mask, swa_loc, torch.full_like(swa_loc, -1)
+                    )
         if row_valid is not None:
             # [MEM-P3] Rank-major all-gather padding rows: -1 means "do not commit",
             # the same contract the commit gate above uses.

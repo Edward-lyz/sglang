@@ -276,6 +276,45 @@ def forward_mega_moe(
     return y
 
 
+_IMAGE_MASK_CACHE: Optional[tuple] = None
+
+
+def _image_token_mask(
+    input_ids: torch.Tensor,
+    image_token_id: int,
+    layer_id: int,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """``input_ids == image_token_id``. With SGLANG_OPT_MEGA_GATE_IMAGE_MASK_ONCE the
+    compare runs once per forward instead of once per MoE layer: a new forward starts
+    when the layer id stops increasing (or the id tensor / hidden buffer changes), which
+    also keeps the result from outliving a CUDA-graph capture's tensors."""
+    global _IMAGE_MASK_CACHE
+    if not envs.SGLANG_OPT_MEGA_GATE_IMAGE_MASK_ONCE.get():
+        return input_ids == image_token_id
+    c = _IMAGE_MASK_CACHE
+    if (
+        c is None
+        or c[0] is not input_ids
+        or c[1] != input_ids.data_ptr()
+        or c[2] != image_token_id
+        or c[3] >= layer_id
+        or c[5] != hidden_states.shape[0]
+    ):
+        mask = input_ids == image_token_id
+    else:
+        mask = c[4]
+    _IMAGE_MASK_CACHE = (
+        input_ids,
+        input_ids.data_ptr(),
+        image_token_id,
+        layer_id,
+        mask,
+        hidden_states.shape[0],
+    )
+    return mask
+
+
 def _try_mega_gate(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -348,7 +387,9 @@ def _try_mega_gate(
             or image_bias.shape != bias.shape
         ):
             return None
-        image_token_mask = input_ids_global == image_token_id
+        image_token_mask = _image_token_mask(
+            input_ids_global, image_token_id, moe.layer_id, hidden_states
+        )
     else:
         image_bias = None
 
@@ -435,6 +476,14 @@ def _try_mega_gate(
 
     if raw_topk_ids:
         return topk_idx, topk_weights
+    if envs.SGLANG_OPT_MEGA_GATE_CAST_MASK_FUSE.get():
+        from sglang.kernels.ops.moe.topk_ids_cast import (
+            can_cast_mask_topk_ids,
+            cast_mask_topk_ids,
+        )
+
+        if can_cast_mask_topk_ids(topk_idx, num_token_non_padded):
+            return cast_mask_topk_ids(topk_idx, num_token_non_padded), topk_weights
     topk_ids = topk_idx.to(torch.int32)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids, topk_weights

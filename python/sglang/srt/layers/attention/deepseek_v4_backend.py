@@ -4700,6 +4700,32 @@ class DeepseekV4AttnBackend(
                 compress_ratio != 0,
                 torch.cuda.is_current_stream_capturing(),
             )
+        if positions.dtype != torch.int32 and envs.SGLANG_OPT_FUSED_O_POSITIONS_I32_ONCE.get():
+            # The fused op wants int32 positions; every layer of one forward passes the same
+            # tensor, so cast once per forward (inside the graph on capture) instead of one
+            # tiny copy kernel per layer between k_norm_rope and the attention kernel. A new
+            # forward starts when the layer id stops increasing, which refreshes the cast
+            # (the batch object and its positions buffer may be reused across steps).
+            cached = getattr(self, "_positions_i32_cache", None)
+            layer_id = layer.layer_id
+            if (
+                cached is None
+                or cached[0] is not positions
+                or cached[1] != positions.data_ptr()
+                or cached[2] >= layer_id
+                or cached[4] is not forward_batch
+            ):
+                cached = (
+                    positions,
+                    positions.data_ptr(),
+                    layer_id,
+                    positions.to(torch.int32),
+                    forward_batch,
+                )
+            else:
+                cached = (cached[0], cached[1], layer_id, cached[3], cached[4])
+            self._positions_i32_cache = cached
+            positions = cached[3]
         self._fused_o_args = SimpleNamespace(
             mode="decode",
             positions=positions,

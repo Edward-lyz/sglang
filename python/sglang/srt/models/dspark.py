@@ -73,6 +73,25 @@ def run_markov_block(
     for step_idx in range(proposal_len):
         step_hidden = None if hidden_states is None else hidden_states[:, step_idx, ...]
         dst = None if corrected_out is None else corrected_out[:, step_idx, :]
+        fused_spec = getattr(sampler, "fused_step_spec", None)
+        if (
+            fused_spec is not None
+            and dst is not None
+            and hasattr(head, "fused_step_sample_applies")
+            and head.fused_step_sample_applies(
+                base_logits[:, step_idx, :], prev_tokens, dst
+            )
+        ):
+            next_tokens = head.apply_step_and_sample(
+                base_logits[:, step_idx, :],
+                token_ids=prev_tokens,
+                corrected_dst=dst,
+                spec=fused_spec,
+                step_idx=step_idx,
+            )
+            sampled_tokens.append(next_tokens)
+            prev_tokens = next_tokens
+            continue
         if dst is not None and getattr(head, "supports_corrected_dst", False):
             step_logits = head.apply_step_logits(
                 base_logits[:, step_idx, :],

@@ -593,6 +593,16 @@ def make_hc_mixing_params(
     )
 
 
+def _hc_mean(x: torch.Tensor) -> torch.Tensor:
+    """``x.mean(dim=1)`` over the hyper-connection axis (DSpark aux hidden states)."""
+    if envs.SGLANG_OPT_HC_MEAN_TRITON.get():
+        from sglang.kernels.ops.layernorm.hc_mean import can_hc_mean, hc_mean
+
+        if can_hc_mean(x):
+            return hc_mean(x)
+    return x.mean(dim=1)
+
+
 def make_hc_head_params(
     hc_mult: int, hidden_size: int
 ) -> Tuple[nn.Parameter, nn.Parameter, nn.Parameter]:
@@ -3626,7 +3636,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.layer_id,
                     residual.shape[0],
                 )
-                aux_out.append(residual.mean(dim=1))
+                aux_out.append(_hc_mean(residual))
             with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
                 x = self.self_attn(
                     x=x, positions=positions, forward_batch=forward_batch, x_quant=None
@@ -3634,7 +3644,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             residual = hidden_states
             if aux_out is not None:
-                aux_out.append(hidden_states.mean(dim=1))
+                aux_out.append(_hc_mean(hidden_states))
             x = self._hc_combine(
                 hidden_states, prev_pre, self.input_layernorm, stats_stream
             )
@@ -4573,7 +4583,7 @@ class DeepseekV4Model(nn.Module):
                 aux = hidden_states
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
-                dspark_aux_hidden_states.append(aux.mean(dim=1))
+                dspark_aux_hidden_states.append(_hc_mean(aux))
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4848,7 +4858,7 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+                    dspark_aux_hidden_states.append(_hc_mean(completed))
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
@@ -4864,7 +4874,17 @@ class DeepseekV4Model(nn.Module):
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
             hidden_states = hc_combine(
-                pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
+                # The kernel widens every load to fp32 itself, so the bf16 tensor gives the
+                # same values without a 126 MB fp32 copy first.
+                (
+                    pre_hc_head
+                    if envs.SGLANG_OPT_HC_HEAD_COMBINE_NO_CAST.get()
+                    and pre_hc_head.dtype == torch.bfloat16
+                    else pre_hc_head.float()
+                ),
+                last_pre,
+                self.hc_mult,
+                hidden_states.dtype,
             )
         else:
             hidden_states = self.hc_head(

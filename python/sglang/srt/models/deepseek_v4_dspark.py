@@ -16,6 +16,8 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     BuildStepLocal,
     CommitKvProj,
+    build_step_sample_triton,
+    can_build_step_sample,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.vocab_gather import (
@@ -505,6 +507,67 @@ class DSparkV4MarkovHead(nn.Module):
             corrected_dst.copy_(out)
         return out
 
+    def _step_bias_sharded(self, token_ids: torch.Tensor) -> torch.Tensor:
+        shard = self._tp_shard
+        latent = self.get_prev_embeddings(token_ids)
+        weight_local = self.markov_w2.weight[
+            shard.org_vocab_start : shard.org_vocab_end
+        ]
+        if self._opt_markov_w2_bf16:
+            return F.linear(latent.to(weight_local.dtype), weight_local)
+        return F.linear(latent.float(), weight_local)
+
+    def fused_step_sample_applies(
+        self,
+        logits: torch.Tensor,
+        token_ids: torch.Tensor,
+        corrected_dst: Optional[torch.Tensor],
+    ) -> bool:
+        """Whether apply_step_and_sample() can stand in for apply_step_logits() followed
+        by the in-graph inline-RNG sampler (single-rank vocab group, block-logits slot)."""
+        if (
+            not envs.SGLANG_OPT_DSPARK_STEP_SAMPLE_FUSE.get()
+            or self._tp_shard is None
+            or corrected_dst is None
+            or not isinstance(self._vocab_gather, LocalVocabGather)
+        ):
+            return False
+        shard = self._tp_shard
+        bias_width = shard.org_vocab_end - shard.org_vocab_start
+        return (
+            logits.is_cuda
+            and logits.dim() == 2
+            and self.vocab_size <= logits.shape[-1]
+            and self.vocab_size <= bias_width
+            and corrected_dst.shape[-1] == self.vocab_size
+        )
+
+    def apply_step_and_sample(
+        self,
+        logits: torch.Tensor,
+        *,
+        token_ids: torch.Tensor,
+        corrected_dst: torch.Tensor,
+        spec,
+        step_idx: int,
+    ) -> torch.Tensor:
+        """apply_step_logits(..., corrected_dst) + sampler in one pass: the step logits
+        never exist as a [bs, vocab] fp32 tensor; the block-logits slot is filled and
+        the Gumbel/greedy token is drawn from the same registers."""
+        bias = self._step_bias_sharded(token_ids)
+        tokens = build_step_sample_triton(
+            bias=bias,
+            base_local=logits,
+            corrected_dst=corrected_dst,
+            vocab=self.vocab_size,
+            temperatures=spec.temperatures,
+            greedy_mask=spec.greedy_mask,
+            rng_counter=spec.rng_counter,
+            rng_step=step_idx,
+            rng_num_steps=spec.num_steps,
+        )
+        return spec.post(tokens)
+
     def _apply_step_logits_sharded(
         self,
         *,
@@ -512,15 +575,7 @@ class DSparkV4MarkovHead(nn.Module):
         token_ids: torch.Tensor,
         corrected_dst: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        shard = self._tp_shard
-        latent = self.get_prev_embeddings(token_ids)
-        weight_local = self.markov_w2.weight[
-            shard.org_vocab_start : shard.org_vocab_end
-        ]
-        if self._opt_markov_w2_bf16:
-            bias = F.linear(latent.to(weight_local.dtype), weight_local)
-        else:
-            bias = F.linear(latent.float(), weight_local)
+        bias = self._step_bias_sharded(token_ids)
         # A group of one gathers nothing, so the step logits are final in step_local
         # and the block-logits slot can be filled by the same kernel.
         fuse_dst = corrected_dst is not None and isinstance(

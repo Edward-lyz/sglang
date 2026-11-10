@@ -599,7 +599,28 @@ class Envs:
     # (bit-identical values, the base-logits slice is read in place), instead of
     # appending each step, torch.cat-ing them and convert-copying the cat into the
     # buffer -- about 0.75 ms/step at bs256 (fp32 [bs, gamma, vocab]).
-    SGLANG_OPT_DSPARK_CORRECTED_INPLACE = EnvBool(False)
+    SGLANG_OPT_DSPARK_CORRECTED_INPLACE = EnvBool(True)
+    # DSpark commit-KV projection (target hidden rows -> every draft stage's wkv): with
+    # DeepGEMM MXFP8-ready wkv weights, quantize the rows once and run one DeepGEMM
+    # MXFP8 GEMM per stage instead of the stacked Triton block-fp8 fallback (~236 us ->
+    # ~40 us per step at 1536 rows). Same math, accumulation order differs (draft KV
+    # only; target verify guards correctness).
+    SGLANG_OPT_DSPARK_COMMIT_KV_DEEPGEMM = EnvBool(False)
+    # MegaMoE gate path: merge the topk_idx int64->int32 cast and the padded-row
+    # mask into one Triton launch (integer-only, bit-identical).
+    SGLANG_OPT_MEGA_GATE_CAST_MASK_FUSE = EnvBool(True)
+    # MegaMoE gate: image-token mask (input_ids == image_token_id) once per forward
+    # instead of per MoE layer (exact).
+    SGLANG_OPT_MEGA_GATE_IMAGE_MASK_ONCE = EnvBool(False)
+    # DSV4 final hc_combine reads the bf16 pre-head tensor directly (the kernel widens
+    # per load) instead of materialising a fp32 copy first (exact).
+    SGLANG_OPT_HC_HEAD_COMBINE_NO_CAST = EnvBool(True)
+    # DSV4 DSpark aux hidden = mean over the hc axis via a single-pass Triton kernel
+    # (bf16 [rows, hc, hidden]; 29 us -> 6 us at 1536 rows, bit-identical in tests).
+    SGLANG_OPT_HC_MEAN_TRITON = EnvBool(True)
+    # DSV4 fused attention-o decode: cast positions to int32 once per forward
+    # instead of one copy kernel per layer (exact).
+    SGLANG_OPT_FUSED_O_POSITIONS_I32_ONCE = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -709,6 +730,24 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    # Batch the per-request SWA window evictions of one scheduler step into a single
+    # page free (~5 kernels instead of ~5 per evicting request). Same slots freed.
+    SGLANG_OPT_SWA_EVICT_BATCH = EnvBool(False)
+    # DSpark draft Markov step: build the step logits (base + w2 bias) and draw the
+    # in-graph inline-RNG token in one kernel, so the fp32 [bs, vocab] step logits are
+    # never written and re-read. Same tokens and block logits as the two-kernel path.
+    SGLANG_OPT_DSPARK_STEP_SAMPLE_FUSE = EnvBool(True)
+    # DSpark target-hidden injection (non-unified-kv path): full->SWA slot gather, commit-length
+    # gate and row_valid gate in one launch instead of ~7 tiny eager kernels (identical ints).
+    SGLANG_OPT_DSPARK_INJECT_LOC_FUSE = EnvBool(True)
+    # DSpark sampling-accept softmax(logits / T): split-vocab Triton kernel that reads the logits in
+    # place (no fp32 convert copy, no repeat_interleave of the temperatures). Agrees with the
+    # flashinfer path to fp32 rounding, not bit-for-bit, so it stays opt-in.
+    SGLANG_OPT_DSPARK_SOFTMAX_SPLIT_TRITON = EnvBool(False)
+    # Host-side scheduling scalars before the draft / verify graph replays: sampling-param staging
+    # (clamp + greedy mask + rng bump) in one launch, local num_token_non_padded in one launch, and
+    # the global_num_tokens fill skipped while the padded bucket is unchanged. Same values.
+    SGLANG_OPT_HOST_SCHED_FUSE = EnvBool(False)
     # Deprecated: the unified radix tree is the default tree cache now, so the
     # registry no longer reads this. Kept because a few model/arch call sites
     # still assert on it; do not use in new code.
@@ -1814,11 +1853,11 @@ class Envs:
     # request share one pass over its index-K cache instead of each re-reading all
     # of it. Bit-identical logits, ~2.9x on the dense ratio-1 logits at 61k/bs256x6.
     # Static verify only (uniform rows per request); ragged verify keeps per-row.
-    SGLANG_OPT_DSV41_INDEXER_REQUEST_GROUPED_ROWS = EnvBool(False)
+    SGLANG_OPT_DSV41_INDEXER_REQUEST_GROUPED_ROWS = EnvBool(True)
     # Widening bf16 -> fp32 copy of the lm_head logits (the fp32 logits buffer fill) with
     # a Triton kernel instead of PyTorch's direct-copy kernel: ~2.8x faster on the
     # [1536, 129280] verify logits, bit-identical.
-    SGLANG_OPT_LOGITS_CAST_TRITON = EnvBool(False)
+    SGLANG_OPT_LOGITS_CAST_TRITON = EnvBool(True)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)

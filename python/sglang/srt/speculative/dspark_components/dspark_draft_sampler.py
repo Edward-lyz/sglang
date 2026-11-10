@@ -8,6 +8,10 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
+from sglang.kernels.ops.speculative.dspark.host_sched import (
+    can_stage_sampling_params,
+    stage_sampling_params_fused,
+)
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -122,6 +126,23 @@ class DsparkDraftSampler:
         the draft graph replay that consumes them."""
         if not self.folded_sampling:
             return
+        if (
+            self._inline_rng
+            and sampling_info is not None
+            and envs.SGLANG_OPT_HOST_SCHED_FUSE.get()
+        ):
+            # counter bump + temperature clamp + greedy mask in one launch (same values)
+            temps_in = sampling_info.temperatures.view(-1)
+            topk_in = sampling_info.top_ks.view(-1)
+            if can_stage_sampling_params(
+                temps_in, topk_in, self.temperatures, self.greedy_mask,
+                self.rng_counter, bs,
+            ):
+                stage_sampling_params_fused(
+                    temps_in, topk_in, self.temperatures, self.greedy_mask,
+                    self.rng_counter, bs,
+                )
+                return
         if self._inline_rng:
             # Bump the graph-safe philox counter so this decode step's replay
             # redraws fresh noise. In-place add on the persistent tensor: the
@@ -207,6 +228,22 @@ class DsparkDraftSampler:
                         SpecTpSyncSite.DSPARK_GRAPH_GREEDY,
                         greedy_step_sampler(step_logits, step_idx),
                     )
+
+            if self.folded_sampling and self._inline_rng:
+                # Heads that can build the step logits and draw the token in one kernel
+                # (DSparkV4MarkovHead.apply_step_and_sample) read their inputs from here;
+                # it is the same draw `sampler` above makes.
+                from types import SimpleNamespace
+
+                sampler.fused_step_spec = SimpleNamespace(
+                    temperatures=self.temperatures[:bs],
+                    greedy_mask=self.greedy_mask[:bs],
+                    rng_counter=self.rng_counter,
+                    num_steps=self.gamma,
+                    post=lambda tokens: self._tp_sync.sync(
+                        SpecTpSyncSite.DSPARK_GRAPH_SAMPLE, tokens
+                    ),
+                )
 
             # Each step writes its corrected logits straight into the static
             # block-logits buffer (no per-step list + cat + convert-copy pass).

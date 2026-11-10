@@ -534,6 +534,42 @@ def commit_kv_proj_fused(
     main_x: torch.Tensor,
     wkv_linears: list[torch.nn.Module],
 ) -> list[torch.Tensor]:
+    if _commit_kv_deepgemm_applies(main_x=main_x, wkv_linears=wkv_linears):
+        # The draft stages' wkv are MXFP8-ready under DeepGEMM: quantize the target
+        # hidden rows once and run one DeepGEMM MXFP8 GEMM per stage (each output is
+        # already contiguous), instead of the stacked Triton block-fp8 fallback
+        # (236 us for the 1536-row commit vs ~12 us per stage here).
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+            w8a8_mxfp8_matmul_deepgemm,
+        )
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "dspark_commit_kv_deepgemm",
+            "DSpark commit-KV projection runs DeepGEMM MXFP8 GEMMs "
+            "(stages=%d, k=%d)",
+            len(wkv_linears),
+            main_x.shape[-1],
+        )
+        q, sf = sglang_per_token_group_quant_fp8(
+            main_x.contiguous(),
+            32,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+        return [
+            w8a8_mxfp8_matmul_deepgemm(
+                q,
+                linear.weight,
+                sf,
+                linear.weight_scale_inv_deepgemm,
+                output_dtype=torch.bfloat16,
+            )
+            for linear in wkv_linears
+        ]
+
     num_stages = len(wkv_linears)
     stacked = _stacked_wkv_weight(wkv_linears=wkv_linears)
 
@@ -574,6 +610,40 @@ def commit_kv_proj_fused(
         kv_all[:, i * head_dim : (i + 1) * head_dim].contiguous()
         for i in range(num_stages)
     ]
+
+
+_COMMIT_KV_DG_OK: dict[int, bool] = {}
+
+
+def _commit_kv_deepgemm_applies(
+    *, main_x: torch.Tensor, wkv_linears: list[torch.nn.Module]
+) -> bool:
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_DSPARK_COMMIT_KV_DEEPGEMM.get():
+        return False
+    if main_x.dtype != torch.bfloat16 or main_x.dim() != 2 or main_x.shape[0] == 0:
+        return False
+    key = id(wkv_linears[0])
+    ok = _COMMIT_KV_DG_OK.get(key)
+    if ok is None:
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        ok = bool(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)
+        for linear in wkv_linears:
+            quant_method = getattr(linear, "quant_method", None)
+            backend = getattr(quant_method, "mxfp8_dense_backend", None)
+            ok = ok and bool(
+                backend is not None
+                and backend.is_deep_gemm()
+                and getattr(quant_method, "block_fp8_as_mxfp8", False)
+                and getattr(linear, "block_fp8_mxfp8_ready", False)
+                and hasattr(linear, "weight_scale_inv_deepgemm")
+                and linear.weight.shape[0] % 64 == 0
+                and linear.weight.shape[1] % 128 == 0
+            )
+        _COMMIT_KV_DG_OK[key] = ok
+    return ok and main_x.shape[-1] == wkv_linears[0].weight.shape[1]
 
 
 class _StackedWkvWeight(msgspec.Struct):
@@ -922,3 +992,145 @@ def build_step_local_triton(
         WRITE_CORRECTED=write_corrected,
     )
     return out
+
+
+
+@triton.jit
+def _step_sample_partial_kernel(
+    bias_ptr,
+    base_ptr,
+    corr_ptr,
+    temperatures_ptr,
+    greedy_mask_ptr,
+    rng_seed_ptr,
+    tile_max_ptr,
+    partial_key_ptr,
+    partial_idx_ptr,
+    org_width,
+    V,
+    base_stride,
+    corr_stride,
+    n_tiles,
+    rng_step,
+    rng_num_steps,
+    BLOCK_V: tl.constexpr,
+    WRITE_CORRECTED: tl.constexpr,
+):
+    # _build_step_local_kernel followed by _online_partial_kernel (inline-RNG branch)
+    # in one pass: the fp32 step logits live in registers instead of a [bs, V] tensor
+    # that the sampler would read back. Same fp32 values, same tiling, same noise key
+    # (row * V + offs), so the sampled token is the one the two-kernel path returns.
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    row64 = row.to(tl.int64)
+    offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    mask = offs < V
+    base = tl.load(base_ptr + row64 * base_stride + offs, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    bias = tl.load(
+        bias_ptr + row64 * org_width + offs, mask=mask & (offs < org_width), other=0.0
+    ).to(tl.float32)
+    step = base + bias
+    if WRITE_CORRECTED:
+        tl.store(
+            corr_ptr + row64 * corr_stride + offs,
+            step.to(corr_ptr.dtype.element_ty),
+            mask=mask,
+        )
+    logits = tl.where(mask, step, float("-inf"))
+    temperature = tl.load(temperatures_ptr + row)
+    s = logits / temperature
+    tile_max = tl.max(s, axis=0)
+    greedy = tl.load(greedy_mask_ptr + row) != 0
+    if greedy:
+        key = tl.exp(s - tile_max)
+    else:
+        base_seed = tl.load(rng_seed_ptr)
+        seed = (base_seed * rng_num_steps + rng_step).to(tl.uint32)
+        u = tl.rand(seed, row * V + offs)
+        key = tl.exp(s - tile_max) / (-tl.log(u))
+    key = tl.where(mask, key, -1.0)
+    tile_best = tl.max(key, axis=0)
+    idx = tl.where(key == tile_best, offs, _IDX_SENTINEL)
+    tl.store(tile_max_ptr + row * n_tiles + tile, tile_max)
+    tl.store(partial_key_ptr + row * n_tiles + tile, tile_best)
+    tl.store(partial_idx_ptr + row * n_tiles + tile, tl.min(idx, axis=0))
+
+
+def can_build_step_sample(
+    *, bias: torch.Tensor, base_local: torch.Tensor, corrected_dst, vocab: int
+) -> bool:
+    """BuildStepSample kernel"""
+    return (
+        base_local.is_cuda
+        and base_local.dim() == 2
+        and bias.dim() == 2
+        and vocab <= base_local.shape[-1]
+        and vocab <= bias.shape[-1]
+        and (corrected_dst is None or corrected_dst.shape[-1] == vocab)
+    )
+
+
+def build_step_sample_triton(
+    *,
+    bias: torch.Tensor,
+    base_local: torch.Tensor,
+    corrected_dst: Optional[torch.Tensor],
+    vocab: int,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+    rng_counter: torch.Tensor,
+    rng_step: int,
+    rng_num_steps: int,
+) -> torch.Tensor:
+    """``SampleStepTokens(BuildStepLocal(bias, base_local)[:, :vocab])`` (inline RNG) in
+    one pass, also filling ``corrected_dst`` with the rounded step logits."""
+    assert can_build_step_sample(
+        bias=bias, base_local=base_local, corrected_dst=corrected_dst, vocab=vocab
+    )
+    bs = base_local.shape[0]
+    device = base_local.device
+    if base_local.stride(-1) != 1:
+        base_local = base_local.contiguous()
+    bias = bias.contiguous()
+    temperatures = temperatures.to(torch.float32).contiguous()
+    greedy_mask = greedy_mask.to(torch.int32).contiguous()
+    write_corrected = corrected_dst is not None
+    if write_corrected:
+        assert corrected_dst.stride(-1) == 1
+
+    n_tiles = triton.cdiv(vocab, _BLOCK_V)
+    tile_max = torch.empty((bs, n_tiles), dtype=torch.float32, device=device)
+    partial_key = torch.empty((bs, n_tiles), dtype=torch.float32, device=device)
+    partial_idx = torch.empty((bs, n_tiles), dtype=torch.int32, device=device)
+    next_tokens = torch.empty((bs,), dtype=torch.int64, device=device)
+    _step_sample_partial_kernel[(bs, n_tiles)](
+        bias,
+        base_local,
+        corrected_dst if write_corrected else base_local,
+        temperatures,
+        greedy_mask,
+        rng_counter,
+        tile_max,
+        partial_key,
+        partial_idx,
+        bias.shape[-1],
+        vocab,
+        base_local.stride(0),
+        corrected_dst.stride(0) if write_corrected else 0,
+        n_tiles,
+        int(rng_step),
+        int(rng_num_steps),
+        BLOCK_V=_BLOCK_V,
+        WRITE_CORRECTED=write_corrected,
+    )
+    _online_combine_kernel[(bs,)](
+        tile_max,
+        partial_key,
+        partial_idx,
+        next_tokens,
+        n_tiles,
+        BLOCK_TILES=triton.next_power_of_2(n_tiles),
+    )
+    return next_tokens

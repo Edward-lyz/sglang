@@ -454,11 +454,39 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self._release_swa(swa_indices)
 
+    # Open while a caller batches the kv-row segments it evicts (see
+    # begin_swa_segment_batch); None otherwise.
+    _swa_seg_batch = None
+
+    def begin_swa_segment_batch(self) -> None:
+        """Collect free_swa_segment() calls until end_swa_segment_batch(), then free them
+        with one call: the per-request evictions of a decode batch are disjoint kv rows,
+        so one gather / page expansion / mapping clear over their concatenation frees the
+        same slots with ~5 kernels instead of ~5 per request."""
+        self._swa_seg_batch = []
+
+    def end_swa_segment_batch(self) -> None:
+        """Free the SWA peers of a batch of evicted kv rows."""
+        segs, self._swa_seg_batch = self._swa_seg_batch, None
+        if not segs:
+            return
+        free_index = segs[0] if len(segs) == 1 else torch.cat(segs)
+        self._free_swa_pages(free_index, start_pos=0)
+
     def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """free_swa() for a kv-row segment; same start-alignment contract as
         free_segment(), and fixed-shape at every page size. No-op for a
         per-request ring, as in free_swa()."""
         if self._swa_req_ring or free_index.numel() == 0:
+            return
+        if (
+            self._swa_seg_batch is not None
+            and start_pos % self.page_size == 0
+            and free_index.numel() % self.page_size == 0
+        ):
+            # Whole pages from a page-aligned start: the concatenation keeps every
+            # segment's first token at a page boundary for the [::page_size] reps.
+            self._swa_seg_batch.append(free_index)
             return
         self._free_swa_pages(free_index, start_pos=start_pos)
 
