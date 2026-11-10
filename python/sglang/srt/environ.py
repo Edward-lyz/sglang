@@ -1757,10 +1757,6 @@ class Envs:
     # ties. OFF by default (must pass the live decode boot gate).
     # (see record_kernel_opt/deepseekv4.1_flash_decode_kernel_candsrc_0923).
     SGLANG_FUSE_CANDIDATE_SOURCE_OPT = EnvBool(False)
-    # [fusion-opt] DSPARK prefill commit: run the stacked [3*512, 5120] wkv of the
-    # draft stages on the DeepGEMM MXFP8 GEMM (same fp8 values + ue8m0 scales as the
-    # block-fp8 weight) instead of the Triton block-fp8 matmul.
-    SGLANG_FUSE_DSPARK_COMMIT_KV_DEEPGEMM = EnvBool(False)
     # [fusion-opt] DSPARK prefill commit under decoder SWA bounded replay: commit only
     # the late-layer tail rows (the only rows whose aux hidden was computed) instead of
     # every row of the chunk.

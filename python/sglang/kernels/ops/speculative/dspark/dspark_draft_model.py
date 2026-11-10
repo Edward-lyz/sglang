@@ -573,18 +573,7 @@ def commit_kv_proj_fused(
     num_stages = len(wkv_linears)
     stacked = _stacked_wkv_weight(wkv_linears=wkv_linears)
 
-    if stacked.deepgemm_scale is not None:
-        # [fusion-opt] SGLANG_FUSE_DSPARK_COMMIT_KV_DEEPGEMM
-        kv_all = wkv_linears[0].quant_method.w8a8_mxfp8_linear(
-            input=main_x,
-            weight=stacked.weight,
-            weight_scale=stacked.deepgemm_scale,
-            input_scale=None,
-            bias=None,
-            weight_scale_swizzled=None,
-        )
-        _selfcheck_deepgemm_commit_once(main_x, kv_all, stacked, wkv_linears)
-    elif stacked.mxfp8_scale is not None:
+    if stacked.mxfp8_scale is not None:
         kv_all = wkv_linears[0].quant_method.w8a8_mxfp8_linear(
             input=main_x,
             weight=stacked.weight,
@@ -650,88 +639,6 @@ class _StackedWkvWeight(msgspec.Struct):
     weight: torch.Tensor
     fp8_scale: Optional[torch.Tensor]
     mxfp8_scale: Optional[torch.Tensor] = None
-    # [fusion-opt] DeepGEMM-packed per-row ue8m0 scale of the stacked weight
-    deepgemm_scale: Optional[torch.Tensor] = None
-
-
-_DEEPGEMM_COMMIT_CHECKED = False
-
-
-def _selfcheck_deepgemm_commit_once(main_x, kv_all, stacked, wkv_linears) -> None:
-    """First call only: compare against the Triton block-fp8 path it replaces."""
-    global _DEEPGEMM_COMMIT_CHECKED
-    if _DEEPGEMM_COMMIT_CHECKED or stacked.fp8_scale is None or main_x.shape[0] == 0:
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return  # .item() would break graph capture (decode / target-verify)
-    _DEEPGEMM_COMMIT_CHECKED = True
-    import logging
-
-    quant_method = wkv_linears[0].quant_method
-    ref = quant_method.w8a8_block_fp8_linear(
-        input=main_x,
-        weight=stacked.weight,
-        block_size=quant_method.quant_config.weight_block_size,
-        weight_scale=stacked.fp8_scale,
-        input_scale=None,
-        bias=None,
-    )
-    err = (kv_all.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12)
-    logging.getLogger(__name__).info(
-        "[fusion-opt] DSPARK commit wkv DeepGEMM vs Triton rel_err=%.3e rows=%d",
-        err.item(),
-        main_x.shape[0],
-    )
-
-
-def _deepgemm_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
-    from sglang.srt.environ import envs
-
-    if not envs.SGLANG_FUSE_DSPARK_COMMIT_KV_DEEPGEMM.get():
-        return False
-    quant_method = wkv_linears[0].quant_method
-    backend = getattr(quant_method, "mxfp8_dense_backend", None)
-    return (
-        backend is not None
-        and backend.is_deep_gemm()
-        and all(getattr(l, "block_fp8_mxfp8_ready", False) for l in wkv_linears)
-    )
-
-
-def _build_deepgemm_scale(
-    *, wkv_linears: list[torch.nn.Module], weight: torch.Tensor, sf_fp32: torch.Tensor
-) -> Optional[torch.Tensor]:
-    """Per-row e8m0 of the stacked block scales, packed the way the DeepGEMM MXFP8
-    linear of the per-stage layers is (Fp8LinearMethod._process_mxfp8_linear_weight_scale)."""
-    import logging
-
-    quant_method = wkv_linears[0].quant_method
-    try:
-        n, k = weight.shape
-        sf = sf_fp32.detach().float().contiguous()
-        if sf.shape[-1] != k // 32:
-            raise ValueError(f"scale {tuple(sf.shape)} is not 32-wide-K for {n}x{k}")
-        bits = sf.view(torch.int32)
-        if not bool(torch.all((bits & 0x7FFFFF) == 0)) or not bool(torch.all(sf > 0)):
-            raise ValueError("scales are not positive powers of two")
-        scale_u8 = (bits >> 23).to(torch.uint8)
-        if scale_u8.shape[0] != n:  # block rows -> per-row
-            block_n = quant_method.quant_config.weight_block_size[0]
-            scale_u8 = scale_u8.repeat_interleave(block_n, dim=0)[:n]
-        scale_u8 = scale_u8.contiguous()
-        if scale_u8.shape != (n, k // 32):
-            raise ValueError(f"per-row scale shape {tuple(scale_u8.shape)}")
-        holder = torch.nn.Module()
-        holder.weight = torch.nn.Parameter(weight, requires_grad=False)
-        quant_method._process_mxfp8_linear_weight_scale(holder, scale_u8=scale_u8)
-        if getattr(holder, "weight_scale_inv_swizzled", None) is not None:
-            return None
-        return holder.weight_scale_inv_deepgemm.data
-    except Exception as e:  # keep the Triton path on any layout surprise
-        logging.getLogger(__name__).warning(
-            "[fusion-opt] DSPARK commit DeepGEMM stack unavailable: %s", e
-        )
-        return None
 
 
 def _stacked_wkv_weight(*, wkv_linears: list[torch.nn.Module]) -> _StackedWkvWeight:
@@ -817,27 +724,11 @@ def _build_stacked_wkv_weight(
                 dim=0,
             )
             scale = transform_scale_ue8m0(sf_fp32, mn=weight.shape[0])
-            dg_scale = (
-                _build_deepgemm_scale(
-                    wkv_linears=wkv_linears, weight=weight, sf_fp32=sf_fp32
-                )
-                if _deepgemm_stack_applies(wkv_linears=wkv_linears)
-                else None
-            )
-            return _StackedWkvWeight(
-                weight=weight, fp8_scale=scale, deepgemm_scale=dg_scale
-            )
+            return _StackedWkvWeight(weight=weight, fp8_scale=scale)
         scale = torch.cat([linear.weight_scale_inv for linear in wkv_linears], dim=0)
         if scale.dim() >= 2 and scale.stride(-2) != 1:
             scale = scale.transpose(-2, -1).contiguous().transpose(-2, -1)
-        dg_scale = (
-            _build_deepgemm_scale(
-                wkv_linears=wkv_linears, weight=weight, sf_fp32=scale.float()
-            )
-            if _deepgemm_stack_applies(wkv_linears=wkv_linears)
-            else None
-        )
-        return _StackedWkvWeight(weight=weight, fp8_scale=scale, deepgemm_scale=dg_scale)
+        return _StackedWkvWeight(weight=weight, fp8_scale=scale)
     weight = torch.cat(
         [_dequant_linear_weight(linear) for linear in wkv_linears], dim=0
     )
