@@ -337,7 +337,20 @@ class AttentionStoreIntegrationMixin:
                 cow_mamba=params.cow_mamba,
                 req=req,
             )
-            return super().match_prefix(capped_params)
+            # The capped Full-KV path can still stop before the negotiated
+            # endpoint when no exact local Mamba/KDA checkpoint exists there.
+            # Continue through the normal AS load path for the remaining gap.
+            local_result = super().match_prefix(capped_params)
+            local_hit_len = len(local_result.device_indices)
+            start_block = local_hit_len // self.page_size
+            if terminal_block == start_block:
+                return local_result
+            if terminal_block < start_block:
+                raise RuntimeError(
+                    "local cache match exceeded the AttentionStore PP terminal "
+                    f"after capping: terminal_block={terminal_block} "
+                    f"local_block={start_block}"
+                )
 
         read_hashes = req.as_block_hashs.hash_ids[start_block:terminal_block]
         read_count = terminal_block - start_block
