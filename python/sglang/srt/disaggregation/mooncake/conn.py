@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
     TransferKVChunk,
+    build_dcp_replicated_token_transfer_plan,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
@@ -137,6 +138,17 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    # Full per-entry KV item_lens list from the decode side. Needed for DCP
+    # relayout when the KV geometry is heterogeneous across entries (e.g. the
+    # speculative draft (MHA) pool ships a head-sharded per-token byte size that
+    # differs from the main MLA KV), where the single dst_kv_item_len scalar
+    # would lose the tail entries.
+    dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
+    # Count of leading MLA (main) entries on the decode side, i.e. the boundary
+    # before its speculative draft pool entries. Under DCP relayout the MLA
+    # prefix takes token relayout and the draft tail takes a replicated
+    # head-slice transfer. 0 when unknown/no draft pool.
+    dst_num_mla_kv_entries: int = 0
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -175,6 +187,20 @@ class KVArgsRegisterInfo:
             ),
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
+            ),
+            # msg[18] carries the full per-entry KV item_lens list (packed as a
+            # single int list) so DCP relayout keeps heterogeneous geometry.
+            dst_kv_item_lens=(
+                unpack_int_lists(msg[18], "I")[0]
+                if len(msg) > 18 and msg[18] != b""
+                else []
+            ),
+            # msg[19] carries the count of leading MLA (main) entries; the draft
+            # tail beyond it takes the replicated head-slice DCP transfer.
+            dst_num_mla_kv_entries=(
+                int(msg[19].decode("ascii"))
+                if len(msg) > 19 and msg[19] != b""
+                else 0
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
@@ -776,9 +802,20 @@ class MooncakeKVManager(CommonKVManager):
         num_kv_tokens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: List[int],
+        mla_entry_count: Optional[int] = None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
+        # Restrict to the leading MLA (main) entries; the head-sharded draft
+        # tail is transferred separately via send_kvcache_dcp_draft, since it is
+        # DCP-replicated (whole token set at every rank) and head-sliced.
+        src_kv_ptrs_all = self.kv_args.kv_data_ptrs
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if mla_entry_count is not None:
+            src_kv_ptrs_all = src_kv_ptrs_all[:mla_entry_count]
+            dst_kv_ptrs = dst_kv_ptrs[:mla_entry_count]
+            dcp_token_item_lens = dcp_token_item_lens[:mla_entry_count]
+            src_layer_ids = src_layer_ids[:mla_entry_count] if src_layer_ids else []
         physical_page_size = self.kv_args.page_size
         plan = build_dcp_token_transfer_plan(
             prefill_kv_indices,
@@ -793,19 +830,18 @@ class MooncakeKVManager(CommonKVManager):
         if plan.src_token_indices.size == 0:
             return 0
 
-        src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
             dst_indices = resolve_dcp_dst_entry_indices(
                 src_layer_ids,
                 dst_layer_ids,
-                len(self.kv_args.kv_data_ptrs),
+                len(src_kv_ptrs_all),
                 len(dst_kv_ptrs),
             )
-            src_kv_ptrs = self.kv_args.kv_data_ptrs
+            src_kv_ptrs = src_kv_ptrs_all
             dst_kv_ptrs = [dst_kv_ptrs[j] for j in dst_indices]
         else:
             src_kv_ptrs, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
-                self.kv_args.kv_data_ptrs,
+                src_kv_ptrs_all,
                 dst_kv_ptrs,
             )
         layers_current_pp_stage = len(src_kv_ptrs)
@@ -860,6 +896,134 @@ class MooncakeKVManager(CommonKVManager):
                 set_transfer_blocks(src_ptr, dst_ptr, token_item_len)
             )
         return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+    def send_kvcache_dcp_draft(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        mla_entry_count: int,
+        dst_attn_tp_size: int,
+        dst_tp_rank: int,
+        draft_total_kv_heads: int,
+        dst_dcp_size: int,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        """Transfer the speculative draft (MHA) KV entries under PD DCP.
+
+        The decode draft pool is DCP-*replicated*: every decode DCP rank holds
+        ALL tokens at their full virtual loc (not a ``1/dcp_size`` shard). So we
+        send the WHOLE token set (no dcp stride) and, because the draft KV is
+        head-sharded, slice heads M-to-N exactly like ``send_kvcache_slice``.
+
+        ``mla_entry_count`` is the count of leading MLA entries; the draft
+        entries are ``kv_data_ptrs[mla_entry_count:]`` (layout
+        ``[draft_K..., draft_V...]``, matching the main pool's K-then-V split).
+        """
+        draft_src_kv_ptrs = self.kv_args.kv_data_ptrs[mla_entry_count:]
+        draft_dst_kv_ptrs = dst_kv_ptrs[mla_entry_count:]
+        if not draft_src_kv_ptrs:
+            return 0
+
+        physical_page_size = self.kv_args.page_size
+        plan = build_dcp_replicated_token_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=physical_page_size,
+            dcp_size=dst_dcp_size,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+        if plan.src_token_indices.size == 0:
+            return 0
+
+        # kv_item_lens is per-PAGE bytes (item_bytes * page_size). The transfer
+        # plan addresses tokens individually (src_token_indices are token-
+        # granular), so reduce to a per-token stride before computing addresses;
+        # otherwise every token index is inflated by page_size and the RDMA
+        # addresses land outside the registered memory region.
+        src_page_item_len = self.kv_args.kv_item_lens[mla_entry_count]
+        src_token_item_len = src_page_item_len // physical_page_size
+        # Head geometry: draft KV is head-sharded by attn_tp_size on each side.
+        dst_heads_per_rank = max(1, draft_total_kv_heads // dst_attn_tp_size)
+        src_heads_per_rank = max(1, draft_total_kv_heads // self.attn_tp_size)
+        bytes_per_head = src_token_item_len // src_heads_per_rank
+        dst_token_item_len = dst_heads_per_rank * bytes_per_head
+
+        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
+
+        # Head-slice offsets: mirror send_kvcache_slice's M-to-N mapping.
+        src_replication = max(1, self.attn_tp_size // draft_total_kv_heads)
+        if self.attn_tp_size > dst_attn_tp_size:
+            # Multiple prefill ranks feed one decode rank.
+            src_head_start = 0
+            num_heads_to_send = src_heads_per_rank
+            unique_head_idx = local_tp_rank_in_group // src_replication
+            dst_head_start = (
+                unique_head_idx * src_heads_per_rank
+            ) % dst_heads_per_rank
+        else:
+            # One prefill rank feeds multiple decode ranks.
+            dst_replication = max(1, dst_attn_tp_size // draft_total_kv_heads)
+            unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
+            src_head_start = (
+                unique_dst_head_idx * dst_heads_per_rank
+            ) % src_heads_per_rank
+            num_heads_to_send = dst_heads_per_rank
+            dst_head_start = 0
+
+        src_head_slice_offset = src_head_start * bytes_per_head
+        dst_head_slice_offset = dst_head_start * bytes_per_head
+        heads_bytes_per_token = num_heads_to_send * bytes_per_head
+        if heads_bytes_per_token > dst_token_item_len:
+            logger.error(
+                f"[{mooncake_session_id}] draft slice size "
+                f"({heads_bytes_per_token}) exceeds target token slot size "
+                f"({dst_token_item_len})"
+            )
+            return -1
+
+        src_tokens = plan.src_token_indices.reshape(-1, 1)
+        dst_tokens = plan.dst_token_indices.reshape(-1, 1)
+
+        def process_draft_layer(src_layer_ptr: int, dst_layer_ptr: int) -> int:
+            src_addrs = (
+                src_layer_ptr
+                + src_tokens * src_token_item_len
+                + src_head_slice_offset
+            )
+            dst_addrs = (
+                dst_layer_ptr
+                + dst_tokens * dst_token_item_len
+                + dst_head_slice_offset
+            )
+            src_addr_list = src_addrs.reshape(-1).tolist()
+            if not src_addr_list:
+                return 0
+            dst_addr_list = dst_addrs.reshape(-1).tolist()
+            length_list = [heads_bytes_per_token] * len(src_addr_list)
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            )
+
+        futures = [
+            executor.submit(process_draft_layer, src_ptr, dst_ptr)
+            for src_ptr, dst_ptr in zip(draft_src_kv_ptrs, draft_dst_kv_ptrs)
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            status = future.result()
+            if status != 0:
+                for f in futures:
+                    f.cancel()
+                return status
+        return 0
 
     def send_kvcache_slice(
         self,
@@ -1575,6 +1739,14 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dcp_token_item_lens
                             )
                             assert dcp_token_item_lens is not None
+                            # Split entries at the MLA/draft boundary: the MLA
+                            # prefix takes DCP token relayout; the head-sharded
+                            # draft tail (DCP-replicated) takes a head-slice
+                            # whole-token transfer.
+                            mla_entry_count = (
+                                target_rank_registration_info.dst_num_mla_kv_entries
+                                or len(self.kv_args.kv_item_lens)
+                            )
                             ret = self.send_kvcache_dcp(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -1590,7 +1762,35 @@ class MooncakeKVManager(CommonKVManager):
                                 dst_layer_ids=(
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
+                                mla_entry_count=mla_entry_count,
                             )
+                            if ret == 0 and mla_entry_count < len(
+                                self.kv_args.kv_item_lens
+                            ):
+                                draft_total_kv_heads = (
+                                    self.kv_args.draft_kv_head_num * self.attn_tp_size
+                                )
+                                ret = self.send_kvcache_dcp_draft(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    mla_entry_count=mla_entry_count,
+                                    dst_attn_tp_size=(
+                                        target_rank_registration_info.dst_attn_tp_size
+                                    ),
+                                    dst_tp_rank=(
+                                        target_rank_registration_info.dst_tp_rank
+                                    ),
+                                    draft_total_kv_heads=draft_total_kv_heads,
+                                    dst_dcp_size=(
+                                        target_rank_registration_info.dst_dcp_size
+                                    ),
+                                    src_page_offset=kv_chunk.index_slice.start or 0,
+                                    decode_prefix_len=req.decode_prefix_len or 0,
+                                    num_kv_tokens=kv_chunk.num_kv_tokens,
+                                    executor=executor,
+                                )
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
@@ -1828,10 +2028,28 @@ class MooncakeKVManager(CommonKVManager):
                         decode_kv_args.dst_dcp_rank,
                     )
                     if decode_kv_args.requires_dcp_relayout:
+                        # Prefer the full per-entry list from the decode side so
+                        # heterogeneous geometry (e.g. the head-sharded draft
+                        # pool) survives; fall back to broadcasting the scalar
+                        # for older peers that only sent dst_kv_item_len.
+                        if decode_kv_args.dst_kv_item_lens:
+                            dst_page_item_lens = decode_kv_args.dst_kv_item_lens
+                        else:
+                            dst_page_item_lens = [
+                                decode_kv_args.dst_kv_item_len
+                            ] * len(self.kv_args.kv_item_lens)
+                        # Boundary before the head-sharded draft tail: validate
+                        # only the MLA prefix for exact geometry match.
+                        num_mla_kv_entries = self._resolve_num_mla_kv_entries(
+                            decode_kv_args.dst_num_mla_kv_entries
+                        )
+                        # Persist the reconciled boundary for the transfer
+                        # dispatch to split MLA vs draft entries.
+                        decode_kv_args.dst_num_mla_kv_entries = num_mla_kv_entries
                         decode_kv_args.dcp_token_item_lens = (
                             self.prepare_dcp_token_item_lens(
-                                [decode_kv_args.dst_kv_item_len]
-                                * len(self.kv_args.kv_item_lens)
+                                dst_page_item_lens,
+                                num_mla_kv_entries=num_mla_kv_entries,
                             )
                         )
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
@@ -2197,6 +2415,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_kv_item_len = str(kv_item_len).encode("ascii")
             dst_dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
             dst_dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
+            # Full per-entry KV item_lens list; used by DCP relayout to preserve
+            # heterogeneous geometry (e.g. the head-sharded draft pool) that the
+            # single dst_kv_item_len scalar cannot represent.
+            packed_kv_item_lens = pack_int_lists(
+                [list(self.kv_mgr.kv_args.kv_item_lens)], "I"
+            )
+            # Count of leading MLA (main) entries; the draft tail beyond it takes
+            # the replicated head-slice DCP transfer.
+            dst_num_mla_kv_entries = str(
+                self.kv_mgr.kv_args.num_mla_kv_entries
+            ).encode("ascii")
             if (
                 self.kv_mgr.enable_staging
                 and self.kv_mgr._staging_ctx.allocator is not None
@@ -2231,6 +2460,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            packed_kv_item_lens,
+                            dst_num_mla_kv_entries,
                         ]
                     )
             except zmq.ZMQError:

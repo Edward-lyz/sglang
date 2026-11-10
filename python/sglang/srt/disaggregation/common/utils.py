@@ -196,3 +196,77 @@ def build_dcp_token_transfer_plan(
         + dst_local_offsets % physical_page_size
     )
     return DCPTokenTransferPlan(src_token_indices, dst_token_indices)
+
+
+def build_dcp_replicated_token_transfer_plan(
+    src_page_indices: npt.NDArray[np.int32],
+    dst_page_indices: npt.NDArray[np.int32],
+    *,
+    physical_page_size: int,
+    dcp_size: int,
+    src_page_offset: int = 0,
+    decode_prefix_len: int = 0,
+    num_kv_tokens: Optional[int] = None,
+) -> DCPTokenTransferPlan:
+    """Transfer plan for a DCP-*replicated* pool (e.g. the speculative draft KV
+    pool), where every decode DCP rank stores ALL tokens at their full virtual
+    loc rather than a ``1/dcp_size`` shard.
+
+    Unlike :func:`build_dcp_token_transfer_plan` (which strides the source by
+    ``dcp_size`` and compresses the destination loc by ``dcp_size``), this plan:
+
+    - selects EVERY source token (no ``dcp_rank`` ownership stride), and
+    - maps each token to its FULL virtual loc on the decode side
+      (``dst_page * virtual_page_size + within_page_offset``), since the
+      replicated pool is sized for the whole virtual space and consumes those
+      locs untranslated.
+
+    ``dst_page_indices`` are the decode-side page ids computed with the virtual
+    (``physical_page_size * dcp_size``) page size, exactly as sent for the main
+    MLA pool; the draft pool shares those same indices with the target model.
+    """
+    virtual_page_size = physical_page_size * dcp_size
+    if decode_prefix_len % virtual_page_size != 0:
+        raise ValueError(
+            "PD DCP replicated transfer requires decode_prefix_len to align to "
+            f"the virtual DCP page size ({virtual_page_size}), got "
+            f"{decode_prefix_len}"
+        )
+
+    src_pages = np.asarray(src_page_indices, dtype=np.int64)
+    dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
+    source_capacity = src_pages.size * physical_page_size
+    if num_kv_tokens is None:
+        num_kv_tokens = source_capacity
+    if not 0 <= num_kv_tokens <= source_capacity:
+        raise ValueError(
+            "num_kv_tokens must fit in the provided source pages, "
+            f"got tokens={num_kv_tokens}, capacity={source_capacity}"
+        )
+    if src_pages.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return DCPTokenTransferPlan(empty, empty.copy())
+
+    offsets = np.arange(num_kv_tokens, dtype=np.int64)
+    src_token_indices = (
+        src_pages[offsets // physical_page_size] * physical_page_size
+        + offsets % physical_page_size
+    )
+
+    relative_positions = src_page_offset * physical_page_size + offsets
+    dst_page_ordinals = relative_positions // virtual_page_size
+    if dst_page_ordinals.size and (
+        dst_pages.size == 0 or int(dst_page_ordinals.max()) >= dst_pages.size
+    ):
+        required_pages = int(dst_page_ordinals.max()) + 1
+        raise ValueError(
+            "Insufficient destination DCP pages for replicated transfer: "
+            f"required={required_pages}, provided={dst_pages.size}, "
+            f"src_page_offset={src_page_offset}"
+        )
+
+    dst_token_indices = (
+        dst_pages[dst_page_ordinals] * virtual_page_size
+        + relative_positions % virtual_page_size
+    )
+    return DCPTokenTransferPlan(src_token_indices, dst_token_indices)
