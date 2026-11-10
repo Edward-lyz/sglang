@@ -112,7 +112,7 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
         if loaded_indices is None or len(loaded_indices) == 0:
             return empty, anchor
 
-        req.ever_read_as = True
+        req.as_read_pending_lock = True
         return self._insert_loaded(cache, req, anchor, load_info, loaded_indices)
 
     def _match_remote(

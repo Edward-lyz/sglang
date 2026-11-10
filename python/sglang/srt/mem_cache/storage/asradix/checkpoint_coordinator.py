@@ -409,7 +409,7 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
                 token_count,
                 len(tree_indices),
             )
-        req.ever_read_as = True
+        req.as_read_pending_lock = True
         return tree_indices, match.last_device_node
 
     def do_write(self, cache, task: _SPAWriteTask) -> int:
@@ -678,7 +678,7 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
         if loaded is None:
             return empty, anchor
         loaded_indices, value_transaction, checkpoint_allocation = loaded
-        req.ever_read_as = True
+        req.as_read_pending_lock = True
         return self._insert_loaded(
             cache,
             req,

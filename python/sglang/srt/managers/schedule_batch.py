@@ -982,6 +982,10 @@ class Req(ReqDllmMixin):
         self.as_max_hit_host_ip: list = []
         self.as_max_hit_token_len: list = []
         self.ever_read_as: bool = False
+        # An AS read only counts once an admission locks the loaded prefix:
+        # a rejected admission leaves it evictable, and a rank that latched
+        # ever_read_as on it would then match a shorter prefix than its peers.
+        self.as_read_pending_lock: bool = False
         # A short/failed AttentionStore read is fatal for this request under PP;
         # allowing forward with a different prefix would desynchronize stages.
         self._as_cache_read_abort_reason: Optional[str] = None
@@ -1734,6 +1738,11 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
+        # The loaded prefix is gone, so a re-prefill must read AttentionStore
+        # again; under PP that joint match is also what caps every stage's local
+        # prefix down to the same absolute terminal block.
+        self.ever_read_as = False
+        self.as_read_pending_lock = False
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.skip_lock_node_ids = {}
