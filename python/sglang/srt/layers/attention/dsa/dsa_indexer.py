@@ -190,6 +190,16 @@ def build_paged_mqa_schedule_metadata(
             context_lens, block_kv, num_sms
         )
 
+    # A (B, next_n) tensor uses DeepGEMM's native single-launch path, where
+    # the kernel walks next_n internally. Chunking would flatten it to one row
+    # per token and silently switch the kernel to kNextN=1, which can deadlock
+    # in fetch_next_task. Keep the native layout intact; per-token (N, 1)
+    # layouts still use chunking for the long-context memory bound.
+    if context_lens.dim() == 2 and context_lens.size(1) > 1:
+        return deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, block_kv, num_sms
+        )
+
     max_rows = max(
         1,
         max_chunk_mb
@@ -202,6 +212,12 @@ def build_paged_mqa_schedule_metadata(
         return deep_gemm.get_paged_mqa_logits_metadata(
             context_lens, block_kv, num_sms
         )
+
+    # Native layouts must return above instead of being flattened into the
+    # generic chunk schedule, which would change the kernel's next_n shape.
+    assert not (
+        context_lens.dim() == 2 and context_lens.size(1) > 1
+    ), f"native paged-MQA layout {tuple(context_lens.shape)} must not be chunked"
 
     flat_context_lens = context_lens.reshape(-1, 1)
     schedules = []
@@ -458,7 +474,7 @@ class Indexer(MultiPlatformOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
-    _mqa_logits_budget_bytes: Dict[int, int] = {}
+    _mqa_logits_budget_bytes: Dict[Tuple[int, float], int] = {}
 
     @staticmethod
     def _mqa_logits_free_mem_fraction() -> float:
@@ -483,6 +499,7 @@ class Indexer(MultiPlatformOp):
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
         config=None,
+        is_nextn: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -492,6 +509,7 @@ class Indexer(MultiPlatformOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.is_nextn = is_nextn
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
@@ -1093,6 +1111,12 @@ class Indexer(MultiPlatformOp):
 
         if isinstance(schedule_metadata, PagedMQAScheduleMetadata):
             assert schedule_metadata.num_rows == q_offset
+            # A chunked schedule and the native single-launch path are
+            # mutually exclusive. Catch an inconsistent schedule on host.
+            assert not use_dg_native, (
+                "chunked schedule reached the native paged-MQA launch "
+                f"(B={B}, next_n={next_n})"
+            )
             seqlens_flat = seqlens_32.reshape(-1)[:q_offset]
             page_table_1 = metadata.get_page_table_1()
             topk_result = torch.full(
@@ -1213,10 +1237,26 @@ class Indexer(MultiPlatformOp):
         return topk_result
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
-        free_mem_fraction = self._mqa_logits_free_mem_fraction()
-        cached_budget = self._mqa_logits_budget_bytes.get(device_index)
+        requested_fraction = self._mqa_logits_free_mem_fraction()
+        # draft 前向仍持有 target 激活，单独限制预算，避免提高 target 预算后挤占显存。
+        free_mem_fraction = (
+            min(requested_fraction, 0.2) if self.is_nextn else requested_fraction
+        )
+        cache_key = (device_index, free_mem_fraction)
+        cached_budget = self._mqa_logits_budget_bytes.get(cache_key)
         if cached_budget is not None:
             return cached_budget
+        if free_mem_fraction != requested_fraction:
+            target_budget = self._mqa_logits_budget_bytes.get(
+                (device_index, requested_fraction)
+            )
+            if target_budget is not None:
+                # 复用 target 首次查询的空闲显存快照，避免在其激活存活时再次同步查询。
+                budget_bytes = max(
+                    1, int(target_budget * free_mem_fraction / requested_fraction)
+                )
+                self._mqa_logits_budget_bytes[cache_key] = budget_bytes
+                return budget_bytes
 
         total_mem = torch.cuda.get_device_properties(device_index).total_memory
 
@@ -1245,7 +1285,7 @@ class Indexer(MultiPlatformOp):
         budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
 
         budget_bytes = max(1, budget_bytes)
-        self._mqa_logits_budget_bytes[device_index] = budget_bytes
+        self._mqa_logits_budget_bytes[cache_key] = budget_bytes
         return budget_bytes
 
     def _should_chunk_mqa_logits(
@@ -1466,6 +1506,8 @@ class Indexer(MultiPlatformOp):
                 topk_indices_offset_override=topk_offset_chunk,
             )
             topk_result[start:end] = raw_topk_chunk
+            # 消费操作已排到当前流；下一块分配前释放引用，只保留一块大 logits 临时张量。
+            del logits_chunk
             start = end
 
         return topk_result
