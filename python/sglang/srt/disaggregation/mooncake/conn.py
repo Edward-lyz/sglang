@@ -1026,27 +1026,53 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
-        src_tokens = plan.src_token_indices.reshape(-1, 1)
-        dst_tokens = plan.dst_token_indices.reshape(-1, 1)
+        # The replicated draft plan selects EVERY source token (no dcp stride), so
+        # consecutive tokens are usually adjacent on both sides. Merging them into
+        # one descriptor per run is only address-equivalent when a token's slice
+        # covers its whole slot on both sides -- with a head slice the per-token
+        # blocks are strided and must stay separate.
+        whole_token_slice = (
+            src_head_slice_offset == 0
+            and dst_head_slice_offset == 0
+            and heads_bytes_per_token == src_token_item_len
+            and heads_bytes_per_token == dst_token_item_len
+        )
+        if whole_token_slice:
+            run_src_starts, run_dst_starts, run_counts = (
+                contiguous_run_starts_and_counts(
+                    plan.src_token_indices,
+                    plan.dst_token_indices,
+                )
+            )
+            src_token_offsets = run_src_starts * src_token_item_len
+            dst_token_offsets = run_dst_starts * dst_token_item_len
+            run_lengths = (run_counts * heads_bytes_per_token).tolist()
+            logger.info_once(
+                "PD DCP draft transfer coalesces whole-token runs "
+                f"(src_item={src_token_item_len} dst_item={dst_token_item_len})"
+            )
+        else:
+            src_token_offsets = (
+                plan.src_token_indices * src_token_item_len + src_head_slice_offset
+            )
+            dst_token_offsets = (
+                plan.dst_token_indices * dst_token_item_len + dst_head_slice_offset
+            )
+            run_lengths = [heads_bytes_per_token] * src_token_offsets.size
+            logger.info_once(
+                "PD DCP draft transfer stays per-token: head slice "
+                f"src_off={src_head_slice_offset} dst_off={dst_head_slice_offset} "
+                f"slice={heads_bytes_per_token} src_item={src_token_item_len} "
+                f"dst_item={dst_token_item_len}"
+            )
 
         def process_draft_layer(src_layer_ptr: int, dst_layer_ptr: int) -> int:
-            src_addrs = (
-                src_layer_ptr
-                + src_tokens * src_token_item_len
-                + src_head_slice_offset
-            )
-            dst_addrs = (
-                dst_layer_ptr
-                + dst_tokens * dst_token_item_len
-                + dst_head_slice_offset
-            )
-            src_addr_list = src_addrs.reshape(-1).tolist()
-            if not src_addr_list:
+            if not run_lengths:
                 return 0
-            dst_addr_list = dst_addrs.reshape(-1).tolist()
-            length_list = [heads_bytes_per_token] * len(src_addr_list)
+            src_addr_list = (src_layer_ptr + src_token_offsets).tolist()
+            dst_addr_list = (dst_layer_ptr + dst_token_offsets).tolist()
             return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+                mooncake_session_id, src_addr_list, dst_addr_list, run_lengths
             )
 
         futures = [
