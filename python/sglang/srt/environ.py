@@ -1001,6 +1001,11 @@ class Envs:
     )
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    # Single-request PAGED prefill top-k through the DeepSeek-V4 v2 JIT kernel
+    # instead of sgl_kernel's fast_topk_transform_fused: ~2x faster on long
+    # rows (3584 x 496K: 4.4 -> 2.2 ms) and exact where the legacy kernel is
+    # not (4096 x 266K rows).
+    SGLANG_DSA_PREFILL_TOPK_V2 = EnvBool(False)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )

@@ -110,6 +110,24 @@ class DSATopKBackend(Enum):
         ):
             return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
 
+        # Single-request PAGED prefill: every row shares the one page-table row
+        # and its scores start at column 0 (ks == 0), so the v2 kernel can read
+        # a stride-0 broadcast of that row. batch_idx_list, if any, is all zeros.
+        if (
+            envs.SGLANG_DSA_PREFILL_TOPK_V2.get()
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and 0 < topk <= 2048
+            and getattr(attn_metadata, "real_page_table", None) is not None
+            and attn_metadata.real_page_table.shape[0] == 1
+            and attn_metadata.real_page_table.dtype == torch.int32
+            and logits.dtype == torch.float32
+            and logits.stride(1) == 1
+            and logits.stride(0) % 4 == 0
+        ):
+            return _topk_transform_v2_paged_prefill(
+                logits, lengths, topk, attn_metadata
+            )
+
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
         # which is always present here: the fold only drops it for the decode case
         # dispatched to v2 above.
@@ -300,6 +318,32 @@ def _topk_transform_v2_paged(
     page_size = get_token_to_kv_pool().page_size
     out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
     topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan)
+    return out
+
+
+def _topk_transform_v2_paged_prefill(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    attn_metadata,
+) -> torch.Tensor:
+    """Prefill variant of :func:`_topk_transform_v2_paged` for a batch of one
+    request: the plan is built from this call's row lengths (prefill metadata
+    carries no ``topk_v2_plan``) and the page table is broadcast per row."""
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        plan_topk_v2,
+        topk_transform_512_v2,
+    )
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    num_rows = logits.shape[0]
+    lengths_i32 = lengths.to(torch.int32)
+    page_table = attn_metadata.real_page_table.expand(num_rows, -1)
+    plan = plan_topk_v2(lengths_i32)
+    out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
+    topk_transform_512_v2(
+        logits, lengths_i32, page_table, out, get_token_to_kv_pool().page_size, plan
+    )
     return out
 
 
