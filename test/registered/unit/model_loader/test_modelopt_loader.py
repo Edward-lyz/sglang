@@ -5,6 +5,7 @@ This test module verifies the functionality of ModelOptModelLoader, which
 applies NVIDIA Model Optimizer quantization to models during loading.
 """
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
+    _is_k3_attn_fp8_target,
 )
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.srt.models.utils import WeightsMapper
@@ -40,6 +42,12 @@ register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 class TestModelOptModelLoader(CustomTestCase):
     """Test cases for ModelOptModelLoader functionality."""
+
+    def test_k3_runtime_qkv_is_an_fp8_target(self):
+        with patch.dict(os.environ, {"SGLANG_K3_ATTN_MOE_FP8": "1"}):
+            self.assertTrue(
+                _is_k3_attn_fp8_target("model.layers.0.self_attn.qkv_proj")
+            )
 
     def setUp(self):
         """Set up test fixtures."""

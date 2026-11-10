@@ -127,6 +127,13 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+# The v3 checkpoint quantizes attention projections to ModelOpt FP8 while
+# retaining the original serialized MXFP4 routed-expert tensors.  Keep the
+# mixed path opt-in so other K3 checkpoints retain their existing dispatch.
+# Single opt-in switch for the K3 FP8 checkpoint. It covers the named
+# attention and MoE projections together so incompatible loader modes cannot
+# be enabled independently.
+_k3_attn_moe_fp8 = get_bool_env_var("SGLANG_K3_ATTN_MOE_FP8")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -275,14 +282,37 @@ class KimiK3MLP(nn.Module):
         _tp_kwargs = (
             dict(tp_rank=tp_rank, tp_size=tp_size) if tp_size is not None else {}
         )
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-            **_tp_kwargs,
-        )
+        # Shared MoE keeps gate_proj in BF16 while up_proj is FP8. Separate
+        # modules preserve the checkpoint dtypes and avoid a mixed merged
+        # parameter being interpreted by one GEMM path.
+        self._mixed_gate_up = _k3_attn_moe_fp8 and ".shared_experts" in prefix
+        if self._mixed_gate_up:
+            self.gate_proj = ColumnParallelLinear(
+                hidden_size,
+                intermediate_size,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.gate_proj",
+                **_tp_kwargs,
+            )
+            self.up_proj = ColumnParallelLinear(
+                hidden_size,
+                intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.up_proj",
+                **_tp_kwargs,
+            )
+            self.gate_up_proj = None
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_up_proj",
+                **_tp_kwargs,
+            )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -318,7 +348,12 @@ class KimiK3MLP(nn.Module):
             local_hidden_states = hidden_states
             hidden_states = get_global_dp_buffer(get_tp_group())
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
-        gate_up, _ = self.gate_up_proj(hidden_states)
+        if self._mixed_gate_up:
+            gate, _ = self.gate_proj(hidden_states)
+            up, _ = self.up_proj(hidden_states)
+            gate_up = torch.cat((gate, up), dim=-1)
+        else:
+            gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
         hidden_states, _ = self.down_proj(hidden_states)
         if use_dp:
@@ -396,10 +431,16 @@ class KimiK3MoE(nn.Module):
         # full precision (matches GateLinear in mke). codespell:ignore mke
         self.gate = MoEGate(config, quant_config=None, prefix=f"{prefix}.gate")
 
-        # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
-        # so FusedMoE's weight_loader uses the MXFP4 fast path
+        # The attention-only FP8 checkpoint still stores routed experts as the
+        # original serialized MXFP4 tensors (uint8 packed weights + UE8M0
+        # block scales). FusedMoE must use the MXFP4 loader instead of
+        # ModelOptFp8MoEMethod, which would allocate dense FP8 expert weights.
         moe_quant_config = quant_config
-        if quant_config is not None and getattr(quant_config, "quant_format", None):
+        if _k3_attn_moe_fp8:
+            from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+
+            moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
+        elif quant_config is not None and getattr(quant_config, "quant_format", None):
             if "mxfp4" in quant_config.quant_format:
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 
@@ -551,7 +592,7 @@ class KimiK3MoE(nn.Module):
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config if _k3_attn_moe_fp8 else None,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             self.routed_expert_norm = (
@@ -563,7 +604,7 @@ class KimiK3MoE(nn.Module):
                 self.moe_hidden_size,
                 hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config if _k3_attn_moe_fp8 else None,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
         else:
@@ -614,9 +655,20 @@ class KimiK3MoE(nn.Module):
             return []
         targets = ["routed_expert_down_proj", "routed_expert_up_proj"]
         if self._shared_experts_tp1 and self.shared_experts is not None:
-            targets.extend(
-                ["shared_experts.gate_up_proj", "shared_experts.down_proj"]
-            )
+            if _k3_attn_moe_fp8:
+                # ModelOpt K3 splits shared gate/up so each physical linear
+                # can retain its own dtype and scale layout.
+                targets.extend(
+                    [
+                        "shared_experts.gate_proj",
+                        "shared_experts.up_proj",
+                        "shared_experts.down_proj",
+                    ]
+                )
+            else:
+                targets.extend(
+                    ["shared_experts.gate_up_proj", "shared_experts.down_proj"]
+                )
         return targets
 
     def _merge_front_weights(self) -> None:
@@ -632,6 +684,10 @@ class KimiK3MoE(nn.Module):
         quantized or mixed-dtype checkpoints keep the unfused path.
         """
         if not self.use_latent_moe or self._weight_shard_hosted:
+            return
+        if self.shared_experts is not None and self.shared_experts._mixed_gate_up:
+            # Mixed BF16 gate + FP8 up cannot be represented by the fused
+            # front weight; retain the independent GEMM path.
             return
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
             mods = [
@@ -2973,11 +3029,22 @@ class KimiK3LinearForCausalLM(nn.Module):
                 )
                 if fused_name in params_dict:
                     param = params_dict[fused_name]
+                    # Attention-only FP8 checkpoints store channel scales as
+                    # a flat [N] vector, while runtime fused parameters keep
+                    # scales in [N, 1] for GEMM broadcasting.
+                    if (
+                        loaded_weight.ndim == 1
+                        and param.data.ndim == 2
+                        and param.data.shape[1] == 1
+                    ):
+                        loaded_weight = loaded_weight.unsqueeze(-1)
                     if ".q_a_proj." in name:
                         param.data[: loaded_weight.shape[0]].copy_(loaded_weight)
                     else:
                         q_lora_rank = self.config.q_lora_rank or 0
-                        param.data[q_lora_rank:].copy_(loaded_weight)
+                        param.data[
+                            q_lora_rank : q_lora_rank + loaded_weight.shape[0]
+                        ].copy_(loaded_weight)
                     loaded_params.add(fused_name)
                     continue
 
@@ -2988,6 +3055,15 @@ class KimiK3LinearForCausalLM(nn.Module):
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
+                    continue
+                # In MoE-FP8 mode shared gate/up are separate parameters. Let
+                # their original checkpoint names fall through to the direct
+                # loader instead of remapping them to gate_up_proj.
+                if (
+                    _k3_attn_moe_fp8
+                    and ".shared_experts." in name
+                    and param_name == ".gate_up_proj"
+                ):
                     continue
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
@@ -3009,6 +3085,12 @@ class KimiK3LinearForCausalLM(nn.Module):
                         continue
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Some checkpoints contain a stacked shard for a projection
+                # that is intentionally unquantized or absent in this runtime
+                # layout. Do not turn that naming mismatch into a process-wide
+                # scheduler crash.
+                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -3052,10 +3134,30 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if maybe_load_truncated_moe_gate(name, param, loaded_weight):
                         loaded_params.add(name)
                         continue
+                    if (
+                        _k3_attn_moe_fp8
+                        and name.endswith(".weight_scale")
+                        and loaded_weight.ndim == 1
+                        and param.data.ndim == 2
+                        and param.data.shape[1] == 1
+                    ):
+                        loaded_weight = loaded_weight.unsqueeze(-1)
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    weight_loader(param, loaded_weight, **kwargs)
+                    try:
+                        weight_loader(param, loaded_weight, **kwargs)
+                    except AssertionError:
+                        logger.error(
+                            "K3 weight shape mismatch name=%s param_shape=%s "
+                            "loaded_shape=%s param_type=%s kwargs=%s",
+                            name,
+                            tuple(param.data.shape),
+                            tuple(loaded_weight.shape),
+                            type(param).__name__,
+                            kwargs,
+                        )
+                        raise
             loaded_params.add(name)
 
         self.post_load_weights()
@@ -3073,13 +3175,62 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer, PPMissingLayer):
                 continue
             self_attn = layer.self_attn
-            w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
+            # FlashInfer bmm_fp8 accepts a per-tensor B scale, while the v3
+            # ModelOpt checkpoint stores kv_b_proj with per-output-channel
+            # scales. Normalize the weight before constructing MLA absorb
+            # buffers so every BMM output uses the intended scale.
+            kv_b_weight = self_attn.kv_b_proj.weight
+            kv_b_weight_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
+            # Some remote/dummy loaders invoke this hook after transposing the
+            # parameter to [in, out]. Restore checkpoint [out, in] layout.
+            kv_b_head_dim = self_attn.qk_nope_head_dim + self_attn.v_head_dim
+            if (
+                kv_b_weight.ndim == 2
+                and kv_b_weight.shape[0] == self_attn.kv_lora_rank
+                and kv_b_weight.shape[1] % kv_b_head_dim == 0
+            ):
+                kv_b_weight = kv_b_weight.transpose(0, 1).contiguous()
+
+            # The unified K3 FP8 switch always uses the corrected
+            # per-channel-to-per-tensor conversion. The old BF16 fallback
+            # switch is intentionally removed so deployment cannot silently
+            # select a different MLA path.
+            use_mla_kvb_bf16 = False
+            if kv_b_weight.dtype == torch.float8_e4m3fn:
+                if kv_b_weight_scale is None:
+                    raise RuntimeError(
+                        "FP8 kv_b_proj is missing weight_scale for MLA absorb"
+                    )
+                if use_mla_kvb_bf16:
+                    # Accuracy-isolation path: bypass FP8 BMM completely.
+                    kv_b_weight = (
+                        kv_b_weight.to(torch.bfloat16)
+                        * kv_b_weight_scale.to(torch.bfloat16)
+                    )
+                    mla_kvb_bmm_scale = 1.0
+                else:
+                    from sglang.srt.layers.quantization.fp8_utils import (
+                        channel_quant_to_tensor_quant,
+                    )
+
+                    kv_b_weight, mla_kvb_bmm_scale = channel_quant_to_tensor_quant(
+                        kv_b_weight, kv_b_weight_scale
+                    )
+                    # FlashInfer expects a single scalar scale tensor.
+                    mla_kvb_bmm_scale = mla_kvb_bmm_scale.reshape(1)
+            else:
+                mla_kvb_bmm_scale = 1.0
+
+            w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-            if hasattr(self_attn.kv_b_proj, "weight_scale"):
-                self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+            if kv_b_weight.dtype != torch.float8_e4m3fn:
+                mla_kvb_bmm_scale = getattr(
+                    self_attn.kv_b_proj, "weight_scale", 1.0
+                )
+            self_attn.w_scale = mla_kvb_bmm_scale
             if envs.SGLANG_K3_DEL_MLA_KVB_DCP.get():
                 dtype = self_attn.kv_b_proj.weight.data.dtype
                 dev = self_attn.kv_b_proj.weight.data.device
@@ -3133,7 +3284,10 @@ class KimiK3LinearForCausalLM(nn.Module):
 
             if precompile_k3_recompute_w_u_kernel(
                 num_heads=layer.self_attn.local_num_heads,
-                dtype=layer.self_attn.o_proj.weight.dtype,
+                # KDA state/recompute kernels operate on the activation
+                # dtype.  Attention projection weights may be FP8 in the
+                # mixed checkpoint, but their GEMM output remains BF16.
+                dtype=torch.bfloat16,
                 device=layer.self_attn.dt_bias.device,
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")

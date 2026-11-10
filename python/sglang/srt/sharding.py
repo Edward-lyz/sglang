@@ -1517,8 +1517,16 @@ def _install_row_shard_loader(
             loaded_weight.narrow(0, lo - block_off, hi - lo)
         )
 
-    # Plain setattr: `set_weight_attrs` asserts the key is absent.
-    param.weight_loader = _row_shard_loader
+    # ModelWeightParameter exposes ``weight_loader`` as a read-only property
+    # backed by ``_weight_loader``.  Replace the backing callback directly so
+    # the loader remains compatible with both vLLM-style parameters and plain
+    # Parameters used by older model implementations.
+    if hasattr(param, "_weight_loader"):
+        param._weight_loader = _row_shard_loader
+    else:
+        # Plain ``torch.nn.Parameter`` instances do not define the backing
+        # field; preserve the legacy attribute-based loader path for them.
+        setattr(param, "weight_loader", _row_shard_loader)
 
 
 def _setup_shard_weight(
@@ -1560,19 +1568,34 @@ def _setup_shard_weight(
 
     weight = target_mod.weight.data  # nn.Linear weight: (out_per_tp, in)
     quant_method = getattr(target_mod, "quant_method", None)
+    is_unquantized = (
+        quant_method is not None
+        and type(quant_method).__name__ == "UnquantizedLinearMethod"
+        and weight.dtype in (torch.bfloat16, torch.float16)
+    )
+    is_modelopt_fp8 = (
+        quant_method is not None
+        and type(quant_method).__name__ == "ModelOptFp8LinearMethod"
+        and weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    )
     if (
         weight.ndim != 2
         or not weight.is_contiguous()
-        or weight.dtype not in (torch.bfloat16, torch.float16)
-        or quant_method is None
-        or type(quant_method).__name__ != "UnquantizedLinearMethod"
+        or not (is_unquantized or is_modelopt_fp8)
     ):
         raise RuntimeError(
-            f"K3 weight sharding only supports contiguous, unquantized bf16/fp16 "
+            f"K3 weight sharding only supports contiguous bf16/fp16 or ModelOpt FP8 "
             f"linear weights; {target_attr} has shape={tuple(weight.shape)}, "
             f"dtype={weight.dtype}, contiguous={weight.is_contiguous()}, "
             f"quant_method={type(quant_method).__name__}"
         )
+    if is_modelopt_fp8:
+        # Keep the serialized FP8 weight in physical (N, K) layout while it is
+        # row-sharded and flat-all-gathered. The corresponding channel scale
+        # remains replicated and is intentionally excluded from the flat
+        # staging layout. ModelOpt's apply() transposes the reconstructed full
+        # weight back to GEMM layout when this marker is present.
+        target_mod._k3_moe_flat_ag_fp8 = True
     out_per_tp, in_dim = weight.shape
     rank0 = (not dist.is_initialized()) or (dist.get_rank() == 0)
     module_tp_size = _module_tp_size(target_mod)
