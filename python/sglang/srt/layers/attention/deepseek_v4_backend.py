@@ -2923,6 +2923,37 @@ class DeepseekV4AttnBackend(
             pos_global = forward_batch.positions[:total].to(torch.int64)
         num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
+            fused_extend = (
+                layer.compressor.use_fused_compress
+                and tail is None
+                and envs.SGLANG_OPT_DSV41_FUSED_EXTEND_COMPRESS.get()
+            )
+            if fused_extend and envs.SGLANG_FUSE_CP_COMPRESS_PROJ_FIRST.get():
+                # [fusion-opt] The compressor projection is row-wise: run it on this
+                # rank's rows and CP-gather the projected [T, D|2D] instead of the raw
+                # [T, hidden] x (2.5x / 10x fewer bytes, 1/cp of the GEMM rows).
+                compressor = layer.compressor
+                proj_local = (
+                    compressor.wkv(x)
+                    if layer.compress_ratio == 1
+                    else compressor.project_fused(x)
+                )
+                proj_global = cp_materialize_global_token_order(
+                    proj_local.contiguous(), forward_batch, torch.cuda.current_stream()
+                )[:total]
+                del proj_local
+                lens = forward_batch.extend_seq_lens.to(torch.int32)
+                self._low_ratio_compress_fused(
+                    layer,
+                    None,
+                    req_global,
+                    pos_global,
+                    extend_offsets=(torch.cumsum(lens, 0, dtype=torch.int32) - lens, lens),
+                    projected=proj_global,
+                )
+                del proj_global
+                run_compressor = False
+        if run_compressor and layer.compressor is not None:
             x_global = cp_materialize_global_token_order(
                 x.contiguous(), forward_batch, torch.cuda.current_stream()
             )[:total]
@@ -3071,7 +3102,7 @@ class DeepseekV4AttnBackend(
         )
 
     def _low_ratio_compress_fused(
-        self, layer, x, req, pos, *, draft_len=1, extend_offsets=None
+        self, layer, x, req, pos, *, draft_len=1, extend_offsets=None, projected=None
     ) -> None:
         """Fused compressor write, index-key projection, then fused index-key write.
         Both write kernels consume metadata dtypes directly and suppress padded stores.
@@ -3100,7 +3131,9 @@ class DeepseekV4AttnBackend(
         kv_layout = pool.get_extra_key_layout(layer_id)
         assert kv_cache is not None
         # The kernels match exactly x's rows; CP extend metadata can be longer.
-        num_rows = x.shape[0]
+        # [fusion-opt] projected: the compressor projection already computed (and
+        # CP-gathered) by the caller; x is unused then.
+        num_rows = projected.shape[0] if projected is not None else x.shape[0]
         raw_out_loc = core.raw_out_loc[:num_rows]
         if extend_offsets is not None:
             from sglang.srt.utils.community_opt import log_community_opt_once
@@ -3115,7 +3148,7 @@ class DeepseekV4AttnBackend(
         if layer.compress_ratio == 1:
             # At ratio 1, c1_out_loc equals the int64 raw_out_loc supplied by the scheduler.
             latent = c1_decode_norm_rope_store(
-                compressor.wkv(x),
+                projected if projected is not None else compressor.wkv(x),
                 compressor.norm.weight.data,
                 pos,
                 raw_out_loc,
@@ -3131,7 +3164,7 @@ class DeepseekV4AttnBackend(
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
             state = pool.get_attention_compress_states(layer_id)
             args = (
-                compressor.project_fused(x),
+                projected if projected is not None else compressor.project_fused(x),
                 state.kv_score_buffer.kv_score,
                 compressor.norm.weight.data,
                 pos,
@@ -3484,7 +3517,23 @@ class DeepseekV4AttnBackend(
                     width,
                 )
                 scores = logits[:, :lc]
-                if publish is not None:
+                if publish is not None and envs.SGLANG_FUSE_CANDIDATE_BLOCK_SCORE.get():
+                    # [fusion-opt] one Triton pass: the length mask (kept in place for
+                    # the top-k below), block amax and newest-block keep
+                    from sglang.kernels.ops.attention.dsv4.candidate_block_score import (
+                        fused_select_candidate_block_ids,
+                    )
+
+                    masks.append(
+                        fused_select_candidate_block_ids(
+                            scores,
+                            lens,
+                            lc,
+                            indexer.candidate_topk_blocks,
+                            indexer.candidate_block_size,
+                        )
+                    )
+                elif publish is not None:
                     # the block selection tells unreachable positions apart by -inf
                     scores.masked_fill_(
                         torch.arange(lc, device=device) >= lens[:, None], -torch.inf

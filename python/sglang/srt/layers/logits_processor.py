@@ -224,6 +224,10 @@ class LogitsProcessorOutput:
     # all-gather padding rows and must not be committed.
     hidden_states_rank_major: Optional[torch.Tensor] = None
     hidden_states_row_token_index: Optional[torch.Tensor] = None
+    # [fusion-opt] SGLANG_FUSE_DSPARK_COMMIT_TAIL_ONLY: per captured row, whether its
+    # aux was computed (late-layer tail); + CPU upper bound of the True count.
+    dspark_commit_mask: Optional[torch.Tensor] = None
+    dspark_commit_rows_ub: Optional[int] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.

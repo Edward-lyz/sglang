@@ -359,6 +359,38 @@ class DeepseekV2MLP(nn.Module):
                 x = (x, None, y)
 
             gate_up, _ = self.gate_up_proj(x)
+        # [fusion-opt] SGLANG_FUSE_SHARED_SILU_QUANT_DEEPGEMM: block-fp8 [32,32] ue8m0
+        # down_proj served as MXFP8 on DeepGEMM -> one JIT kernel does silu*up + clamp
+        # + per-32 ue8m0 quant straight into DeepGEMM's packed scale layout, instead of
+        # silu_and_mul_clamp (bf16 out) + a separate per_token_group_quant inside down_proj.
+        if (
+            envs.SGLANG_FUSE_SHARED_SILU_QUANT_DEEPGEMM.get()
+            and self.swiglu_limit is not None
+            and not self.down_proj.reduce_results
+            and not isinstance(gate_up, tuple)
+            and gate_up.dtype == torch.bfloat16
+            and gate_up.is_contiguous()
+            and gate_up.shape[0] > 0
+            and _down_proj_is_deepgemm_mxfp8(self.down_proj)
+        ):
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                w8a8_mxfp8_matmul_deepgemm,
+            )
+            from sglang.kernels.ops.quantization.silu_mul_mxfp8_deepgemm import (
+                silu_mul_mxfp8_deepgemm,
+            )
+
+            down_input_fp8, down_input_scale = silu_mul_mxfp8_deepgemm(
+                gate_up, float(self.swiglu_limit)
+            )
+            return w8a8_mxfp8_matmul_deepgemm(
+                down_input_fp8,
+                self.down_proj.weight,
+                down_input_scale,
+                self.down_proj.weight_scale_inv_deepgemm,
+                output_dtype=torch.bfloat16,
+            )
+
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).
@@ -488,6 +520,25 @@ class DeepseekV2MLP(nn.Module):
             x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+
+def _down_proj_is_deepgemm_mxfp8(linear) -> bool:
+    """[fusion-opt] down_proj runs the block-fp8-as-MXFP8 route on DeepGEMM."""
+    qm = getattr(linear, "quant_method", None)
+    backend = getattr(qm, "mxfp8_dense_backend", None)
+    weight = getattr(linear, "weight", None)
+    return (
+        getattr(qm, "block_fp8_as_mxfp8", False)
+        and getattr(linear, "block_fp8_mxfp8_ready", False)
+        and backend is not None
+        and backend.is_deep_gemm()
+        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and getattr(linear, "weight_scale_inv_swizzled", None) is None
+        and weight is not None
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.shape[0] % 64 == 0
+        and weight.shape[1] % 128 == 0
+    )
 
 
 class MoEGate(nn.Module):

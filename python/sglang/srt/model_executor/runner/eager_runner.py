@@ -467,6 +467,8 @@ class EagerRunner(BaseRunner):
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
         aux_row_to_token = None
+        dspark_commit_mask = None
+        aux_tail_gathered = None
         if aux_hidden_states is not None:
             if isinstance(aux_hidden_states, torch.Tensor):
                 aux_hidden_states = cp_gather_after_forward(
@@ -488,7 +490,32 @@ class EagerRunner(BaseRunner):
                 # hidden_states_row_token_index carries. See SOLUTION.md §4/§10.
                 local_packed = torch.cat(aux_hidden_states, dim=-1)
                 del aux_hidden_states[:]
-                if forward_batch.capture_hidden_mode.is_full():
+                tail_global_idx = getattr(
+                    forward_batch, "dspark_aux_tail_global_idx", None
+                )
+                if tail_global_idx is not None:
+                    # [fusion-opt] SGLANG_FUSE_DSPARK_AUX_TAIL_GATHER: every rank holds
+                    # its (equally padded) tail rows; gather them rank-major together
+                    # with their global token index. The logits processor gets no aux
+                    # (it would index it by token); the commit reads it below.
+                    from sglang.srt.layers.dp_attention import (
+                        attn_cp_all_gather_into_tensor,
+                    )
+                    from sglang.srt.runtime_context import get_parallel
+
+                    cp_size = get_parallel().attn_cp_size
+                    rows = local_packed.shape[0]
+                    gathered = local_packed.new_empty(
+                        (cp_size * rows, local_packed.shape[1])
+                    )
+                    attn_cp_all_gather_into_tensor(gathered, local_packed.contiguous())
+                    gathered_idx = tail_global_idx.new_empty((cp_size * rows,))
+                    attn_cp_all_gather_into_tensor(
+                        gathered_idx, tail_global_idx.contiguous()
+                    )
+                    aux_tail_gathered = (gathered, gathered_idx.to(torch.int64))
+                    aux_hidden_states = None
+                elif forward_batch.capture_hidden_mode.is_full():
                     aux_hidden_states, aux_row_to_token = cp_gather_rank_major(
                         local_packed, forward_batch, stream
                     )
@@ -500,6 +527,13 @@ class EagerRunner(BaseRunner):
                         local_packed, forward_batch, stream
                     )
                 del local_packed
+                if aux_hidden_states is not None and getattr(
+                    forward_batch, "dspark_commit_mask_appended", False
+                ):
+                    # [fusion-opt] SGLANG_FUSE_DSPARK_COMMIT_TAIL_ONLY: the model
+                    # appended a 1-column commit mask; split it back off.
+                    dspark_commit_mask = aux_hidden_states[:, -1] > 0.5
+                    aux_hidden_states = aux_hidden_states[:, :-1]
         logits_kwargs = {}
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
         if isinstance(hidden_states, tuple):
@@ -525,6 +559,15 @@ class EagerRunner(BaseRunner):
             output.hidden_states_rank_major = output.hidden_states
             output.hidden_states_row_token_index = aux_row_to_token
             output.hidden_states = None
+        if aux_tail_gathered is not None:
+            output.hidden_states_rank_major = aux_tail_gathered[0]
+            output.hidden_states_row_token_index = aux_tail_gathered[1]
+            output.hidden_states = None
+        if dspark_commit_mask is not None:
+            # [fusion-opt] rows of the (gathered) aux that carry a computed aux, and
+            # an upper bound on their count (CPU-known, avoids a nonzero sync)
+            output.dspark_commit_mask = dspark_commit_mask
+            output.dspark_commit_rows_ub = forward_batch.dspark_commit_rows_ub
         return output
 
     def _execute_idle(

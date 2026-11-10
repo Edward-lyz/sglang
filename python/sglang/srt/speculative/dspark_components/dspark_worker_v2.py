@@ -637,6 +637,32 @@ class DSparkWorkerV2(BaseSpecWorker):
             if state_slot is not None:
                 state_slot = state_slot[safe_index]
                 final_pos = final_pos[safe_index]
+        commit_mask = logits_output.dspark_commit_mask
+        if (
+            commit_mask is not None
+            and token_indices is None
+            and commit_mask.shape[0] == target_hidden.shape[0]
+        ):
+            # [fusion-opt] SGLANG_FUSE_DSPARK_COMMIT_TAIL_ONLY: under decoder SWA
+            # bounded replay only the late-layer tail rows have a computed aux (the
+            # rest are uninitialized and never read), so compact the commit to those
+            # rows. Stable sort keeps them first; the CPU upper bound avoids a sync.
+            if row_valid is None:
+                n = positions.shape[0]
+                target_hidden = target_hidden[:n]
+                commit_mask = commit_mask[:n]
+                keep = commit_mask
+            else:
+                keep = commit_mask & row_valid
+            ub = min(int(logits_output.dspark_commit_rows_ub), keep.shape[0])
+            idx = torch.argsort((~keep).to(torch.int8), stable=True)[:ub]
+            target_hidden = target_hidden[idx]
+            cache_loc = cache_loc[idx]
+            positions = positions[idx]
+            if state_slot is not None:
+                state_slot = state_slot[idx]
+                final_pos = final_pos[idx]
+            row_valid = keep[idx]
         self._kv_injector.inject_target_hidden(
             target_hidden=target_hidden,
             cache_loc=cache_loc,
@@ -651,6 +677,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output.hidden_states_token_indices = None
         logits_output.hidden_states_rank_major = None
         logits_output.hidden_states_row_token_index = None
+        logits_output.dspark_commit_mask = None
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
