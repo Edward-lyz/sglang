@@ -26,6 +26,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_gather_rank_major,
     cp_shard_model_inputs,
     get_cp_strategy,
     is_cp_active,
@@ -79,6 +80,166 @@ _is_hip = is_hip()
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _cp_last_token_rows(hidden_states, forward_batch):
+    """[fusion-opt] SGLANG_FUSE_CP_LAST_TOKEN_GATHER: when the logits only read each
+    request's last prompt token (prefill, no input logprobs, no FULL hidden capture),
+    CP-gather just those bs rows instead of the whole [T, hidden] (and the interleave
+    reorder). Interleave CP keeps global token t on rank t % cp, local row t // cp; each
+    rank contributes its owned rows, the gather is a plain copy -> bitwise the rows the
+    stock gather + last-token prune yields. Returns rows in batch order (same tuple
+    shape as cp_gather_after_forward), or None when the batch does not qualify."""
+    from sglang.srt.environ import envs
+
+    forward_batch.cp_last_rows_pruned = False
+    if not envs.SGLANG_FUSE_CP_LAST_TOKEN_GATHER.get():
+        return None
+    from sglang.srt.layers.cp.base import get_cp_strategy
+    from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+    from sglang.srt.layers.dp_attention import attn_cp_all_gather_into_tensor
+    from sglang.srt.runtime_context import get_parallel
+
+    meta = getattr(forward_batch, "attn_cp_metadata", None)
+    mode = forward_batch.forward_mode
+    lens_cpu = forward_batch.extend_seq_lens_cpu
+    if (
+        meta is None
+        or meta.gather_index is not None
+        or not isinstance(get_cp_strategy(), InterleaveCPStrategy)
+        or not mode.is_extend()
+        or mode.is_target_verify()
+        or mode.is_draft_extend_v2()
+        or (
+            # FULL capture only reads the full rows when the DSpark aux does not take
+            # the F2b tail path (which replaces output.hidden_states with the aux)
+            forward_batch.capture_hidden_mode.is_full()
+            and getattr(forward_batch, "dspark_aux_tail_global_idx", None) is None
+        )
+        or forward_batch.extend_seq_lens is None
+        or not lens_cpu
+        or min(lens_cpu) <= 0
+        or sum(lens_cpu) != int(meta.total_seq_lens)
+    ):
+        return None
+    if forward_batch.return_logprob and any(
+        e - st > 0
+        for e, st in zip(lens_cpu, forward_batch.extend_logprob_start_lens_cpu)
+    ):
+        return None  # input logprobs need every row
+
+    parallel = get_parallel()
+    cp, rank = parallel.attn_cp_size, parallel.attn_cp_rank
+    last = torch.cumsum(forward_batch.extend_seq_lens.to(torch.int64), dim=0) - 1
+    owner = last % cp
+    bs = last.shape[0]
+
+    def pick(x):
+        """CP-gather the last-token row of each request from its owner rank."""
+        if x is None:
+            return None
+        local = x[(last // cp).clamp(max=max(x.shape[0] - 1, 0))]
+        local = torch.where((owner == rank).view(-1, *[1] * (x.dim() - 1)), local, 0)
+        gathered = local.new_empty((cp * bs, *x.shape[1:]))
+        attn_cp_all_gather_into_tensor(gathered, local.contiguous())
+        return gathered[owner * bs + torch.arange(bs, device=x.device)]
+
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "fusion-opt cp_last_token_gather",
+        "CP-gather only the last-token rows (bs=%d, total=%d, cp=%d)",
+        bs,
+        int(meta.total_seq_lens),
+        cp,
+    )
+    forward_batch.cp_last_rows_pruned = True
+    if isinstance(hidden_states, tuple):
+        out = tuple(pick(item) for item in hidden_states)
+        if len(out) == 2 and out[1] is None:
+            return out[0]
+        return out
+    return pick(hidden_states)
+
+
+def _cp_embed_reduce_scatter(embed, input_ids, forward_batch):
+    """[fusion-opt] SGLANG_FUSE_CP_EMBED_REDUCE_SCATTER: this rank's interleave-CP shard of
+    the vocab-parallel embedding via one reduce-scatter of rank-major ids, instead of an
+    all-reduce over all T rows followed by the shard copy. Every row has exactly one
+    non-zero contributor (the vocab shard owning its id), so the sum is exact and the
+    result is bitwise the stock one. None when the layout does not qualify."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_FUSE_CP_EMBED_REDUCE_SCATTER.get():
+        return None
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.cp.base import get_cp_strategy
+    from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+    from sglang.srt.runtime_context import get_parallel
+
+    meta = getattr(forward_batch, "attn_cp_metadata", None)
+    parallel = get_parallel()
+    cp, tp = parallel.attn_cp_size, parallel.tp_size
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "fusion-opt cp_embed_reduce_scatter gate",
+        "embed RS gate: meta=%s strategy=%s use_attn_tp=%s enable_tp=%s emb_tp=%s tp=%s "
+        "cp=%s tp_rank=%s cp_rank=%s gather_index=%s logical=%s actual=%s",
+        meta is not None,
+        type(get_cp_strategy()).__name__,
+        getattr(embed, "use_attn_tp_group", None),
+        getattr(embed, "enable_tp", None),
+        getattr(embed, "tp_size", None),
+        tp,
+        cp,
+        parallel.tp_rank,
+        parallel.attn_cp_rank,
+        None if meta is None else meta.gather_index is not None,
+        None if meta is None else meta.per_rank_logical_token,
+        None if meta is None else meta.per_rank_actual_token,
+    )
+    if (
+        meta is None
+        or not isinstance(get_cp_strategy(), InterleaveCPStrategy)
+        or getattr(embed, "use_attn_tp_group", False)
+        or not getattr(embed, "enable_tp", False)
+        or getattr(embed, "tp_size", 1) != tp
+        or tp != cp
+        or parallel.tp_rank != parallel.attn_cp_rank
+        or meta.gather_index is not None
+        or len(set(meta.per_rank_actual_token)) != 1
+    ):
+        return None
+    total = int(meta.total_seq_lens)
+    rank_len = max(meta.per_rank_actual_token)
+    if total == 0 or rank_len == 0:
+        return None
+    m = torch.arange(cp * rank_len, device=input_ids.device)
+    t = (m % rank_len) * cp + m // rank_len
+    ids_rm = torch.where(
+        t < total, input_ids[t.clamp(max=total - 1)], torch.zeros_like(input_ids[:1])
+    )
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "fusion-opt cp_embed_reduce_scatter",
+        "CP embedding via reduce-scatter (total=%d rank_len=%d cp=%d)",
+        total,
+        rank_len,
+        cp,
+    )
+    partial = embed._embed_local_shard(ids_rm)
+    out = partial.new_empty((rank_len, partial.shape[1]))
+    get_tp_group().reduce_scatter_tensor(out, partial)
+    # rows past this rank's logical count are the CP padding pad_local_rows zero-fills
+    logical = meta.per_rank_logical_token or meta.per_rank_actual_token
+    local_len = logical[parallel.attn_cp_rank]
+    if local_len < rank_len:
+        out[local_len:].zero_()
+    if meta.per_rank_logical_token is None or meta.per_rank_logical_token == meta.per_rank_actual_token:
+        return out[:local_len]
+    return out
 
 
 class EagerRunner(BaseRunner):
@@ -386,14 +547,65 @@ class EagerRunner(BaseRunner):
         model = self.model_runner.model
 
         input_embeds = kwargs.get("input_embeds")
+        complete_input_ids = forward_batch.input_ids
+        local_embeds = None
         if input_embeds is None:
-            input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+            # CP vision fix: merge image features into the embeddings BEFORE the CP
+            # shard, mirroring DeepseekV4ForCausalLM.forward. The CP path calls the
+            # inner model body (model.model) directly and bypasses the causal-LM
+            # forward's multimodal merge, so without this the body only sees the
+            # text embedding of the image placeholder tokens and the model cannot
+            # see the image (garbage multimodal output under CP).
+            if (
+                getattr(model, "vision", None) is not None
+                and not forward_batch.forward_mode.is_decode()
+                and getattr(forward_batch, "mm_inputs", None) is not None
+                and any(x is not None for x in forward_batch.mm_inputs)
+                and hasattr(model, "_prepare_mm_embeddings")
+            ):
+                input_embeds = model._prepare_mm_embeddings(
+                    complete_input_ids, forward_batch
+                )
+                from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+                # Remap image-hash pad IDs -> image_token_id for the model body
+                # (input_ids_global gather / routing), matching the non-CP path.
+                complete_input_ids = complete_input_ids.masked_fill(
+                    complete_input_ids >= MM_PAD_SHIFT_VALUE,
+                    model.config.image_token_id,
+                )
+            else:
+                local_embeds = _cp_embed_reduce_scatter(
+                    model.get_input_embeddings(), complete_input_ids, forward_batch
+                )
+                if local_embeds is not None:
+                    # [fusion-opt] already CP-local; hand the shard helper a 1-column
+                    # stand-in so the positions / ids / metadata sharding stays as is.
+                    input_embeds = complete_input_ids.new_zeros(
+                        (complete_input_ids.shape[0], 1)
+                    )
+                else:
+                    input_embeds = model.get_input_embeddings()(complete_input_ids)
         with cp_shard_model_inputs(
             input_embeds,
             forward_batch.positions,
             forward_batch,
-            forward_batch.input_ids,
+            complete_input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
+            if local_embeds is not None:
+                assert local_embeds.shape[0] == sharded_input_embeds.shape[0], (
+                    local_embeds.shape,
+                    sharded_input_embeds.shape,
+                )
+                sharded_input_embeds = local_embeds
+                local_embeds = None
+            # [MEM-R3] The full-order embedding is [T, hidden] (640 MiB at a 65532-token
+            # chunk) and exists only to produce the CP-local shard above; the body runs
+            # on `sharded_input_embeds`. Holding the reference here would pin it for the
+            # whole model body, where it stacks on the ratio-1/2 indexer transients.
+            # (If the caller passed input_embeds in `kwargs`, that reference still owns
+            # the tensor, so this only drops our own.)
+            input_embeds = None
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -416,18 +628,94 @@ class EagerRunner(BaseRunner):
             )
 
         stream = torch.cuda.current_stream()
-        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
+        # [MEM-P1] DSV4 returns (hidden_states, pre_hc_head). When DSpark aux
+        # capture is on, pre_hc_head is dropped at the logits boundary below
+        # (`if aux_hidden_states is None`), so CP-gathering it is pure waste:
+        # pre_hc_head is [T, hc_mult*H] and the interleave gather materializes it
+        # twice (all-gather dst + out-of-place index_select reorder).
+        # Dropping item 1 before the gather removes ~2x[T, hc_mult*H] from the
+        # prefill activation peak. Passing None keeps cp_gather_after_forward's
+        # existing `(x, None) -> x` contract, so nothing downstream changes.
+        if (
+            aux_hidden_states is not None
+            and isinstance(hidden_states, tuple)
+            and len(hidden_states) == 2
+        ):
+            hidden_states = (hidden_states[0], None)
+        pruned = _cp_last_token_rows(hidden_states, forward_batch)
+        if pruned is not None:
+            hidden_states = pruned
+        else:
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
+        aux_row_to_token = None
+        dspark_commit_mask = None
+        aux_tail_gathered = None
         if aux_hidden_states is not None:
             if isinstance(aux_hidden_states, torch.Tensor):
                 aux_hidden_states = cp_gather_after_forward(
                     aux_hidden_states, forward_batch, stream
                 )
             else:
-                aux_hidden_states = [
-                    cp_gather_after_forward(aux, forward_batch, stream)
-                    for aux in aux_hidden_states
-                ]
+                # [MEM-P3] Pack the K captures locally ([T_local, K*hidden], 240 MiB
+                # here) and CP-gather ONCE in rank-major order, instead of gathering
+                # K full [T, hidden] tensors and letting the logits processor cat
+                # them into a [T, K*hidden] copy. Dropping the local list before the
+                # gather keeps the K local captures out of the live set.
+                # The local pack ALONE was a regression (measured 5.70 -> 6.41 GiB):
+                # the ordinary gather keeps both the all-gather destination and the
+                # out-of-place index_select reorder alive, so packing only moved the
+                # cost. Rank-major drops the reorder, so the two only pay off
+                # together. The aux consumer (DSpark write_target_hidden_kv) scatters
+                # per row, so it does not need the global token order -- it needs
+                # cache_loc/positions permuted the same way, which
+                # hidden_states_row_token_index carries. See SOLUTION.md §4/§10.
+                local_packed = torch.cat(aux_hidden_states, dim=-1)
+                del aux_hidden_states[:]
+                tail_global_idx = getattr(
+                    forward_batch, "dspark_aux_tail_global_idx", None
+                )
+                if tail_global_idx is not None:
+                    # [fusion-opt] SGLANG_FUSE_DSPARK_AUX_TAIL_GATHER: every rank holds
+                    # its (equally padded) tail rows; gather them rank-major together
+                    # with their global token index. The logits processor gets no aux
+                    # (it would index it by token); the commit reads it below.
+                    from sglang.srt.layers.dp_attention import (
+                        attn_cp_all_gather_into_tensor,
+                    )
+                    from sglang.srt.runtime_context import get_parallel
+
+                    cp_size = get_parallel().attn_cp_size
+                    rows = local_packed.shape[0]
+                    gathered = local_packed.new_empty(
+                        (cp_size * rows, local_packed.shape[1])
+                    )
+                    attn_cp_all_gather_into_tensor(gathered, local_packed.contiguous())
+                    gathered_idx = tail_global_idx.new_empty((cp_size * rows,))
+                    attn_cp_all_gather_into_tensor(
+                        gathered_idx, tail_global_idx.contiguous()
+                    )
+                    aux_tail_gathered = (gathered, gathered_idx.to(torch.int64))
+                    aux_hidden_states = None
+                elif forward_batch.capture_hidden_mode.is_full():
+                    aux_hidden_states, aux_row_to_token = cp_gather_rank_major(
+                        local_packed, forward_batch, stream
+                    )
+                else:
+                    # LAST capture prunes the aux by global token index inside the
+                    # logits processor, so those rows must be in global order. The
+                    # pruned tensor is [bs, K*hidden] -- no memory concern.
+                    aux_hidden_states = cp_gather_after_forward(
+                        local_packed, forward_batch, stream
+                    )
+                del local_packed
+                if aux_hidden_states is not None and getattr(
+                    forward_batch, "dspark_commit_mask_appended", False
+                ):
+                    # [fusion-opt] SGLANG_FUSE_DSPARK_COMMIT_TAIL_ONLY: the model
+                    # appended a 1-column commit mask; split it back off.
+                    dspark_commit_mask = aux_hidden_states[:, -1] > 0.5
+                    aux_hidden_states = aux_hidden_states[:, :-1]
         logits_kwargs = {}
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
         if isinstance(hidden_states, tuple):
@@ -436,7 +724,7 @@ class EagerRunner(BaseRunner):
             # DSpark aux capture is on, else it overrides the packed aux.
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        return model.logits_processor(
+        output = model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
             model.lm_head,
@@ -444,6 +732,25 @@ class EagerRunner(BaseRunner):
             aux_hidden_states,
             **logits_kwargs,
         )
+        if aux_row_to_token is not None:
+            # [MEM-P3] Captured aux rows are rank-major, not in global token order.
+            # Move them off `hidden_states` (post_forward_mlp_sync_batch prefix-
+            # slices that field, which would drop live rank-major rows) and publish
+            # the row -> global token map so the DSpark KV injector permutes
+            # cache_loc/positions instead of the activation itself.
+            output.hidden_states_rank_major = output.hidden_states
+            output.hidden_states_row_token_index = aux_row_to_token
+            output.hidden_states = None
+        if aux_tail_gathered is not None:
+            output.hidden_states_rank_major = aux_tail_gathered[0]
+            output.hidden_states_row_token_index = aux_tail_gathered[1]
+            output.hidden_states = None
+        if dspark_commit_mask is not None:
+            # [fusion-opt] rows of the (gathered) aux that carry a computed aux, and
+            # an upper bound on their count (CPU-known, avoids a nonzero sync)
+            output.dspark_commit_mask = dspark_commit_mask
+            output.dspark_commit_rows_ub = forward_batch.dspark_commit_rows_ub
+        return output
 
     def _execute_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
