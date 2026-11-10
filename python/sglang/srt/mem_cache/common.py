@@ -44,33 +44,6 @@ def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
     return (kv_indices[::page_size] // page_size).cpu().numpy()
 
 
-def kv_to_page_indices_pinned(
-    kv_indices: torch.Tensor,
-    page_size: int,
-    *,
-    stream: torch.cuda.Stream,
-    host_buf: torch.Tensor,
-) -> np.ndarray:
-    """kv_to_page_indices without a host-blocking D2H on the caller's stream.
-
-    The strided-slice gather and the D2H are enqueued on ``stream`` (the caller
-    runs inside its context); completion is the caller's job -- record an event
-    on ``stream`` after this returns and ``synchronize()`` it before reading.
-    The caller-owned pinned ``host_buf`` must be at least
-    ``ceil(kv_indices.numel() / page_size)`` elements; the returned view is only
-    valid until the buffer is reused, and the consuming sender must snapshot
-    it (np.copy / torch tensor) before the next call reuses the buffer.
-    """
-    # ceil: the strided slice below yields ceil(numel/page_size) rows for a
-    # ragged tail, so a floored num_pages would size-mismatch the copy_.
-    num_pages = (kv_indices.numel() + page_size - 1) // page_size
-    dev_pages = (kv_indices[::page_size] // page_size).to(host_buf.dtype)
-    host_buf[:num_pages].copy_(dev_pages, non_blocking=True)
-    kv_indices.record_stream(stream)
-    dev_pages.record_stream(stream)
-    return host_buf[:num_pages].numpy()
-
-
 def kv_to_page_num(num_kv_indices: int, page_size: int):
     return (num_kv_indices + page_size - 1) // page_size
 
@@ -333,13 +306,6 @@ def _release_uncommitted_chunk_tail_swa_slots(
     req.as_swa_kv_slots = []
 
 
-def seal_as_trace(req: Req) -> None:
-    """Let a fired AS trace finalize once its pending AS writes retire."""
-    context = getattr(req, "as_trace_context", None)
-    if context is not None:
-        context.seal_registered()
-
-
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
@@ -353,7 +319,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.kv.mamba_pool_idx.unsqueeze(-1)
             )
             req.kv.mamba_pool_idx = None
-        seal_as_trace(req)
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
@@ -362,7 +327,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
         kv_len_to_handle=effective_kv_committed_len,
     )
-    seal_as_trace(req)
 
     # After cache_finished_req, so a write submitted there has already advanced
     # as_written_count and keeps ownership of its slots.

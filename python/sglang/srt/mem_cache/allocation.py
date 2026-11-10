@@ -339,6 +339,68 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     return batch.tree_cache.page_size
 
 
+def _alloc_chunk_tail_slots_for_batch(batch: ScheduleBatch) -> None:
+    """Reserve chunk_tail_swa_pool slots for the swa_step checkpoints this extend
+    crosses, so ``detect_and_may_copy_as_swa`` has somewhere to rescue the tail
+    SWA window to before eviction drops it.
+
+    One slot per checkpoint, appended to ``req.as_swa_kv_slots``. A ``-1`` entry
+    is the "no SWA data for this checkpoint" sentinel and must be skipped by the
+    copy, write and free paths alike.
+    """
+    kvcache = batch.tree_cache.token_to_kv_pool_allocator.get_kvcache()
+    pool = getattr(kvcache, "chunk_tail_swa_pool", None)
+    if pool is None:
+        return
+    policy = kvcache.swa_policy
+    new_lens = batch.seq_lens_cpu.tolist()
+    for i, (req, new_len) in enumerate(zip(batch.reqs, new_lens)):
+        extend_len = batch.extend_lens[i]
+        prev_checkpoints = policy.num_checkpoints(new_len - extend_len)
+        new_checkpoints = policy.num_checkpoints(new_len)
+
+        # First extend: placeholder the whole hit prefix with -1 and never back-fill
+        # it. SWA is a sliding window, so only the last `sliding_window` prefix
+        # tokens survive in HBM — out-of-window prefix checkpoints have no SWA left
+        # to copy. An AS-hit prefix is already in AttentionStore; an HBM-hit prefix
+        # was written when it was first prefilled. Continuity still holds: the first
+        # new checkpoint's window covers the retained tail tokens.
+        if not req.as_swa_kv_slots and prev_checkpoints > 0:
+            req.as_swa_kv_slots.extend([-1] * prev_checkpoints)
+            # Lift both water-marks past the un-writable prefix so the incremental
+            # write slice [as_written_count:as_swa_copy_count) starts at the first
+            # NEW checkpoint. Otherwise an HBM hit leaves as_written_count=0, the
+            # slice still contains the leading -1s, and the writer's sentinel guard
+            # drops the whole write including the valid new checkpoints. max() also
+            # covers the mixed HBM+AS case, where init_load_back only advanced
+            # as_written_count over the (shorter) AS segment.
+            req.as_written_count = max(req.as_written_count, prev_checkpoints)
+            req.as_swa_copy_count = max(req.as_swa_copy_count, prev_checkpoints)
+
+        n_new = new_checkpoints - prev_checkpoints
+        if n_new <= 0:
+            continue
+        # Key the fail-fast off the explicit flag, never off as_swa_kv_slots[-1]:
+        # a hit prefix ends in -1 placeholders, which are not alloc failures.
+        if req.as_swa_alloc_failed:
+            req.as_swa_kv_slots.extend([-1] * n_new)
+            continue
+        slots = pool.alloc(n_new)
+        if slots is None:
+            req.as_swa_alloc_failed = True
+            req.as_swa_kv_slots.extend([-1] * n_new)
+            logger.warning(
+                "chunk_tail_swa_pool full for req=%s, need=%d slots, avail=%d, "
+                "num_pages=%d (consider raising --as-swa-buffer-coef)",
+                req.rid,
+                n_new,
+                pool.available_size(),
+                pool.num_pages,
+            )
+        else:
+            req.as_swa_kv_slots.extend(slots)
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -445,6 +507,8 @@ def alloc_for_extend(
     for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
         req.kv.kv_allocated_len = seq_len
         req.kv.kv_committed_len = seq_len
+
+    _alloc_chunk_tail_slots_for_batch(batch)
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 

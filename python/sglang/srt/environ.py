@@ -687,6 +687,11 @@ class Envs:
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
+    # AttentionStore (asradix) diagnostics: content digest (D2H + hash per page)
+    # and producer-event barrier diagnostic. Off by default; each can be flipped
+    # at runtime via /set_internal_state (log_as_cache_digest/log_as_barrier_debug).
+    SGLANG_LOG_AS_CACHE_DIGEST = EnvBool(False)
+    SGLANG_LOG_AS_BARRIER_DEBUG = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime

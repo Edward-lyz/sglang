@@ -18,7 +18,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.observability.admission_diag import ADMISSION_DIAG
 
 from .transport import _once, barrier_debug_enabled, cache_digest_logger
 from .types import AttentionStoreWriteContext, AttentionStoreWriteOwner
@@ -143,6 +142,7 @@ class _PreparedPageIds:
 
 @dataclass
 class _PreparedSlot:
+
     host: Any = None
     ready_event: Any = None
     source: Optional[torch.Tensor] = None
@@ -172,14 +172,13 @@ class _PreparedSlot:
 def _request_block_hash_ids(
     req, token_ids: Sequence[int], page_size: int, page_count: int
 ) -> tuple[int, ...]:
-    """Reuse scheduler-canonical request hashes when they cover the write prefix.
-
-    Scheduler refreshes req.as_block_hashs after any input-id rewrite, so these
-    hashes describe the same canonical token sequence used for AS matching. Only
-    writes beyond that request-hash horizon (for example generated output tokens)
-    fall back to hashing the concrete write token sequence.
-    """
-    if req.as_block_hashs is not None:
+    """Reuse request block hashes when they cover the written prefix."""
+    # Padding preserves length, so a length check alone would let the scheduler's
+    # multimodal substitution (which rebinds origin_input_ids) hash away the image.
+    if (
+        req.as_block_hashs is not None
+        and req.origin_input_ids is req.origin_input_ids_unpadded
+    ):
         request_hashes = req.as_block_hashs.hash_ids
         if len(request_hashes) >= page_count:
             return tuple(map(int, request_hashes[:page_count]))
@@ -214,12 +213,6 @@ class AttentionStoreCoordinator:
         """Initialize an idle asynchronous write coordinator."""
         self._write_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._pending_writes: list[_PendingWrite] = []
-        # Deferred load-back lane (SGLANG_ENABLE_AS_LOAD_BACK_ASYNC): the
-        # reader thread runs the SDK read, the scheduler thread commits.
-        # Both fields are scheduler-thread-only; the reader thread sees the
-        # task object, never this queue.
-        self._load_back_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
-        self._pending_load_backs: list[Any] = []
         self._page_id_copy_stream = None
         self._closed = False
         # Synchronous cache commit hooks use this only for dummy tasks and for
@@ -256,11 +249,10 @@ class AttentionStoreCoordinator:
         device = torch.device(device)
         if device.type not in ("cuda", "xpu"):
             return None
-        # Resolve an unindexed pool device (e.g. "cuda") from the producer
-        # stream instead of the writer thread's current device.
-        if stream is not None:
-            device = torch.device(stream.device)
         device_module = torch.get_device_module(device)
+        # This may be called from the writer thread (do_write), whose current
+        # device can differ from the KV pool's; pin it so the event and the
+        # producer stream are created on the same device.
         with device_module.device(device):
             if stream is None:
                 stream = device_module.current_stream(device)
@@ -370,14 +362,6 @@ class AttentionStoreCoordinator:
         """Restore an L2 hit into the components declared by the cache plan."""
         raise NotImplementedError
 
-    def commit_load_backs(self, cache) -> None:
-        """Drain finished deferred load-back reads (async mode).
-
-        The default is a no-op: only the checkpointed-page coordinators
-        implement the deferred-read lane; other plans never queue tasks.
-        """
-        return
-
     def do_write(self, cache, task) -> int:
         """Execute one payload-specific AttentionStore write."""
         raise NotImplementedError
@@ -426,24 +410,6 @@ class AttentionStoreCoordinator:
             cache, task, task.release_after_write, "staging resource"
         )
         self._release_task_resource(cache, task, task.release, "retained resource")
-        self._release_trace_write(task)
-
-    @staticmethod
-    def _retain_trace_write(task) -> None:
-        recorder = getattr(task, "trace_recorder", None)
-        if recorder is None or getattr(task, "_as_trace_retained", False):
-            return
-        recorder.ctx.retain_write()
-        task._as_trace_retained = True
-
-    @staticmethod
-    def _release_trace_write(task) -> None:
-        if not getattr(task, "_as_trace_retained", False):
-            return
-        task._as_trace_retained = False
-        recorder = getattr(task, "trace_recorder", None)
-        if recorder is not None:
-            recorder.ctx.release_write()
 
     def _resolve_write_owner(self, cache, task) -> Optional[AttentionStoreWriteOwner]:
         """Resolve the scheduler owner attached to an asynchronous write.
@@ -482,13 +448,9 @@ class AttentionStoreCoordinator:
                     f"rid={getattr(task, 'rid', '<unknown>')}"
                 )
             self._set_task_owner(task, owner)
-        self._retain_trace_write(task)
         try:
             logical_id = self._task_logical_id(task)
-            native_submit = getattr(self, "_submit_native_write", None)
-            future = native_submit(cache, task) if native_submit is not None else None
-            if future is None:
-                future = self._ensure_executor().submit(self._run_write, cache, task)
+            future = self._ensure_executor().submit(self._run_write, cache, task)
         except Exception:
             self._discard_unsubmitted(cache, task)
             raise
@@ -500,8 +462,6 @@ class AttentionStoreCoordinator:
                 owner=owner,
             )
         )
-        if ADMISSION_DIAG is not None:
-            ADMISSION_DIAG.write_event("write_submit", self._pending_writes[-1])
 
     def submit_completed(self, task, result: int = 0, owner=None) -> None:
         """Queue an already completed task for ordered retirement."""
@@ -522,8 +482,6 @@ class AttentionStoreCoordinator:
                 owner=owner,
             )
         )
-        if ADMISSION_DIAG is not None:
-            ADMISSION_DIAG.write_event("write_submit_completed", self._pending_writes[-1])
 
     def _resolve_result(
         self, cache, pending: _PendingWrite, timeout: Optional[float]
@@ -568,10 +526,7 @@ class AttentionStoreCoordinator:
                 pending.task.release,
                 "retained resource",
             )
-            if ADMISSION_DIAG is not None:
-                ADMISSION_DIAG.write_event("write_unlock", pending)
             first_error = first_error or release_error
-            self._release_trace_write(pending.task)
         retirement_succeeded = first_error is None
         if synchronize:
             retirement_succeeded = bool(cache._tp_min(int(retirement_succeeded)))
@@ -739,19 +694,10 @@ class AttentionStoreCoordinator:
             return
         completed = 0
         for pending in self._pending_writes:
-            done = pending.future.done()
-            if ADMISSION_DIAG is not None:
-                ADMISSION_DIAG.write_event("write_poll", pending, done=done)
-            if not done:
+            if not pending.future.done():
                 break
             completed += 1
-        local_completed = completed
         completed = cache._tp_min(completed)
-        if ADMISSION_DIAG is not None:
-            ADMISSION_DIAG.write_event(
-                "write_frontier", local_completed=local_completed,
-                completed=completed, pending=len(self._pending_writes),
-            )
         if not completed:
             return
         pending_writes = self._pending_writes[:completed]
@@ -835,28 +781,13 @@ class AttentionStoreCoordinator:
         )
 
     def shutdown(self, cache) -> None:
-        """Drain writes and stop the background executors."""
+        """Drain writes and stop the background executor."""
         try:
             # atexit is not ordered across PP processes. Agent only publishes a
             # block after every shard is complete, so local retirement is safe.
             self._drain(cache, synchronize=False)
         finally:
             self._closed = True
-            if self._load_back_executor is not None:
-                # Pending reads have no scheduler loop to commit them anymore;
-                # wait for the in-flight read, then let the task objects go.
-                self._load_back_executor.shutdown(wait=True)
-                self._load_back_executor = None
-            # Metadata readers may have returned after native submission.
-            # Join copy and release before dropping task/pool owners.
-            for task in self._pending_load_backs:
-                native = getattr(task, "native_read_future", None)
-                if native is not None:
-                    try:
-                        native.result()
-                    except Exception as exc:
-                        logger.warning("AS native read failed during close: %s", exc)
-            self._pending_load_backs = []
             if self._write_executor is not None:
                 self._write_executor.shutdown(wait=True)
                 self._write_executor = None

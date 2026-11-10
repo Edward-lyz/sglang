@@ -282,6 +282,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.chunk_tail_swa_pool import free_chunk_tail_swa_slots
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -495,6 +496,7 @@ class Scheduler(
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
+        self.enable_asradix_cache = get_memory().enable_asradix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
@@ -613,6 +615,9 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.ascli = None
+        if self.enable_asradix_cache:
+            self._init_attention_store(server_args)
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
@@ -1921,6 +1926,305 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def _init_attention_store(self, server_args):
+        """Attach the AttentionStore (asradix) binding for the single-node
+        (DP1/TP8, no-PP) DeepSeek-V4/V4.1 case.
+
+        Builds one InitContext, creates the SPA/SPAG binding via the tree cache,
+        refs it, and injects the model forward_stream into the write coordinator
+        so its producer fence targets the stream the KV writes actually run on.
+        On any failure it disables AS rather than crashing the scheduler.
+        """
+        import os
+
+        try:
+            from sglang.srt.mem_cache.storage.asradix.types import (
+                AS_BLOCK_SIZE,
+                AttentionStoreInitContext,
+            )
+
+            pod_name = os.getenv("POD_NAME")
+            model_id = os.getenv("MODEL_ID")
+            if pod_name is None or model_id is None:
+                raise ValueError(
+                    "enable_asradix_cache but POD_NAME / MODEL_ID env not set"
+                )
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+            cache_plan = self.tree_cache.attention_store_plan
+            layer_info = self.tp_worker.model_runner.layer_info
+            target_layer_ids = tuple(
+                range(int(layer_info.start_layer), int(layer_info.end_layer))
+            )
+            page_shard_id = int(self.ps.attn_tp_rank)
+            page_shard_num = int(self.ps.attn_tp_size)
+            draft_kv_cache, draft_layer_ids = self._as_draft_swa_layers(
+                cache_plan.name, len(target_layer_ids)
+            )
+            logger.info(
+                "[AS] init: plan=%s pod=%s shard=%d/%d layers=%d draft_layers=%d "
+                "page_size=%d gpu_count=%d",
+                cache_plan.name,
+                pod_name,
+                page_shard_id,
+                page_shard_num,
+                len(target_layer_ids),
+                len(draft_layer_ids),
+                self.page_size,
+                server_args.per_node_gpu_num,
+            )
+            ctx = AttentionStoreInitContext(
+                kv_cache=kv_cache,
+                req_to_token_pool=self.req_to_token_pool,
+                namespace_base=model_id,
+                pod_name=pod_name,
+                model_version="v1",
+                page_size=self.page_size,
+                block_size=AS_BLOCK_SIZE,
+                tp_rank=self.ps.attn_tp_rank,
+                tp_size=self.ps.attn_tp_size,
+                pp_rank=0,
+                pp_size=1,
+                node_pp_start=0,
+                node_pp_end=1,
+                dp_rank=self.ps.attn_dp_rank,
+                device_id=self.ps.gpu_id,
+                gpu_count=server_args.per_node_gpu_num,
+                target_layer_ids=target_layer_ids,
+                page_layer_ids=target_layer_ids,
+                draft_kv_cache=draft_kv_cache,
+                draft_layer_ids=draft_layer_ids,
+                page_shard_id=page_shard_id,
+                page_shard_num=page_shard_num,
+                page_layer_num=len(target_layer_ids),
+                endpoint_schema=dict(cache_plan.schema_factory(kv_cache)),
+            )
+            binding = self.tree_cache.create_attention_store_binding(ctx)
+            self.tree_cache.ref_as_binding(binding)
+            self.ascli = binding.cache_store
+            _as_coord = getattr(self.tree_cache, "_as_coordinator", None)
+            if _as_coord is not None:
+                _as_coord.forward_stream = getattr(
+                    getattr(self.tp_worker, "model_runner", None),
+                    "forward_stream",
+                    None,
+                )
+            logger.info(
+                "[AS] initialized: plan=%s namespace=%s forward_stream=%s",
+                cache_plan.name,
+                model_id,
+                getattr(_as_coord, "forward_stream", None),
+            )
+        except Exception as exc:
+            logger.error(
+                "[AS] AttentionStore init failed; disabling AS: %s",
+                exc,
+                exc_info=True,
+            )
+            self.enable_asradix_cache = False
+            self.ascli = None
+
+    def _as_draft_swa_layers(
+        self, plan_name: str, target_layer_count: int
+    ) -> Tuple[Any, Tuple[int, ...]]:
+        """Resolve the draft SWA layers the AttentionStore binding must cover.
+
+        Returns ``(draft_kv_cache, draft_layer_ids)``, both empty when there is
+        nothing to fan out to. Only SPAG consumes them: it folds the draft's SWA
+        layers into the same block segment as the target's, so a restored
+        checkpoint brings back both. The other plans pair ``draft_layer_ids`` with
+        ``page_layer_ids`` instead, and this branch never populates those.
+        """
+        if plan_name != "SPAG":
+            return None, ()
+        draft_pool = (
+            self.draft_worker.primary_draft_kv_pool if self.draft_worker else None
+        )
+        if draft_pool is None:
+            if self.draft_worker is not None:
+                # ngram and frozen-KV MTP have no draft KV pool at all, so there
+                # is no draft SWA state to persist. Correct, but say so: the
+                # alternative is wondering later why draft_layers=0.
+                logger.info(
+                    "[AS] draft SWA fan-out disabled: %s exposes no draft KV pool",
+                    type(self.draft_worker).__name__,
+                )
+            return None, ()
+        draft_swa = getattr(draft_pool, "swa_kv_pool", None)
+        # The layer count MUST come from the draft SWA pool itself. Under DSpark
+        # the pool holds one layer per stage while num_nextn_predict_layers stays
+        # 1, so deriving it from the server arg would register a single layer and
+        # leave the rest of the segment addressing the target's buffers.
+        draft_swa_layers = int(getattr(draft_swa, "layer_num", 0) or 0)
+        if draft_swa_layers <= 0:
+            logger.warning(
+                "[AS] draft SWA fan-out disabled: draft KV pool has no SWA layers"
+            )
+            return None, ()
+        self._assert_draft_swa_geometry(draft_pool)
+        return draft_pool, tuple(
+            range(target_layer_count, target_layer_count + draft_swa_layers)
+        )
+
+    def _assert_draft_swa_geometry(self, draft_pool) -> None:
+        """Fail AS init unless the draft SWA pool is slot-compatible with target.
+
+        ``detect_and_may_copy_as_swa`` stages each checkpoint's window into both
+        pools using the *target's* staging slot id and the *target's* SWA page
+        index. That is only meaningful while the two pools share one slot-id space
+        and one ``full_to_swa_index_mapping``; they do today (the draft is
+        allocated with one slot per target token, in the same process), but
+        nothing in the type system says so, and a divergence would stage the wrong
+        page instead of failing.
+        """
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        target = self.token_to_kv_pool_allocator.get_kvcache()
+        if not isinstance(target, DeepSeekV4TokenToKVPool) or not isinstance(
+            draft_pool, DeepSeekV4TokenToKVPool
+        ):
+            raise RuntimeError(
+                "AS draft SWA fan-out requires DeepSeekV4TokenToKVPool on both "
+                "the target and the draft worker"
+            )
+        if not draft_pool.compression_ratios or not all(
+            ratio == 0 for ratio in draft_pool.compression_ratios
+        ):
+            raise RuntimeError("AS draft SWA fan-out expects SWA-only NextN layers")
+        if target._unified_kv != draft_pool._unified_kv:
+            raise RuntimeError(
+                "AS draft SWA fan-out requires the same unified-KV mode on the "
+                "target and the draft worker"
+            )
+        if target._unified_kv:
+            raise RuntimeError(
+                "AS draft SWA fan-out requires the paged SWA pool: the unified-KV "
+                "ring has no page halves to stage a window from"
+            )
+        if (
+            target.full_to_swa_index_mapping
+            is not draft_pool.full_to_swa_index_mapping
+        ):
+            raise RuntimeError(
+                "AS draft SWA fan-out requires the target and draft pools to "
+                "share one full->swa index mapping object"
+            )
+        target_geometry = (target.page_size, target.sliding_window)
+        draft_geometry = (draft_pool.page_size, draft_pool.sliding_window)
+        if target_geometry != draft_geometry:
+            raise RuntimeError(
+                "AS draft SWA fan-out requires identical paged SWA geometry: "
+                f"target={target_geometry}, draft={draft_geometry}"
+            )
+        target_tail = getattr(target, "chunk_tail_swa_pool", None)
+        draft_tail = getattr(draft_pool, "chunk_tail_swa_pool", None)
+        if target_tail is None or draft_tail is None:
+            raise RuntimeError(
+                "AS draft SWA fan-out requires a chunk-tail staging pool on both "
+                "workers (target=%s, draft=%s)"
+                % (target_tail is not None, draft_tail is not None)
+            )
+        if target_tail.num_pages != draft_tail.num_pages:
+            raise RuntimeError(
+                "AS draft SWA staging pools must be the same size, because a slot "
+                "id allocated on the target is used verbatim on the draft: "
+                f"target={target_tail.num_pages}, draft={draft_tail.num_pages}"
+            )
+
+    def detect_and_may_copy_as_swa(self, req: Req) -> None:
+        """Rescue the tail SWA window at every swa_step checkpoint this request
+        has now committed.
+
+        Must run right after a chunk's forward completes: ``UnifiedRadixCache``
+        evicts everything older than ``max(sliding_window, page_size)``, so a
+        checkpoint's window is only still in HBM during the chunk that produced
+        it. A loop (not an ``if``) because one forward can cross several
+        checkpoints.
+        """
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        pool = getattr(kvcache, "chunk_tail_swa_pool", None)
+        if pool is None:
+            return
+        policy = kvcache.swa_policy
+        swa_win = pool.swa_win
+        # This branch has no ``Req.fill_ids`` attribute (that is master-v4's name):
+        # the token array lives in ``full_untruncated_fill_ids`` and
+        # ``get_fill_ids()`` slices it at ``extend_range.end``, i.e. exactly the
+        # prefix that this forward has just filled. Using the untruncated array
+        # here would count tokens of later chunks as committed and stage a window
+        # whose KV has not been written yet.
+        committed_len = len(req.get_fill_ids())
+        req_to_token = self.req_to_token_pool.req_to_token
+        draft_pool = (
+            self.draft_worker.primary_draft_kv_pool if self.draft_worker else None
+        )
+        draft_tail = getattr(draft_pool, "chunk_tail_swa_pool", None)
+
+        while req.as_swa_copy_count < len(req.as_swa_kv_slots):
+            checkpoint_no = req.as_swa_copy_count
+            checkpoint_pos = policy.checkpoint_pos(checkpoint_no)
+            if checkpoint_pos > committed_len:
+                # Not committed yet; a later chunk will pick it up.
+                break
+            slot_id = req.as_swa_kv_slots[checkpoint_no]
+            if slot_id == -1:
+                req.as_swa_copy_count += 1
+                continue
+            # The last swa_win tokens before checkpoint_pos live in the UPPER half
+            # (half=1) of their SWA page — guaranteed by the
+            # swa_step % swa_page_size == 0 assert in init_as_swa_pool. Resolve the
+            # physical page through req_to_token -> full_to_swa rather than
+            # tail_start_pos // swa_page_size, which would be wrong whenever this
+            # request's SWA pages do not start at physical page 0.
+            tail_start_pos = checkpoint_pos - swa_win
+            full_slot = int(req_to_token[req.kv.req_pool_idx, tail_start_pos].item())
+            swa_slot = int(kvcache.full_to_swa_index_mapping[full_slot].item())
+            if swa_slot == 0:
+                # Slot 0 is the reserved SWA padding sink and is never handed out
+                # (see allocator/swa.py:25-27), so reading it back means
+                # clear_full_to_swa_mapping already dropped this token's mapping:
+                # the window has been evicted. Copying anyway would silently stage
+                # the padding page's garbage and AS would serve it as valid KV.
+                # Degrade to the -1 sentinel and recycle the staging slot.
+                logger.warning(
+                    "chunk_tail_swa: rid=%s checkpoint#%d pos=%d tail_start=%d "
+                    "full_slot=%d has no live full->swa mapping (window already "
+                    "evicted); skipping this checkpoint",
+                    req.rid,
+                    checkpoint_no,
+                    checkpoint_pos,
+                    tail_start_pos,
+                    full_slot,
+                )
+                req.as_swa_kv_slots[checkpoint_no] = -1
+                free_chunk_tail_swa_slots(kvcache, [slot_id])
+                req.as_swa_copy_count += 1
+                continue
+            swa_page_idx = swa_slot // kvcache.swa_page_size
+            pool.copy_swa_page_half(slot_id, kvcache.swa_kv_pool, swa_page_idx, half=1)
+            if draft_tail is not None:
+                # Same slot_id and same swa_page_idx: the draft shares the target's
+                # slot-id space and the very same full_to_swa_index_mapping object
+                # (asserted in _assert_draft_swa_geometry).
+                draft_tail.copy_swa_page_half(
+                    slot_id, draft_pool.swa_kv_pool, swa_page_idx, half=1
+                )
+            req.as_swa_copy_count += 1
+
+    def retire_ascache_writes(self) -> None:
+        """Retire completed AttentionStore async writes in submission order.
+
+        Every scheduler loop that can produce AttentionStore writes must call
+        this once per round: retirement is the only place a write's retained
+        tree lock is given back, so skipping it pins the written prefix (FULL
+        path-to-root plus one SWA window) for the process lifetime.
+        """
+        if self.enable_asradix_cache and hasattr(
+            self.tree_cache, "check_ascache_events"
+        ):
+            self.tree_cache.check_ascache_events()
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1929,6 +2233,7 @@ class Scheduler(
                 break
 
             self.metrics_reporter.iter_start_time = time.perf_counter()
+            self.retire_ascache_writes()
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -1974,6 +2279,7 @@ class Scheduler(
                 break
 
             self.metrics_reporter.iter_start_time = time.perf_counter()
+            self.retire_ascache_writes()
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -2824,6 +3130,18 @@ class Scheduler(
                 zmq_time = req.time_stats.get_request_zmq_time()
                 if zmq_time > 0:
                     self.metrics_collector.observe_request_zmq_time(zmq_time)
+
+            # AttentionStore: carry the tokenizer-computed block hashes / cache
+            # params / prior-hit hints onto the request for AS match & write.
+            if self.enable_asradix_cache:
+                req.as_block_hashs = getattr(recv_req, "as_block_hashs", None)
+                req.as_kv_cache_params = getattr(recv_req, "as_kv_cache_params", None)
+                req.as_max_hit_host_ip = (
+                    getattr(recv_req, "as_max_hit_host_ip", None) or []
+                )
+                req.as_max_hit_token_len = (
+                    getattr(recv_req, "as_max_hit_token_len", None) or []
+                )
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -5035,6 +5353,12 @@ class Scheduler(
         if self.is_fully_idle():
             self.cur_batch_for_debug = None
             self.last_batch = None
+            # Drain in-flight AttentionStore async writes before resetting the
+            # tree cache so pending SPA/SPAG writes are not dropped mid-flight.
+            if self.enable_asradix_cache and hasattr(
+                self.tree_cache, "drain_attention_store_writes"
+            ):
+                self.tree_cache.drain_attention_store_writes()
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()

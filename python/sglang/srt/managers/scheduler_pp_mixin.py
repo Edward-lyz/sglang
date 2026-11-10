@@ -258,6 +258,14 @@ class SchedulerPPMixin:
         """
         self.init_pp_loop_state()
 
+        # NOTE(AttentionStore): this loop does NOT call retire_ascache_writes().
+        # Every other event loop does, and that call is what releases the KV and
+        # chunk-tail-SWA slots owned by completed AS write tasks. Reaching this
+        # loop with --enable-asradix-cache would therefore leak those slots until
+        # the pools stall (the 2026-09-17 regression). PP is unused on the AS
+        # prefill path today (pp=1), so this is a latent hazard rather than a live
+        # bug — add the call here before enabling PP together with AS.
+
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size

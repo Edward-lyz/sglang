@@ -61,7 +61,6 @@ from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
-from types import MethodType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -93,7 +92,7 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -143,19 +142,15 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import flatten_nested_list
-from sglang.srt.utils.nvtx_utils import (
-    NVTX_OPERATIONS_ENABLED,
-    operations_nvtx_range,
-    profile_method,
-)
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
+    from typing import Any, Dict
+
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
-    from sglang.srt.managers.io_struct import TraceReq
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -1022,8 +1017,6 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
-        skip_radix_cache_insert: bool = False,
-        trace_config=None,
     ):
         # Input and output info
         self.rid = rid
@@ -1064,13 +1057,6 @@ class Req(ReqDllmMixin):
         self.as_max_hit_host_ip: List[str] = []
         self.as_max_hit_token_len: List[int] = []
         self.ever_read_as: bool = False
-        # An AS read only counts once an admission locks the loaded prefix:
-        # a rejected admission leaves it evictable, and a rank that latched
-        # ever_read_as on it would then match a shorter prefix than its peers.
-        self.as_read_pending_lock: bool = False
-        # Deferred AS load-back task in flight (async mode): set from submit
-        # until the scheduler-thread commit publishes or frees the prefix.
-        self._as_pending_load_back: Optional[Any] = None
         # AS SWA chunk-tail KV pool (mem_cache/chunk_tail_swa_pool.py) slot IDs for
         # the full lifecycle of this request. One slot per swa_step checkpoint
         # crossed; populated by _alloc_chunk_tail_slots_for_batch. A value of -1 is
@@ -1086,8 +1072,6 @@ class Req(ReqDllmMixin):
         # AS write task and freed asynchronously on retirement; slots at or after it
         # are freed synchronously in release_kv_cache.
         self.as_written_count: int = 0
-        self.as_spag_submitted_write = None
-        self.as_kv_ready_event = None
         # Fail-fast flag: set True only when a genuine chunk_tail_swa_pool alloc has
         # failed (pool full). Distinct from the -1 AS-hit prefix placeholders, which
         # are NOT alloc failures. Once set, later extends skip alloc.
@@ -1210,10 +1194,6 @@ class Req(ReqDllmMixin):
         # admission; less than host_hit_length when the load-back was declined
         # or the staged splice dropped (that shortfall is re-prefilled).
         self.host_loaded_length = 0
-        # A deferred AS read publishes before the next admission re-matches the
-        # tree. Keep its actual restored interval separate from host_hit_length,
-        # which describes IO still needed and becomes zero after publication.
-        self._as_materialized_host_span: Optional[Tuple[int, int]] = None
         # Buffer-mode host memory is transport staging, not an L2 cache tier.
         self.host_hit_is_storage = False
         # Storage prefetch retry state while queued
@@ -1235,30 +1215,6 @@ class Req(ReqDllmMixin):
         # would make it stale); the only allocation-time reader is the
         # ChunkCache fallback, which has no tree nodes and no rebind.
         self.kv_rotation_base: Optional[int] = None
-        # for trace
-        self.trace_config: Optional[Dict[str, Any]] = trace_config
-        self.to_trace_req: Optional[TraceReq] = self.build_trace_req()
-        self.trace_info: Optional[Dict[str, Any]] = None
-        # Online AS trace: hold the finish output until AS writes retire.
-        # defer_finish_output is set by TraceManager; finish_output_deferred
-        # marks that output_streamer skipped the finish output and owes a resend.
-        self.defer_finish_output: bool = False
-        self.finish_output_deferred: bool = False
-        # AS trace: pure in-memory event collector owned by the request.
-        # unique_trace_id lives on to_trace_req so normal trace and AS trace
-        # share the same id; JSON writing and rank info are owned by TraceManager.
-        self.as_trace_context: Optional[Any] = None
-        if (
-            trace_config
-            and trace_config.get("enable_trace")
-            and trace_config.get("trace_type") in ("as_cache", "all")
-            and self.to_trace_req is not None
-        ):
-            from sglang.srt.mem_cache.as_trace import ASTraceContext
-
-            self.as_trace_context = ASTraceContext(
-                self, self.to_trace_req.unique_trace_id
-            )
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1400,8 +1356,7 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        # Fake-prefill user requests cache normally; warmup/health opt out.
-        self.skip_radix_cache_insert = skip_radix_cache_insert
+        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
@@ -1451,30 +1406,6 @@ class Req(ReqDllmMixin):
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
 
-    def build_trace_req(self):
-        """Build TraceReq from trace_config at init time.
-
-        Parses trace_config to create a TraceReq. Returns None if tracing is
-        not enabled or trace_type is missing.
-        """
-        from sglang.srt.content_detection.config import DETECTION_CONFIG
-        from sglang.srt.managers.io_struct import TraceReq, TraceTrigger, TraceType
-        from sglang.srt.mem_cache.as_trace import build_unique_trace_id
-
-        cfg = self.trace_config or {}
-        if not cfg.get("enable_trace") or not cfg.get("trace_type"):
-            return None
-        return TraceReq(
-            rid=self.rid,
-            trace_type=cfg.get("trace_type", TraceType.METADATA),
-            dump_dir=cfg.get("dump_dir") or DETECTION_CONFIG.trace_dump_dir,
-            trigger=cfg.get("trigger", TraceTrigger.ON_FINISH),
-            payload=cfg.get("payload"),
-            return_logprob=cfg.get("return_logprob", False),
-            return_online=cfg.get("online", True),
-            unique_trace_id=build_unique_trace_id(self),
-        )
-
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1513,17 +1444,7 @@ class Req(ReqDllmMixin):
         """Host-hit tokens that actually reached the device: the metrics tier
         split must not credit host/storage for a declined or dropped
         load-back, whose span was re-prefilled and counted as input."""
-        prefix_len = len(self.prefix_indices)
-        synchronous = min(prefix_len, self.host_hit_length, self.host_loaded_length)
-        span = getattr(self, "_as_materialized_host_span", None)
-        if span is None:
-            return synchronous
-        # Credit only restored bytes still covered by the admitted prefix.
-        # A shortened/evicted prefix must never retain the planned host hit.
-        start = max(0, min(prefix_len, span[0]))
-        end = max(start, min(prefix_len, span[1]))
-        overlap = max(0, end - max(start, prefix_len - synchronous))
-        return synchronous + end - start - overlap
+        return min(self.host_hit_length, self.host_loaded_length)
 
     def fulfilled_storage_hit_len(self, prefix_len: int) -> int:
         """L3-fetched tokens covered by the admitted cached prefix."""
@@ -1578,30 +1499,6 @@ class Req(ReqDllmMixin):
 
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.extend_range.end]
-
-    _GET_FILL_IDS_FOR_LENGTH = get_fill_ids
-
-    def _get_fill_ids_len(self) -> int:
-        """Length of the public fill snapshot, without exporting a token view."""
-        get_fill_ids = self.get_fill_ids
-        if (
-            type(self) is Req
-            and type(get_fill_ids) is MethodType
-            and get_fill_ids.__self__ is self
-            and get_fill_ids.__func__ is Req._GET_FILL_IDS_FOR_LENGTH
-        ):
-            token_ids = self.full_untruncated_fill_ids
-            extend_range = self.extend_range
-            if (
-                type(token_ids) is array
-                and token_ids.typecode == "q"
-                and type(extend_range) is Range
-                and type(extend_range.end) is int
-            ):
-                # Normalize exactly as token_ids[:end], including negative and
-                # arbitrarily large ends. The step is one and the start is zero.
-                return slice(None, extend_range.end).indices(len(token_ids))[1]
-        return len(get_fill_ids())
 
     def _refresh_fill_ids(self) -> None:
         """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
@@ -2010,13 +1907,7 @@ class Req(ReqDllmMixin):
         self.kv.cache_protected_len = 0
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
-        # The loaded prefix is gone, so a re-prefill must read AttentionStore
-        # again; under PP that joint match is also what caps every stage's
-        # local prefix down to the same absolute terminal block.
-        self.ever_read_as = False
-        self.as_read_pending_lock = False
         self.lock_receipt = DecLockRefParams()
-        self._as_materialized_host_span = None
         self.swa_prefix_lock_released = False
         self.swa_branching_seqlen = None
         self.extend_range = None
@@ -2376,34 +2267,6 @@ def _compute_chunked_req_next_prompt_token(
     return None
 
 
-_REQ_GET_FILL_IDS = Req.get_fill_ids
-
-
-def _get_extend_input_ids(req: Req) -> array:
-    """Copy only this extend's suffix; keep the public fill snapshot unchanged."""
-    get_fill_ids = req.get_fill_ids
-    if (
-        type(req) is Req
-        and type(get_fill_ids) is MethodType
-        and get_fill_ids.__self__ is req
-        and get_fill_ids.__func__ is _REQ_GET_FILL_IDS
-        and type(req.extend_range) is Range
-        and type(req.prefix_indices) is torch.Tensor
-    ):
-        token_ids = req.full_untruncated_fill_ids
-        end = req.extend_range.end
-        if (
-            type(token_ids) is array
-            and token_ids.typecode == "q"
-            and type(end) is int
-        ):
-            # len(prefix_indices) is nonnegative, so this is equivalent to
-            # token_ids[:end][len(prefix_indices):], including clipped ends.
-            # Retain an owned array across allocator/encoder callbacks below.
-            return token_ids[len(req.prefix_indices) : end]
-    return get_fill_ids()[len(req.prefix_indices) :]
-
-
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2463,8 +2326,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
-    admission_attempt_id: Optional[int] = None
-    as_kv_ready_event: Optional[object] = None
     launch_ts: Optional[float] = None
     after_idle_gap: bool = False
 
@@ -2787,7 +2648,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
-    @profile_method("sched.prepare_extend", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -2797,7 +2657,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [_get_extend_input_ids(r) for r in reqs]
+        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [r.extend_range.end for r in reqs]
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
@@ -2853,10 +2713,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 r.kv.req_pool_idx is None or r.is_retracted for r in reqs
             ]
         # Allocate memory
-        with operations_nvtx_range("sched.prepare_extend.alloc"):
-            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
-                alloc_for_extend(self)
-            )
+        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
+            self
+        )
 
         # Set fields
         input_embeds = []
@@ -3887,8 +3746,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
-            admission_attempt_id=self.admission_attempt_id,
-            as_kv_ready_event=self.as_kv_ready_event,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,
@@ -3905,12 +3762,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
             self.token_to_kv_pool_allocator.free_group_begin()
-            allocator = self.token_to_kv_pool_allocator
-            batch_segments = envs.SGLANG_OPT_SWA_EVICT_BATCH.get() and hasattr(
-                allocator, "begin_swa_segment_batch"
-            )
-            if batch_segments:
-                allocator.begin_swa_segment_batch()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
@@ -3959,8 +3810,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)
-            if batch_segments:
-                allocator.end_swa_segment_batch()
             self.token_to_kv_pool_allocator.free_group_end()
 
     def _evict_swa(self, req: Req, pre_len: int):

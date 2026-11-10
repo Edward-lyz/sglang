@@ -23,6 +23,7 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.chunk_tail_swa_pool import ChunkTailSWAPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
@@ -806,6 +807,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         is_draft_worker: bool = False,
         kv_layout: Union[str, KVLayout] = KVLayout.V4,
         compressed_kv_layout: Optional[str] = None,
+        max_context_length: Optional[int] = None,
     ):
         super().__init__(
             swa_size,
@@ -1039,6 +1041,109 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_paged_compress_states(enable_memory_saver)
 
+        self.max_context_length = max_context_length
+        self.is_draft_worker = is_draft_worker
+        self.init_as_swa_pool()
+
+    def init_as_swa_pool(self):
+        """Allocate the chunk-tail SWA staging pool (``ChunkTailSWAPool``).
+
+        The AS write path can only persist a SWA window that still exists in HBM,
+        but ``UnifiedRadixCache`` evicts everything older than
+        ``max(sliding_window, page_size)`` as prefill advances. So at every
+        ``swa_step`` checkpoint we copy the tail window out to this independent
+        pool, where it survives until the async AS write retires it.
+
+        Must run after ``_init_paged_compress_states`` so ``swa_kv_pool``'s
+        buffers (and therefore ``kv_cache_total_dim``) are populated.
+
+        The draft worker builds its own pool too: the draft shares the target's
+        slot-id space (``req_to_token_pool`` / ``full_to_swa_index_mapping`` are
+        the same objects), and the AS binding needs the draft pool's write
+        pointers to persist the draft SWA layers alongside the target's.
+        """
+        from sglang.srt.runtime_context import get_memory, get_schedule
+        from sglang.srt.mem_cache.swa_step_policy import (
+            SwaStepPolicy,
+            resolve_swa_step,
+        )
+
+        memory_args = get_memory()
+        # Draft ChunkTailSWAPools registered by the AS binding; every free must fan
+        # out to them because they mirror this pool's slot ids (see
+        # free_chunk_tail_swa_slots).
+        self.draft_chunk_tail_pools: List[ChunkTailSWAPool] = []
+        # swa_kv_pool is None on the encoder-replay and unified-kv paths; neither
+        # exposes a paged SWA page to copy a half out of, so there is nothing to
+        # stage. Returning here keeps those paths from an AttributeError.
+        if not memory_args.enable_as_swa_pool or self.swa_kv_pool is None:
+            self.chunk_tail_swa_pool = None
+            self.swa_policy = None
+            return
+
+        page_size = self.page_size
+        effective_swa_step = resolve_swa_step(memory_args, page_size)
+        if memory_args.enable_dynamic_swa_step:
+            self.swa_policy = SwaStepPolicy.from_spec(
+                memory_args.swa_step_tiers, page_size
+            )
+        else:
+            self.swa_policy = SwaStepPolicy.single(effective_swa_step, page_size)
+        self.swa_step = effective_swa_step
+        assert effective_swa_step % self.swa_page_size == 0, (
+            f"swa_step={effective_swa_step} must be a multiple of "
+            f"swa_page_size={self.swa_page_size}. This guarantees "
+            "tail_start % swa_page_size == swa_win, so half=1 always."
+        )
+
+        # Sized per in-flight chunk, not per request: a slot is returned as soon
+        # as its async AS write retires, so only the concurrently un-flushed
+        # chunks need coverage. as_swa_buffer_coef sets how many.
+        chunked_prefill_size = get_schedule().chunked_prefill_size or 0
+        if chunked_prefill_size <= 0:
+            chunked_prefill_size = self.max_context_length
+        if not chunked_prefill_size or chunked_prefill_size <= 0:
+            logger.warning(
+                "chunk_tail_swa_pool disabled: neither chunked_prefill_size nor "
+                "max_context_length is known, so the pool cannot be sized."
+            )
+            self.chunk_tail_swa_pool = None
+            self.swa_policy = None
+            return
+
+        swa_win = (
+            self.sliding_window
+            if self.sliding_window is not None
+            else self.swa_page_size // 2
+        )
+        slots_per_chunk = max(
+            1, chunked_prefill_size // (self.swa_page_size // swa_win) // swa_win
+        )
+        num_pages = int(slots_per_chunk * memory_args.as_swa_buffer_coef)
+        self.chunk_tail_swa_pool = ChunkTailSWAPool(
+            num_pages=num_pages,
+            layer_num=self.swa_kv_pool.layer_num,
+            bytes_per_token=self.swa_kv_pool.kv_cache_total_dim,
+            src_swa_page_size=self.swa_page_size,
+            swa_win=swa_win,
+            device=self.swa_kv_pool.device,
+        )
+        logger.info(
+            "DSV4 chunk_tail_swa_pool: worker=%s, num_pages=%d, layers=%d, "
+            "slot_bytes=%d, swa_win=%d, swa_step=%d, dynamic=%s, "
+            "chunked_prefill_size=%d, slots_per_chunk=%d, coef=%s",
+            "draft" if self.is_draft_worker else "target",
+            num_pages,
+            self.chunk_tail_swa_pool.layer_num,
+            self.chunk_tail_swa_pool.slot_bytes,
+            swa_win,
+            effective_swa_step,
+            memory_args.enable_dynamic_swa_step,
+            chunked_prefill_size,
+            slots_per_chunk,
+            memory_args.as_swa_buffer_coef,
+        )
+
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         # Under HiCache the compressed region is loaded H->D per layer; wait for this
         # layer's transfer before attention reads it. No-op when HiCache is off.
@@ -1060,17 +1165,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 
-    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        data_ptrs: List[int] = []
-        data_lens: List[int] = []
-        item_lens: List[int] = []
+    def _iter_contiguous_page_buffers(self):
+        """Yield one record per contiguous page buffer, in PD wire order.
 
-        def append_page_buffer(buf: torch.Tensor) -> None:
-            assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-            data_ptrs.append(buf.data_ptr())
-            data_lens.append(buf.nbytes)
-            item_lens.append(buf[0].nbytes)
+        Single source of truth for the SPA/SPAG page transfer layout: both
+        ``get_contiguous_buf_infos`` (the ptr/len view the SDK gathers) and
+        ``get_contiguous_buf_tensor_infos`` (the tensor view the digest hashes)
+        derive from this so the two can never drift apart.
 
+        Each record is ``(kind, tensor, offset_bytes, transfer_bytes,
+        item_bytes)``: ``kind`` is ``"content"`` (KV) or ``"index"`` (indexer);
+        the transfer starts at ``tensor.data_ptr() + offset_bytes`` and covers
+        ``transfer_bytes``; one FULL page occupies ``item_bytes``.
+        """
         stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
         # Registration order defines the PD wire layout: C4 KV, C4 indexer, C128 KV.
         # Keep each indexer immediately after the KV buffers of the same ratio.
@@ -1087,12 +1194,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     row_bytes = buf[0].nbytes
                     rows_per_page = self.page_size // ratio
                     compress_rows = buf.shape[0] - swa_pages
-                    data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
-                    data_lens.append(compress_rows * row_bytes)
-                    item_lens.append(rows_per_page * row_bytes)
+                    yield (
+                        "content",
+                        buf,
+                        swa_pages * row_bytes,
+                        compress_rows * row_bytes,
+                        rows_per_page * row_bytes,
+                    )
             elif kv_pool is not None:
                 for buf in kv_pool.kv_buffer:
-                    append_page_buffer(buf)
+                    assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
+                    yield ("content", buf, 0, buf.nbytes, buf[0].nbytes)
 
             indexer_pool = self.index_pools.get(ratio)
             if indexer_pool is None:
@@ -1113,11 +1225,42 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 )
             for buf in indexer_pool.contiguous_page_row_buffers():
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-                data_ptrs.append(buf.data_ptr())
-                data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes * index_pages_per_full_page)
+                yield (
+                    "index",
+                    buf,
+                    0,
+                    buf.nbytes,
+                    buf[0].nbytes * index_pages_per_full_page,
+                )
 
+    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """Return per-buffer ``(data_ptrs, data_lens, item_lens)`` for page transfer."""
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        for _kind, buf, offset_bytes, transfer_bytes, item_bytes in (
+            self._iter_contiguous_page_buffers()
+        ):
+            data_ptrs.append(buf.data_ptr() + offset_bytes)
+            data_lens.append(transfer_bytes)
+            item_lens.append(item_bytes)
         return data_ptrs, data_lens, item_lens
+
+    def get_contiguous_buf_tensor_infos(self):
+        """Tensor-level view of the page transfer for the AS content digest.
+
+        Returns a list of ``(kind, tensor, offset_bytes, item_bytes)`` in the
+        exact same order as ``get_contiguous_buf_infos``. ``kind`` is
+        ``"content"`` (KV) or ``"index"`` (indexer). The digest hashes
+        ``tensor.view(uint8)[offset_bytes + page_id*item_bytes :][:item_bytes]``,
+        i.e. the very bytes the SDK moves for that FULL page.
+        """
+        return [
+            (kind, buf, offset_bytes, item_bytes)
+            for kind, buf, offset_bytes, _transfer_bytes, item_bytes in (
+                self._iter_contiguous_page_buffers()
+            )
+        ]
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         # StateType.SWA_RING transfers [0, swa_pages) of each unified_kv layer;

@@ -1362,7 +1362,11 @@ class KVCacheConfigurator:
             # decode kernel (SGLANG_DSV4_KV_LAYOUT / SGLANG_DSV4_COMPRESSED_KV_LAYOUT).
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
             kv_layout_kwargs = dict(
-                kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
+                kv_layout=kv_layout,
+                compressed_kv_layout=compressed_kv_layout,
+                # Fallback for sizing the chunk-tail SWA staging pool when chunked
+                # prefill is off; the pool is not sized per request.
+                max_context_length=self.model_config.context_len,
             )
 
         token_to_kv_pool = pool_cls(
