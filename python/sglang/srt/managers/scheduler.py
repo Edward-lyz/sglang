@@ -367,6 +367,7 @@ class Scheduler(
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] Scheduler.__init__ start")
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -647,6 +648,10 @@ class Scheduler(
             self.msit_tracer = MsitLLMTracer(
                 self.tp_worker.model_runner, envs, self.server_args
             )
+
+        logger.info(
+            f"[BOOTSTRAP_ANALYZING][{os.getpid()}] Scheduler.__init__ (tp{self.ps.tp_rank}) done"
+        )
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -941,6 +946,7 @@ class Scheduler(
 
     def init_model_worker(self):
         # Load model weights.
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_model_worker start")
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
 
@@ -1053,6 +1059,8 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_model_worker done")
+
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
         if not self.enable_hisparse:
@@ -1066,6 +1074,7 @@ class Scheduler(
         """Construct one typed AS binding and attach it after topology consensus."""
         import os
 
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _init_attention_store start")
         binding = None
         init_error = None
         cache_plan = None
@@ -1586,6 +1595,7 @@ class Scheduler(
             self.ps.attn_tp_rank,
             binding.layout_id,
         )
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _init_attention_store done")
         return
 
     def _get_draft_kv_info(self):
@@ -1766,6 +1776,7 @@ class Scheduler(
             configure_gc_logger()
 
     def init_disaggregation(self):
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_disaggregation start")
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
         self.disagg_prefill_inflight_queue = None
@@ -1963,6 +1974,8 @@ class Scheduler(
             # MMPreallocQueue -> MMTransferQueue -> waiting_queue
             self.disagg_prefill_mm_prealloc_queue = MMPreallocQueue(self.mm_receiver)
             self.disagg_prefill_mm_transfer_queue = MMTransferQueue(self.mm_receiver)
+
+        logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] init_disaggregation done")
 
     def _validate_pp_pd_early_last_chunk(self):
         """Reject configurations the early-last-chunk path does not cover yet.
@@ -3592,6 +3605,9 @@ class Scheduler(
             sender = getattr(req, "disagg_kv_sender", None)
             if sender is not None and hasattr(sender, "abort"):
                 sender.abort()
+        # Abort before prefill: return any held EPD pinned-pool pages
+        if req.multimodal_inputs is not None:
+            req.multimodal_inputs.release_pool_buffers()
         req.mamba_cow_src_index = None
         req.mamba_needs_clear = False
         if req.req_pool_idx is not None or req.mamba_pool_idx is not None:
@@ -4140,16 +4156,17 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
-        # A lone request (nothing else waiting) is split into ~pp_size chunks
-        # so it occupies every PP stage at once. PP0 only: replay ranks follow
-        # the plan.
+        # Under light load (few pending requests) short-extend requests run
+        # as min_chunk microbatches so they occupy every PP stage at once. PP0
+        # only: replay ranks follow the plan.
         pp_tail_split = None
         tail_min_chunk = envs.SGLANG_PP_TAIL_SPLIT_MIN_CHUNK.get()
+        num_pending = len(self.waiting_queue) + (self.chunked_req is not None)
         if (
             tail_min_chunk > 0
             and self.ps.pp_size > 1
             and authoritative_admissions is None
-            and len(self.waiting_queue) + (self.chunked_req is not None) == 1
+            and 0 < num_pending <= envs.SGLANG_PP_TAIL_SPLIT_MAX_REQS.get()
         ):
             pp_tail_split = (self.ps.pp_size, tail_min_chunk)
 
@@ -5040,6 +5057,13 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+            # With DP attention the ranks must stay in lockstep, so a rank with
+            # nothing to run executes an idle batch instead of falling through to
+            # on_idle(). The metrics refresh hung off on_idle() therefore never
+            # fires there and the "mostrecent" gauges keep exporting the last
+            # busy value -- a flat line on the dashboards. Refresh here as well;
+            # the callee is rate-limited internally, so this stays cheap.
+            self.metrics_reporter._maybe_log_idle_metrics()
 
         self._record_step_counters(batch, result)
 

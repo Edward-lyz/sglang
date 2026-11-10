@@ -639,12 +639,16 @@ class Envs:
     # --max-prefill-tokens). Lets TIME_BUDGET_MS size long-history chunks
     # without also packing short requests into fewer, larger microbatches.
     SGLANG_DYNAMIC_CHUNKING_BATCH_TOKENS = EnvInt(0)
-    # PP prefill: while a single request is pending and its extend at first
-    # admission is <= pp_size * this, cut it into chunks of this many tokens
-    # so the stages work on it in parallel (a short extend on a long cached
+    # PP prefill: while at most SGLANG_PP_TAIL_SPLIT_MAX_REQS requests are
+    # pending, requests whose extend at first admission is <= pp_size * this
+    # run in microbatches of this many tokens (summed over such requests), so
+    # the stages work on them in parallel (a short extend on a long cached
     # prefix otherwise runs as 1-3 chunks walking the pipeline one stage at a
     # time). Long uncached prompts are untouched. 0 = off.
     SGLANG_PP_TAIL_SPLIT_MIN_CHUNK = EnvInt(0)
+    # Light-load bound for the above: above it the pipeline is already full
+    # and small microbatches only add per-microbatch overhead.
+    SGLANG_PP_TAIL_SPLIT_MAX_REQS = EnvInt(4)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     # Per-rank constant that stands in for the all-gathered sync value when
     # SGLANG_SCHEDULER_SKIP_ALL_GATHER is on but the MLP path still needs a

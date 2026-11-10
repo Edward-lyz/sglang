@@ -599,9 +599,10 @@ class PrefillAdder:
         self.cost_chunk_cap = cost_chunk_cap
         self.dllm_config = dllm_config
         self.checkpoint_end_align_size = checkpoint_end_align_size
-        # (pp_size, min_chunk) when the scheduler has a single pending request
-        # and SGLANG_PP_TAIL_SPLIT_MIN_CHUNK is set; see _pp_tail_split_limit.
+        # (pp_size, min_chunk) when few requests are pending and
+        # SGLANG_PP_TAIL_SPLIT_MIN_CHUNK is set; see _pp_tail_split_limit.
         self.pp_tail_split = pp_tail_split
+        self._pp_tail_budget: Optional[int] = None
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -956,19 +957,28 @@ class PrefillAdder:
         return cost
 
     def _pp_tail_split_limit(self, req: Req, extend_len: int) -> Optional[int]:
-        """Chunk cap for a lone short-extend request, or None. A short extend
-        on a long cached prefix otherwise runs as 1-3 large chunks that walk
-        the pipeline one stage at a time; min_chunk-sized chunks overlap
-        across stages. Eligibility is decided at first admission
-        (extend <= pp_size * min_chunk) and sticks to the request, so the
-        tail of a long uncached prompt keeps its cost-model chunks."""
+        """Chunk cap for a short-extend request under light load, or None; 0
+        means this batch's small-chunk budget is spent and the request waits.
+
+        A short extend on a long cached prefix otherwise runs as 1-3 large
+        chunks (or, with a few such requests at once, one large batch) that
+        walk the pipeline one stage at a time. Keeping each microbatch's
+        eligible tokens at min_chunk lets successive microbatches overlap
+        across stages. Eligibility is decided at first admission (extend <=
+        pp_size * min_chunk) and sticks to the request, so the tail of a long
+        uncached prompt keeps its cost-model chunks."""
         if self.pp_tail_split is None:
             return None
         pp_size, min_chunk = self.pp_tail_split
         min_chunk = self.ceil_paged_tokens(min_chunk)
         if not hasattr(req, "_pp_tail_split"):
             req._pp_tail_split = min_chunk < extend_len <= pp_size * min_chunk
-        return min_chunk if req._pp_tail_split and min_chunk < extend_len else None
+        if not req._pp_tail_split:
+            return None
+        budget = min_chunk if self._pp_tail_budget is None else self._pp_tail_budget
+        limit = max(0, min(budget, extend_len))
+        self._pp_tail_budget = budget - limit
+        return limit
 
     def _cost_chunk_limit(self, prefix_len: int) -> int:
         """Largest page-aligned chunk that fits every stage's remaining budget,
