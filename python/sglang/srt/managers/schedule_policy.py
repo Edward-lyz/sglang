@@ -583,6 +583,14 @@ class PrefillAdder:
         # predicted compute instead of raw token count.
         self.cost_model = cost_model
         self.rem_cost = rem_cost if cost_model is not None else None
+        # Hot-path caches for the cost model, both exact: the tightest stage's
+        # remaining budget (rem_cost only changes in _update_prefill_budget)
+        # and the last priced (prefix, paged extend) -- admission prices a
+        # request in _cost_admit and charges the same shape right after.
+        self._rem_cost_min = (
+            float(self.rem_cost.min()) if self.rem_cost is not None else None
+        )
+        self._cost_memo = None
         # Per-request chunk cap in cost-model mode: budgets admit more
         # requests, they must never inflate a single chunk beyond the
         # validated base chunk size (long chunks hit untested kernel paths,
@@ -935,7 +943,13 @@ class PrefillAdder:
         ``_update_prefill_budget`` actually charges to the token budgets."""
         if self.cost_model is None:
             return None
-        return self.cost_model.req_cost(prefix_len, self.ceil_paged_tokens(extend_len))
+        key = (prefix_len, self.ceil_paged_tokens(extend_len))
+        memo = self._cost_memo
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        cost = self.cost_model.req_cost(*key)
+        self._cost_memo = (key, cost)
+        return cost
 
     def _cost_chunk_limit(self, prefix_len: int) -> int:
         """Largest page-aligned chunk that fits every stage's remaining budget,
@@ -975,9 +989,7 @@ class PrefillAdder:
         if can_defer:
             if self.batch_has_partial_req:
                 return "defer", None
-            if self.cost_model.reexpand_cost(prefix_len) >= float(
-                np.min(self.rem_cost)
-            ):
+            if self.cost_model.reexpand_cost(prefix_len) >= self._rem_cost_min:
                 return "defer", None
         return "chunk", self._cost_chunk_limit(prefix_len)
 
@@ -1007,7 +1019,7 @@ class PrefillAdder:
         else:
             if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
-            if self.rem_cost is not None and np.any(self.rem_cost <= 0):
+            if self.rem_cost is not None and self._rem_cost_min <= 0:
                 return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
@@ -1056,6 +1068,7 @@ class PrefillAdder:
             self.rem_chunk_tokens -= extend_input_len
         if self.rem_cost is not None and cost is not None:
             self.rem_cost -= cost
+            self._rem_cost_min = float(self.rem_cost.min())
 
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.

@@ -1664,6 +1664,8 @@ class Scheduler(
 
         # Init the dynamic chunking predictor for PP
         self.chunk_cost_model = None
+        # Per-stage actual-vs-predicted timing (SGLANG_DYNAMIC_CHUNKING_OBSERVE).
+        self.chunk_stage_observer = None
         self.enable_dynamic_chunking = (
             self.server_args.enable_dynamic_chunking and self.ps.pp_size > 1
         )
@@ -4122,6 +4124,14 @@ class Scheduler(
             # the token budget stays as a memory/workspace guard (the A2A
             # workspace is validated against max_prefill_tokens).
             chunked_prefill_size = self.max_prefill_tokens
+            # Optional cap on a whole batch's new tokens, decoupled from the
+            # period: a long period lets long-history chunks grow, but must not
+            # also pack many short requests into few microbatches (fewer
+            # microbatches in flight leaves the pipeline under-filled). PP0
+            # only: replay ranks follow the plan and must not reject it.
+            batch_cap = envs.SGLANG_DYNAMIC_CHUNKING_BATCH_TOKENS.get()
+            if batch_cap > 0 and authoritative_admissions is None:
+                chunked_prefill_size = min(chunked_prefill_size, batch_cap)
             # Copied: PrefillAdder decrements it in place per admission.
             rem_cost = cost_model.target_cost.copy()
         elif self.chunked_req is not None and self.enable_dynamic_chunking:

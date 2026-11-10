@@ -33,7 +33,18 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.chunk_calibration import (
+    calibrate_and_fit,
+    config_fingerprint,
+    load_profile,
+    resolve_profile_path,
+    save_profile,
+)
 from sglang.srt.managers.chunk_cost_model import ChunkCostModel
+from sglang.srt.managers.chunk_stage_observer import (
+    StageCostObserver,
+    parse_stage_scales,
+)
 from sglang.srt.managers.chunk_flops_estimator import (
     aggregate_stage_flops,
     estimate_stage_flops_per_token,
@@ -1924,6 +1935,12 @@ class SchedulerPPMixin:
         elif use_cost_model:
             stage_flops_buckets = [local_buckets] if local_buckets else None
 
+        # Measured coefficients replace the FLOPs ones when PP0 asks for them.
+        # Every rank enters this together (use_cost_model is PP0's decision).
+        measured_coefs = (
+            self._pp_measured_cost_coefs() if use_cost_model else None
+        )
+
         if self.pp_group.is_first_rank and not use_cost_model:
             model_runner = self.tp_worker.model_runner
             model_config = model_runner.model_config
@@ -2135,10 +2152,28 @@ class SchedulerPPMixin:
             self.length_predictor.is_ready = True
 
         # Per-stage compute cost model (batch-composition-aware budgets).
-        # Coefficients come from the walked per-token FLOPs plus the config's
-        # per-layer attention constants -- no fitting, no hardware calibration.
+        # Measured mode fits ms coefficients from timed per-stage forwards;
+        # otherwise coefficients come from the walked per-token FLOPs plus the
+        # config's per-layer attention constants -- no fitting, no calibration.
         self.chunk_cost_model = None
-        if use_cost_model:
+        if use_cost_model and measured_coefs is not None:
+            # Same coefficients on every rank, so a failure here is a decision
+            # all ranks make together; they fall through to the FLOPs model.
+            try:
+                cost_model = ChunkCostModel()
+                cost_model.init_measured(measured_coefs)
+                cost_model.set_target_cost(
+                    self.chunked_prefill_size,
+                    period=envs.SGLANG_DYNAMIC_CHUNKING_TIME_BUDGET_MS.get(),
+                )
+                cost_model.is_ready = True
+                self.chunk_cost_model = cost_model
+            except Exception as e:
+                logger.warning(
+                    f"[PP Dynamic Chunk] Measured cost model init failed: {e}. "
+                    "Falling back to the FLOPs cost model."
+                )
+        if use_cost_model and self.chunk_cost_model is None:
             # Multimodal configs (K3) nest the LLM fields in text_config.
             hf_cfg = resolve_llm_config(self.model_config.hf_config)
             num_heads = getattr(hf_cfg, "num_attention_heads", 0)
@@ -2195,10 +2230,173 @@ class SchedulerPPMixin:
             )
         else:
             logger.info(
-                "[PP Dynamic Chunk] [PP%d] Predictor ready (per-stage FLOPs cost "
+                "[PP Dynamic Chunk] [PP%d] Predictor ready (per-stage %s cost "
                 "model); latency profiling skipped.",
                 self.ps.pp_rank,
+                (
+                    "measured"
+                    if self.chunk_cost_model is not None
+                    and self.chunk_cost_model.unit == "ms"
+                    else "FLOPs"
+                ),
             )
+        self._pp_apply_stage_scales()
+        self.chunk_stage_observer = None
+        if self.chunk_cost_model is not None and envs.SGLANG_DYNAMIC_CHUNKING_OBSERVE.get():
+            self.chunk_stage_observer = StageCostObserver(
+                self.chunk_cost_model, self.ps.pp_rank
+            )
+
+    def _pp_apply_stage_scales(self: Scheduler) -> None:
+        """Apply SGLANG_DYNAMIC_CHUNKING_STAGE_SCALE before anything reads the
+        budget. Local: only PP0's model decides, other ranks use theirs for
+        the observer's predictions, so a disagreeing pod only skews its logs."""
+        cost_model = self.chunk_cost_model
+        if cost_model is None:
+            return
+        try:
+            scales = parse_stage_scales(
+                envs.SGLANG_DYNAMIC_CHUNKING_STAGE_SCALE.get(), self.ps.pp_size
+            )
+            if scales is None:
+                return
+            cost_model.scale_stages(scales)
+            cost_model.set_target_cost(
+                self.chunked_prefill_size,
+                period=(
+                    envs.SGLANG_DYNAMIC_CHUNKING_TIME_BUDGET_MS.get()
+                    if cost_model.unit == "ms"
+                    else None
+                ),
+            )
+        except Exception as e:
+            logger.warning(
+                f"[PP Dynamic Chunk] Ignoring SGLANG_DYNAMIC_CHUNKING_STAGE_SCALE: {e}"
+            )
+
+    def _pp_measured_cost_coefs(self: Scheduler) -> Optional[List[List[float]]]:
+        """Per-stage measured cost coefficients ``[pp_size, 4]``, or None to
+        keep the FLOPs model. Collective over the PP group: every rank must
+        call it, and every rank returns the same value.
+
+        PP0's env decides the source, the acceptance threshold and whether a
+        saved profile is used, the same way it decides the cost-model flag.
+
+        With TP inside a stage every TP rank schedules the same batches, so
+        all of them must hold the same coefficients: TP rank 0's result (its
+        own timings and accept/reject verdict) is broadcast to the others.
+        """
+        coefs = self._pp_measured_cost_coefs_local()
+        tp_group = getattr(self, "tp_cpu_group", None)
+        if self.ps.tp_size > 1 and tp_group is not None:
+            obj = [coefs]
+            torch.distributed.broadcast_object_list(
+                obj, src=torch.distributed.get_global_rank(tp_group, 0), group=tp_group
+            )
+            coefs = obj[0]
+        return coefs
+
+    def _pp_measured_cost_coefs_local(self: Scheduler) -> Optional[List[List[float]]]:
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return None
+        group = self.pp_group.cpu_group
+        world = torch.distributed.get_world_size(group)
+
+        def gather(obj):
+            out = [None] * world
+            torch.distributed.all_gather_object(out, obj, group=group)
+            return out
+
+        local_source = envs.SGLANG_DYNAMIC_CHUNKING_COST_SOURCE.get().strip().lower()
+        profile_path, profile_writable = resolve_profile_path(
+            envs.SGLANG_DYNAMIC_CHUNKING_PROFILE_PATH.get()
+        )
+        fingerprint = config_fingerprint(self)
+        cached = None
+        if local_source == "measured" and self.pp_group.is_first_rank:
+            cached = load_profile(profile_path, fingerprint, self.ps.pp_size)
+        decisions = gather(
+            (local_source, envs.SGLANG_DYNAMIC_CHUNKING_FIT_MAX_ERR.get(), cached)
+        )
+        source, max_err, cached = decisions[0]
+        if any(d[0] != source for d in decisions):
+            logger.warning(
+                "[PP Dynamic Chunk] SGLANG_DYNAMIC_CHUNKING_COST_SOURCE disagrees "
+                "across PP ranks (%s); following PP0 (%s).",
+                [d[0] for d in decisions],
+                source,
+            )
+        if source != "measured":
+            return None
+        if cached is not None:
+            logger.info(
+                "[PP Dynamic Chunk] Using measured profile %s (fingerprint %s).",
+                profile_path,
+                fingerprint,
+            )
+            return cached
+
+        # Stages calibrate independently, so a stage's forward must not contain
+        # a collective: one rank failing mid-grid would strand its peers. The
+        # launch config is identical on every rank, so this check agrees too.
+        # SGLANG_DYNAMIC_CHUNKING_CALIB_INTRA_STAGE_COMM opts TP/EP stages in:
+        # their ranks walk the same grid in the same order, so the in-forward
+        # collectives line up (a rank failing mid-grid still hangs its peers).
+        # DP attention and attention CP stay excluded: their ranks would time
+        # different microbatches.
+        sa = self.server_args
+        allow_tp = envs.SGLANG_DYNAMIC_CHUNKING_CALIB_INTRA_STAGE_COMM.get()
+        intra_stage_comm = (
+            ((self.ps.tp_size > 1 or self.ps.attn_tp_size > 1) and not allow_tp)
+            or self.ps.attn_cp_size > 1
+            or (getattr(sa, "ep_size", 1) > 1 and not allow_tp)
+            or sa.dp_size > 1
+        )
+        if intra_stage_comm:
+            logger.warning(
+                "[PP Dynamic Chunk] Measured cost model needs tp=attn_tp=attn_cp="
+                "ep=dp=1 per stage (got tp=%d attn_tp=%d attn_cp=%d ep=%d dp=%d); "
+                "using the FLOPs cost model.",
+                self.ps.tp_size,
+                self.ps.attn_tp_size,
+                self.ps.attn_cp_size,
+                getattr(sa, "ep_size", 1),
+                sa.dp_size,
+            )
+            return None
+
+        ok, coef, err, msg = calibrate_and_fit(self, self.chunked_prefill_size)
+        results = gather((ok, coef, err, msg))
+        errs = [r[2] for r in results]
+        bad = [i for i, r in enumerate(results) if not r[0] or r[2] > max_err]
+        if bad:
+            logger.warning(
+                "[PP Dynamic Chunk] Measured calibration rejected on PP ranks %s "
+                "(p90 LOO rel err=%s, max=%.3f, errors=%s); using the FLOPs cost "
+                "model.",
+                bad,
+                [round(e, 4) for e in errs],
+                max_err,
+                [results[i][3] for i in bad if results[i][3]],
+            )
+            return None
+        coefs = [r[1] for r in results]
+        logger.info(
+            "[PP Dynamic Chunk] Measured calibration accepted, p90 LOO rel err "
+            "per stage: %s",
+            [round(e, 4) for e in errs],
+        )
+        if self.pp_group.is_first_rank:
+            if profile_writable:
+                save_profile(profile_path, fingerprint, coefs, errs)
+            else:
+                logger.info(
+                    "[PP Dynamic Chunk] No profile path (fingerprint %s); the "
+                    "calibration is kept in memory. Set "
+                    "SGLANG_DYNAMIC_CHUNKING_PROFILE_PATH to persist it.",
+                    fingerprint,
+                )
+        return coefs
 
     def predict_next_chunk_size(self: Scheduler, history_len: int) -> Optional[int]:
         """
@@ -3361,6 +3559,11 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                observer = self.chunk_stage_observer
+                obs_start = None
+                if observer is not None and cur_batch.forward_mode.is_extend():
+                    obs_start = self.device_module.Event(enable_timing=True)
+                    obs_start.record(self.device_module.current_stream())
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(
                     cur_batch.reqs,
@@ -3370,6 +3573,21 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                if obs_start is not None:
+                    obs_end = self.device_module.Event(enable_timing=True)
+                    obs_end.record(self.device_module.current_stream())
+                    observer.submit(
+                        list(
+                            zip(
+                                cur_batch.prefix_lens or (),
+                                cur_batch.extend_lens or (),
+                            )
+                        ),
+                        obs_start,
+                        obs_end,
+                    )
+                if observer is not None:
+                    observer.poll()
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     forward_done=event,

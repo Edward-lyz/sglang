@@ -610,6 +610,35 @@ class Envs:
     # Coefficients are pure FLOPs counts derived at startup from a walk of the
     # loaded weights plus the model config, so no configuration is needed.
     SGLANG_DYNAMIC_CHUNKING_COST_MODEL = EnvBool(False)
+    # Where the cost model's coefficients come from: "flops" (weight walk, no
+    # calibration) or "measured" (every PP stage times a (prefix, chunk) grid
+    # of forwards at startup and fits ms coefficients; falls back to "flops"
+    # on every rank together if any stage fails).
+    SGLANG_DYNAMIC_CHUNKING_COST_SOURCE = EnvStr("flops")
+    # Explicit microbatch period in ms for the measured model. 0 derives it
+    # from a fresh --chunked-prefill-size chunk on the slowest stage.
+    SGLANG_DYNAMIC_CHUNKING_TIME_BUDGET_MS = EnvFloat(0.0)
+    # JSON file with measured coefficients. Loaded when its config fingerprint
+    # matches, otherwise recalibrated and rewritten by PP0. Empty = no profile:
+    # every startup recalibrates and keeps the result in memory only.
+    SGLANG_DYNAMIC_CHUNKING_PROFILE_PATH = EnvStr("")
+    # Reject a stage's fit when its p90 leave-one-out relative error exceeds this.
+    SGLANG_DYNAMIC_CHUNKING_FIT_MAX_ERR = EnvFloat(0.10)
+    # Allow measured calibration on stages with TP/EP collectives (all ranks
+    # of a stage time the same grid in lockstep; TP rank 0's fit is used).
+    SGLANG_DYNAMIC_CHUNKING_CALIB_INTRA_STAGE_COMM = EnvBool(False)
+    # Per-stage multipliers on the cost model's coefficients, "s0,s1,...",
+    # one per PP stage. Corrects per-stage work the model does not see (DSpark
+    # projection / draft-KV injection, eager-bank hop, last-stage sampling).
+    # Only PP0's value decides batches. Empty = all 1.
+    SGLANG_DYNAMIC_CHUNKING_STAGE_SCALE = EnvStr("")
+    # Time every prefill microbatch per stage and log actual/predicted with a
+    # suggested STAGE_SCALE entry. Local to each rank, no collectives.
+    SGLANG_DYNAMIC_CHUNKING_OBSERVE = EnvBool(False)
+    # Cost-model mode: cap on one prefill batch's new tokens (0 = only
+    # --max-prefill-tokens). Lets TIME_BUDGET_MS size long-history chunks
+    # without also packing short requests into fewer, larger microbatches.
+    SGLANG_DYNAMIC_CHUNKING_BATCH_TOKENS = EnvInt(0)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     # Per-rank constant that stands in for the all-gathered sync value when
     # SGLANG_SCHEDULER_SKIP_ALL_GATHER is on but the MLP path still needs a

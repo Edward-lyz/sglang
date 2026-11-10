@@ -317,9 +317,13 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         elif cu_seqlens_q is not None:
             cu_seqlens_q = cu_seqlens_q.to(torch.int32)
             cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
+            # One offset per logits row; output_size skips the device->host
+            # sync repeat_interleave otherwise needs to size its output (it
+            # ran per row-chunk per indexer layer when logits are chunked).
             cu_topk_indices_offset = torch.repeat_interleave(
                 cu_seqlens_q_topk[:-1],
                 cu_seqlens_q,
+                output_size=logits.shape[0],
             )
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q

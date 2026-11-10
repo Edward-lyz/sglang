@@ -1091,6 +1091,24 @@ class Fp8LinearMethod(LinearMethodBase):
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
         )
 
+    def apply_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the FP8 linear into caller-owned storage (e.g. the K3 SP-MoE
+        o_proj buffer in multicast symmetric memory). The FP8 kernels allocate
+        their own output, so this copies; one [T, hidden] bf16 copy per call."""
+        out = self.apply(layer, x, bias=bias)
+        if output.shape != out.shape:
+            raise ValueError(
+                f"linear output has shape {output.shape}, expected {tuple(out.shape)}"
+            )
+        output.copy_(out)
+        return output
+
 
 class Fp8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.
