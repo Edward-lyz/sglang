@@ -43,7 +43,9 @@ def validate_deepseek_v4_mega_moe_token_budget(
     if cfg.enable_prefill_cp:
         token_partition_size = cfg.attn_cp_size
         token_partition_name = "attn_cp_size"
-        token_alignment = 1
+        # Interleave CP pads every local shard to a multiple of CP size
+        # (pad_logical_token_to_physical), including an uneven final chunk.
+        token_alignment = cfg.attn_cp_size
         local_chunked_prefill_size = (
             cfg.chunked_prefill_size + token_partition_size - 1
         ) // token_partition_size
@@ -326,16 +328,27 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        is_fake_decode_benchmark = (
+            cfg.disaggregation_mode == "decode"
+            and cfg.disaggregation_transfer_backend == "fake"
+        )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend != "mooncake"
+            or (
+                cfg.disaggregation_transfer_backend != "mooncake"
+                and not is_fake_decode_benchmark
+            )
+            # [experimental] allow CP on the prefill side with DSpark: the
+            # prefill-CP shard produces KV that the dp decode pulls; decode
+            # itself must still stay CP=1. Runtime compatibility unverified.
+            or (cfg.attn_cp_size != 1 and not cfg.enable_prefill_cp)
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "and decode CP=1 (prefill CP and DP>1 are allowed). Both "
-                "servers must enable DSpark with the same block size and TP "
-                "size."
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake "
+                "(or fake for decode-only synthetic benchmarking), "
+                "DP=1 and CP=1 (prefill CP allowed experimentally). Both "
+                "servers must enable DSpark with the same block size and TP size."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase

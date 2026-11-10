@@ -67,6 +67,10 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 
+# One-time warning latch for the prefill-CP + DP-attention idle-sync guard in
+# _get_pruned_states (avoids per-forward log spam / device syncs).
+_CP_EMPTY_EXTEND_WARNED = False
+
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
@@ -615,14 +619,46 @@ class LogitsProcessor(nn.Module):
         ):
             # Prefill without input logprobs.
             last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
-            pruned_states = hidden_states[last_index]
-            if hidden_states_before_norm is not None:
-                pruned_states_before_norm = hidden_states_before_norm[last_index]
+            # prefill-CP + DP-attention: an idle DP group runs a 0-token
+            # placeholder extend to keep every DP rank stepping together, so the
+            # CP-gathered hidden state is empty (0 rows) while extend_seq_lens
+            # still lists placeholder sequence(s) -> last_index == -1 would index
+            # out of bounds. Guard with cheap, sync-free tensor ops (no .item()
+            # on the forward hot path): zero-fill when the shard is empty, else
+            # clamp indices (a no-op for healthy batches, and it also absorbs a
+            # stray 0-length sequence). Placeholder rows are discarded downstream.
+            n_rows = hidden_states.shape[0]
+            if n_rows == 0:
+                global _CP_EMPTY_EXTEND_WARNED
+                if not _CP_EMPTY_EXTEND_WARNED:
+                    logger.warning(
+                        "prefill-CP + DP-attention: empty CP-gathered hidden "
+                        "states on an idle DP sync step; emitting zero "
+                        "last-token states for placeholder sequence(s). "
+                        "(logged once)"
+                    )
+                    _CP_EMPTY_EXTEND_WARNED = True
+
+                def _prune(t):
+                    return (
+                        None
+                        if t is None
+                        else t.new_zeros((last_index.shape[0], *t.shape[1:]))
+                    )
+
+            else:
+                safe_index = last_index.clamp(0, n_rows - 1)
+
+                def _prune(t):
+                    return None if t is None else t[safe_index]
+
+            pruned_states = _prune(hidden_states)
+            pruned_states_before_norm = _prune(hidden_states_before_norm)
             if aux_hidden_states is not None:
                 aux_pruned_states = (
-                    aux_hidden_states[last_index]
+                    _prune(aux_hidden_states)
                     if isinstance(aux_hidden_states, torch.Tensor)
-                    else [hidden[last_index] for hidden in aux_hidden_states]
+                    else [_prune(hidden) for hidden in aux_hidden_states]
                 )
             sample_indices = None
             input_logprob_indices = None

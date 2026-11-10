@@ -1443,6 +1443,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
 
+            # [DSPARK-PD-DBG] per-state-component layout dump to pinpoint which
+            # DSpark state fails to transfer under prefill-CP(attn_tp=8) -> dp
+            # decode(attn_tp=1). Gated by SGLANG_DSPARK_PD_DEBUG=1 (default off).
+            if envs.SGLANG_DSPARK_PD_DEBUG.get():
+                try:
+                    logger.error(
+                        "[DSPARK-PD-DBG] room=%s comp=%d st=%s src_attn_tp=%s "
+                        "dst_attn_tp=%s n_src_idx=%s n_dst_idx=%s "
+                        "src_item_lens=%s dst_item_lens=%s src_dim=%s dst_dim=%s "
+                        "n_src_ptrs=%d n_dst_ptrs=%d src_layers=%s dst_layers=%s",
+                        getattr(req, "room", getattr(req, "bootstrap_room", "?")),
+                        i, st, self.attn_tp_size,
+                        getattr(target_rank_registration_info, "dst_attn_tp_size", None),
+                        (len(indices) if indices is not None else -1),
+                        len(dst_indices),
+                        list(src_item_lens)[:4], list(dst_item_lens)[:4],
+                        list(src_dim_per_tensor)[:4], list(dst_dim_per_tensor)[:4],
+                        len(src_data_ptrs), len(dst_data_ptrs),
+                        list(src_state_layer_ids)[:6], list(dst_state_layer_ids)[:6],
+                    )
+                except Exception:
+                    pass
+
             if st == StateType.MAMBA:
                 if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
                     src_item_lens
