@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -33,7 +34,7 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -42,7 +43,17 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
 
+logger = logging.getLogger(__name__)
+
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_MEGA_GATE_RUNTIME_DISABLED = False
+_MEGA_GATE_LOGGED: set = set()
+_MEGA_GATE_CAPTURED_LOGGED = False
+_MEGA_GATE_CAPTURE_FALLBACK_WARNED = False
+
+# DeepGEMM raises this host-side (before any stream work) when it would have to
+# lazily initialise its per-stream workspace while the stream is capturing.
+_CAPTURE_ASSERT_MARK = "CaptureStatus"
 
 
 def _mega_moe_mma_type() -> str:
@@ -208,6 +219,164 @@ def forward_mega_moe(
     return y
 
 
+def _try_mega_gate(
+    moe: DeepseekV2MoE,
+    hidden_states: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor],
+    input_ids_global: Optional[torch.Tensor] = None,
+):
+    """Router GEMM + biased top-k in one `deep_gemm.bf16_mega_gate` launch.
+
+    Replaces `moe.gate(hidden_states)` followed by `moe.topk(...)` (or
+    `vision_topk`). The kernel scores with sigmoid/sqrtsoftplus, selects top-k
+    on `score + correction_bias` and renormalizes the unbiased scores -- exactly
+    the `moe_fused_gate` semantics, including     the V4.1 VL variant where
+    image-token rows use `e_score_correction_bias_vl` (`image_bias` +
+    `image_token_mask`). Anything outside that routing shape returns `None`.
+    Gated by SGLANG_OPT_DEEPGEMM_MEGA_GATE.
+
+    Runs under CUDA-graph capture too: DeepGEMM only refuses a capturing stream
+    on its lazy-init path, and sglang's graph runner warms up on the capture
+    stream first (see sglang/kernels/ops/layernorm/mega_mhc.py for the measured
+    behaviour). A refusal throws before any stream work, so falling back inside
+    the capture is safe.
+    """
+    global _MEGA_GATE_RUNTIME_DISABLED, _MEGA_GATE_CAPTURED_LOGGED
+    global _MEGA_GATE_CAPTURE_FALLBACK_WARNED
+
+    if _MEGA_GATE_RUNTIME_DISABLED or not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get():
+        return None
+    if _device_sm < 100 or getattr(moe, "is_hash", False):
+        return None
+    if moe.num_fused_shared_experts:
+        return None
+
+
+    gate = moe.gate
+    bias = getattr(gate, "e_score_correction_bias", None)
+    if bias is None or bias.dtype != torch.float32 or bias.dim() != 1:
+        return None
+    if gate.weight.dtype != torch.bfloat16 or hidden_states.dtype != torch.bfloat16:
+        return None
+
+    cfg = getattr(moe.topk, "topk_config", None)
+    if cfg is None or getattr(moe.topk, "enable_waterfill", False):
+        return None
+    if (
+        cfg.use_grouped_topk
+        or not cfg.renormalize
+        or cfg.top_k <= 1
+        or cfg.num_fused_shared_experts
+        or cfg.custom_routing_function is not None
+        or cfg.scoring_func not in ("sigmoid", "sqrtsoftplus")
+    ):
+        return None
+    # V4.1 VL: image-token rows route with a second correction bias. The kernel
+    # expresses it with image_bias + a per-token bool image_token_mask, which
+    # needs the token ids; without them `vision_topk` is not reproducible here.
+    image_bias = getattr(gate, "e_score_correction_bias_vl", None)
+    image_token_mask = None
+    is_vl = isinstance(image_bias, torch.Tensor)
+    if is_vl:
+        image_token_id = getattr(moe.config, "image_token_id", None)
+        if (
+            image_token_id is None
+            or input_ids_global is None
+            or input_ids_global.shape[0] != hidden_states.shape[0]
+            or image_bias.dtype != torch.float32
+            or image_bias.shape != bias.shape
+        ):
+            return None
+        image_token_mask = input_ids_global == image_token_id
+    else:
+        image_bias = None
+
+    # EPLB logical->physical remap (and the `fake` logit transform) can't be
+    # reproduced by the fused kernel. Only the NON-VL fallback (`moe.topk`)
+    # consumes expert_location_dispatch; the VL fallback (`vision_topk`) ignores
+    # it, so for a VL gate no remap is applied on this path either -- declining
+    # on a present dispatch info would just forfeit the fusion for nothing (e.g.
+    # under `--ep-dispatch-algorithm fake`). Keep declining only for non-VL.
+    if (
+        not is_vl
+        and ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id) is not None
+    ):
+        return None
+
+    import deep_gemm
+
+    # Routed scaling lives at two independent levels; this is the GATE level and
+    # it mirrors `moe_fused_gate` (what the fallback `vision_topk` calls) exactly:
+    #   * gate level: the kernel folds the factor into topk_weights, but only
+    #     when `cfg.apply_routed_scaling_factor_on_output` says the TopK output
+    #     is where the factor belongs -- otherwise we pass 1.0 and the weights
+    #     stay unscaled. `moe_fused_gate` takes the factor and that same flag and
+    #     applies the identical conditional internally, so the topk_weights
+    #     returned here carry the same semantics as the unfused path's.
+    #   * output level: `_run_mega_routed` scales the MoE output `y` further down
+    #     (see `apply_routed_scaling` there), outside this branch, so it covers
+    #     the fused and unfused gates alike. Nothing is double-scaled or dropped.
+    routed_scaling = (
+        cfg.routed_scaling_factor if cfg.apply_routed_scaling_factor_on_output else 1.0
+    )
+    capturing = torch.cuda.is_current_stream_capturing()
+    try:
+        topk_idx, topk_weights = deep_gemm.bf16_mega_gate(
+            hidden_states.contiguous(),
+            gate.weight,
+            cfg.top_k,
+            False,  # use_shared_as_routed
+            0,  # num_shared_experts
+            float(routed_scaling if routed_scaling is not None else 1.0),
+            get_parallel().moe_ep_rank,
+            cfg.scoring_func,
+            None,  # mask
+            bias,
+            image_bias,
+            image_token_mask,
+        )
+    except Exception as err:  # noqa: BLE001
+        if _CAPTURE_ASSERT_MARK in str(err):
+            # Lazy init refused under capture; nothing was issued on the stream,
+            # so the graph stays valid and this capture records the TopK path.
+            if not _MEGA_GATE_CAPTURE_FALLBACK_WARNED:
+                logger.warning(
+                    "deep_gemm.bf16_mega_gate declined a capturing stream that was "
+                    "not warmed up; this graph records the router GEMM + TopK path"
+                )
+                _MEGA_GATE_CAPTURE_FALLBACK_WARNED = True
+            return None
+        logger.warning(
+            "deep_gemm.bf16_mega_gate failed, falling back to the TopK path: %s", err
+        )
+        _MEGA_GATE_RUNTIME_DISABLED = True
+        return None
+
+    from sglang.srt.layers.moe.topk import _mask_topk_ids_padded_region
+
+    log_key = (cfg.top_k, image_bias is not None)
+    if log_key not in _MEGA_GATE_LOGGED:
+        logger.info(
+            "deep_gemm.bf16_mega_gate is serving the MoE router "
+            "(top_k=%d, scoring_func=%s, routed_scaling=%s, vl_bias=%s)",
+            cfg.top_k,
+            cfg.scoring_func,
+            routed_scaling,
+            image_bias is not None,
+        )
+        _MEGA_GATE_LOGGED.add(log_key)
+    if capturing and not _MEGA_GATE_CAPTURED_LOGGED:
+        logger.info(
+            "deep_gemm.bf16_mega_gate was captured into a CUDA graph (tokens=%d)",
+            hidden_states.shape[0],
+        )
+        _MEGA_GATE_CAPTURED_LOGGED = True
+
+    topk_ids = topk_idx.to(torch.int32)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_ids, topk_weights
+
+
 def _run_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -223,37 +392,43 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         num_token_non_padded = (
             forward_batch.num_token_non_padded if forward_batch is not None else None
         )
-        if isinstance(
-            getattr(moe.gate, "e_score_correction_bias_vl", None), torch.Tensor
-        ):
-            # V4.1 VL: image-token rows route with a separate correction bias.
-            # MegaMoE consumes the same routed ids/weights as the normal TopK
-            # path; mirror deepseek_v2.forward_normal's vision routing.
-            from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
-
-            topk_output = vision_topk(
-                moe,
-                router_logits,
-                input_ids_global,
-                num_token_non_padded=num_token_non_padded,
-            )
+        mega_gate_output = _try_mega_gate(
+            moe, hidden_states, num_token_non_padded, input_ids_global
+        )
+        if mega_gate_output is not None:
+            topk_ids, topk_weights = mega_gate_output
         else:
-            topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-            topk_output = moe.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=moe.layer_id,
-                ),
-                **topk_kwargs,
-            )
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
+            router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+            if isinstance(
+                getattr(moe.gate, "e_score_correction_bias_vl", None), torch.Tensor
+            ):
+                # V4.1 VL: image-token rows route with a separate correction bias.
+                # MegaMoE consumes the same routed ids/weights as the normal TopK
+                # path; mirror deepseek_v2.forward_normal's vision routing.
+                from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+
+                topk_output = vision_topk(
+                    moe,
+                    router_logits,
+                    input_ids_global,
+                    num_token_non_padded=num_token_non_padded,
+                )
+            else:
+                topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+                topk_output = moe.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=moe.layer_id,
+                    ),
+                    **topk_kwargs,
+                )
+            topk_ids = topk_output.topk_ids
+            topk_weights = topk_output.topk_weights
     else:
         topk_ids = None
         topk_weights = None
