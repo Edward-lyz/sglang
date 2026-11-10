@@ -249,7 +249,9 @@ def _push_gather(capacity_bytes: int) -> "_PushGather":
     return pg
 
 
-@triton.jit
+# The default ==1 / %16 specialization of these per-batch sizes buys nothing here
+# (they only feed masks and index math) but compiled a new variant per combination.
+@triton.jit(do_not_specialize=["total", "rank_len", "npages_per_rank"])
 def _scatter_kv_rows_kernel(
     src_ptr,  # int32 view of the gathered staging pages [cp * npages, PB / 4]
     dst_ptr,  # int32 view of the SWA cache [num_pages, PB / 4]
@@ -435,7 +437,16 @@ def _scatter_gathered(gathered, kvcache, swa_loc, meta, total, rank_len,
     src_row = swa_loc  # placeholder pointer when INTERLEAVE
     if not interleave:
         src_row = meta.gather_index[:total].to(torch.int64)
-    loc = swa_loc[:total]
+    _launch_scatter_kv_rows(
+        gathered=gathered, kvcache=kvcache, loc=swa_loc[:total], src_row=src_row,
+        interleave=interleave, total=total, rank_len=rank_len, npages=npages,
+        page_bytes=page_bytes, page_size=page_size, layout=layout, cp_size=cp_size,
+    )
+
+
+def _launch_scatter_kv_rows(*, gathered, kvcache, loc, src_row, interleave, total,
+                            rank_len, npages, page_bytes, page_size, layout,
+                            cp_size) -> None:
     _scatter_kv_rows_kernel[(triton.cdiv(total, _SCATTER_BLOCK_T),)](
         gathered.view(torch.int32),
         kvcache.view(torch.int32),
@@ -455,3 +466,28 @@ def _scatter_gathered(gathered, kvcache, swa_loc, meta, total, rank_len,
         BLOCK_T=_SCATTER_BLOCK_T,
         num_warps=4,
     )
+
+
+def warmup_scatter_kv_rows(*, page_size: int, layout, cp_size: int, device) -> None:
+    """Compile the ``_scatter_kv_rows_kernel`` variants serving can select.
+
+    Interleave on / off, each with 16B-aligned and misaligned index pointers.
+    Every slot is ``-1``, so the launches write nothing.
+    """
+    page_bytes = layout.page_bytes(page_size)
+    gathered = torch.zeros((cp_size, page_bytes), dtype=torch.uint8, device=device)
+    kvcache = torch.zeros((1, page_bytes), dtype=torch.uint8, device=device)
+    loc32 = torch.full((2,), -1, dtype=torch.int32, device=device)
+    loc64 = loc32.to(torch.int64)
+    for loc in (loc32[:1], loc32[1:]):
+        # Interleave ignores the row map but it still enters the specialization key.
+        row_maps = (
+            (True, loc32[:1]), (True, loc32[1:]), (False, loc64[:1]), (False, loc64[1:])
+        )
+        for interleave, src_row in row_maps:
+            _launch_scatter_kv_rows(
+                gathered=gathered, kvcache=kvcache, loc=loc, src_row=src_row,
+                interleave=interleave, total=1, rank_len=1, npages=1,
+                page_bytes=page_bytes, page_size=page_size, layout=layout,
+                cp_size=cp_size,
+            )

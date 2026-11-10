@@ -1104,6 +1104,14 @@ class ModelRunner:
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
         self.maybe_warmup_deepgemm_mega_kernels()
+        self.maybe_warmup_model_triton_kernels()
+
+    def maybe_warmup_model_triton_kernels(self) -> None:
+        """Compile the model's serving-path Triton kernel variants before ready."""
+        warmup = getattr(self.model, "warmup_triton_kernels", None)
+        if warmup is None or self.device != "cuda":
+            return
+        warmup(token_to_kv_pool=self.token_to_kv_pool)
 
     def maybe_warmup_deepgemm_mega_kernels(self) -> None:
         """vllm#60468 / #57843: compile the DeepGEMM mega kernels before ready."""

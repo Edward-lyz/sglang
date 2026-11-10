@@ -5666,6 +5666,51 @@ class DeepseekV4ForCausalLM(nn.Module):
                 type(self).__name__,
             )
 
+    def warmup_triton_kernels(self, *, token_to_kv_pool) -> None:
+        """Compile the prefill Triton kernel variants serving can select before ready.
+
+        Each would otherwise JIT (~75 ms per rank) inside the first live request
+        that hits it. Local-only launches, no collectives.
+        """
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        device = torch.cuda.current_device()
+        if (
+            envs.SGLANG_FUSE_CP_CANDIDATE_MASK.get()
+            and self.config.candidate_topk_blocks > 0
+        ):
+            from sglang.kernels.ops.attention.dsv4.candidate_block_score import (
+                warmup_mask_candidate_logits,
+            )
+
+            warmup_mask_candidate_logits(
+                max_topk_blocks=self.config.candidate_topk_blocks,
+                block_size=self.config.candidate_block_size,
+                device=device,
+            )
+        # Same pool gate as DeepseekV4Attention._cp_kv_store_local_first_ok.
+        if (
+            envs.SGLANG_FUSE_CP_KV_STORE_LOCAL_FIRST.get()
+            and is_dsa_enable_prefill_cp()
+            and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and token_to_kv_pool.request_window is None
+            and not token_to_kv_pool.uniform_fp8
+            and token_to_kv_pool.kv_layout in (KVLayout.V4, KVLayout.V41)
+        ):
+            from sglang.kernels.ops.attention.dsv4.cp_kv_store import (
+                warmup_scatter_kv_rows,
+            )
+
+            warmup_scatter_kv_rows(
+                page_size=token_to_kv_pool.swa_page_size,
+                layout=token_to_kv_pool.kv_layout,
+                cp_size=get_parallel().attn_cp_size,
+                device=device,
+            )
+
     def warmup_deepgemm_mega_kernels(
         self, *, max_moe_tokens: int, max_mhc_tokens: int
     ) -> None:
