@@ -129,6 +129,47 @@ def _project_q_replicated(
     )
 
 
+def _use_dcp_vc_before_a2a(self: DeepseekV2AttentionMLA) -> bool:
+    """SGLANG_OPT_DCP_VC_BEFORE_A2A applies to this layer (full-head w_vc gathered,
+    plain 16-bit w_vc bmm, no LoRA correction on the latent output)."""
+    return (
+        self.w_vc_qrep is not None
+        and not self.use_deep_gemm_bmm
+        and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+        and not is_kv_b_lora_active(self)
+        and not is_in_tc_piecewise_cuda_graph()
+    )
+
+
+def _dcp_vc_then_a2a_lse_reduce(
+    self: DeepseekV2AttentionMLA,
+    attn_output: torch.Tensor,
+    lse: torch.Tensor,
+    comm_backend: str,
+) -> torch.Tensor:
+    """w_vc on every DCP-group head first, then the a2a exchange + LSE combine.
+
+    The LSE combine is a per-(token, head) scalar weighting of the rank
+    partials, so it commutes with the per-head w_vc; projecting first shrinks
+    the exchanged partials from kv_lora_rank to v_head_dim.
+    attn_output [B, H_dcp, kv_lora_rank] -> [B, H_local * v_head_dim].
+    """
+    out_v = attn_output.new_empty(
+        (attn_output.shape[0], attn_output.shape[1], self.v_head_dim)
+    )
+    torch.bmm(
+        attn_output.transpose(0, 1), self.w_vc_qrep, out=out_v.transpose(0, 1)
+    )
+    out_v = dcp_a2a_lse_reduce(
+        out_v,
+        lse.contiguous(),
+        get_parallel().dcp_group,
+        is_lse_base_on_e=False,
+        comm_backend=comm_backend,
+    )
+    return out_v.flatten(1, 2)
+
+
 def _is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
     if not get_parallel().dcp_enabled:
         return False
@@ -886,6 +927,21 @@ class DeepseekMLAForwardMixin:
                 )
             else:
                 dcp_comm_backend = get_server_args().dcp_comm_backend
+                if dcp_comm_backend in ("a2a", "fi_a2a") and _use_dcp_vc_before_a2a(
+                    self
+                ):
+                    # w_vc is applied per head before the exchange, so the
+                    # reduced output is already [B, H_local * v_head_dim].
+                    output, _ = self.o_proj(
+                        _dcp_vc_then_a2a_lse_reduce(
+                            self, attn_output, lse, dcp_comm_backend
+                        )
+                    )
+                    if self.next_skip_topk is None:
+                        return output
+                    if not self.next_skip_topk:
+                        return output, None
+                    return output, topk_indices
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
                     # A2A exchange of head partials + LSE, then local Triton combine.
                     # MLA decode LSE is base-2 (FlashInfer-MLA/FlashMLA) -> base_on_e=False.

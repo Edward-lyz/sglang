@@ -966,6 +966,7 @@ class ModelRunner:
             return
         n_prepared = 0
         n_fp8 = 0
+        n_vc = 0
         for m in self.model.modules():
             if not isinstance(m, DeepseekV2AttentionMLA):
                 continue
@@ -1001,6 +1002,14 @@ class ModelRunner:
             m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
             m.q_b_proj_qrep_weight = q_weight
             m.q_b_proj_qrep_scale = q_scale
+            if envs.SGLANG_OPT_DCP_VC_BEFORE_A2A.get() and m.w_vc.dtype in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                # [H_local, kv_lora, v_head] -> [H_dcp, kv_lora, v_head], same
+                # rank-major head order as w_kc_qrep and the a2a head split.
+                m.w_vc_qrep = dcp_group.all_gather(m.w_vc.contiguous(), dim=0)
+                n_vc += 1
             # Only the 16-bit path reclaims the per-rank weights. The FP8 path
             # leaves qp intact because non-decode forward modes still project Q
             # through qp itself (see q_b_proj_forward).
@@ -1016,6 +1025,12 @@ class ModelRunner:
             n_fp8,
             n_prepared - n_fp8,
         )
+        if envs.SGLANG_OPT_DCP_VC_BEFORE_A2A.get():
+            logger.info(
+                "SGLANG_OPT_DCP_VC_BEFORE_A2A: gathered full-head w_vc for %d MLA "
+                "layers",
+                n_vc,
+            )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(
@@ -1218,9 +1233,6 @@ class ModelRunner:
         )
         logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model.sync_barrier done")
         logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] {_role} load_model done")
-
-    def maybe_precompile_model_kernels_after_loading(self) -> None:
-        maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)

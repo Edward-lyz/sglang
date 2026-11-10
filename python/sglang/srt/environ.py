@@ -1387,6 +1387,13 @@ class Envs:
     # Grid = dcp_size x SLICES blocks of BLOCK threads.
     SGLANG_K3_DCP_PUSH_SLICES = EnvInt(8)
     SGLANG_K3_DCP_PUSH_BLOCK = EnvInt(512)
+    # MLA decode: apply w_vc (kv_lora_rank -> v_head_dim) to every DCP-group
+    # head before the a2a exchange instead of after the LSE combine. The combine
+    # is a per-(token, head) scalar weighting of the rank partials, so it
+    # commutes with the per-head w_vc, and the exchanged partials shrink from
+    # kv_lora_rank to v_head_dim. Needs the full-head w_vc gathered next to
+    # --dcp-replicate-q-proj. Off by default: the rounding order changes.
+    SGLANG_OPT_DCP_VC_BEFORE_A2A = EnvBool(False)
     # ====================================================================
 
     # ====================================================================
