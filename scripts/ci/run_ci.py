@@ -40,16 +40,19 @@ List profiles      ./run_ci.py list -c scripts/ci/ci_tests.json
 
 import argparse
 import ast
+import datetime
 import fnmatch
 import glob
+import html
 import json
 import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 # ==============================================================================
 #  Path setup
@@ -543,6 +546,276 @@ class MethodTarget:
     source: str = ""
 
 
+@dataclass
+class TestCaseResult:
+    """A single test case parsed from a JUnit XML report."""
+
+    target: str
+    classname: str
+    name: str
+    status: str
+    elapsed: float
+    message: str = ""
+    details: str = ""
+
+
+@dataclass
+class TestRunResult:
+    """A single executed CI target result used by the generated report."""
+
+    kind: str
+    name: str
+    status: str
+    elapsed: float
+    attempts: int
+    command: str
+    exit_code: Optional[int] = None
+    timeout: Optional[int] = None
+    source: str = ""
+    reason: str = ""
+    junit_xml: str = ""
+    cases: List[TestCaseResult] = field(default_factory=list)
+
+
+def _format_duration(seconds: float) -> str:
+    """Format a duration in seconds for terminal and report output."""
+    total_seconds = int(round(seconds))
+    minutes, sec = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {sec}s"
+    if minutes:
+        return f"{minutes}m {sec}s"
+    return f"{sec}s"
+
+
+def _status_badge(status: str) -> str:
+    """Return a styled HTML badge for a test status."""
+    escaped = html.escape(status.upper())
+    return f'<span class="badge {html.escape(status)}">{escaped}</span>'
+
+
+def _safe_report_stem(value: str) -> str:
+    """Return a filesystem-safe report file stem."""
+    safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in value)
+    return safe_name.strip("-") or "ci-report"
+
+
+def _parse_junit_xml(xml_path: str, target: str) -> List[TestCaseResult]:
+    """Parse pytest JUnit XML into case-level results."""
+    if not xml_path or not os.path.isfile(xml_path):
+        return []
+    try:
+        root = ET.parse(xml_path).getroot()
+    except ET.ParseError:
+        return []
+
+    cases: List[TestCaseResult] = []
+    for testcase in root.iter("testcase"):
+        status = "passed"
+        message = ""
+        details = ""
+        for child_status in ("failure", "error", "skipped"):
+            child = testcase.find(child_status)
+            if child is not None:
+                status = "failed" if child_status in ("failure", "error") else "skipped"
+                message = child.attrib.get("message", "")
+                details = child.text or ""
+                break
+        cases.append(
+            TestCaseResult(
+                target=target,
+                classname=testcase.attrib.get("classname", ""),
+                name=testcase.attrib.get("name", ""),
+                status=status,
+                elapsed=float(testcase.attrib.get("time", 0.0) or 0.0),
+                message=message,
+                details=details,
+            )
+        )
+    return cases
+
+
+def _write_run_reports(
+    report_dir: str,
+    report_name: str,
+    metadata: Mapping[str, object],
+    results: List[TestRunResult],
+) -> Tuple[Path, Path]:
+    """Write HTML and JSON reports for a CI run and return their paths."""
+    output_dir = Path(report_dir)
+    if not output_dir.is_absolute():
+        output_dir = REPO_ROOT / output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = f"{_safe_report_stem(report_name)}-{timestamp}"
+    html_path = output_dir / f"{stem}.html"
+    json_path = output_dir / f"{stem}.json"
+
+    all_cases = [case for item in results for case in item.cases]
+    if all_cases:
+        total = len(all_cases)
+        passed = sum(1 for case in all_cases if case.status == "passed")
+        failed = sum(1 for case in all_cases if case.status == "failed")
+        skipped = sum(1 for case in all_cases if case.status == "skipped")
+    else:
+        total = len(results)
+        passed = sum(1 for item in results if item.status == "passed")
+        failed = sum(1 for item in results if item.status == "failed")
+        skipped = sum(1 for item in results if item.status == "skipped")
+    timed_out = sum(1 for item in results if item.status == "timeout")
+    elapsed_value = metadata.get("elapsed_total", 0.0)
+    elapsed_total = float(elapsed_value) if isinstance(elapsed_value, (int, float, str)) else 0.0
+
+    json_payload = {
+        "metadata": metadata,
+        "summary": {
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+            "timeout": timed_out,
+            "target_total": len(results),
+            "target_failed": sum(1 for item in results if item.status in ("failed", "timeout")),
+            "elapsed": elapsed_total,
+        },
+        "results": [asdict(item) for item in results],
+    }
+    json_path.write_text(json.dumps(json_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    report_rows = []
+    for item in sorted(
+        results,
+        key=lambda r: (r.status == "passed", r.status == "skipped", -r.elapsed),
+    ):
+        case_failed = sum(1 for case in item.cases if case.status == "failed")
+        case_skipped = sum(1 for case in item.cases if case.status == "skipped")
+        case_passed = sum(1 for case in item.cases if case.status == "passed")
+        case_summary = f"{case_passed}/{case_failed}/{case_skipped}"
+        junit_link = ""
+        if item.junit_xml:
+            try:
+                junit_link = os.path.relpath(item.junit_xml, output_dir)
+            except ValueError:
+                junit_link = item.junit_xml
+        junit_cell = ""
+        if junit_link:
+            junit_href = html.escape(json.dumps(junit_link), quote=False)
+            junit_cell = f'<a href={junit_href}>XML</a>'
+
+        item_cases = sorted(
+            item.cases,
+            key=lambda c: (c.status == "passed", c.status == "skipped", -c.elapsed),
+        )
+        if not item_cases:
+            item_cases = [
+                TestCaseResult(
+                    target=item.name,
+                    classname="",
+                    name=item.name,
+                    status=item.status,
+                    elapsed=item.elapsed,
+                    message=item.reason,
+                    details=item.reason,
+                )
+            ]
+
+        for case in item_cases:
+            case_name = case.name
+            if case.classname:
+                case_name = f"{case.classname}::{case.name}"
+            detail_cell = ""
+            if case.details:
+                detail_cell = (
+                    "<details><summary>详情</summary>"
+                    f"<pre>{html.escape(case.details)}</pre></details>"
+                )
+            report_rows.append(
+                "<tr>"
+                f"<td>{_status_badge(case.status)}</td>"
+                f"<td>{html.escape(item.source)}</td>"
+                f"<td class='name'>{html.escape(case_name)}</td>"
+                f"<td class='reason'>{html.escape(case.message)}</td>"
+                f"<td class='detail-cell'>{detail_cell}</td>"
+                f"<td>{case_summary}</td>"
+                f"<td>{_format_duration(case.elapsed)}</td>"
+                f"<td>{junit_cell}</td>"
+                f"<td class='command'>{html.escape(item.command)}</td>"
+                "</tr>"
+            )
+
+    command_line = " ".join(html.escape(arg) for arg in sys.argv)
+    html_doc = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>SGLang CI Report</title>
+<style>
+body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f5f7fb; }}
+header {{ padding: 28px 36px; color: #fff; background: linear-gradient(135deg, #263a8b, #12aab5); }}
+h1 {{ margin: 0 0 8px; font-size: 28px; }}
+.meta {{ opacity: .92; font-size: 14px; }}
+main {{ padding: 24px 36px 40px; }}
+.cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 22px; }}
+.card {{ padding: 16px; border-radius: 14px; background: #fff; box-shadow: 0 6px 18px rgba(30, 41, 59, .08); }}
+.card .num {{ display: block; font-size: 28px; font-weight: 700; }}
+.card .label {{ color: #64748b; font-size: 13px; }}
+section {{ margin-top: 20px; padding: 18px; border-radius: 14px; background: #fff; box-shadow: 0 6px 18px rgba(30, 41, 59, .08); }}
+h2 {{ margin: 0 0 12px; font-size: 18px; }}
+.table-wrap {{ width: 100%; overflow-x: auto; }}
+table {{ min-width: 1180px; width: max-content; border-collapse: collapse; font-size: 13px; }}
+th, td {{ padding: 10px 8px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; }}
+th {{ color: #475569; background: #f8fafc; position: sticky; top: 0; }}
+a {{ color: #2563eb; text-decoration: none; }}
+.name, .command, .reason {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+.name {{ min-width: 180px; max-width: 420px; overflow-wrap: break-word; word-break: normal; }}
+.command {{ min-width: 520px; max-width: 760px; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; color: #475569; }}
+.reason {{ min-width: 360px; max-width: 720px; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; }}
+.detail-cell {{ min-width: 240px; max-width: 560px; }}
+.badge {{ display: inline-block; min-width: 64px; padding: 4px 8px; border-radius: 999px; color: #fff; font-weight: 700; text-align: center; font-size: 12px; }}
+.passed {{ background: #16a34a; }}
+.failed {{ background: #dc2626; }}
+.timeout {{ background: #ea580c; }}
+.skipped {{ background: #64748b; }}
+pre {{ padding: 12px; overflow: auto; border-radius: 10px; background: #0f172a; color: #e2e8f0; }}
+</style>
+</head>
+<body>
+<header>
+<h1>SGLang CI 测试报告</h1>
+<div class="meta">生成时间：{html.escape(str(metadata.get('generated_at', '')))} · 硬件：{html.escape(str(metadata.get('hardware', '')))} · Nightly：{html.escape(str(metadata.get('nightly', '')))}</div>
+</header>
+<main>
+<div class="cards">
+<div class="card"><span class="num">{total}</span><span class="label">总数</span></div>
+<div class="card"><span class="num">{passed}</span><span class="label">通过</span></div>
+<div class="card"><span class="num">{failed}</span><span class="label">失败</span></div>
+<div class="card"><span class="num">{timed_out}</span><span class="label">超时</span></div>
+<div class="card"><span class="num">{skipped}</span><span class="label">跳过</span></div>
+<div class="card"><span class="num">{_format_duration(elapsed_total)}</span><span class="label">总耗时</span></div>
+</div>
+<section>
+<h2>执行信息</h2>
+<pre>{command_line}</pre>
+</section>
+<section>
+<h2>测试明细</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>状态</th><th>来源</th><th>用例</th><th>失败原因</th><th>详情</th><th>用例 P/F/S</th><th>耗时</th><th>JUnit</th><th>命令</th></tr></thead>
+<tbody>{''.join(report_rows) or '<tr><td colspan="9">未生成测试明细。</td></tr>'}</tbody>
+</table>
+</div>
+</section>
+</main>
+</body>
+</html>
+"""
+    html_path.write_text(html_doc, encoding="utf-8")
+    return html_path, json_path
+
+
 def cmd_run(
     hw_name: str,
     nightly: bool,
@@ -562,6 +835,8 @@ def cmd_run(
     max_est_time: Optional[float],
     partition_id: Optional[int],
     partition_size: Optional[int],
+    report_dir: str,
+    report_name: str,
 ):
     """Resolve all targets, build the execution plan, and run the selected tests."""
     _ensure_ci_imports()
@@ -865,6 +1140,7 @@ def cmd_run(
     tic = time.perf_counter()
     passed: List[Tuple[str, str]] = []
     failed: List[Tuple[str, str]] = []
+    results: List[TestRunResult] = []
 
     def _cleanup_gpu_memory():
         """Kill stray GPU processes left over from the previous test.
@@ -914,29 +1190,65 @@ def cmd_run(
             print("[env] test_mamba2_mixer: CUDA_VISIBLE_DEVICES=0,1", flush=True)
         return env
 
+    def _read_test_file(filepath: str) -> str:
+        """Read a test file relative to the current test directory."""
+        full = os.path.join(os.getcwd(), filepath)
+        if not os.path.isfile(full):
+            return ""
+        try:
+            with open(full, "r", errors="ignore") as f:
+                return f.read()
+        except Exception:
+            return ""
+
     def _should_skip_gated(filepath: str) -> bool:
         """Check whether a test file references gated models and should be skipped."""
         if not _SKIP_GATED or not filepath:
             return False
-        full = os.path.join(os.getcwd(), filepath)
-        if not os.path.isfile(full):
-            return False
-        try:
-            with open(full, "r", errors="ignore") as f:
-                content = f.read()
-            return any(pat in content for pat in _GATED_MODEL_PATTERNS)
-        except Exception:
-            return False
+        content = _read_test_file(filepath)
+        return any(pat in content for pat in _GATED_MODEL_PATTERNS)
 
-    def _run_cmd(cmd: List[str], label: str, timeout_sec: int, filepath: str = "") -> bool:
+    def _junit_xml_path(label: str, attempt: int) -> str:
+        """Return the JUnit XML path for a target attempt."""
+        junit_dir = Path(report_dir)
+        if not junit_dir.is_absolute():
+            junit_dir = REPO_ROOT / junit_dir
+        junit_dir = junit_dir / "junit"
+        junit_dir.mkdir(parents=True, exist_ok=True)
+        return str(junit_dir / f"{_safe_report_stem(label)}-attempt-{attempt}.xml")
+
+    def _file_run_cmd(full_path: str, filepath: str, junit_xml: str) -> List[str]:
+        """Build the command used for a file-level target."""
+        content = _read_test_file(filepath)
+        if "pytest" in content or "unittest" in content or "def test_" in content:
+            return ["python3", "-m", "pytest", full_path, "-xvs", f"--junitxml={junit_xml}"]
+        return ["python3", full_path]
+
+    def _method_run_cmd(spec: str, junit_xml: str) -> List[str]:
+        """Build the command used for a method-level target."""
+        return ["python3", "-m", "pytest", spec, "-xvs", f"--junitxml={junit_xml}"]
+
+    def _run_cmd(cmd: List[str], label: str, timeout_sec: int, filepath: str = "") -> TestRunResult:
+        """Run a command once and return a structured result."""
+        command = " ".join(cmd)
         # Skip tests that reference gated models when HF_TOKEN is invalid
         if _should_skip_gated(filepath):
             print(f"\n{YELLOW}  SKIPPED{NC} {label} (gated model, no valid HF_TOKEN)\n")
-            return True  # count as "passed" so we don't block the pipeline
+            return TestRunResult(
+                kind="",
+                name=label,
+                status="skipped",
+                elapsed=0.0,
+                attempts=1,
+                command=command,
+                timeout=timeout_sec,
+                reason="gated model, no valid HF_TOKEN",
+            )
 
-        print(f"\n...\n{BOLD}Running:{NC} {' '.join(cmd)}\n...\n", flush=True)
+        print(f"\n...\n{BOLD}Running:{NC} {command}\n...\n", flush=True)
         file_tic = time.perf_counter()
         env = _build_env(filepath)
+        proc: Optional[subprocess.Popen] = None
         try:
             proc = subprocess.Popen(cmd, stdout=None, stderr=None, env=env)
             proc.wait(timeout=timeout_sec)
@@ -944,29 +1256,82 @@ def cmd_run(
             _cleanup_gpu_memory()
             if proc.returncode == 0:
                 print(f"\n{GREEN}  PASSED{NC} {label} ({elapsed:.0f}s)\n")
-                return True
-            else:
-                print(
-                    f"\n{RED}  FAILED{NC} {label} (exit {proc.returncode}, {elapsed:.0f}s)\n"
+                return TestRunResult(
+                    kind="",
+                    name=label,
+                    status="passed",
+                    elapsed=elapsed,
+                    attempts=1,
+                    command=command,
+                    exit_code=proc.returncode,
+                    timeout=timeout_sec,
                 )
-                return False
+            print(
+                f"\n{RED}  FAILED{NC} {label} (exit {proc.returncode}, {elapsed:.0f}s)\n"
+            )
+            return TestRunResult(
+                kind="",
+                name=label,
+                status="failed",
+                elapsed=elapsed,
+                attempts=1,
+                command=command,
+                exit_code=proc.returncode,
+                timeout=timeout_sec,
+                reason=f"exit {proc.returncode}",
+            )
         except subprocess.TimeoutExpired:
-            _kill(proc.pid)
+            elapsed = time.perf_counter() - file_tic
+            if proc is not None:
+                _kill(proc.pid)
             time.sleep(3)
             _cleanup_gpu_memory()
             print(f"\n{RED}  TIMEOUT{NC} {label} after {timeout_sec}s\n")
-            return False
+            return TestRunResult(
+                kind="",
+                name=label,
+                status="timeout",
+                elapsed=elapsed,
+                attempts=1,
+                command=command,
+                timeout=timeout_sec,
+                reason=f"timeout after {timeout_sec}s",
+            )
 
-    def run_with_retry(cmd: List[str], label: str, timeout_sec: int, filepath: str = "") -> bool:
+    def run_with_retry(
+        cmd_factory: Callable[[str], List[str]],
+        label: str,
+        timeout_sec: int,
+        filepath: str = "",
+    ) -> TestRunResult:
+        """Run a command with optional retry and return the final attempt result."""
         attempts = max_attempts if retry else 1
+        total_elapsed = 0.0
+        last_result: Optional[TestRunResult] = None
         for attempt in range(1, attempts + 1):
             if attempt > 1:
                 print(f"{YELLOW}  [Retry {attempt}/{max_attempts}]{NC} {label}")
                 time.sleep(DEFAULT_RETRY_WAIT)
-            ok = _run_cmd(cmd, label, timeout_sec, filepath=filepath)
-            if ok:
-                return True
-        return False
+            junit_xml = _junit_xml_path(label, attempt)
+            cmd = cmd_factory(junit_xml)
+            last_result = _run_cmd(cmd, label, timeout_sec, filepath=filepath)
+            total_elapsed += last_result.elapsed
+            last_result.attempts = attempt
+            last_result.elapsed = total_elapsed
+            last_result.junit_xml = junit_xml if os.path.isfile(junit_xml) else ""
+            last_result.cases = _parse_junit_xml(last_result.junit_xml, label)
+            if last_result.status in ("passed", "skipped"):
+                return last_result
+        return last_result or TestRunResult(
+            kind="",
+            name=label,
+            status="failed",
+            elapsed=0.0,
+            attempts=attempts,
+            command="",
+            timeout=timeout_sec,
+            reason="not executed",
+        )
 
     effective_timeout = timeout
     if retry:
@@ -979,9 +1344,19 @@ def cmd_run(
         # Give each test at least effective_timeout, but scale up for long-
         # running tests so that a 1000s-est test is not killed at 1800s.
         file_timeout = max(effective_timeout, int(ft.est_time * 1.5))
-        ok = run_with_retry(
-            ["python3", full_path], label, file_timeout, filepath=ft.filepath
+        result = run_with_retry(
+            lambda junit_xml, path=full_path, rel=ft.filepath: _file_run_cmd(
+                path, rel, junit_xml
+            ),
+            label,
+            file_timeout,
+            filepath=ft.filepath,
         )
+        result.kind = "FILE"
+        result.name = ft.filepath
+        result.source = ft.source
+        results.append(result)
+        ok = result.status in ("passed", "skipped")
         (passed if ok else failed).append(("FILE", ft.filepath))
         if not ok and not continue_on_error:
             break
@@ -998,13 +1373,18 @@ def cmd_run(
             else:
                 spec = full_path
             label = f"({i + 1}/{len(method_targets_list)}) {mt.filepath}::{mt.class_name}::{mt.method_name}"
-            ok = run_with_retry(
-                ["python3", "-m", "pytest", spec, "-xvs"],
+            result = run_with_retry(
+                lambda junit_xml, target=spec: _method_run_cmd(target, junit_xml),
                 label,
                 effective_timeout,
                 filepath=mt.filepath,
             )
-            (passed if ok else failed).append(("METHOD", label))
+            result.kind = "METHOD"
+            result.name = f"{mt.filepath}::{mt.class_name}::{mt.method_name}"
+            result.source = mt.source
+            results.append(result)
+            ok = result.status in ("passed", "skipped")
+            (passed if ok else failed).append(("METHOD", result.name))
             if not ok and not continue_on_error:
                 break
 
@@ -1022,6 +1402,23 @@ def cmd_run(
     if failed:
         for kind, name in failed:
             print(f"  {RED}  FAIL [{kind}]{NC} {name}")
+    print("=" * 60)
+
+    metadata = {
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "hardware": hw_name,
+        "nightly": nightly,
+        "timeout": timeout,
+        "retry": retry,
+        "max_attempts": max_attempts,
+        "continue_on_error": continue_on_error,
+        "elapsed_total": elapsed_total,
+        "total_targets": total_targets,
+        "report_name": report_name,
+    }
+    html_path, json_path = _write_run_reports(report_dir, report_name, metadata, results)
+    print(f"  {BOLD}Report:{NC} {html_path}")
+    print(f"  {BOLD}JSON:  {NC} {json_path}")
     print("=" * 60)
 
     sys.exit(0 if not failed else 1)
@@ -1107,6 +1504,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--partition-id", type=int, default=None)
     parser.add_argument("--partition-size", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true", default=False)
+    _ = parser.add_argument("--report-dir", default="ci_reports")
+    _ = parser.add_argument("--report-name", default="sglang-ci")
 
     return parser
 
@@ -1255,6 +1654,8 @@ def main():
             max_est_time=max_est_time,
             partition_id=args.partition_id,
             partition_size=args.partition_size,
+            report_dir=args.report_dir,
+            report_name=args.report_name,
         )
         return
 

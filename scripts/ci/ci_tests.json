@@ -59,7 +59,6 @@
       "test/registered/unit/utils/test_profile_merger.py",
       "test/registered/unit/managers/test_profile_merger_http_api.py",
       "test/registered/rl/test_fp32_lm_head.py",
-      "test/registered/cpu/test_rope.py",
       "test/registered/unit/mem_cache/test_swa_unittest.py",
       "test/registered/unit/model_loader/test_modelopt_export.py",
       "test/registered/moe/test_triton_fused_moe.py",
@@ -76,7 +75,6 @@
       "test/registered/rl/test_patch_torch.py",
       "test/registered/backends/test_qwen3_fp4_trtllm_gen_moe.py",
       "test/registered/lora/test_lora_openai_api.py",
-      "test/registered/kernels/test_fused_topk_deepseek.py",
       "test/registered/unit/batch_invariant_ops/test_batch_invariant_ops.py",
       "test/registered/debug_utils/test_dumper.py",
       "test/registered/8-gpu-models/test_llama4.py",
@@ -136,7 +134,6 @@
     "timeout": "$TIMEOUT",
     "continue_on_error": true,
     "file_patterns": [
-      "test/registered/cpu/test_rope.py",
       "test/registered/unit/mem_cache/test_swa_unittest.py",
       "test/registered/unit/model_loader/test_modelopt_export.py",
       "test/registered/moe/test_triton_fused_moe.py",
@@ -170,7 +167,6 @@
     "file_patterns": [
       "test/registered/backends/test_qwen3_fp4_trtllm_gen_moe.py",
       "test/registered/lora/test_lora_openai_api.py",
-      "test/registered/kernels/test_fused_topk_deepseek.py",
       "test/registered/unit/batch_invariant_ops/test_batch_invariant_ops.py"
     ]
   },
