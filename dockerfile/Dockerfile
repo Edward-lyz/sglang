@@ -26,10 +26,20 @@ RUN cd /tmp/aiak_sglang && find . -name "*.py" -exec cp --parents {} /sgl-worksp
     cp -R python/sglang/kernels/jit /sgl-workspace/sglang/python/sglang/kernels && \
     cp -R python/sglang/jit_kernel /sgl-workspace/sglang/python/sglang && \
     git log -1 --format="%H %s %an %ad" > /sgl-workspace/sglang/aiak-last-commit && \
+    git log -1 --format="%h" > /sgl-workspace/sglang/.aiak-commit-short && \
     rm -rf /tmp/aiak_sglang
 
 RUN pip config set global.index-url http://mirrors.baidubce.com/pypi/simple/ && \
     pip config set global.trusted-host mirrors.baidubce.com
+
+# Re-install sglang as editable so the dist-info (and sglang.__version__) records
+# our internal version instead of the base image's 0.0.0.dev0 fallback.
+RUN AIAK_VERSION="0.5.8+aiak.g$(cat /sgl-workspace/sglang/.aiak-commit-short)" && \
+    echo "Installing sglang as ${AIAK_VERSION}" && \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${AIAK_VERSION}" \
+        pip install --no-deps --force-reinstall -e /sgl-workspace/sglang/python && \
+    pip show sglang | head -3 && \
+    rm -f /sgl-workspace/sglang/.aiak-commit-short
 
 # Install dependencies from configuration file
 COPY aiak_sglang/dockerfile/gpu_requirements.env /tmp/gpu_requirements.env
