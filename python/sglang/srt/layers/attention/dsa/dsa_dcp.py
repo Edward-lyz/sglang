@@ -9,6 +9,8 @@ heads and returns the LSE; the MLA DCP merge combines the partials.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
@@ -18,6 +20,7 @@ TRTLLM_MAX_BATCH_ROWS = 65535
 # per call; the rest is kernel scratch.
 _SOFTMAX_BYTES_PER_ROW_HEAD = 256 * 8
 _SCRATCH_RESERVE_BYTES = 128 << 20
+_LSE_BASE2_FROM_NATURAL_LOG = math.log2(math.e)
 
 
 def trtllm_rows_per_call(*, workspace_bytes: int, heads: int) -> int:
@@ -118,6 +121,11 @@ def dcp_flashmla_rope8_sparse_attention(
 
     out, lse = attention(query=query, return_lse=True, **attention_kwargs)
     out = out.view(rows, heads, -1)
+    # FlashMLA's decode LSE is natural-log (no-split: mi * ln2 + log(li); the
+    # split combine divides by log2(e)), but the DCP merge - like trtllm-gen's
+    # LSE - is base-2. Unconverted, every rank's weight is 2^lse instead of
+    # e^lse and the partials are mis-blended.
+    lse = lse * _LSE_BASE2_FROM_NATURAL_LOG
     # FlashMLA reports lse=+inf (and out=0) for a row whose every slot is -1,
     # while the DCP merge expects -inf. fixup_zero_kv_rows writes exactly that
     # for the rows local_seq_lens marks as empty.
