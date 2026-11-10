@@ -1813,6 +1813,11 @@ class Envs:
     # symmetric-memory low-contention all-gather) instead of NCCL, so it does not take
     # SMs from the compute it overlaps under SGLANG_FUSE_CP_SWA_STORE_OVERLAP.
     SGLANG_FUSE_CP_SWA_GATHER_CE = EnvBool(False)
+    # [fusion-opt] The FFN->attn mega_mhc also writes the attention input as mxfp8
+    # (y_fp8 + per-32 ue8m0 GEMM scales, DeepInfer v4_modules/hc.py) and wqkv_a takes it
+    # pre-quantized: no per_token_group_quant before wqkv_a. Prefill + DeepGEMM MXFP8
+    # route only; the kernel quantizes its own normed output, not bitwise the stock cast.
+    SGLANG_FUSE_MEGA_MHC_FP8_ATTN_INPUT = EnvBool(False)
     # [fusion-opt] TileKernels (deepseek-ai/TileKernels, TileLang JIT) activation casts
     # for the DeepGEMM MXFP8 linear route (SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM):
     # per_token_cast replaces the per-32 ue8m0 group quant in front of every such GEMM;

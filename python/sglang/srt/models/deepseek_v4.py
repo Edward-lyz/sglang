@@ -3580,6 +3580,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         ffn_pre: torch.Tensor,
         ffn_post: torch.Tensor,
         ffn_comb: torch.Tensor,
+        fp8_out: bool = False,
     ):
         """The FFN->next-attn mHC boundary in one ``deep_gemm.mega_mhc`` launch.
 
@@ -3625,7 +3626,23 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=norm_weight,
             norm_eps=norm.variance_epsilon,
             label="FFN->attn",
+            fp8_out=fp8_out,
         )
+
+    def _mega_mhc_attn_input_fp8_ok(self, forward_batch: ForwardBatch) -> bool:
+        """[fusion-opt] Gate of SGLANG_FUSE_MEGA_MHC_FP8_ATTN_INPUT: the FFN->attn
+        mega_mhc also writes the attention input as mxfp8 for wqkv_a, which then takes
+        it pre-quantized (DeepGEMM per-32 ue8m0 route only)."""
+        if not (
+            envs.SGLANG_FUSE_MEGA_MHC_FP8_ATTN_INPUT.get()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and getattr(self.self_attn, "fuse_wqa_wkv", False)
+            and envs.SGLANG_OPT_BLOCK_FP8_MXFP8_DEEPGEMM.get()
+        ):
+            return False
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        return bool(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)
 
     def write_kv(
         self,
@@ -3682,8 +3699,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states if deferred is None else deferred[0], forward_batch
         )
         opened = None
+        attn_x_quant = None
         if deferred is not None:
-            opened = self._mega_mhc_ffn_boundary(*deferred)
+            fp8_in = self._mega_mhc_attn_input_fp8_ok(forward_batch)
+            opened = self._mega_mhc_ffn_boundary(*deferred, fp8_out=fp8_in)
+            if opened is not None and fp8_in:
+                attn_x_quant, opened = opened[5], opened[:5]
             if opened is None:
                 # Fused FFN boundary unavailable: close it the unfused way.
                 moe_out, prev_residual, d_pre, d_post, d_comb = deferred
@@ -3704,7 +3725,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 aux_out.append(_hc_mean(residual))
             with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
                 x = self.self_attn(
-                    x=x, positions=positions, forward_batch=forward_batch, x_quant=None
+                    x=x,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    x_quant=attn_x_quant,
                 )
         else:
             residual = hidden_states

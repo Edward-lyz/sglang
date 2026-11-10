@@ -119,13 +119,16 @@ def mega_mhc_boundary(
     norm_weight: Optional[torch.Tensor],
     norm_eps: float,
     label: str = "mHC",
+    fp8_out: bool = False,
 ) -> Optional[Tuple[torch.Tensor, ...]]:
     """One mHC boundary of the predecessor-pre scheme.
 
     Returns ``(new_residual, layer_input, new_pre, new_post, new_comb)`` with
     ``new_pre/new_post`` shaped ``(T, hc_mult)`` and ``new_comb`` ``(T, hc_mult,
     hc_mult)`` -- the same contracts as ``hc_post`` / ``_hc_mix_stats`` -- or
-    ``None`` when the kernel cannot serve this call.
+    ``None`` when the kernel cannot serve this call. ``fp8_out`` appends the layer
+    input as ``(e4m3 [T, hidden], packed-ue8m0 per-32 scales)`` in DeepGEMM's
+    column-major TMA-aligned layout, written by the same launch.
     """
     global _RUNTIME_DISABLED, _FIRED_LOGGED, _CAPTURED_LOGGED
     global _CAPTURE_FALLBACK_WARNED
@@ -152,6 +155,17 @@ def mega_mhc_boundary(
         (num_tokens, hc_mult, hc_mult), dtype=torch.float32, device=device
     )
     layer_input = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device=device)
+    y_fp8 = y_gemm_sf = None
+    if fp8_out:
+        # DeepInfer v4_modules/hc.py: the mxfp8 TMA column-major per-32 layout is the
+        # kernel's own gran_k=32 output, so the GEMM SF comes out directly
+        y_fp8 = torch.empty(
+            (num_tokens, hidden), dtype=torch.float8_e4m3fn, device=device
+        )
+        m_pad = (num_tokens + 3) // 4 * 4
+        y_gemm_sf = torch.empty(
+            (hidden // 128, m_pad), dtype=torch.int32, device=device
+        ).mT[:num_tokens]
 
     try:
         mega_mhc(
@@ -177,6 +191,7 @@ def mega_mhc_boundary(
             new_post,
             new_comb,
             layer_input,
+            **({"y_fp8": y_fp8, "y_gemm_sf": y_gemm_sf} if fp8_out else {}),
         )
     except Exception as err:  # noqa: BLE001
         if _CAPTURE_ASSERT_MARK in str(err):
@@ -212,10 +227,15 @@ def mega_mhc_boundary(
         )
         _CAPTURED_LOGGED.add(label)
 
-    return (
+    out = (
         new_residual,
         layer_input,
         new_pre.squeeze(-1),
         new_post.squeeze(-1),
         new_comb,
     )
+    if not fp8_out:
+        return out
+    from sglang.srt.layers.quantization.mxfp8_input import Mxfp8DeepGemmInput
+
+    return out + (Mxfp8DeepGemmInput(y_fp8, y_gemm_sf),)
