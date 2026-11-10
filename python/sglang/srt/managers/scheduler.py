@@ -221,6 +221,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -3339,6 +3340,14 @@ class Scheduler(
             # finishing between rounds also get reclaimed.
             ROUNDS = 5
             INTERVAL_S = 0.1
+            # Drain any pending AS writes first so the nodes they hold
+            # locked become evictable. Otherwise /clear_all_cache would
+            # leave those nodes in the tree, AND a later reset() (e.g.
+            # via /flush_cache) on a still-populated _as_write_queue would
+            # orphan their references and trip the cross-tree assertion in
+            # dec_lock_ref.
+            if hasattr(self.tree_cache, "_drain_as_write_queue"):
+                self.tree_cache._drain_as_write_queue()
             for i in range(1, ROUNDS + 1):
                 evict_size = self.tree_cache.evictable_size()
                 if evict_size > 0:

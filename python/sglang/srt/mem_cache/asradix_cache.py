@@ -274,6 +274,47 @@ class AsRadixCache(RadixCache):
 
         return result
 
+    def reset(self):
+        """Reset the radix tree.
+
+        AsRadixCache holds node references in `_as_write_queue` whose lock_ref
+        was incremented by `_write_kv_on_finish`. The base `RadixCache.reset()`
+        replaces `self.root_node` with a brand-new TreeNode, which orphans
+        every node referenced by the queue (their parent chain still points
+        to the OLD root). A subsequent `check_ascache_events()` would then
+        call `dec_lock_ref(old_node)` and fail in the base class with:
+          AssertionError: This request holds the node from another tree
+        because walking up the old chain reaches a parent=None node that
+        is not the new `self.root_node`.
+
+        Drain pending AS writes first (synchronously wait + dec_lock_ref
+        while the old tree is still live), then call the base reset.
+        """
+        self._drain_as_write_queue()
+        super().reset()
+
+    def _drain_as_write_queue(self):
+        """Synchronously drain `_as_write_queue`, waiting for every pending
+        future and dec_lock_ref'ing each task node.
+
+        Safe to call without TP all_reduce: every rank's queue length is
+        kept identical by `_write_kv_on_finish` (real or dummy entry on
+        each call), so all ranks drain the same number of entries.
+        """
+        if not self._as_write_queue:
+            return
+
+        for future, task in self._as_write_queue:
+            try:
+                future.result(timeout=30.0)
+            except Exception as e:
+                logger.warning(
+                    f"AS write task failed during drain: "
+                    f"node_id={id(task.node)}, error={e}"
+                )
+            self.dec_lock_ref(task.node)
+        self._as_write_queue = []
+
     # ===== HiCache-compatible hooks =====
 
     def init_load_back(
