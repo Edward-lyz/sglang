@@ -1,3 +1,5 @@
+"""register_custom_op: torch.library custom-op registration for sglang kernels."""
+
 from __future__ import annotations
 
 import inspect
@@ -7,6 +9,7 @@ import torch
 import torch.library
 
 from sglang.kernels.kernel_api_logging import debug_torch_op
+from sglang.srt.environ import envs
 
 F = TypeVar("F", bound=Callable)
 
@@ -130,7 +133,25 @@ def register_custom_op(
     return decorator
 
 
+def _direct_when_eager(op_func: Callable, dispatched: Callable) -> Callable:
+    """Call ``op_func`` directly outside torch.compile tracing: skips the torch.ops
+    dispatcher round trip (Python -> C++ dispatcher -> Python) per eager call."""
+    is_compiling = torch.compiler.is_compiling
+
+    def call(*args, **kwargs):
+        """Direct eager call; dispatcher only while dynamo traces."""
+        if is_compiling():
+            return dispatched(*args, **kwargs)
+        return op_func(*args, **kwargs)
+
+    call.__name__ = getattr(op_func, "__name__", "custom_op")
+    call.__doc__ = op_func.__doc__
+    return call
+
+
 class CustomOpWrapper:
+    """Lazily registered torch.library custom op around a python implementation."""
+
     def __init__(
         self,
         op_name: str,
@@ -149,6 +170,7 @@ class CustomOpWrapper:
 
     @property
     def real_impl(self) -> Callable:
+        """The callable used at call sites (registered on first access)."""
         if self._impl is None:
             if not hasattr(torch.ops.sglang, self.op_name):
                 from sglang.srt.utils.common import direct_register_custom_op
@@ -163,6 +185,10 @@ class CustomOpWrapper:
                 )
             self._impl = debug_torch_op(self.op_func, self.op_name)
             assert self._impl is not None
+            if envs.SGLANG_OPT_EAGER_CUSTOM_OP_DIRECT.get() and not hasattr(
+                self._impl, "_debug_kernel_wrapped"
+            ):
+                self._impl = _direct_when_eager(self.op_func, self._impl)
         return self._impl
 
     @property
