@@ -21,7 +21,9 @@ import asyncio
 import dataclasses
 import logging
 import os
+import re
 import ssl
+import subprocess
 import tempfile
 import threading
 import time
@@ -1014,8 +1016,13 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
-    """Flush the radix cache."""
+async def flush_cache(
+    timeout: float = Query(0.0, ge=0.0),
+    evict_evictable: bool = Query(
+        False, description="Evict available device blocks while retaining AS data."
+    ),
+):
+    """Flush the radix cache, or only evict available device blocks."""
     # The scheduler refuses to flush while requests are in flight. Health
     # checks (and other background traffic) frequently keep the batch
     # non-empty, so retry until the scheduler goes idle.
@@ -1023,7 +1030,9 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     RETRY_INTERVAL_S = 1.0
     ret = None
     for attempt in range(1, MAX_RETRIES + 1):
-        ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
+        ret = await _global_state.tokenizer_manager.flush_cache(
+            timeout_s=timeout, evict_evictable=evict_evictable
+        )
         if ret.success:
             break
         logger.info(
@@ -1156,7 +1165,7 @@ async def clear_all_cache(
 
     logger.info("[/clear_all_cache] received request, memory_only=%s", memory_only)
 
-    # Device cache: scheduler-side does 5 rounds / 100ms spacing. In
+    # Device cache: scheduler evicts in rounds while retiring completed AS writes. In
     # memory-only mode it must be retained for callers that need independent
     # control of the two cache tiers.
     if memory_only:
@@ -1173,7 +1182,7 @@ async def clear_all_cache(
             lines.append(f"[device] exception: {e}")
             logger.exception("[/clear_all_cache] device cache clear raised")
         if device_ok:
-            lines.append("[device] evicted evictable blocks (5 rounds)")
+            lines.append("[device] evicted evictable blocks")
         else:
             lines.append("[device] evict failed; see backend logs")
             all_ok = False

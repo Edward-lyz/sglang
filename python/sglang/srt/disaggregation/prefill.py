@@ -27,6 +27,7 @@ import threading
 import time
 from array import array
 from collections import deque
+from contextlib import nullcontext
 from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -37,6 +38,10 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.prefill_continuous import (
+    ContinuousPrefillController,
+    make_try_get,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -60,6 +65,9 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+)
+from sglang.srt.managers.scheduler_components.prefill_admission import (
+    PrefillAdmission,
 )
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
@@ -664,6 +672,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
         self._fwd_in_q = queue.Queue(maxsize=1)
         self._fwd_out_q = queue.Queue(maxsize=1)
+        # Continuous admission may take the result off _fwd_out_q while it
+        # polls. _fwd_collect consumes this single stashed item first.
+        self._fwd_stashed = None
         self._fwd_submission_done = threading.Event()
         self._fwd_submission_done.set()
         self._pf_forward_inflight = False
@@ -734,11 +745,21 @@ class SchedulerDisaggregationPrefillMixin:
         self._fwd_in_q.put((batch, prep_done, input_lens, logprob_lens))
 
     def _fwd_collect(self: Scheduler):
-        result, batch_copy, exc = self._fwd_out_q.get()
+        item = getattr(self, "_fwd_stashed", None)
+        if item is None:
+            item = self._fwd_out_q.get()
+        else:
+            self._fwd_stashed = None
+        result, batch_copy, exc = item
         if exc is not None:
             raise exc
         self._pf_forward_inflight = False
         return result, batch_copy
+
+    def _stash_fwd_result(self: Scheduler, item) -> None:
+        if self._fwd_stashed is not None:
+            raise RuntimeError("prefill forward result stash is already occupied")
+        self._fwd_stashed = item
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill_threaded(self: Scheduler) -> None:
@@ -762,6 +783,202 @@ class SchedulerDisaggregationPrefillMixin:
             snap.spec_info = copy.copy(batch.spec_info)
         return snap
 
+    def begin_next_disagg_prefill_batch(
+        self: Scheduler,
+        *,
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch],
+        deferred_finalize: List,
+    ) -> PrefillAdmission:
+        """Open and initially fill an admission without sealing its batch."""
+        self.process_pending_chunked_abort()
+        running_batch.batch_is_full = False
+        self.resolve_waiting_queue_bootstrap()
+        self.process_prefill_chunk(
+            last_batch=last_batch,
+            running_batch=running_batch,
+            deferred_finalize=deferred_finalize,
+        )
+
+        prefill_delayer_single_pass = None
+        if self.prefill_delayer:
+            max_pool_usage = (
+                self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
+            )
+            prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
+                self.prefill_delayer, token_usage=max_pool_usage
+            )
+        admission = self._open_prefill_admission(
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
+            running_batch=running_batch,
+        )
+        self._admit_prefill_candidates(admission, admission.initial_candidates)
+        return admission
+
+    def finish_next_disagg_prefill_batch(
+        self: Scheduler, admission: PrefillAdmission
+    ) -> NextBatchPlan:
+        """Seal a continuous admission and apply the normal batch adapters."""
+        if admission.adder is None:
+            ret, running_batch = None, admission.running_batch
+        else:
+            ret, running_batch = self._seal_prefill_admission(admission)
+        if self.prefill_delayer and admission.prefill_delayer_single_pass is not None:
+            admission.prefill_delayer_single_pass.finalize(
+                actual_prefill=ret is not None
+            )
+        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+        if ret:
+            set_schedule_time_batch(ret)
+        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _pop_bootstrapped_into_waiting(
+        self: Scheduler,
+    ) -> None:
+        ready = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        if ready:
+            self.waiting_queue.extend(ready)
+
+    def _admit_while_forward_runs(
+        self: Scheduler,
+        admission: PrefillAdmission,
+        controller: ContinuousPrefillController,
+        try_get,
+    ) -> PrefillAdmission:
+        """Keep filling the same adder until the previous forward returns."""
+        while not admission.closed and not controller.poll_forward_done(try_get):
+            recv_reqs = self.request_receiver.recv_requests()
+            self.process_input_requests(recv_reqs)
+            self._pop_bootstrapped_into_waiting()
+            if self.enable_asradix_cache:
+                # This is the existing TP/FIFO completion protocol.  It
+                # reclaims completed writes while deferred reads remain in the
+                # outer handoff scope.
+                self.tree_cache.check_ascache_events()
+            if self._engine_paused:
+                continue
+            candidates = [
+                req
+                for req in self.waiting_queue
+                if req.rid not in admission.offered
+            ]
+            if not candidates:
+                continue
+            if admission.adder is None:
+                admission = self._open_prefill_admission(
+                    prefill_delayer_single_pass=(
+                        admission.prefill_delayer_single_pass
+                    ),
+                    running_batch=admission.running_batch,
+                )
+                if admission.adder is None:
+                    admission.closed = True
+                    continue
+            self._admit_prefill_candidates(admission, candidates)
+            if admission.adder is not None:
+                self.open_prefill_admission_rids = frozenset(
+                    req.rid for req in admission.adder.can_run_list
+                )
+        return admission
+
+    @torch.no_grad()
+    def event_loop_overlap_disagg_prefill_continuous(
+        self: Scheduler,
+    ) -> None:
+        """Run AHEAD admission while keeping the next batch open."""
+        self.result_queue = deque()
+        self._ensure_prefill_fwd_thread()
+        controller = ContinuousPrefillController(
+            is_leader=(
+                getattr(self.ps, "attn_tp_rank", getattr(self.ps, "tp_rank", 0))
+                == 0
+                and getattr(self.ps, "attn_cp_rank", 0) == 0
+            ),
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            poll_s=envs.SGLANG_PREFILL_ADMISSION_POLL_MS.get() / 1000.0,
+        )
+        try_get = make_try_get(
+            self._fwd_out_q,
+            self._stash_fwd_result,
+            has_stash=lambda: self._fwd_stashed is not None,
+        )
+        inflight = None
+
+        with self.device_module.StreamContext(self.schedule_stream):
+            while True:
+                self.iter_start_time = time.perf_counter()
+                self.metrics_reporter.iter_start_time = self.iter_start_time
+                recv_reqs = self.request_receiver.recv_requests()
+                self.process_input_requests(recv_reqs)
+                if self._engine_paused:
+                    continue
+                self._pop_bootstrapped_into_waiting()
+
+                deferred_finalize = []
+                load_scope = (
+                    self.tree_cache.batch_as_load_handoffs()
+                    if self.enable_asradix_cache
+                    else nullcontext()
+                )
+                with load_scope:
+                    admission = self.begin_next_disagg_prefill_batch(
+                        running_batch=self.running_batch,
+                        last_batch=self.last_batch,
+                        deferred_finalize=deferred_finalize,
+                    )
+                    if inflight is not None:
+                        self.open_prefill_admission_rids = frozenset(
+                            req.rid for req in admission.adder.can_run_list
+                        ) if admission.adder is not None else frozenset()
+                        admission = self._admit_while_forward_runs(
+                            admission, controller, try_get
+                        )
+                    self.open_prefill_admission_rids = frozenset()
+                    plan = self.finish_next_disagg_prefill_batch(admission)
+
+                self.running_batch = plan.running_batch
+                batch = self.ngram_embedding_manager.prepare_for_forward(
+                    plan.batch_to_run, chunked_req=self.chunked_req
+                )
+                self.cur_batch_for_debug = batch
+
+                prev_result = None
+                prev_copy = None
+                if inflight is not None:
+                    prev_result, prev_copy = self._fwd_collect()
+
+                if prev_result is not None:
+                    self._apply_war_barrier()
+                    self.launch_batch_sample_if_needed(prev_result, prev_copy)
+                    if getattr(prev_result, "copy_done", None) is not None:
+                        prev_result.copy_done.synchronize()
+
+                for finalize in deferred_finalize:
+                    finalize()
+
+                if prev_result is not None:
+                    self.process_batch_result(prev_copy, prev_result)
+                elif (
+                    batch is None
+                    and inflight is None
+                    and not self.disagg_prefill_inflight_queue
+                    and not self.waiting_queue
+                ):
+                    self.on_idle()
+
+                self.process_disagg_prefill_inflight_queue()
+                self.last_batch = batch
+
+                if batch:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(batch)
+                    snap = self._snapshot_batch_for_forward(batch)
+                    self._fwd_submit(snap)
+                else:
+                    snap = None
+                inflight = snap
+
     @torch.no_grad()
     def _event_loop_overlap_disagg_prefill_threaded_impl(self: Scheduler) -> None:
         """Overlap loop with the forward launched on a worker thread.
@@ -774,10 +991,10 @@ class SchedulerDisaggregationPrefillMixin:
         inflight = None
 
         while True:
-            if inflight is not None:
-                # 中文：前向已入队后才允许主线程操作 CUDA。AS load 与前向的
-                # GPU 执行仍重叠，避免的是两线程同时进行首次算子初始化/提交。
-                self._fwd_submission_done.wait()
+            # _fwd_submit only records the scheduler-stream dependency and puts
+            # the batch in the bounded worker queue. Admission must start
+            # immediately after that handoff; waiting for run_batch() to return
+            # here serializes the AS load-back with the forward.
             self.iter_start_time = time.perf_counter()
             self.metrics_reporter.iter_start_time = self.iter_start_time
             recv_reqs = self.request_receiver.recv_requests()

@@ -440,6 +440,14 @@ class Envs:
     # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # Keep the next prefill admission open while the previous forward runs.
+    # Requires the threaded forward path and its AHEAD gate.
+    SGLANG_ENABLE_PREFILL_CONTINUOUS_ADMISSION = EnvBool(False)
+    # Rank-0 wait used by the continuous admission completion poll.
+    SGLANG_PREFILL_ADMISSION_POLL_MS = EnvFloat(1.0)
+    # Threaded prefill uses the stride-unspecialized DSA page-table transform
+    # kernel. False keeps the original kernel on P as well; D always uses it.
+    SGLANG_DSA_THREADED_TRANSFORM_KERNEL = EnvBool(True)
     # Force-enable the WAR (write-after-read) barrier for the overlap scheduler
     # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
     # already enabled regardless of this flag (see start_event_loop).

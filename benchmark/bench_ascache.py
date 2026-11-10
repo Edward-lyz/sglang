@@ -99,7 +99,9 @@ def get_dp_size(base_url: str) -> int:
 
 def flush_cache(base_url: str):
     """只清理 GPU/device KV cache，保留各节点的内存 cache。"""
-    resp = requests.post(f"{base_url}/flush_cache", timeout=60)
+    resp = requests.post(
+        f"{base_url}/flush_cache", params={"evict_evictable": "true"}, timeout=60
+    )
     resp.raise_for_status()
 
 

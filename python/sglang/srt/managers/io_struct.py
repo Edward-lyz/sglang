@@ -292,6 +292,8 @@ class GenerateReqInput:
     custom_labels: Optional[Dict[str, str]] = None
     # Optional content-detection / online trace configuration.
     trace_config: Optional[Dict[str, Any]] = None
+    # Function call continuation: token IDs to replay for grammar state recovery
+    continuation_token_ids: Optional[List[int]] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
@@ -320,6 +322,11 @@ class GenerateReqInput:
 
     # For Unlimited-OCR
     images_config: Optional[dict] = None
+
+    # AttentionStore (AS) secondary cache parameters.
+    as_kv_cache_params: Optional[Union[List[dict], dict]] = None
+    as_max_hit_host_ip: Optional[Union[List[List[str]], List[str]]] = None
+    as_max_hit_token_len: Optional[Union[List[List[int]], List[int]]] = None
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
@@ -502,6 +509,7 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_as_params(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -746,6 +754,44 @@ class GenerateReqInput:
         elif isinstance(self.decode_tp_size, list):
             self.decode_tp_size = self.decode_tp_size * self.parallel_sample_num
 
+    def _normalize_as_params(self, num):
+        """Normalize AttentionStore parameters for batch processing."""
+        if self.as_kv_cache_params is None:
+            self.as_kv_cache_params = [None] * num
+        elif not isinstance(self.as_kv_cache_params, list):
+            self.as_kv_cache_params = [self.as_kv_cache_params] * num
+        elif len(self.as_kv_cache_params) == self.batch_size:
+            self.as_kv_cache_params = self.as_kv_cache_params * self.parallel_sample_num
+        elif len(self.as_kv_cache_params) != num:
+            raise ValueError(
+                "The length of as_kv_cache_params should match the batch size "
+                "or expanded batch size."
+            )
+
+        if self.as_max_hit_host_ip is None or not self.as_max_hit_host_ip:
+            self.as_max_hit_host_ip = [None] * num
+        elif not isinstance(self.as_max_hit_host_ip[0], list):
+            self.as_max_hit_host_ip = [self.as_max_hit_host_ip] * num
+        elif len(self.as_max_hit_host_ip) == self.batch_size:
+            self.as_max_hit_host_ip = self.as_max_hit_host_ip * self.parallel_sample_num
+        elif len(self.as_max_hit_host_ip) != num:
+            raise ValueError(
+                "The length of as_max_hit_host_ip should match the batch size "
+                "or expanded batch size."
+            )
+
+        if self.as_max_hit_token_len is None or not self.as_max_hit_token_len:
+            self.as_max_hit_token_len = [None] * num
+        elif not isinstance(self.as_max_hit_token_len[0], list):
+            self.as_max_hit_token_len = [self.as_max_hit_token_len] * num
+        elif len(self.as_max_hit_token_len) == self.batch_size:
+            self.as_max_hit_token_len = self.as_max_hit_token_len * self.parallel_sample_num
+        elif len(self.as_max_hit_token_len) != num:
+            raise ValueError(
+                "The length of as_max_hit_token_len should match the batch size "
+                "or expanded batch size."
+            )
+
     def _get_positional_embed_overrides_item(
         self, i: int
     ) -> Optional[PositionalEmbeds]:
@@ -837,6 +883,22 @@ class GenerateReqInput:
             return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
             received_time=self.received_time,
+            # AttentionStore parameters normalized above for batched requests.
+            as_kv_cache_params=(
+                self.as_kv_cache_params[i]
+                if self.as_kv_cache_params is not None
+                else None
+            ),
+            as_max_hit_host_ip=(
+                self.as_max_hit_host_ip[i]
+                if self.as_max_hit_host_ip is not None
+                else None
+            ),
+            as_max_hit_token_len=(
+                self.as_max_hit_token_len[i]
+                if self.as_max_hit_token_len is not None
+                else None
+            ),
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
                 if self.multi_item_delimiter_indices is not None
@@ -883,6 +945,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
+    # Function call continuation: token IDs to replay for grammar state recovery
+    continuation_token_ids: Optional[List[int]] = None
 
     # Session info for continual prompting
     session_id: Optional[str] = None
@@ -955,6 +1019,12 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Optional content-detection / online trace configuration.
     trace_config: Optional[Dict[str, Any]] = None
+
+    # AttentionStore parameters. ``as_block_hashs`` is generated after tokenization.
+    as_block_hashs: Optional[Any] = None
+    as_kv_cache_params: Optional[dict] = None
+    as_max_hit_host_ip: Optional[List[str]] = None
+    as_max_hit_token_len: Optional[List[int]] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
@@ -1434,6 +1504,10 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output decoded strings
     output_strs: List[str]
+    # Optional per-token split of output_strs for multi-token (speculative)
+    # steps. Aligned with rids: one list per request; "" marks a token held
+    # back for incomplete UTF-8. None => no split (use output_strs).
+    per_token_strs: Optional[List[List[str]]] = None
     # The token ids
     output_ids: Optional[List[array]]
 
@@ -1561,6 +1635,8 @@ class ClearHiCacheReqOutput(BaseReq, kw_only=True):
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
+    # 只驱逐可回收的GPU页，不重置AS Host缓存或请求池。
+    evict_evictable: bool = False
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):
@@ -1984,6 +2060,7 @@ class TraceType:
     SAMPLE = "sample"
     LOGPROBS = "logprobs"
     ALL = "all"
+    AS_CACHE = "as_cache"
 
 
 class TraceTrigger:
@@ -2002,6 +2079,9 @@ class TraceReq(BaseReq, kw_only=True):
     payload: Optional[Dict[str, Any]] = None
     return_logprob: bool = False
     return_online: bool = False
+    # Deterministic request id shared by normal trace and AS trace. Minted at
+    # Req init (build_trace_req); downstream (TraceManager, ASCache) reads it here.
+    unique_trace_id: Optional[str] = None
 
     def __post_init__(self):
         if self.rid is None:

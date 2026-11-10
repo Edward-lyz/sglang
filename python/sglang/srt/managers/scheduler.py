@@ -182,6 +182,9 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_components.prefill_admission import (
+    PrefillAdmission,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -1352,6 +1355,7 @@ class Scheduler(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             ipc_channels=self.ipc_channels,
+            evict_evictable_cache=self.evict_evictable_cache,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
@@ -3440,6 +3444,352 @@ class Scheduler(
             self.waiting_queue.insert(0, r)
         return can_run_list
 
+    def _open_prefill_admission(
+        self,
+        *,
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+        running_batch: ScheduleBatch,
+    ) -> PrefillAdmission:
+        """Prepare a PrefillAdder without sealing the batch.
+
+        The ordinary path below keeps its original implementation.  This
+        split path is used only by continuous admission, where the same adder
+        must remain alive while the previous forward is running.
+        """
+        if self.grammar_manager.has_waiting_grammars():
+            for req in self.grammar_manager.get_ready_grammar_requests():
+                self._add_request_to_queue(req)
+
+        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
+            self.tree_cache.check_hicache_events()
+        elif self.enable_asradix_cache:
+            self.tree_cache.check_ascache_events()
+
+        if self.enable_priority_preemption or self.is_hybrid_swa:
+            running_batch.batch_is_full = False
+
+        if (
+            running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
+            return PrefillAdmission(
+                running_batch=running_batch,
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+            )
+
+        running_bs = len(running_batch.reqs)
+        if (
+            self.min_free_slots_delayer is not None
+            and self.chunked_req is None
+            and self.min_free_slots_delayer.should_delay(
+                running_bs=running_bs,
+                num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
+            )
+        ):
+            return PrefillAdmission(
+                running_batch=running_batch,
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+            )
+
+        if (
+            self.get_num_allocatable_reqs(running_bs) <= 0
+            and self.chunked_req is None
+            and not self.enable_priority_preemption
+        ):
+            running_batch.batch_is_full = True
+            return PrefillAdmission(
+                running_batch=running_batch,
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+            )
+
+        self.policy.calc_priority(self.waiting_queue, running_batch)
+        if self.enable_asradix_cache:
+            self.tree_cache.refresh_pending_prefixes(self.waiting_queue)
+
+        if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+            return PrefillAdmission(
+                running_batch=running_batch,
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+            )
+
+        chunked_prefill_size = self.chunked_prefill_size
+        if self.chunked_req is not None and self.enable_dynamic_chunking:
+            history_len = len(self.chunked_req.prefix_indices)
+            dynamic_size = self.predict_next_chunk_size(history_len)
+            if dynamic_size is not None:
+                chunked_prefill_size = dynamic_size
+
+        adder = PrefillAdder(
+            self.page_size,
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
+            running_batch,
+            self.new_token_ratio_tracker.current,
+            self.max_prefill_tokens,
+            chunked_prefill_size,
+            running_bs if self.is_mixed_chunk else 0,
+            self.priority_scheduling_preemption_threshold,
+            max_prefill_bs=self.max_prefill_bs,
+            max_running_requests=self.max_running_requests,
+            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
+            dllm_config=self.dllm_config,
+            waiting_queue_len=len(self.waiting_queue),
+        )
+
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+
+        running_loras = None
+        if self.enable_lora:
+            running_loras = {
+                req.lora_id for req in running_batch.reqs if not req.finished()
+            }
+            running_loras.update(req.lora_id for req in adder.can_run_list)
+            if self.lora_drainer:
+                self.lora_drainer.update_draining_state(
+                    self.waiting_queue, running_batch.reqs
+                )
+
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if mamba_allocator is not None:
+            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+
+        return PrefillAdmission(
+            running_batch=running_batch,
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
+            adder=adder,
+            initial_candidates=list(self.waiting_queue),
+            running_loras=running_loras,
+            mamba_allocator=mamba_allocator,
+        )
+
+    def _admit_prefill_candidates(
+        self, admission: PrefillAdmission, candidate_reqs: List[Req]
+    ) -> None:
+        """Add candidates to an open adder and leave the budget state intact."""
+        if admission.closed or admission.adder is None:
+            return
+        if admission.mamba_allocator is not None and admission.offered:
+            # The allocator group was sized from the initial waiting queue.
+            # Do not append late requests after that group has been opened.
+            admission.closed = True
+            return
+
+        adder = admission.adder
+        running_batch = admission.running_batch
+        running_loras = admission.running_loras
+        reclaimed_tokens = 0
+        stopped = False
+
+        for req in candidate_reqs:
+            if req.rid in admission.offered:
+                continue
+            admission.offered.add(req.rid)
+            if self.enable_lora and not self._can_schedule_lora_req(
+                req, running_loras
+            ):
+                continue
+
+            running_bs = len(running_batch.reqs)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+                running_batch.batch_is_full = True
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                    running_batch.batch_is_full = True
+
+            if running_batch.batch_is_full:
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
+                ):
+                    stopped = True
+                    break
+
+            if self.enable_hicache_storage:
+                if not self.tree_cache.check_prefetch_progress(req.rid):
+                    continue
+                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                if loaded_tokens > 0:
+                    req.storage_hit_length = loaded_tokens
+
+            req.init_next_round_input(self.tree_cache)
+            if self.enable_asradix_cache and self.tree_cache.deferred_as_load_conflict(req):
+                _asp.add("admit.defer_conflict")
+                stopped = True
+                break
+
+            _asp_ta = _asp.now()
+            res = adder.add_one_req(
+                req,
+                has_chunked_req=(self.chunked_req is not None),
+                truncation_align_size=self.truncation_align_size,
+            )
+            _asp.add("admit.add_n")
+            _asp.add("admit.add_ms", _asp.ms(_asp_ta))
+
+            if (
+                self.enable_asradix_cache
+                and res == AddReqResult.CONTINUE
+                and os.environ.get("AS_DIAG_EARLY_WRITE_RECLAIM", "1") == "1"
+            ):
+                before = self.tree_cache.evictable_size()
+                _asp_tr = _asp.now()
+                self.tree_cache.check_ascache_events()
+                _asp.add("admit.reclaim_n")
+                _asp.add("admit.reclaim_ms", _asp.ms(_asp_tr))
+                reclaimed_tokens += max(
+                    0, self.tree_cache.evictable_size() - before
+                )
+
+            if self.enable_lora:
+                running_loras.add(req.lora_id)
+
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    if self.enable_hierarchical_cache:
+                        running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                            not running_batch.is_empty()
+                        )
+                    else:
+                        running_batch.batch_is_full = True
+                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                if not added:
+                    req.mamba_cow_src_index = None
+                    req.mamba_needs_clear = False
+                    if req.mamba_pool_idx is not None and not getattr(
+                        req, "session", None
+                    ):
+                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                            req.mamba_pool_idx.unsqueeze(-1)
+                        )
+                        req.mamba_pool_idx = None
+                stopped = True
+                break
+
+        admission.as_admission_reclaimed_tokens += reclaimed_tokens
+        if stopped:
+            admission.closed = True
+
+    def _seal_prefill_admission(
+        self, admission: PrefillAdmission
+    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        """Finalize an open adder and construct the forward batch."""
+        admission.closed = True
+        adder = admission.adder
+        running_batch = admission.running_batch
+        if admission.mamba_allocator is not None:
+            admission.mamba_allocator.alloc_group_end()
+        if adder is None:
+            return None, running_batch
+
+        can_run_list: List[Req] = adder.can_run_list
+        if not can_run_list:
+            return None, running_batch
+
+        if admission.as_admission_reclaimed_tokens:
+            logger.info(
+                "AS admission reclaimed: requests=%d, tokens=%d",
+                len(can_run_list),
+                admission.as_admission_reclaimed_tokens,
+            )
+
+        can_run_set = set(can_run_list)
+        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        for req in adder.preempt_list:
+            self._add_request_to_queue(req)
+
+        if adder.new_chunked_req is not None:
+            assert self.chunked_req is None
+            self.chunked_req = adder.new_chunked_req
+        if self.chunked_req is not None:
+            self.chunked_req.inflight_middle_chunks += 1
+
+        newly_forwarded_reqs = [
+            req for req in can_run_list if req.time_stats.forward_entry_time == 0
+        ]
+        set_time_batch(can_run_list, "set_forward_entry_time")
+        if self.metrics_reporter.enable_metrics:
+            for req in newly_forwarded_reqs:
+                self.metrics_collector.observe_request_waiting_time(
+                    req.time_stats.get_request_waiting_time()
+                )
+
+        if self.enable_asradix_cache:
+            _asp_tf = _asp.now()
+            outcomes = self.tree_cache.flush_as_load_handoffs(
+                wait_for_kv=os.environ.get("AS_MOVER_DEFER_KV_FENCE", "0") != "1"
+            )
+            _asp.add("admit.flush_ms", _asp.ms(_asp_tf))
+            if outcomes:
+                can_run_list = self._apply_deferred_as_load_outcomes(
+                    can_run_list, outcomes
+                )
+                if not can_run_list:
+                    return None, running_batch
+
+        _asp_ti = _asp.now()
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            chunked_req=self.chunked_req,
+        )
+        new_batch.contains_last_prefill_chunk = (
+            self.chunked_req is None or len(can_run_list) != 1
+        )
+        self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
+        _asp.add("admit.init_ms", _asp.ms(_asp_ti))
+
+        if self.enable_hierarchical_cache:
+            new_batch.hicache_consumer_index = (
+                self.tree_cache.ready_to_load_host_cache()
+            )
+
+        _asp_tp = _asp.now()
+        new_batch.prepare_for_extend()
+        _asp.add("admit.prepare_ms", _asp.ms(_asp_tp))
+
+        if self.tp_worker.model_runner.prefill_aware_swa:
+            for req in can_run_list:
+                req.swa_evict_floor = req.extend_range.end
+
+        new_batch.prefill_stats = PrefillStats.from_adder(
+            adder,
+            running_batch.reqs,
+            self.enable_priority_scheduling,
+            num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
+                chunk_deduct=(
+                    self.chunked_req.extend_range.length
+                    if self.chunked_req is not None
+                    else 0
+                ),
+            ),
+        )
+
+        if (
+            self.is_mixed_chunk
+            and not running_batch.is_empty()
+            and not (new_batch.return_logprob or running_batch.return_logprob)
+            and new_batch.input_embeds is None
+        ):
+            running_batch.filter_batch()
+            if not running_batch.is_empty():
+                running_batch.prepare_for_decode()
+                new_batch.mix_with_running(running_batch)
+                new_batch.decoding_reqs = running_batch.reqs
+            running_batch = ScheduleBatch(
+                reqs=[], batch_is_full=running_batch.batch_is_full
+            )
+        else:
+            new_batch.decoding_reqs = None
+
+        return new_batch, running_batch
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3598,7 +3948,11 @@ class Scheduler(
             _asp.add("admit.add_n")
             _asp.add("admit.add_ms", _asp.ms(_asp_ta))
 
-            if self.enable_asradix_cache and res == AddReqResult.CONTINUE:
+            if (
+                self.enable_asradix_cache
+                and res == AddReqResult.CONTINUE
+                and os.environ.get("AS_DIAG_EARLY_WRITE_RECLAIM", "1") == "1"
+            ):
                 # AS restores can take long enough for previous-batch
                 # writes to finish. Reclaim their locks before the next
                 # request reads the dynamic available/evictable budget.
@@ -4760,6 +5114,17 @@ class Scheduler(
         to_del = []
         for i, req in enumerate(self.waiting_queue):
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if req.rid in getattr(self, "open_prefill_admission_rids", frozenset()):
+                    # The request is already owned by the open PrefillAdder.
+                    # Keep it in the queue until sealing; the normal result
+                    # path will retire its aborted resources.
+                    prepare_abort(req, "Aborted by AbortReq.")
+                    if (
+                        self.disaggregation_mode == DisaggregationMode.PREFILL
+                        and req.disagg_kv_sender is not None
+                    ):
+                        req.disagg_kv_sender.abort()
+                    continue
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -5268,7 +5633,16 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:
             if os.environ.get("SGLANG_ENABLE_PREFILL_FWD_THREAD", "0") == "1":
-                scheduler.event_loop_overlap_disagg_prefill_threaded()
+                if (
+                    os.environ.get(
+                        "SGLANG_PREFILL_FWD_THREAD_AHEAD", "0"
+                    )
+                    == "1"
+                    and envs.SGLANG_ENABLE_PREFILL_CONTINUOUS_ADMISSION.get()
+                ):
+                    scheduler.event_loop_overlap_disagg_prefill_continuous()
+                else:
+                    scheduler.event_loop_overlap_disagg_prefill_threaded()
             else:
                 scheduler.event_loop_overlap_disagg_prefill()
         else:

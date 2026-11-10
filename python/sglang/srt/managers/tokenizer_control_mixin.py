@@ -294,11 +294,17 @@ class TokenizerControlMixin:
         )
 
     async def flush_cache(
-        self: TokenizerManager, timeout_s: Optional[float] = None
+        self: TokenizerManager,
+        timeout_s: Optional[float] = None,
+        evict_evictable: bool = False,
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
         return (
-            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
+            await self.flush_cache_communicator(
+                FlushCacheReqInput(
+                    timeout_s=timeout_s, evict_evictable=evict_evictable
+                )
+            )
         )[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
