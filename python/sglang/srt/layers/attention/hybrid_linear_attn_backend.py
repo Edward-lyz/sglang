@@ -258,10 +258,25 @@ class MambaAttnBackendBase(AttentionBackend):
         lens_to_track = (
             forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
         )
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
-        aligned_len = (lens_to_track // mamba_cache_chunk_size) * mamba_cache_chunk_size
+        checkpoint_chunk_size = getattr(
+            self, "checkpoint_chunk_size", get_server_args().mamba_cache_chunk_size
+        )
+        exact_checkpoint_tracking = getattr(self, "exact_checkpoint_tracking", False)
+        aligned_len = (
+            lens_to_track
+            if exact_checkpoint_tracking
+            else (lens_to_track // checkpoint_chunk_size) * checkpoint_chunk_size
+        )
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
         start_indices = start_indices[forward_batch.mamba_track_mask]
+
+        if exact_checkpoint_tracking:
+            tracked_lens = lens_to_track[forward_batch.mamba_track_mask]
+            extend_lens = forward_batch.extend_seq_lens[forward_batch.mamba_track_mask]
+            if torch.any(
+                (tracked_lens < conv_state_len) | (tracked_lens > extend_lens)
+            ):
+                raise ValueError("tracked conv window must be inside its own extend")
 
         indices = start_indices.unsqueeze(-1) + torch.arange(
             conv_state_len,
@@ -269,6 +284,8 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
+        if exact_checkpoint_tracking:
+            return indices
         return indices.clamp(0, query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(
@@ -277,7 +294,9 @@ class MambaAttnBackendBase(AttentionBackend):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary."""
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        checkpoint_chunk_size = getattr(
+            self, "checkpoint_chunk_size", get_server_args().mamba_cache_chunk_size
+        )
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -286,10 +305,27 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
+        # The cache checkpoint grid and the kernel's intermediate-state grid are
+        # distinct. KDA, for example, computes/materializes h every 64 tokens
+        # while AttentionStore may checkpoint every 256 tokens. Keep the packed-h
+        # offsets on the kernel grid, then map the cache boundary back to that grid.
+        exact_checkpoint_tracking = getattr(self, "exact_checkpoint_tracking", False)
+        state_chunk_size = (
+            self.intermediate_state_chunk_size
+            if exact_checkpoint_tracking
+            else checkpoint_chunk_size
+        )
+        if checkpoint_chunk_size % state_chunk_size != 0:
+            raise ValueError(
+                "checkpoint chunk size must be divisible by the kernel "
+                f"intermediate-state chunk size, got {checkpoint_chunk_size=} "
+                f"and {state_chunk_size=}"
+            )
+
         if isinstance(self, Mamba2AttnBackend):
-            num_h_states = extend_seq_lens // mamba_cache_chunk_size
+            num_h_states = extend_seq_lens // checkpoint_chunk_size
         else:
-            num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
+            num_h_states = (extend_seq_lens - 1) // state_chunk_size + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -299,19 +335,43 @@ class MambaAttnBackendBase(AttentionBackend):
         offset_masked = track_ssm_src_offset[mamba_track_mask]
         dst_masked = mamba_track_indices[mamba_track_mask]
 
-        is_aligned = (lens_masked % mamba_cache_chunk_size) == 0
+        if exact_checkpoint_tracking:
+            # The scheduler already passed the exact absolute checkpoint. Convert
+            # it to an offset inside this extend. If the checkpoint is the extend
+            # end, the in-place final recurrent state is exact; otherwise read the
+            # corresponding 64-token intermediate h row.
+            extend_masked = extend_seq_lens[mamba_track_mask]
+            if torch.any(lens_masked <= 0):
+                raise ValueError(
+                    f"tracked checkpoint must be inside the extend, got {lens_masked=}"
+                )
+            is_final = lens_masked == extend_masked
+            interior_lens = lens_masked[~is_final]
+            if torch.any(interior_lens % state_chunk_size != 0):
+                raise ValueError(
+                    "exact checkpoint is not on the kernel intermediate-state grid: "
+                    f"{interior_lens=} {state_chunk_size=}"
+                )
 
-        # Aligned: last_recurrent_state from ssm_states.
-        track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
-        track_ssm_final_dst = dst_masked[is_aligned]
+            track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_final]
+            track_ssm_final_dst = dst_masked[is_final]
+            track_ssm_h_src = offset_masked[~is_final] + (
+                interior_lens // state_chunk_size
+            )
+            track_ssm_h_dst = dst_masked[~is_final]
+        else:
+            is_aligned = (lens_masked % checkpoint_chunk_size) == 0
 
-        # Unaligned: intermediate state from h.
-        # TODO: handle mamba_cache_chunk_size % page size != 0
-        not_aligned = ~is_aligned
-        track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // mamba_cache_chunk_size
-        )
-        track_ssm_h_dst = dst_masked[not_aligned]
+            # Aligned: last_recurrent_state from ssm_states.
+            track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
+            track_ssm_final_dst = dst_masked[is_aligned]
+
+            # Unaligned: intermediate state from h.
+            not_aligned = ~is_aligned
+            track_ssm_h_src = offset_masked[not_aligned] + (
+                lens_masked[not_aligned] // checkpoint_chunk_size
+            )
+            track_ssm_h_dst = dst_masked[not_aligned]
 
         return (
             track_ssm_h_src.to(self.device, non_blocking=True),

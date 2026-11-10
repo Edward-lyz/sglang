@@ -1355,11 +1355,13 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     guard replicates the union of the legacy call-site guards so the pass is
     self-sufficient in the end-state pass list.
     """
+    from sglang.srt.configs.hybrid_arch import uses_kda_attentionstore_checkpoints
     from sglang.srt.configs.linear_attn_model_registry import (
         get_linear_attn_spec_by_arch,
     )
 
-    hf_config = view.get_model_config().hf_config
+    model_config = view.get_model_config()
+    hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
     in_branch = model_arch in _MAMBA_RADIX_CACHE_ARCHS
@@ -1369,14 +1371,35 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
             for layer_type in getattr(hf_config, "layer_types", [])
         )
     spec = get_linear_attn_spec_by_arch(model_arch)
-    if not ((spec is not None and spec.uses_mamba_radix_cache) or in_branch):
+    is_kda_attentionstore = uses_kda_attentionstore_checkpoints(view, model_config)
+    if not (
+        (spec is not None and spec.uses_mamba_radix_cache)
+        or in_branch
+        or is_kda_attentionstore
+    ):
         return {}
 
     if view.disable_radix_cache:
         return {}
 
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
-    if view.mamba_radix_cache_strategy == "auto":
+
+    # AttentionStore persists KDA checkpoints independently of the radix/cache
+    # page size. A checkpoint can sit inside a longer extend (e.g. state@256 for
+    # a 350-token request), so the KDA path needs per-chunk h snapshots.
+    if is_kda_attentionstore:
+        if view.mamba_radix_cache_strategy == "auto":
+            declared["mamba_radix_cache_strategy"] = "extra_buffer"
+        elif view.mamba_radix_cache_strategy == "no_buffer":
+            raise ValueError(
+                "KDA AttentionStore requires mamba_radix_cache_strategy="
+                "extra_buffer (or extra_buffer_lazy), not no_buffer"
+            )
+
+    if (
+        view.mamba_radix_cache_strategy == "auto"
+        and "mamba_radix_cache_strategy" not in declared
+    ):
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(

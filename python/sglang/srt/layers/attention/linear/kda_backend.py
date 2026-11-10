@@ -4,13 +4,13 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
-from sglang.kernels.ops.kimi_k3.kda_short_conv import (
-    covered as kda_short_conv_covered,
-)
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.kernels.ops.kimi_k3.kda_short_conv import covered as kda_short_conv_covered
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.configs.hybrid_arch import uses_kda_attentionstore_checkpoints
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_verify_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.environ import envs
+from sglang.srt.mem_cache.storage.asradix.types import AS_BLOCK_SIZE
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -379,6 +379,10 @@ def ragged_verify_dense_scatter_indices(
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
+    # chunk_kda materializes one h row per FLA compute chunk. The radix/cache
+    # checkpoint grid may be coarser (e.g. AttentionStore uses 256 tokens).
+    intermediate_state_chunk_size = FLA_CHUNK_SIZE
+
     # The verify kernel is varlen and the conv path scatters ragged tokens
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
@@ -391,6 +395,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.exact_checkpoint_tracking = uses_kda_attentionstore_checkpoints(
+            model_runner.server_args, model_runner.model_config
+        )
+        self.checkpoint_chunk_size = (
+            AS_BLOCK_SIZE
+            if self.exact_checkpoint_tracking
+            else model_runner.server_args.mamba_cache_chunk_size
+        )
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
         # conv_states_shape[-1] as the conv window length (kernel_size - 1).
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
@@ -644,9 +656,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             prefix_lens=forward_batch.extend_prefix_lens,
             mixed_qkv=mixed_qkv,
             conv_pool=mamba_cache_params.conv[0] if track else None,
-            track_indices=(
-                self.forward_metadata.track_conv_indices if track else None
-            ),
+            track_indices=(self.forward_metadata.track_conv_indices if track else None),
             destination_indices=(
                 self.forward_metadata.conv_states_mask_indices if track else None
             ),

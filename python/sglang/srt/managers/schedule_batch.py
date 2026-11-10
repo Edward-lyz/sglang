@@ -1943,6 +1943,29 @@ class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_seqlen: int
 
 
+def _latest_checkpoint_in_extend(
+    prefix_len: int, extend_len: int, checkpoint_size: int
+) -> Optional[int]:
+    """Return the deepest absolute checkpoint newly crossed by this extend."""
+    extend_end = prefix_len + extend_len
+    checkpoint = (extend_end // checkpoint_size) * checkpoint_size
+    return checkpoint if checkpoint > prefix_len else None
+
+
+def _can_track_exact_checkpoint(
+    prefix_len: int,
+    extend_len: int,
+    checkpoint: int,
+    state_chunk_size: int,
+    conv_state_len: int,
+) -> bool:
+    """Require both recurrent and conv snapshots to exist in this extend."""
+    relative_len = checkpoint - prefix_len
+    return max(1, conv_state_len) <= relative_len <= extend_len and (
+        relative_len == extend_len or relative_len % state_chunk_size == 0
+    )
+
+
 def mamba_lazy_spec_in_window(
     req, mamba_track_interval: int, max_draft_tokens: int
 ) -> bool:
@@ -2722,53 +2745,61 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
         server_args = get_server_args()
-        mamba_cache_chunk_size = server_args.mamba_cache_chunk_size
+        checkpoint_chunk_size = server_args.mamba_cache_chunk_size
+        from sglang.srt.configs.hybrid_arch import uses_kda_attentionstore_checkpoints
 
-        def _force_track_h(i: int) -> int:
-            assert i % mamba_cache_chunk_size == 0
-            # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
-            # 1) aligned with mamba_cache_chunk_size-> retrieve from last_recurrent_state
-            #    a) is the last position -> retrieve from last_recurrent_state
-            #    b) is NOT the last position -> retrieve from h
-            # 2) unaligned with mamba_cache_chunk_size -> retrieve from h
-            # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
-            # to force the math calculation to retrieve the correct mamba state from h.
-            return i + 1
+        is_kda_attentionstore = uses_kda_attentionstore_checkpoints(
+            server_args, self.model_config
+        )
+        if is_kda_attentionstore:
+            from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE
+            from sglang.srt.mem_cache.storage.asradix.types import AS_BLOCK_SIZE
 
-        mask = req.extend_range.length >= mamba_cache_chunk_size
+            checkpoint_chunk_size = AS_BLOCK_SIZE
+            conv_state_len = self.req_to_token_pool.mamba_pool.mamba_cache.conv[
+                0
+            ].shape[-2]
+
+        prefix_len = len(req.prefix_indices)
+        extend_end = prefix_len + req.extend_range.length
+
+        # KDA AttentionStore checkpoints are absolute 256-token boundaries,
+        # independent of how dynamic chunked prefill partitions this request.
+        # A short chunk can still cross a boundary, so do not key the mask only
+        # on extend_range.length.
+        if is_kda_attentionstore:
+            checkpoint_target = _latest_checkpoint_in_extend(
+                prefix_len, req.extend_range.length, checkpoint_chunk_size
+            )
+            mask = checkpoint_target is not None and _can_track_exact_checkpoint(
+                prefix_len,
+                req.extend_range.length,
+                checkpoint_target,
+                CHUNK_SIZE,
+                conv_state_len,
+            )
+        else:
+            checkpoint_target = None
+            mask = req.extend_range.length >= checkpoint_chunk_size
+
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
         if mask:
-            # mamba_track_seqlen is used to calculate the indices to track in
-            # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
-            # fact that the ssm state between aligned and non-aligned are retrieved differently,
-            # if 1) last pos and 2) is aligned, then retrieved from the last_recurrent_state,
-            # otherwise retrieved from h (i.e. unaligned).
-            # We need to pass the non-aligned seqlen to the calculation. Even though
-            # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-            mamba_track_seqlen = len(req.prefix_indices) + req.extend_range.length
-
-            # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
-            # mamba radix cache to track which seqlen this mamba state should store at.
-            mamba_track_seqlen_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_range.length // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
-            )
-
-            # mamba_track_fla_chunk_aligned is the aligned seqlen based on mamba_cache_chunk_size
-            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
-            # page_size > mamba_cache_chunk_size, we need to force the math calculation to retrieve the correct mamba state from h
-            # by _force_track_h()
-            mamba_track_fla_chunk_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_range.length // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
-            )
-            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
-                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
+            if is_kda_attentionstore:
+                # Pass the exact absolute checkpoint to the KDA backend. It maps
+                # this to either the final recurrent state or the matching
+                # intermediate 64-token h row.
+                mamba_track_seqlen = checkpoint_target
+                mamba_track_seqlen_aligned = checkpoint_target
+            else:
+                # Legacy Mamba/GDN semantics: pass the current extend end and
+                # separately record the last cache-chunk-aligned state.
+                mamba_track_seqlen = extend_end
+                mamba_track_seqlen_aligned = (
+                    prefix_len
+                    + (req.extend_range.length // checkpoint_chunk_size)
+                    * checkpoint_chunk_size
+                )
 
             # In lazy mode, skip the swap — the second ping-pong slot is not
             # allocated yet; it will be allocated on demand at the track boundary
@@ -2779,22 +2810,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.mamba_next_track_idx
                     )
                 )
+
             if req.mamba_branching_seqlen is not None:
-                # track branching point in this forward if the branching point
-                # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
-                    req.mamba_branching_seqlen - len(req.prefix_indices)
-                ) % mamba_cache_chunk_size == 0
+                    req.mamba_branching_seqlen % checkpoint_chunk_size == 0
+                    if is_kda_attentionstore
+                    else (req.mamba_branching_seqlen - prefix_len)
+                    % checkpoint_chunk_size
+                    == 0
+                )
                 if (
-                    req.mamba_branching_seqlen > len(req.prefix_indices)
+                    req.mamba_branching_seqlen > prefix_len
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
+                    and (
+                        not is_kda_attentionstore
+                        or _can_track_exact_checkpoint(
+                            prefix_len,
+                            req.extend_range.length,
+                            req.mamba_branching_seqlen,
+                            CHUNK_SIZE,
+                            conv_state_len,
+                        )
+                    )
                 ):
-                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                    # See _force_track_h() for more details.
-                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
+                    mamba_track_seqlen = req.mamba_branching_seqlen
+                    if not is_kda_attentionstore:
+                        # Legacy backends use an unaligned length to select h
+                        # instead of the final recurrent state.
+                        assert mamba_track_seqlen % checkpoint_chunk_size == 0
+                        mamba_track_seqlen += 1
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(
