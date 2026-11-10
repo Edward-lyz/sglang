@@ -370,3 +370,45 @@ def test_pp0_profiling_failure_degrades_instead_of_hanging(monkeypatch):
     assert sched.length_predictor is None
     assert sched.chunk_cost_model is None
 
+
+class _PackedParam(_FakeParam):
+    """A packed parameter that declares how many values a stored element holds."""
+
+    def __init__(self, shape, packed_factor, dtype=torch.uint8):
+        super().__init__(shape, dtype)
+        self.packed_factor = packed_factor
+
+
+def test_declared_packed_factor_beats_the_dtype_guess():
+    """A byte-typed tensor does not say how many values it packs. Guessing 4-bit
+    from `uint8` doubles that stage's count, and since stages can carry
+    different quantization the error does not cancel in the max-over-stages
+    normalization -- it moves the chunk. A declared factor must win."""
+    # 8-bit weights that happen to be stored untyped: one value per element.
+    eight_bit = [("model.layers.0.self_attn.o_proj.weight",
+                  _PackedParam((7168, 16384), packed_factor=1))]
+    buckets = estimate_stage_flops_per_token(_FakeModel(eight_bit), _FakeConfig())
+    assert buckets["flops"] == pytest.approx(2.0 * 7168 * 16384)
+
+    # Four values per element, e.g. a 4-bit scheme packed into int16-sized words.
+    four_per = [("model.layers.0.self_attn.o_proj.weight",
+                 _PackedParam((7168, 4096), packed_factor=4))]
+    buckets = estimate_stage_flops_per_token(_FakeModel(four_per), _FakeConfig())
+    assert buckets["flops"] == pytest.approx(2.0 * 7168 * 4096 * 4)
+
+    # No declaration: uint8 still falls back to the 4-bit assumption, which is
+    # what mxfp4 needs, while int8 and float8 count one value per element.
+    for dtype, expected_factor in (
+        (torch.uint8, 2.0),
+        (torch.int8, 1.0),
+        (torch.float8_e4m3fn, 1.0),
+        (torch.bfloat16, 1.0),
+    ):
+        params = [("model.layers.0.self_attn.o_proj.weight",
+                   _FakeParam((512, 512), dtype))]
+        buckets = estimate_stage_flops_per_token(_FakeModel(params), _FakeConfig())
+        assert buckets["flops"] == pytest.approx(
+            2.0 * 512 * 512 * expected_factor
+        ), dtype
+
+
