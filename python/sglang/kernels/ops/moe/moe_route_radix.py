@@ -32,6 +32,29 @@ if TYPE_CHECKING:
 _NUM_EXPERTS = 896
 _TOPK = 16
 
+# int64 id sibling for consumers that widen the ids first thing (DeepEP
+# dispatch). When requested, route_radix also stores the winners as int64 from
+# its epilogue and records the (int32 ids, int64 ids) pair; int64_ids_for()
+# hands the copy back only for that very int32 tensor, so any post-processing
+# that replaces the ids falls back to the caller's own cast. One slot.
+_EMIT_INT64_IDS = False
+_INT64_IDS_SLOT = None
+
+
+def request_int64_ids(enabled: bool = True) -> None:
+    """Make route_radix also store its top-k ids as int64."""
+    global _EMIT_INT64_IDS
+    _EMIT_INT64_IDS = bool(enabled)
+
+
+def int64_ids_for(ids: torch.Tensor):
+    """The int64 copy route_radix emitted for exactly this int32 ids tensor,
+    or None if there is none."""
+    slot = _INT64_IDS_SLOT
+    if slot is not None and slot[0] is ids:
+        return slot[1]
+    return None
+
 
 @cache_once
 def _jit_route_radix_module() -> Module:
@@ -80,18 +103,27 @@ def route_radix(
     output order. Either way the winner set matches Triton exactly; the renorm
     sum is taken in the respective output order, so weights may differ by
     <= ~1 ulp."""
+    global _INT64_IDS_SLOT
     M = scores.shape[0]
     out_w = torch.empty((M, topk), dtype=torch.float32, device=scores.device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=scores.device)
+    out_i64 = (
+        torch.empty((M, topk), dtype=torch.int64, device=scores.device)
+        if _EMIT_INT64_IDS
+        else None
+    )
     _jit_route_radix_module().run(
         scores,
         bias,
         out_w,
         out_i,
+        out_i64,
         topk,
         float(routed_scaling_factor),
         bool(renormalize),
         bool(apply_scale),
         bool(sorted),
     )
+    if out_i64 is not None:
+        _INT64_IDS_SLOT = (out_i, out_i64)
     return out_w, out_i

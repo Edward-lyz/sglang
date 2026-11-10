@@ -344,6 +344,15 @@ class DeepEPConfig(BaseDispatcherConfig):
         return cls._instance
 
 
+def _as_int64_ids(topk_ids: torch.Tensor) -> torch.Tensor:
+    """int64 ids for DeepEP: the router's int64 copy of these exact ids when it
+    emitted one (bit-identical, saves the cast kernel), else a cast."""
+    from sglang.kernels.ops.moe import moe_route_radix
+
+    ids64 = moe_route_radix.int64_ids_for(topk_ids)
+    return ids64 if ids64 is not None else topk_ids.to(torch.int64)
+
+
 class _DeepEPDispatcherImplBase:
     def __init__(
         self,
@@ -381,6 +390,11 @@ class _DeepEPDispatcherImplBase:
         assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.handle = None
+        # The router can emit the int64 ids this dispatcher needs directly.
+        if envs.SGLANG_K3_ROUTE_RADIX_INT64_IDS.get():
+            from sglang.kernels.ops.moe import moe_route_radix
+
+            moe_route_radix.request_int64_ids()
 
         self.quant_config: Optional[dict] = None
 
@@ -506,7 +520,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_output: TopKOutput,
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        topk_ids = _as_int64_ids(topk_ids)
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -671,7 +685,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        topk_ids = _as_int64_ids(topk_ids)
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts

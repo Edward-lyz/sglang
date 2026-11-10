@@ -423,6 +423,9 @@ class Envs:
     # Dense MLP: fuse the SiTU activation with the down-proj DeepGEMM block-FP8
     # input quant (situ_and_mul_quant).
     SGLANG_K3_MLP_SITU_QUANT = EnvBool(False)
+    # route_radix also stores the top-k ids as int64 for DeepEP dispatch,
+    # saving the int32 -> int64 cast kernel.
+    SGLANG_K3_ROUTE_RADIX_INT64_IDS = EnvBool(False)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
