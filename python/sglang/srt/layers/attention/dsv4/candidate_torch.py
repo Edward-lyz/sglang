@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
@@ -24,6 +25,73 @@ from sglang.srt.layers.attention.dsv4.indexer import (
 class CandidateMasks(CandidateMetadata):
     mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
     request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
+
+
+@dataclass
+class PrefillCandidateBlocks(CandidateMetadata):
+    """Prefill level-one candidates as int32 block ids ``[rows_b, <= topk_blocks]``
+    per request (-1 = none), instead of bool ``[rows_b, lc_b]`` position masks:
+    the published size no longer grows with the prompt length."""
+
+    request_blocks: List[torch.Tensor]
+
+    def tail(self, lengths: List[int]) -> "PrefillCandidateBlocks":
+        """Like ``tail`` for requests, but returning blocks instead of masks."""
+        return PrefillCandidateBlocks(
+            request_blocks=[
+                blocks[blocks.shape[0] - length :]
+                for blocks, length in zip(self.request_blocks, lengths)
+            ]
+        )
+
+
+def published_prefill_blocks(candidate) -> PrefillCandidateBlocks:
+    """The forward's ``candidate_metadata`` as the block ids the source published."""
+    assert isinstance(candidate, PrefillCandidateBlocks), "candidate blocks missing"
+    return candidate
+
+
+def _candidate_block_topk(
+    logits: torch.Tensor,
+    compress_lens,
+    topk_blocks: int,
+    block_size: int,
+):
+    width = logits.size(-1)
+    padding = -width % block_size
+    scores = F.pad(logits, (0, padding), value=-torch.inf) if padding else logits
+    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    num_blocks = scores.size(-1)
+    # The block holding the query's newest position is always kept.
+    last = (compress_lens - 1) // block_size
+    scores = scores.masked_fill(
+        torch.arange(num_blocks, device=logits.device) == last, torch.inf
+    )
+    return scores.topk(min(topk_blocks, num_blocks), dim=-1)
+
+
+def select_candidate_block_ids(
+    logits: torch.Tensor,
+    compress_lens,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """``select_candidate_blocks`` as block ids: the same kept blocks, -1 where the
+    mask would keep nothing (all -inf block)."""
+    top = _candidate_block_topk(logits, compress_lens, topk_blocks, block_size)
+    return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
+
+
+def candidate_block_mask(
+    blocks: torch.Tensor, width: int, block_size: int
+) -> torch.Tensor:
+    """Expand block ids back to the bool position mask over ``width`` columns."""
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (*blocks.shape[:-1], num_blocks + 1), dtype=torch.bool, device=blocks.device
+    )
+    keep.scatter_(-1, blocks.to(torch.int64).masked_fill(blocks < 0, num_blocks), True)
+    return keep[..., :num_blocks].repeat_interleave(block_size, dim=-1)[..., :width]
 
 
 def published_masks(candidate) -> CandidateMasks:

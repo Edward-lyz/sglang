@@ -35,6 +35,13 @@ def _jit_c2_module(
 ) -> Module:
     # rope_dim / page_size / layout only shape the store half; the norm-only
     # entry point ignores them.
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "#41660 c2_decode_fast_mod",
+        "c2 decode/verify kernel with 32-bit magic-number ring modulo enabled (layout=%s)",
+        layout.cpp_name,
+    )
     args = make_cpp_args(
         head_dim,
         rope_dim,
@@ -49,6 +56,7 @@ def _jit_c2_module(
         cuda_wrappers=[
             ("decode", f"FlashC2DecodeKernel<{args}>::run_decode"),
             ("decode_fusion", f"FlashC2DecodeKernel<{args}>::run_decode_fusion"),
+            ("prefill_fusion", f"FlashC2DecodeKernel<{args}>::run_prefill_fusion"),
         ],
     )
 
@@ -169,6 +177,62 @@ def c2_decode_or_verify_norm_rope_store(
         k_cache,
         ring_size,
         draft_len,
+    )
+    return out
+
+
+def c2_prefill_norm_rope_store(
+    kv_input: torch.Tensor,
+    kv_state: torch.Tensor,
+    norm_weight: torch.Tensor,
+    positions: torch.Tensor,
+    req: torch.Tensor,
+    raw_out_loc: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    k_cache: torch.Tensor,
+    extend_start_loc: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    ring_size: int,
+    layout: Union[KVLayout, str] = KVLayout.V4,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """:func:`c2_decode_or_verify_norm_rope_store` for an extend batch, then the ring
+    write-back.
+
+    Rows may mix requests, prefix offsets and padding (``raw_out_loc == 0``). An odd
+    position pairs with the previous row when that row is the same request's previous
+    position, else with its ring slot. Afterwards each request's last ``ring_size``
+    rows are saved to the ring, which a later step reads for its first partner.
+
+    :param extend_start_loc: int32 ``[num_reqs]``, each request's first row.
+    :param extend_seq_lens: int32 ``[num_reqs]``, each request's row count.
+    :return: ``out``, ``[num_tokens, head_dim]`` bf16. Only the rows of odd
+             positions are written; the rest are left as they were.
+    """
+    num_tokens, fused_dim = kv_input.shape
+    head_dim = fused_dim // 2
+    if out is None:
+        out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
+
+    layout = KVLayout.parse(layout)
+    module = _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size, layout)
+    module.prefill_fusion(
+        kv_input,
+        kv_state,
+        out,
+        norm_weight,
+        positions,
+        req,
+        raw_out_loc,
+        eps,
+        freqs_cis,
+        k_cache,
+        ring_size,
+        extend_start_loc,
+        extend_seq_lens,
     )
     return out
 

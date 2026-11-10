@@ -754,6 +754,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
     uses_own_vocab_modules = _is_npu
+    # Same MegaMoE shared-expert fusion as the target (#39313): target and draft
+    # must agree, or they would size different MegaMoE symm buffers.
+    precompile_kernels_after_loading = (
+        DeepseekV4ForCausalLM.precompile_kernels_after_loading
+    )
 
     @classmethod
     def shared_experts_fusion_disable_reason(

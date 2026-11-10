@@ -288,10 +288,11 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
 
   const auto input_ptr = static_cast<const DType*>(params.kv) + work_id * params.kv_stride_batch;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
-  const auto out_loc = params.out_loc[work_id];
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
+  // out_loc may be written by the preceding (PDL primary) kernel; read it after the wait.
+  const auto out_loc = params.out_loc[work_id];
   Float2 data, freq;
 
   // part 1: norm. Each thread owns one 2-elem pack (the `tx`-th).

@@ -104,32 +104,44 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    num_shared_experts: int = 0,
 ) -> SymmBuffer:
     import deep_gemm
 
     mma_type = _mega_moe_mma_type()
-    key = (
-        id(group),
-        num_max_tokens_per_rank,
-        num_experts,
-        num_topk,
-        hidden,
-        intermediate_hidden,
-        mma_type,
-    )
-    buf = _MEGA_MOE_SYMM_BUFFER.get(key)
-    if buf is None:
-        buf = deep_gemm.get_symm_buffer_for_mega_moe(
-            group,
-            num_experts,
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+        key = (
+            id(group),
             num_max_tokens_per_rank,
+            num_experts,
             num_topk,
             hidden,
             intermediate_hidden,
-            mma_type=mma_type,
-            activation="swiglu",
+            mma_type,
+            num_shared_experts,
+            deep_gemm.get_num_sms(),
         )
-        _MEGA_MOE_SYMM_BUFFER[key] = buf
+        buf = _MEGA_MOE_SYMM_BUFFER.get(key)
+        if buf is None:
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "#39223 mega_moe_sm_budget_buffer",
+                "MegaMoE symm buffer sized under the kernel's SM budget (num_sms=%d)",
+                deep_gemm.get_num_sms(),
+            )
+            buf = deep_gemm.get_symm_buffer_for_mega_moe(
+                group,
+                num_experts,
+                num_max_tokens_per_rank,
+                num_topk,
+                hidden,
+                intermediate_hidden,
+                num_shared_experts=num_shared_experts,
+                mma_type=mma_type,
+                activation="swiglu",
+            )
+            _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
 
 
@@ -153,6 +165,29 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     return max_tokens_per_rank <= cap
 
 
+def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
+    """Fusing shared experts into DeepGEMM MegaMoE."""
+    # DeepGEMM's in-kernel shared expert takes FP8 weights on SM100 fp8xfp4 only.
+    # Upstream (#39313) admits [128, 128] blocks; [32, 32] ue8m0 blocks transform
+    # to the same per-row 1x32 scale layout (see _transform_mega_moe_shared_sf).
+    shared = getattr(moe, "shared_experts", None)
+    return (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS.get()
+        and shared is not None
+        and moe.num_fused_shared_experts == 0
+        # The kernel adds the whole shared expert per token: it must be replicated.
+        and getattr(moe, "_shared_expert_tp1", False)
+        and get_moe_a2a_backend().is_megamoe()
+        and getattr(moe.experts, "_mega_moe_weights_built", False)
+        and _device_sm == 100
+        and _mega_moe_mma_type() == "fp8xfp4"
+        and moe.shared_experts_is_fp8
+        and moe.shared_experts_weight_block_size in ([128, 128], [32, 32])
+        and not getattr(shared.gate_up_proj, "aiter_bpreshuffled", False)
+        and not getattr(shared.down_proj, "aiter_bpreshuffled", False)
+    )
+
+
 def forward_mega_moe(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -160,10 +195,30 @@ def forward_mega_moe(
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
+    fused_shared = moe.mega_shared_l1_weights is not None
+    if fused_shared:
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "#39313 mega_moe_fused_shared",
+            "shared expert fused into DeepGEMM MegaMoE (block=%s, tokens=%d)",
+            moe.shared_experts_weight_block_size,
+            num_tokens,
+        )
+        if (
+            envs.SGLANG_COMMUNITY_SELFCHECK_MEGA_SHARED.get()
+            and not get_is_capture_mode()
+            and num_tokens >= 256
+            and not getattr(forward_mega_moe, "_selfcheck_done", False)
+        ):
+            forward_mega_moe._selfcheck_done = True
+            _selfcheck_fused_shared(
+                moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            )
 
     sbo_overlap_flag = (
         moe.alt_stream is not None
-        and moe.num_fused_shared_experts == 0
+        and (fused_shared or moe.num_fused_shared_experts == 0)
         and num_tokens > 0
         and get_is_capture_mode()
     )
@@ -171,11 +226,11 @@ def forward_mega_moe(
     if sbo_overlap_flag:
         current_stream = torch.cuda.current_stream()
         moe.alt_stream.wait_stream(current_stream)
-        shared_output = moe._forward_shared_experts(hidden_states)
         mega_stream_ctx = torch.cuda.stream(moe.alt_stream)
     else:
-        shared_output = moe._forward_shared_experts(hidden_states)
         mega_stream_ctx = nullcontext()
+    # The fused kernel adds the shared expert itself.
+    shared_output = None if fused_shared else moe._forward_shared_experts(hidden_states)
 
     # Optionally fuse the routed scaling into the shared-expert residual add:
     # one torch.add(shared, y, alpha=scale) instead of y.mul_(scale) then
@@ -197,6 +252,7 @@ def forward_mega_moe(
             input_ids_global,
             num_tokens,
             apply_routed_scaling=not fuse_scale_add,
+            fuse_shared=fused_shared,
         )
 
     if sbo_overlap_flag:
@@ -384,6 +440,7 @@ def _run_mega_routed(
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
     apply_routed_scaling: bool = True,
+    fuse_shared: bool = False,
 ) -> torch.Tensor:
     import deep_gemm
 
@@ -454,6 +511,7 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
+        num_shared_experts=moe.n_shared_experts if fuse_shared else 0,
     )
 
     if num_tokens > 0:
@@ -491,6 +549,28 @@ def _run_mega_routed(
             mma_type=mma_type,
         )
     else:
+        # The in-kernel shared expert output is unscaled, so the routed scaling
+        # moves onto the routed weights instead of y.
+        scale_in_weights = (
+            fuse_shared
+            and apply_routed_scaling
+            and not moe.experts.should_fuse_routed_scaling_factor_in_topk
+            and float(moe.routed_scaling_factor) != 1.0
+        )
+        if scale_in_weights:
+            topk_weights_in = topk_weights_in * float(moe.routed_scaling_factor)
+        shared_block_m = 0
+        if fuse_shared:
+            shared_block_m = deep_gemm.get_block_m_for_mega_moe(
+                num_ranks=buf.group.size(),
+                num_experts=buf.num_experts,
+                # DeepGEMM rounds the requested capacity up for its buffer.
+                num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+                # Match the non-null output allocation passed to DeepGEMM.
+                num_tokens=max(num_tokens, 1),
+                num_topk=buf.num_topk,
+                mma_type=buf.mma_type,
+            )
         mega_moe_pre_dispatch(
             hidden_states,
             topk_ids_in,
@@ -500,6 +580,8 @@ def _run_mega_routed(
             buf.topk_idx,
             buf.topk_weights,
             quant_group_size=32,
+            shared_x_sf=buf.shared_l1_acts_sf if fuse_shared else None,
+            shared_block_m=shared_block_m,
         )
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
@@ -516,6 +598,8 @@ def _run_mega_routed(
             moe.experts.mega_l1_weights,
             moe.experts.mega_l2_weights,
             buf,
+            shared_l1_weights=moe.mega_shared_l1_weights if fuse_shared else None,
+            shared_l2_weights=moe.mega_shared_l2_weights if fuse_shared else None,
             recipe=(1, 1, 32),
             activation="swiglu",
             activation_clamp=swiglu_limit,
@@ -523,9 +607,60 @@ def _run_mega_routed(
         )
     y = y[:num_tokens]
 
+    if fuse_shared:
+        return y
     if apply_routed_scaling and not moe.experts.should_fuse_routed_scaling_factor_in_topk:
         y.mul_(moe.routed_scaling_factor)
     return y
+
+
+def _selfcheck_fused_shared(
+    moe, hidden_states, forward_batch, input_ids_global, num_tokens
+) -> None:
+    """Verification aid (SGLANG_COMMUNITY_SELFCHECK_MEGA_SHARED): compare the fused
+    output and the production path (routed + separate shared expert) against an
+    fp32-weight shared-expert reference on the same input. Every EP rank reaches
+    this at the same layer, so the extra MegaMoE launches stay collective."""
+    from sglang.kernels.ops.attention.dsv4.moe import silu_and_mul_clamp
+
+    y_fused = _run_mega_routed(
+        moe, hidden_states, forward_batch, input_ids_global, num_tokens,
+        fuse_shared=True,
+    ).float()
+    y_routed = _run_mega_routed(
+        moe, hidden_states, forward_batch, input_ids_global, num_tokens,
+        fuse_shared=False,
+    ).float()
+    shared_prod = moe._forward_shared_experts(hidden_states).float()
+
+    def dequant(linear):
+        w = linear.weight.data.float()
+        sf = linear.weight_scale_inv.data.float()
+        bn, bk = linear.quant_method.quant_config.weight_block_size
+        return w * sf.repeat_interleave(bn, 0)[: w.shape[0]].repeat_interleave(bk, 1)[:, : w.shape[1]]
+
+    shared = moe.shared_experts
+    gate_up = (hidden_states.float() @ dequant(shared.gate_up_proj).t()).to(torch.bfloat16)
+    act = gate_up.new_empty((gate_up.shape[0], gate_up.shape[1] // 2))
+    if shared.swiglu_limit is not None:
+        silu_and_mul_clamp(gate_up, act, float(shared.swiglu_limit))
+    else:
+        act = shared.act_fn(gate_up)
+    shared_fp32 = act.float() @ dequant(shared.down_proj).t()
+    target = y_routed + shared_fp32
+    denom = shared_fp32.norm().clamp_min(1e-12)
+    err_prod = (shared_prod - shared_fp32).norm() / denom
+    err_fused = (y_fused - target).norm() / denom
+    logger.info(
+        "[community-opt] #39313 selfcheck: layer=%s tokens=%d "
+        "rel_err_vs_fp32_shared: production=%.4e fused=%.4e "
+        "(fused vs production rel=%.4e)",
+        getattr(moe, "layer_id", None),
+        num_tokens,
+        err_prod.item(),
+        err_fused.item(),
+        ((y_fused - (y_routed + shared_prod)).norm() / denom).item(),
+    )
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
@@ -625,3 +760,39 @@ def build_mega_moe_experts_weights(experts) -> None:
     experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
 
     experts._mega_moe_weights_built = True
+
+
+def build_mega_moe_shared_weights(shared_experts):
+    """Interleaved FP8 L1 / L2 shared-expert weights for DeepGEMM's MegaMoE. The L1
+    is a copy; the originals stay for the forward_normal fallback above the cap."""
+    from deep_gemm import transform_weights_for_mega_moe
+
+    gate_up_proj, down_proj = shared_experts.gate_up_proj, shared_experts.down_proj
+    return transform_weights_for_mega_moe(
+        (gate_up_proj.weight.data, _transform_mega_moe_shared_sf(gate_up_proj)),
+        (down_proj.weight.data, _transform_mega_moe_shared_sf(down_proj)),
+    )
+
+
+def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
+    from deep_gemm import transform_sf_into_required_layout
+
+    from sglang.srt.layers.quantization.fp8_utils import inverse_transform_scale_ue8m0
+
+    n, k = linear.weight.shape
+    sf = linear.weight_scale_inv.data
+    block_n, block_k = linear.quant_method.quant_config.weight_block_size
+    if sf.dtype == torch.int32:
+        # Requantized for the DeepGEMM linear runner (128-wide K groups).
+        sf = inverse_transform_scale_ue8m0(sf, mn=n)[:, : k // 128]
+        block_n, block_k = 128, 128
+    sf = sf.float()
+    if block_k == 128:
+        sf, recipe = sf.repeat_interleave(4, dim=-1), (block_n, 32)
+    else:
+        # [32, 32] ue8m0 blocks: DeepGEMM broadcasts the 32-row granularity to the
+        # same per-row 1x32 layout (checked equal to an explicit (1, 32) expansion).
+        recipe = (block_n, block_k)
+    return transform_sf_into_required_layout(
+        sf, mn=n, k=k, recipe=recipe, disable_ue8m0_cast=False
+    )

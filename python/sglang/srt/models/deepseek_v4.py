@@ -2929,7 +2929,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             if (
                 x.is_cuda
                 and get_platform().is_blackwell
-                and tiny
+                and 0 < x.shape[0]
                 and self.hc_mult == 4
                 and x_flat.shape[1] == 20480
                 and x.dtype == norm.weight.dtype == torch.bfloat16
@@ -2940,6 +2940,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             ):
                 from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
 
+                if not tiny:
+                    from sglang.srt.utils.community_opt import log_community_opt_once
+
+                    log_community_opt_once(
+                        "#42245 hc_combine_norm_any_rows",
+                        "fused combine+RMSNorm beyond 8 rows enabled (rows=%d)",
+                        x.shape[0],
+                    )
+                # One fused form for every row count (per-row reduction order is
+                # fixed regardless of the grid split).
                 y = hc_combine_norm(
                     x_flat, apply_pre, norm.weight, norm.variance_epsilon
                 )
@@ -4014,12 +4024,27 @@ class DeepseekV4Model(nn.Module):
                         forward_batch,
                         cp_all_tokens=cp_extend,
                     )
+                # Only multimodal placeholders become image_token_id, so a text-only
+                # batch skips this full-residual where (#41704). before_engram is only
+                # bound for vision-capable models (MEM-R6), so gate on that first.
                 if keep_before_engram:
-                    hidden_states = torch.where(
-                        (input_ids == self.config.image_token_id)[:, None, None],
-                        before_engram,
-                        hidden_states,
-                    )
+                    from sglang.srt.utils.community_opt import log_community_opt_once
+
+                    if forward_batch.contains_mm_inputs():
+                        log_community_opt_once(
+                            "#41704 image_where_applied",
+                            "multimodal batch keeps the post-engram image-token where",
+                        )
+                        hidden_states = torch.where(
+                            (input_ids == self.config.image_token_id)[:, None, None],
+                            before_engram,
+                            hidden_states,
+                        )
+                    else:
+                        log_community_opt_once(
+                            "#41704 skip_image_where",
+                            "text-only batch skips the post-engram image-token where",
+                        )
                 before_engram = None
             if capture_dspark and i in self.dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
@@ -4185,7 +4210,15 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            from sglang.kernels.ops.layernorm.mhc import hc_broadcast
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "#41704 hc_broadcast",
+                "Triton initial mHC residual broadcast enabled (tokens=%d)",
+                hidden_states.shape[0],
+            )
+            hidden_states = hc_broadcast(hidden_states, self.hc_mult)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -4726,6 +4759,32 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
+
+    def precompile_kernels_after_loading(self) -> None:
+        """Community #39313: build the in-kernel MegaMoE shared-expert weights."""
+        from sglang.srt.layers.moe.mega_moe import (
+            build_mega_moe_shared_weights,
+            should_fuse_mega_moe_shared_experts,
+        )
+
+        num_built = 0
+        for module in self.modules():
+            if isinstance(
+                module, deepseek_v2.DeepseekV2MoE
+            ) and should_fuse_mega_moe_shared_experts(module):
+                module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
+                    build_mega_moe_shared_weights(module.shared_experts)
+                )
+                num_built += 1
+        if num_built:
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "#39313 mega_moe_fused_shared_build",
+                "built in-kernel shared-expert weights for %d MegaMoE layers (%s)",
+                num_built,
+                type(self).__name__,
+            )
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.encoder_only:

@@ -653,6 +653,19 @@ class DeepSeekV4IndexerPool(KVCache):
         [page_size * 64 payload | page_size * 4 scale bytes]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if buf.is_cuda:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                gather_fp4_index_k,
+            )
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "#41658 gather_fp4_index_k",
+                "Triton index-K fp4 gather enabled (rows=%d, page_size=%d)",
+                slots.numel(),
+                self.page_size,
+            )
+            return gather_fp4_index_k(buf, slots, page_size=self.page_size)
         slots = slots.to(torch.int64)
         p = self.page_size
         page, off = (slots // p).unsqueeze(-1), slots % p

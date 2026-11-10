@@ -1296,6 +1296,12 @@ class Envs:
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+    # Community #39313: run the shared expert inside DeepGEMM's MegaMoE kernel
+    # (locally extended to 32x32 ue8m0 block-FP8 shared weights).
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
+    # Verification only: on the first eager fused call per process, also run the
+    # unfused path and log the difference.
+    SGLANG_COMMUNITY_SELFCHECK_MEGA_SHARED = EnvBool(False)
     # Fuse the MegaMoE shared-expert residual combine
     #   hidden = shared_output + routed_scaling_factor * routed_y
     # from the two elementwise kernels the path issues today (y.mul_(scale) in
@@ -1719,6 +1725,9 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # Community #41660: fused c1/c2 compressor for eager extend (non-CP and, locally, the CP
+    # global-order path) instead of the torch pair-partner chain.
+    SGLANG_OPT_DSV41_FUSED_EXTEND_COMPRESS = EnvBool(True)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

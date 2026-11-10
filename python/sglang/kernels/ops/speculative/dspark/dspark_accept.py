@@ -597,6 +597,31 @@ class AcceptGreedy:
         )
 
 
+def _row_argmax(logits: torch.Tensor) -> torch.Tensor:
+    # torch.argmax uses one block per row; tens to hundreds of verify rows over a
+    # wide vocab leave most of the machine idle. The medium split kernel keeps
+    # torch.argmax's NaN priority and lowest-index tie rule, so it is exact.
+    if (
+        logits.is_cuda
+        and logits.dim() == 2
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and 64 < logits.shape[0] <= 384
+        and logits.shape[1] >= 65536
+    ):
+        from sglang.kernels.ops.speculative.row_argmax import row_argmax
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "#39704 medium row_argmax",
+            "split-vocab verify argmax enabled (rows=%d, vocab=%d)",
+            logits.shape[0],
+            logits.shape[1],
+        )
+        return row_argmax(logits)
+    return torch.argmax(logits, dim=-1)
+
+
 def accept_greedy(
     *,
     candidates: torch.Tensor,
@@ -605,7 +630,7 @@ def accept_greedy(
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = torch.argmax(target_logits, dim=-1).view(
+    target_predict = _row_argmax(target_logits).view(
         bs, verify_num_draft_tokens
     )
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
@@ -657,7 +682,7 @@ def accept_greedy_triton(
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = torch.argmax(target_logits, dim=-1).view(
+    target_predict = _row_argmax(target_logits).view(
         bs, verify_num_draft_tokens
     )
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(

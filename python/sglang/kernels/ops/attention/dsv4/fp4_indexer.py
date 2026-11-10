@@ -4,6 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
+# One index-K slot: 64 packed e2m1 bytes and four ue8m0 block exponents.
+INDEX_K_SLOT_BYTES = 64 + 4
+
 
 @triton.jit
 def _select_group_value(group, v0, v1, v2, v3):
@@ -125,6 +128,56 @@ def _quantize_fp4_indexer_kernel(
 
 
 @triton.jit
+def _quantize_fp4_indexer_rows(
+    x,
+    x_fp4,
+    x_sf,
+    M,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_N: tl.constexpr,
+    RNE: tl.constexpr,
+):
+    tl.static_assert(BLOCK_N == 128 and GROUP_N == 32)
+    # Each reduction covers one scale group. Keep its values for packing,
+    # avoiding four masked full-row reductions and a second input load.
+    group = tl.program_id(0) * BLOCK_M * 4 + tl.arange(0, BLOCK_M * 4)
+    offs = tl.arange(0, GROUP_N)
+    values = tl.load(
+        x + group[:, None].to(tl.int64) * GROUP_N + offs[None, :],
+        group[:, None] < M * 4,
+        0,
+    ).to(tl.float32)
+    amax = tl.max(tl.abs(values), axis=1)
+    exp = _ceil_ue8m0_exp(tl.maximum(amax / 6.0, 1.0e-4))
+    scale = (exp << 23).to(tl.float32, bitcast=True)
+    v0, v1 = tl.split(
+        tl.reshape(values / scale[:, None], (BLOCK_M * 4, GROUP_N // 2, 2))
+    )
+    if RNE:
+        code0 = _fp4_e2m1_code_rne(v0)
+        code1 = _fp4_e2m1_code_rne(v1)
+    else:
+        code0 = _fp4_e2m1_code(v0)
+        code1 = _fp4_e2m1_code(v1)
+    packed = (code0 & 0x0F) | ((code1 & 0x0F) << 4)
+    tl.store(
+        x_fp4
+        + group[:, None].to(tl.int64) * (GROUP_N // 2)
+        + tl.arange(0, GROUP_N // 2)[None, :],
+        packed,
+        group[:, None] < M * 4,
+    )
+    # The four exponents occupy disjoint bytes, so integer sum packs them.
+    shifts = tl.arange(0, 4) * 8
+    packed_sf = tl.sum(
+        tl.reshape(exp.to(tl.uint32), (BLOCK_M, 4)) << shifts[None, :], axis=1
+    )
+    token_id = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    tl.store(x_sf + token_id, packed_sf.to(tl.int32), token_id < M)
+
+
+@triton.jit
 def _store_fp4_index_k_cache_kernel(
     k_fp4,
     k_sf,
@@ -161,7 +214,29 @@ def quantize_fp4_indexer_tensor(
     x = x.contiguous().view(-1, x.shape[-1])
     x_fp4 = torch.empty((x.shape[0], 64), device=x.device, dtype=torch.int8)
     x_sf = torch.empty((x.shape[0],), device=x.device, dtype=torch.int32)
-    if x.shape[0] > 0:
+    from sglang.srt.runtime_context import get_platform
+
+    if x.shape[0] >= 4096 and get_platform().is_blackwell:
+        from sglang.srt.utils.community_opt import log_community_opt_once
+
+        log_community_opt_once(
+            "#39704 quantize_fp4_indexer_rows",
+            "row-group fp4 indexer quant kernel enabled (rows=%d)",
+            x.shape[0],
+        )
+        # Independent rows share a CTA to avoid one block per 128 values.
+        _quantize_fp4_indexer_rows[(triton.cdiv(x.shape[0], 8),)](
+            x,
+            x_fp4,
+            x_sf,
+            x.shape[0],
+            8,
+            BLOCK_N=128,
+            GROUP_N=32,
+            RNE=rne,
+            num_warps=4,
+        )
+    elif x.shape[0] > 0:
         _quantize_fp4_indexer_kernel[(x.shape[0],)](
             x,
             x_fp4,
@@ -198,4 +273,135 @@ def store_fp4_index_k_cache(
         page_size,
         cache.stride(0),
         BLOCK=64,
+    )
+
+
+@triton.jit
+def _gather_fp4_index_k_kernel(
+    cache,
+    cache_stride,
+    slots,
+    payload,
+    scales,
+    n,
+    page_size: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    # int32 view of a page: page_size * 16 payload words, then page_size scale words.
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    valid = rows < n
+    slot = tl.load(slots + rows, valid, 0).to(tl.int64)
+    page = slot // page_size
+    offset = slot - page * page_size
+    page_base = cache + page * cache_stride
+    words = tl.arange(0, 16)
+    payload_words = tl.load(
+        page_base[:, None] + offset[:, None] * 16 + words[None, :], valid[:, None]
+    )
+    tl.store(
+        payload + rows[:, None].to(tl.int64) * 16 + words[None, :],
+        payload_words,
+        valid[:, None],
+    )
+    tl.store(scales + rows, tl.load(page_base + page_size * 16 + offset, valid), valid)
+
+
+def gather_fp4_index_k(
+    cache: torch.Tensor, slots: torch.Tensor, *, page_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Packed fp4 rows at ``slots`` of the index-K ``cache`` (``[pages, page_size *
+    68]`` uint8, ``store_fp4_index_k_cache``'s layout): (payload int8 ``[n, 64]``,
+    ue8m0 scales packed int32 ``[n]``), the layout ``quantize_fp4_indexer_tensor``
+    returns."""
+    assert cache.shape[1] == page_size * INDEX_K_SLOT_BYTES and cache.stride(1) == 1
+    # The kernel addresses slots as `slots + rows`, so a strided view would be read
+    # as if its elements were packed.
+    assert slots.is_contiguous()
+    words = cache.view(torch.int32)
+    n = slots.shape[0]
+    payload = torch.empty((n, 16), device=cache.device, dtype=torch.int32)
+    scales = torch.empty((n,), device=cache.device, dtype=torch.int32)
+    if n > 0:
+        block_rows = 64
+        _gather_fp4_index_k_kernel[(triton.cdiv(n, block_rows),)](
+            words,
+            words.stride(0),
+            slots,
+            payload,
+            scales,
+            n,
+            page_size,
+            BLOCK_ROWS=block_rows,
+            num_warps=4,
+        )
+    return payload.view(torch.int8), scales
+
+
+@triton.jit(do_not_specialize=["NUM_SLOTS"])
+def _finish_flat_indexer_topk_kernel(
+    Indices,
+    Slots,
+    Starts,
+    Pages,
+    Raw,
+    K: tl.constexpr,
+    NUM_SLOTS,
+    IDX_STRIDE: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
+    RAW_STRIDE: tl.constexpr,
+    WRITE_RAW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    unselected = 2147483647
+    idx = tl.load(Indices + row * IDX_STRIDE + col, col < K, unselected)
+    idx = tl.sort(tl.where(idx < 0, unselected, idx), descending=False)
+    chosen = (col < K) & (idx != unselected)
+    slot = tl.load(Slots + tl.minimum(idx, NUM_SLOTS - 1), chosen, -1)
+    tl.store(Pages + row * PAGE_STRIDE + col, slot, col < K)
+    if WRITE_RAW:
+        start = tl.load(Starts + row)
+        tl.store(
+            Raw + row * RAW_STRIDE + col, tl.where(chosen, idx - start, -1), col < K
+        )
+
+
+def finish_flat_indexer_topk(
+    indices: torch.Tensor,
+    slots: torch.Tensor,
+    request_starts: torch.Tensor,
+    page_indices: torch.Tensor,
+    raw_indices: torch.Tensor | None,
+) -> None:
+    """Sort flattened prefill positions and map them to KV slots in one kernel.
+
+    Negative positions and INT32_MAX are unselected. Write only the selected
+    rows and columns; callers retain responsibility for resetting output padding.
+    """
+    rows, k = indices.shape
+    if not rows or not k:
+        return
+    assert indices.dtype == torch.int32 and indices.stride(1) == 1
+    assert slots.ndim == 1 and slots.is_contiguous() and slots.numel() > 0
+    assert request_starts.shape == (rows,) and request_starts.is_contiguous()
+    assert page_indices.shape[0] >= rows and page_indices.shape[1] >= k
+    assert page_indices.dtype == torch.int32 and page_indices.stride(1) == 1
+    if raw_indices is not None:
+        assert raw_indices.shape[0] >= rows and raw_indices.shape[1] >= k
+        assert raw_indices.dtype == torch.int32 and raw_indices.stride(1) == 1
+    _finish_flat_indexer_topk_kernel[(rows,)](
+        indices,
+        slots,
+        request_starts,
+        page_indices,
+        raw_indices,
+        k,
+        slots.numel(),
+        indices.stride(0),
+        page_indices.stride(0),
+        raw_indices.stride(0) if raw_indices is not None else 0,
+        raw_indices is not None,
+        triton.next_power_of_2(k),
+        num_warps=4,
     )
