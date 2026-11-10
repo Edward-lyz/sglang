@@ -681,7 +681,7 @@ class SchedulerPPMixin:
         never needs this: it authors the plan and simply omits the aborted rid.
         """
         if (
-            self.pp_size <= 1
+            self.ps.pp_size <= 1
             or not self.enable_asradix_cache
             or self.pp_group.is_first_rank
         ):

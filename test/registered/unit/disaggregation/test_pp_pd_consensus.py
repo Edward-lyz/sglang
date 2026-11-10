@@ -609,6 +609,65 @@ class TestPPBootstrapAbortPlanRace(CustomTestCase):
         record["pp_batch_plan_id"] = seq
         return record
 
+    class _NoteHarness(SchedulerPPMixin):
+        """Minimal scheduler surface for exercising the ledger *write* path.
+
+        Only `_pp_note_bootstrap_abort` is driven here, so it wires the exact
+        attributes that method touches: `ps.pp_size` / `ps.pp_rank` (pp size and
+        this rank live on the ParallelState, not the Scheduler), the asradix
+        toggle, and the pp group's first-rank flag.
+        """
+
+        def __init__(self, *, is_first_rank, pp_size=2, asradix=True, pp_rank=8):
+            self.ps = SimpleNamespace(pp_size=pp_size, pp_rank=pp_rank)
+            self.enable_asradix_cache = asradix
+            self.pp_group = SimpleNamespace(is_first_rank=is_first_rank)
+            self._pp_pending_bootstrap_aborts = {}
+
+    def test_note_bootstrap_abort_ledgers_downstream_failure(self):
+        """A downstream rank's bootstrap-failure abort must be recorded.
+
+        Regression: the gate read `self.pp_size`, but pp size lives on
+        `self.ps` -- so the very first sub-expression raised AttributeError on
+        *every* call, crashing the scheduler on any disagg bootstrap failure
+        (worse than the race it was meant to fix). Driving the real write path
+        (not a pre-seeded ledger) is what makes this red on the typo.
+        """
+        harness = self._NoteHarness(is_first_rank=False, pp_rank=8)
+        req = SimpleNamespace(rid="req-bad")
+
+        harness._pp_note_bootstrap_abort(req, "Prefill bootstrap failed for request")
+
+        self.assertEqual(
+            harness._pp_pending_bootstrap_aborts,
+            {
+                "req-bad": {
+                    "rid": "req-bad",
+                    "origin_pp_rank": 8,
+                    "reason_code": "PREFILL_BOOTSTRAP_FAILED",
+                    "reason": "Prefill bootstrap failed for request",
+                }
+            },
+        )
+
+    def test_note_bootstrap_abort_skips_first_rank_and_non_pp(self):
+        """The gate must no-op where projection is unnecessary or impossible.
+
+        First rank authors the plan (it just omits the aborted rid), and
+        pp_size<=1 / asradix-off deployments have no downstream install to
+        protect -- recording there would leak ledger entries that never flush.
+        """
+        for kwargs in (
+            {"is_first_rank": True},
+            {"is_first_rank": False, "pp_size": 1},
+            {"is_first_rank": False, "asradix": False},
+        ):
+            harness = self._NoteHarness(**kwargs)
+            harness._pp_note_bootstrap_abort(
+                SimpleNamespace(rid="req-bad"), "Prefill bootstrap failed"
+            )
+            self.assertEqual(harness._pp_pending_bootstrap_aborts, {}, kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()
