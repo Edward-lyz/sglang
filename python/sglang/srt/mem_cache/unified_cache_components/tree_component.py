@@ -96,6 +96,8 @@ class ComponentDeviceValueAllocator:
         Callable[[int], tuple[Optional[torch.Tensor], Optional[tuple[int, ...]]]]
     ] = None
     free_with_metadata: Optional[Callable[[torch.Tensor, Sequence[int]], Any]] = None
+    # FULL reports one host page ID per page_size slots.
+    values_per_host_id: int = 1
 
     def release(
         self, value: torch.Tensor, host_value: Optional[Sequence[int]] = None
@@ -132,14 +134,18 @@ class ComponentDeviceValueAllocator:
         if len(value) != count:
             metadata = (
                 host_value
-                if host_value is not None and len(host_value) == len(value)
+                if host_value is not None
+                and len(host_value) * self.values_per_host_id == len(value)
                 else None
             )
             self.release(value, metadata)
             raise RuntimeError(
                 f"Allocated {len(value)} of {count} component device value(s)"
             )
-        if host_value is not None and len(host_value) != count:
+        if (
+            host_value is not None
+            and len(host_value) * self.values_per_host_id != count
+        ):
             self.free(value)
             raise RuntimeError(
                 f"Allocated {len(host_value)} of {count} host component value ID(s)"
@@ -187,8 +193,11 @@ class ComponentValueAllocation:
             return
         self._closed = True
         if self._consumed < len(self.value):
+            ratio = self._allocator.values_per_host_id
             host_value = (
-                None if self.host_value is None else self.host_value[self._consumed :]
+                None
+                if self.host_value is None or self._consumed % ratio
+                else self.host_value[self._consumed // ratio :]
             )
             self._allocator.release(self.value[self._consumed :], host_value)
 

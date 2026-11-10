@@ -59,7 +59,6 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.parameter import BlockQuantScaleParameter
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -74,6 +73,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.parameter import BlockQuantScaleParameter
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -411,9 +411,7 @@ class KimiK3MLP(nn.Module):
                 )
             else:
                 hidden_states = get_global_dp_buffer(get_tp_group())
-                dp_gather_replicate(
-                    hidden_states, local_hidden_states, forward_batch
-                )
+                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         if self._mixed_gate_up:
             gate, _ = self.gate_proj(hidden_states)
             up, _ = self.up_proj(hidden_states)
@@ -1888,6 +1886,8 @@ class KimiK3DeltaAttention(nn.Module):
             if envs.SGLANG_OPT_USE_KDA_STRIDED_ONORM.get():
                 from sglang.kernels.ops.kimi_k3.kda_strided_onorm import (
                     covered as _kda_strided_onorm_covered,
+                )
+                from sglang.kernels.ops.kimi_k3.kda_strided_onorm import (
                     kda_strided_onorm,
                 )
 
@@ -2214,9 +2214,7 @@ class KimiK3DecoderLayer(nn.Module):
             # 8-rank block and keeps its DP gather/reduction inside that
             # block. The default vocab_tp_size == tp_size leaves the original
             # global-TP Dense MLP path unchanged.
-            dense_mlp_vocab_tp = (
-                get_parallel().vocab_tp_size < get_parallel().tp_size
-            )
+            dense_mlp_vocab_tp = get_parallel().vocab_tp_size < get_parallel().tp_size
             rank0_log(
                 f"K3 dense MLP layer {layer_idx} parallelism: "
                 f"tp_size={get_parallel().tp_size}, "
@@ -2233,16 +2231,10 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
-                tp_rank=(
-                    get_parallel().vocab_tp_rank if dense_mlp_vocab_tp else None
-                ),
-                tp_size=(
-                    get_parallel().vocab_tp_size if dense_mlp_vocab_tp else None
-                ),
+                tp_rank=(get_parallel().vocab_tp_rank if dense_mlp_vocab_tp else None),
+                tp_size=(get_parallel().vocab_tp_size if dense_mlp_vocab_tp else None),
                 tp_group=(
-                    get_parallel().vocab_tp_group
-                    if dense_mlp_vocab_tp
-                    else None
+                    get_parallel().vocab_tp_group if dense_mlp_vocab_tp else None
                 ),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -2326,13 +2318,9 @@ class KimiK3DecoderLayer(nn.Module):
             return
         targets: List[str] = []
         if get_parallel().attn_tp_size == 1:
-            targets += [
-                f"self_attn.{p}" for p in self.self_attn.weight_shard_targets()
-            ]
+            targets += [f"self_attn.{p}" for p in self.self_attn.weight_shard_targets()]
         mlp_targets = (
-            self.mlp.weight_shard_targets()
-            if isinstance(self.mlp, KimiK3MoE)
-            else []
+            self.mlp.weight_shard_targets() if isinstance(self.mlp, KimiK3MoE) else []
         )
         targets += [f"mlp.{p}" for p in mlp_targets]
         if not targets:
@@ -2727,6 +2715,19 @@ class KimiK3LinearModel(nn.Module):
                 )
         else:
             self.norm = PPMissingLayer()
+            if config.attn_res_block_size is not None:
+                # DSPARK capture at this stage's last layer needs layer
+                # end_layer's attention-side mixture weights (lives on next stage).
+                self.next_stage_attn_res_norm = RMSNorm(
+                    config.hidden_size, eps=config.rms_norm_eps
+                )
+                self.next_stage_attn_res_proj = ReplicatedLinear(
+                    config.hidden_size,
+                    1,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.next_stage_attn_res_proj",
+                )
 
     def forward(
         self,
@@ -2902,9 +2903,7 @@ class KimiK3LinearModel(nn.Module):
         if self._weight_shard_finalized:
             return
         modules = [module for _, module in self._weight_shard_layers]
-        self._weight_shard_pool = finalize_model_weight_shard(
-            modules, mode="force"
-        )
+        self._weight_shard_pool = finalize_model_weight_shard(modules, mode="force")
         self._weight_shard_finalized = True
         if modules:
             torch.cuda.empty_cache()
@@ -2929,10 +2928,14 @@ class KimiK3LinearModel(nn.Module):
             score_proj = next_layer.self_attention_res_proj
             score_norm = next_layer.self_attention_res_norm
             nvb = next_layer.prev_valid_blocks
-        else:
+        elif self.pp_group.is_last_rank:
             # Last layer: the model's own output-side aggregation weights.
             score_proj = self.output_attn_res_proj
             score_norm = self.output_attn_res_norm
+            nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
+        else:
+            score_proj = self.next_stage_attn_res_proj
+            score_norm = self.next_stage_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
         return aggregate_stream(
             hidden_states, attn_res.block_residual, nvb, score_proj, score_norm
@@ -3047,6 +3050,22 @@ class KimiK3LinearForCausalLM(nn.Module):
             create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
         )
 
+    def _next_stage_weight_map(self) -> dict[str, str]:
+        """Checkpoint-name suffix -> param name for the next stage's first-layer
+        attn-res weights that a non-last PP stage loads for DSPARK capture."""
+        if not hasattr(self.model, "next_stage_attn_res_proj"):
+            return {}
+        end = self.model.end_layer
+        return {
+            f"layers.{end}.self_attention_res_proj.weight": "model.next_stage_attn_res_proj.weight",
+            f"layers.{end}.self_attention_res_norm.weight": "model.next_stage_attn_res_norm.weight",
+        }
+
+    def pp_extra_weight_suffixes(self) -> tuple[str, ...]:
+        """Return weight-name suffixes kept across pipeline-parallel boundaries."""
+        # Keeps the PP weight filter from dropping the out-of-range tensors above.
+        return tuple(self._next_stage_weight_map())
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         use_full_rank_gate = bool(
             (self.config.linear_attn_config or {}).get("use_full_rank_gate", False)
@@ -3130,11 +3149,22 @@ class KimiK3LinearForCausalLM(nn.Module):
             param.data.copy_(truncated_weight)
             return True
 
+        next_stage_params = self._next_stage_weight_map()
+
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
 
             layer_id = get_layer_id(name)
+            if next_stage_params and layer_id == self.model.end_layer:
+                for suffix, pname in next_stage_params.items():
+                    if name.endswith(suffix):
+                        param = params_dict[pname]
+                        getattr(param, "weight_loader", default_weight_loader)(
+                            param, loaded_weight
+                        )
+                        loaded_params.add(pname)
+                        break
             if layer_id is not None and (
                 layer_id < self.model.start_layer or layer_id >= self.model.end_layer
             ):
@@ -3335,9 +3365,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             # buffers so every BMM output uses the intended scale.
             kv_b_weight = self_attn.kv_b_proj.weight
             kv_b_weight_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
-            kv_b_block_scale = getattr(
-                self_attn.kv_b_proj, "weight_scale_inv", None
-            )
+            kv_b_block_scale = getattr(self_attn.kv_b_proj, "weight_scale_inv", None)
             # Some remote/dummy loaders invoke this hook after transposing the
             # parameter to [in, out]. Restore checkpoint [out, in] layout.
             kv_b_head_dim = self_attn.qk_nope_head_dim + self_attn.v_head_dim
@@ -3379,9 +3407,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                     )
                 elif use_mla_kvb_bf16:
                     # Accuracy-isolation path: bypass FP8 BMM completely.
-                    kv_b_weight = (
-                        kv_b_weight.to(torch.bfloat16)
-                        * kv_b_weight_scale.to(torch.bfloat16)
+                    kv_b_weight = kv_b_weight.to(torch.bfloat16) * kv_b_weight_scale.to(
+                        torch.bfloat16
                     )
                     mla_kvb_bmm_scale = 1.0
                 else:
@@ -3403,14 +3430,14 @@ class KimiK3LinearForCausalLM(nn.Module):
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             if kv_b_weight.dtype != torch.float8_e4m3fn:
-                mla_kvb_bmm_scale = getattr(
-                    self_attn.kv_b_proj, "weight_scale", 1.0
-                )
+                mla_kvb_bmm_scale = getattr(self_attn.kv_b_proj, "weight_scale", 1.0)
             self_attn.w_scale = mla_kvb_bmm_scale
             if envs.SGLANG_K3_DEL_MLA_KVB_DCP.get():
                 dtype = self_attn.kv_b_proj.weight.data.dtype
                 dev = self_attn.kv_b_proj.weight.data.device
-                self_attn.kv_b_proj.weight.data = torch.empty(0, dtype=dtype, device=dev)
+                self_attn.kv_b_proj.weight.data = torch.empty(
+                    0, dtype=dtype, device=dev
+                )
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the
@@ -3428,6 +3455,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                 _warm_cw(layer.mlp_res_proj, layer.mlp_res_norm)
         if hasattr(self.model, "output_attn_res_proj"):
             _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
+        if hasattr(self.model, "next_stage_attn_res_proj"):
+            _warm_cw(
+                self.model.next_stage_attn_res_proj, self.model.next_stage_attn_res_norm
+            )
 
         # Post-load: merge the horizontally-fused decode weights. Module
         # weights are re-pointed to views of the merged buffers (net extra
@@ -3674,6 +3705,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.language_model is None:
             return self.config.text_config.num_hidden_layers
         return self.language_model.model.end_layer
+
+    def pp_extra_weight_suffixes(self) -> tuple[str, ...]:
+        """Delegate PP extra weight suffixes to the underlying language model."""
+        if self.language_model is None:
+            return ()
+        return self.language_model.pp_extra_weight_suffixes()
 
     def prepare_context_parallel_metadata_for_dcp(
         self,

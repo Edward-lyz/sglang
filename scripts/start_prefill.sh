@@ -1,15 +1,14 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 
-MODEL_PATH="/Kimi-K3"
-export MODEL_PATH
-
-DRAFT_MODEL_PATH="/Kimi-K3-DSpark"
-export DRAFT_MODEL_PATH
+export MODEL_ID="$MODEL_ID"
 
 MASTER_IP=$(cut -d ',' -f 1 "$FED_MEMBER_FILE")
 export MASTER_IP
+
+export MODEL_PATH="/Kimi-K3-ATTN-MOE-DENSE-FP8"
+export DRAFT_MODEL_PATH="/Kimi-K3-DSpark"
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 NUM_NODES=2
@@ -17,10 +16,10 @@ export NUM_NODES
 GPUS_PER_NODE=8
 export TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
-PP_SIZE=$((NUM_NODES * 1))
+PP_SIZE=$((NUM_NODES * 8))
 export PP_SIZE
 
-TP_SIZE=$((NUM_NODES * 4))
+TP_SIZE=1
 export TP_SIZE
 
 export MC_TE_METRIC=true
@@ -48,6 +47,7 @@ export NVSHMEM_IB_TRAFFIC_CLASS=130
 export NVSHMEM_BOOTSTRAP=UID
 
 export SGLANG_TBO_DEBUG=0
+export SGLANG_K3_ATTN_MOE_FP8=1
 export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
 export SGLANG_MOONCAKE_SEND_AUX_TCP=1
@@ -55,13 +55,25 @@ export SGLANG_TOOL_STRICT_LEVEL=2
 export SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=50
 export SGLANG_DISAGGREGATION_QUEUE_SIZE=50
 export SGLANG_FLASHKDA_MIN_SEQ_LEN=64
-export SGLANG_FLASHKDA_MAX_SEQ_LEN=32768
-export SGLANG_PP_LAYER_PARTITION="48,45"
-export SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096
+export SGLANG_FLASHKDA_MAX_SEQ_LEN=24576
+export SGLANG_DYNAMIC_CHUNKING_COST_MODEL=1
+export SGLANG_PP_EAGER_BANK_FORWARD=1
+export SGLANG_PP_EAGER_BANK_RANKS="7"
+export SGLANG_PP_LAYER_PARTITION="7,5,7,5,7,5,7,5,7,5,7,5,7,5,6,3"
+export SGLANG_ENABLE_PP_WEIGHT_FILTER=1
+export SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS=1
 export SGLANG_WARMUP_PREFILL_LENS="512,2048,8192,32768,65536"
 export SGLANG_WARMUP_BATCH_SIZE=1
 export SGLANG_WARMUP_TIMEOUT=600
 export SGLANG_HEALTH_CHECK_TIMEOUT=20
+export SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK=1
+export SGLANG_PP_PD_KV_TRANSFER_TARGET_PARALLEL=1
+export SGLANG_OPT_USE_KDA_STRIDED_ONORM=1
+export SGLANG_K3_KDA_SHORT_CONV=1
+export SGLANG_OPT_USE_K3_KDA_FUSED_BETA_SIGMOID=1
+export SGLANG_OPT_USE_K3_KDA_FUSED_TRACK_CONV_STATE=1
+export SGLANG_OPT_USE_FLATROW_CONCAT_MHA_K=1
+export SGLANG_OPT_USE_TRITON_MLA_QKV_FP8_CAST=1
 
 export HTTP_PORT=8000
 export PD_SEPARATE_STAGE=prefill
@@ -73,25 +85,26 @@ export IB_DEVICE
 
 export DEEPEP_CONFIG_JSON='{"normal_dispatch": {"num_sms": 32, "num_max_nvl_chunked_send_tokens": 36, "num_max_nvl_chunked_recv_tokens": 288, "num_max_rdma_chunked_send_tokens": 20, "num_max_rdma_chunked_recv_tokens": 128}, "normal_combine": {"num_sms": 32, "num_max_nvl_chunked_send_tokens": 4, "num_max_nvl_chunked_recv_tokens": 288, "num_max_rdma_chunked_send_tokens": 12, "num_max_rdma_chunked_recv_tokens": 128}}'
 
+export AS_READ_MAX_BLOCKS=0
+export AS_WRITE_MAX_BLOCKS=16
 export AS_KDA_CHECKPOINT_GPU_COUNT=4
 export AS_AGENT_ADDRESS="${HOST_IP}:7070"
-export AS_SHARED_MEMORY_SIZE_BYTES=429496729600
+export AS_SHARED_MEMORY_SIZE_BYTES=429496729600 # 400GiB
 export AIAK_HOST_CACHE_PORT=7070
 
-export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}/sgl-workspace/sglang/python"
-
-LOG_FILE="${LOG_FILE:-/sgl-workspace/prefill.log}"
+export PYTHONPATH="/sgl-workspace/sglang/python:${PYTHONPATH:-}"
+# LOG_FILE="/sgl-workspace/prefill.log"
 
 PARALLEL_ARGS=(
-    --tp-size "$TP_SIZE"
     --pp-size "$PP_SIZE"
     --disable-overlap-schedule
+    # --enable-dynamic-chunking
 )
 
 MTP=(
     --speculative-algorithm DSPARK
     --speculative-draft-model-path "$DRAFT_MODEL_PATH"
-    --speculative-dspark-block-size 3
+    --speculative-dspark-block-size 5
 )
 
 MM_ARG=(
@@ -105,9 +118,21 @@ MM_ARG=(
 CACHE_OPT=(
     --per-node-gpu-num 8
     --enable-asradix-cache
+    # --disable-asradix-cache
 )
 
-sglang serve \
+if [[ "${PROFILE_NSYS:-0}" == "1" ]]; then
+    export SGLANG_ENABLE_NVTX_SCHEDULER=1
+    nsys start --session-new=sglprof \
+        -c cudaProfilerApi \
+        --capture-range-end=repeat:3:sync \
+        -o "/sgl-workspace/ascache_pp${FED_POD_INDEX}"
+    NSYS_PREFIX="nsys launch --session=sglprof -t cuda,nvtx,osrt --cuda-graph-trace=node --trace-fork-before-exec=true --cuda-memory-usage=false"
+else
+    NSYS_PREFIX=""
+fi
+
+$NSYS_PREFIX sglang serve \
     --host 0.0.0.0 \
     --port 8000 \
     --trust-remote-code \
@@ -129,16 +154,16 @@ sglang serve \
     --disaggregation-bootstrap-port 8200 \
     --disaggregation-zmq-ports 7000-7007 \
     "${MM_ARG[@]}" \
-    --moe-a2a-backend megamoe \
-    --moe-runner-backend deep_gemm \
     --attention-backend trtllm_mla \
+    --moe-runner-backend flashinfer_mxfp4 \
     --linear-attn-prefill-backend flashkda \
     --mamba-full-memory-ratio 0.25 \
+    --max-mamba-cache-size 256 \
     --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' \
     --disable-flashinfer-autotune \
-    --chunked-prefill-size $((32 * 1024)) \
+    --chunked-prefill-size $((16 * 1024)) \
     --max-prefill-tokens $((512 * 1024)) \
-    --max-total-tokens 1050000 \
+    --max-total-tokens $((4 * 1024 * 1024)) \
     --max-running-requests 64 \
     --pp-async-batch-depth 2 \
     --page-size 64 \
@@ -150,3 +175,5 @@ sglang serve \
     --enable-metrics \
     --enable-cache-report \
     --collect-tokens-histogram
+
+# --ep-dispatch-algorithm fake >"$LOG_FILE" 2>&1 &

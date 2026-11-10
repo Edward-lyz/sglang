@@ -146,6 +146,56 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 pass
         self.clear()
 
+    @property
+    def free_pages(self):
+        """Return the tensor tracking currently free page IDs."""
+        return self._free_pages
+
+    @free_pages.setter
+    def free_pages(self, value):
+        # Track when free_pages' storage was produced; alloc slices are views
+        # and must keep the original producer so page-ID D2H skips later work.
+        prev = getattr(self, "_free_pages", None)
+        if (
+            value is not None
+            and value.is_cuda
+            and (
+                prev is None
+                or value.untyped_storage().data_ptr()
+                != prev.untyped_storage().data_ptr()
+            )
+        ):
+            ready = torch.cuda.Event()
+            ready.record()
+            self._free_pages_ready = ready
+        self._free_pages = value
+
+    def alloc_with_page_ids(self, need_size: int):
+        """Allocate pages and return (slot indices, host page IDs)."""
+        num_pages = need_size // self.page_size
+        if self.need_sort and num_pages > len(self.free_pages):
+            self.merge_and_sort_free()
+        if num_pages > len(self.free_pages):
+            return None, None
+        page_ids = self._page_ids_to_host(self.free_pages[:num_pages])
+        return self.alloc(need_size), page_ids
+
+    def _page_ids_to_host(self, pages: torch.Tensor) -> tuple[int, ...]:
+        # A plain .tolist() on the scheduler stream also waits for the in-flight
+        # forward queued ahead of it; only the free_pages producer matters here.
+        ready = getattr(self, "_free_pages_ready", None)
+        if ready is None or not pages.is_cuda or pages.numel() == 0:
+            return tuple(pages.tolist())
+        stream = getattr(self, "_page_ids_d2h_stream", None)
+        if stream is None:
+            stream = self._page_ids_d2h_stream = torch.cuda.Stream(device=pages.device)
+        host = torch.empty(pages.shape, dtype=pages.dtype, pin_memory=True)
+        stream.wait_event(ready)
+        with torch.cuda.stream(stream):
+            host.copy_(pages, non_blocking=True)
+        stream.synchronize()
+        return tuple(host.tolist())
+
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
         if self.debug_mode:

@@ -40,7 +40,9 @@ import asyncio
 import json
 import os
 import random
+import subprocess
 import time
+from contextlib import contextmanager
 from typing import List, Tuple
 
 import aiohttp
@@ -54,6 +56,48 @@ AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 # with the same request index share a deterministic prefix.
 FIRST_TOKEN_BASE = 1000
 ARANGE_OFFSET = 10000
+
+# ---------------------------------------------------------------------------
+# nsys capture control
+# ---------------------------------------------------------------------------
+# The server is launched under `nsys launch --session-new=<name>` with collection
+# deferred (see start_prefill.sh). We only want the trace to cover the measured
+# full-length wave — not the cache clear, cache-fill, or GPU flush before it — so
+# the bench itself brackets that wave with `nsys start`/`nsys stop`. The report
+# name comes from the session's `-o`, so it is not set here. The bench must run
+# on the same host as the session daemon.
+
+
+def _run_nsys(cmd_args: List[str]) -> None:
+    """Issue an nsys control command, logging failures without aborting the bench."""
+    cmd = ["nsys"] + cmd_args
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except Exception as e:  # nsys missing, session gone, etc. — never fail the run.
+        print(f"  [nsys] failed to run {' '.join(cmd)}: {e}")
+        return
+    if proc.returncode != 0:
+        print(
+            f"  [nsys] {' '.join(cmd_args)} -> rc={proc.returncode}: "
+            f"{(proc.stderr or proc.stdout).strip()}"
+        )
+    else:
+        print(f"  [nsys] {' '.join(cmd_args)} ok")
+
+
+@contextmanager
+def nsys_capture(session):
+    """Context manager that starts/stops an nsys capture for the given session."""
+    if not session:
+        yield
+        return
+
+    _run_nsys(["start", f"--session={session}"])
+    try:
+        yield
+    finally:
+        _run_nsys(["stop", f"--session={session}"])
+
 
 # ---------------------------------------------------------------------------
 # Server / tokenizer helpers
@@ -525,6 +569,7 @@ async def run_one_hit_rate(
     qps: float = None,
     duration: float = 60.0,
     fill_block_size: int = None,
+    nsys_session: str = None,
 ) -> dict:
     """针对一个目标命中率执行一次完整、彼此隔离的 cache 压测。
 
@@ -552,9 +597,7 @@ async def run_one_hit_rate(
     # Reported hit per request in page units (logging only): the matched prefix
     # is what the fill wave actually committed (fill_block aligned) and cannot
     # exceed the store's own match cap on the measured prompt.
-    expected_hit_pages = (
-        min(warmup_len, fill_blocks * fill_block) // page_size
-    )
+    expected_hit_pages = min(warmup_len, fill_blocks * fill_block) // page_size
 
     # 两层 cache 分开清理：内存层必须走 clear_all_cache 的 memory_only
     # 模式，确保接口会遍历该实例的所有节点，而非只清理入口所在节点。
@@ -642,28 +685,29 @@ async def run_one_hit_rate(
         await asyncio.sleep(0.5)
 
         print(f"  Full-length wave: prompt_len={total_len} ...")
-        bench_start = time.perf_counter()
-        all_results = await send_requests_qps(
-            api_url=api_url,
-            model=model,
-            output_len=output_len,
-            vocab_size=vocab_size,
-            total_len=total_len,
-            page_size=page_size,
-            target_hit_rate=target_hit_rate,
-            first_token_base=first_token_base,
-            arange_offset=arange_offset,
-            qps=qps,
-            duration=duration,
-            semaphore=semaphore,
-            rng=rng,
-            np_rng=np_rng,
-            schedule=schedule,
-            bootstrap_host=bootstrap_host,
-            bootstrap_port=bootstrap_port,
-            dp_size=dp_size,
-        )
-        bench_elapsed = time.perf_counter() - bench_start
+        with nsys_capture(nsys_session):
+            bench_start = time.perf_counter()
+            all_results = await send_requests_qps(
+                api_url=api_url,
+                model=model,
+                output_len=output_len,
+                vocab_size=vocab_size,
+                total_len=total_len,
+                page_size=page_size,
+                target_hit_rate=target_hit_rate,
+                first_token_base=first_token_base,
+                arange_offset=arange_offset,
+                qps=qps,
+                duration=duration,
+                semaphore=semaphore,
+                rng=rng,
+                np_rng=np_rng,
+                schedule=schedule,
+                bootstrap_host=bootstrap_host,
+                bootstrap_port=bootstrap_port,
+                dp_size=dp_size,
+            )
+            bench_elapsed = time.perf_counter() - bench_start
 
         successful_all = [r for r in all_results if r["success"]]
         failed = len(all_results) - len(successful_all)
@@ -818,74 +862,75 @@ async def run_one_hit_rate(
 
     print(f"  Full-length wave: prompt_len={total_len} ...")
     global_req_id = 0
-    bench_start = time.perf_counter()
+    with nsys_capture(nsys_session):
+        bench_start = time.perf_counter()
 
-    for round_idx in range(num_rounds):
-        batch_prompts, _ = build_batch(
-            vocab_size=vocab_size,
-            total_len=total_len,
-            page_size=page_size,
-            target_hit_rate=target_hit_rate,
-            batch_size=batch_size,
-            req_id_offset=global_req_id,
-            rng=rng,
-            first_token_base=first_token_base,
-            arange_offset=arange_offset,
-        )
+        for round_idx in range(num_rounds):
+            batch_prompts, _ = build_batch(
+                vocab_size=vocab_size,
+                total_len=total_len,
+                page_size=page_size,
+                target_hit_rate=target_hit_rate,
+                batch_size=batch_size,
+                req_id_offset=global_req_id,
+                rng=rng,
+                first_token_base=first_token_base,
+                arange_offset=arange_offset,
+            )
 
-        round_start = time.perf_counter()
-        results = await send_batch(
-            api_url,
-            model,
-            output_len,
-            batch_prompts,
-            semaphore,
-            req_id_offset=global_req_id,
-            bootstrap_host=bootstrap_host,
-            bootstrap_port=bootstrap_port,
-            dp_size=dp_size,
-        )
-        global_req_id += len(batch_prompts)
-        round_elapsed = time.perf_counter() - round_start
+            round_start = time.perf_counter()
+            results = await send_batch(
+                api_url,
+                model,
+                output_len,
+                batch_prompts,
+                semaphore,
+                req_id_offset=global_req_id,
+                bootstrap_host=bootstrap_host,
+                bootstrap_port=bootstrap_port,
+                dp_size=dp_size,
+            )
+            global_req_id += len(batch_prompts)
+            round_elapsed = time.perf_counter() - round_start
 
-        successful = [r for r in results if r["success"]]
-        r_prompt = sum(r["prompt_tokens"] for r in successful)
-        r_cached = sum(r["cached_tokens"] for r in successful)
-        r_hit_rate = r_cached / r_prompt if r_prompt > 0 else 0.0
-        r_ttfts = [r["ttft"] for r in successful if r["ttft"] > 0]
+            successful = [r for r in results if r["success"]]
+            r_prompt = sum(r["prompt_tokens"] for r in successful)
+            r_cached = sum(r["cached_tokens"] for r in successful)
+            r_hit_rate = r_cached / r_prompt if r_prompt > 0 else 0.0
+            r_ttfts = [r["ttft"] for r in successful if r["ttft"] > 0]
 
-        # Per-request hit_chunks distribution
-        actual_hit_chunks = [r["cached_tokens"] // page_size for r in successful]
-        hit_chunks_dist = sorted(set(actual_hit_chunks))
+            # Per-request hit_chunks distribution
+            actual_hit_chunks = [r["cached_tokens"] // page_size for r in successful]
+            hit_chunks_dist = sorted(set(actual_hit_chunks))
 
-        per_round_stats.append(
-            {
-                "round": round_idx,
-                "prompt_tokens": r_prompt,
-                "cached_tokens": r_cached,
-                "hit_rate": r_hit_rate,
-                "expected_hit_chunks_mean": float(expected_hit_pages),
-                "actual_hit_chunks_dist": hit_chunks_dist,
-                "elapsed_s": round_elapsed,
-                "num_successful": len(successful),
-            }
-        )
+            per_round_stats.append(
+                {
+                    "round": round_idx,
+                    "prompt_tokens": r_prompt,
+                    "cached_tokens": r_cached,
+                    "hit_rate": r_hit_rate,
+                    "expected_hit_chunks_mean": float(expected_hit_pages),
+                    "actual_hit_chunks_dist": hit_chunks_dist,
+                    "elapsed_s": round_elapsed,
+                    "num_successful": len(successful),
+                }
+            )
 
-        print(
-            f"  round {round_idx:02d}  "
-            f"hit_rate={r_hit_rate:.3f}  "
-            f"cached={r_cached}/{r_prompt}  "
-            f"hit_chunks_dist={hit_chunks_dist}  "
-            f"ttft_mean={np.mean(r_ttfts) * 1000 if r_ttfts else 0.0:.1f}ms  "
-            f"elapsed={round_elapsed:.2f}s"
-        )
+            print(
+                f"  round {round_idx:02d}  "
+                f"hit_rate={r_hit_rate:.3f}  "
+                f"cached={r_cached}/{r_prompt}  "
+                f"hit_chunks_dist={hit_chunks_dist}  "
+                f"ttft_mean={np.mean(r_ttfts) * 1000 if r_ttfts else 0.0:.1f}ms  "
+                f"elapsed={round_elapsed:.2f}s"
+            )
 
-        # Tag each result with its expected hit_chunks
-        for i, r in enumerate(results):
-            r["expected_hit_chunks"] = expected_hit_pages
-        all_results.extend(results)
+            # Tag each result with its expected hit_chunks
+            for i, r in enumerate(results):
+                r["expected_hit_chunks"] = expected_hit_pages
+            all_results.extend(results)
 
-    bench_elapsed = time.perf_counter() - bench_start
+        bench_elapsed = time.perf_counter() - bench_start
 
     # 4. Aggregate
     successful_all = [r for r in all_results if r["success"]]
@@ -1153,6 +1198,7 @@ async def main(args):
                     qps=qps,
                     duration=args.duration,
                     fill_block_size=fill_block_size,
+                    nsys_session=args.nsys_session,
                 )
                 all_stats.append(stats)
                 if "error" not in stats:
@@ -1189,6 +1235,7 @@ async def main(args):
                 qps=None,
                 duration=args.duration,
                 fill_block_size=fill_block_size,
+                nsys_session=args.nsys_session,
             )
             all_stats.append(stats)
             if "error" not in stats:
@@ -1355,6 +1402,16 @@ if __name__ == "__main__":
         help="Data-parallel size. 0 = auto-detect from /get_server_info. "
         "Each request is pinned to data_parallel_rank = req_id %% dp_size, so "
         "both waves send the same req_id to the same rank and prefix cache.",
+    )
+    parser.add_argument(
+        "--nsys-session",
+        type=str,
+        default=None,
+        help="Name of a running nsys session (e.g. 'sglprof' from "
+        "start_prefill.sh) to bracket the measured full-length wave with "
+        "`nsys start`/`nsys stop`. The cache clear, cache-fill, and GPU flush "
+        "are left out of the trace. Requires the bench to run on the same host "
+        "as the session daemon. Omit to disable nsys control.",
     )
 
     args = parser.parse_args()

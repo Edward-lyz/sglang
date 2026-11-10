@@ -380,6 +380,18 @@ def _resolve_pp_layer_range(model) -> Optional[Tuple[int, int]]:
     return None
 
 
+def _resolve_pp_extra_weight_suffixes(model) -> Tuple[str, ...]:
+    """Out-of-range weight-name suffixes the model still loads under PP.
+
+    Optional model hook ``pp_extra_weight_suffixes()``; only consulted when the
+    PP weight filter is on.
+    """
+    if model is None or not envs.SGLANG_ENABLE_PP_WEIGHT_FILTER.get():
+        return ()
+    hook = getattr(model, "pp_extra_weight_suffixes", None)
+    return tuple(hook()) if hook is not None else ()
+
+
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
@@ -411,6 +423,9 @@ class DefaultModelLoader(BaseModelLoader):
         """[start_layer, end_layer) owned by this pipeline-parallel rank, if the
         decoder stack is PP-sharded. Used to skip reading unowned weights."""
 
+        pp_extra_weight_suffixes: Tuple[str, ...] = ()
+        """Weights outside pp_layer_range that this rank still loads."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -420,6 +435,7 @@ class DefaultModelLoader(BaseModelLoader):
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
                 model_config=model_config,
                 pp_layer_range=_resolve_pp_layer_range(model),
+                pp_extra_weight_suffixes=_resolve_pp_extra_weight_suffixes(model),
             )
 
     counter_before_loading_weights: float = 0.0
@@ -575,7 +591,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _maybe_build_pp_name_filter(
-        self, source: "DefaultModelLoader.Source"
+        self, source: DefaultModelLoader.Source
     ) -> Optional[Callable[[str], bool]]:
         """Build a weight-name predicate keeping only this PP rank's layers.
 
@@ -609,7 +625,12 @@ class DefaultModelLoader(BaseModelLoader):
         if end_layer - start_layer >= num_hidden_layers:
             return None
 
-        return make_pp_layer_name_filter(start_layer, end_layer, num_hidden_layers)
+        return make_pp_layer_name_filter(
+            start_layer,
+            end_layer,
+            num_hidden_layers,
+            extra_suffixes=getattr(source, "pp_extra_weight_suffixes", ()),
+        )
 
     def _get_weights_iterator(
         self, source: Source

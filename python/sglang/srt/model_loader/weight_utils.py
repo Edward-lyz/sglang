@@ -709,7 +709,10 @@ _PP_DECODER_LAYER_PATTERN = re.compile(r"(?:^|\.)model\.layers\.(\d+)\.")
 
 
 def make_pp_layer_name_filter(
-    start_layer: int, end_layer: int, num_hidden_layers: int
+    start_layer: int,
+    end_layer: int,
+    num_hidden_layers: int,
+    extra_suffixes: Tuple[str, ...] = (),
 ) -> Callable[[str], bool]:
     """Build a predicate selecting the checkpoint weights this PP rank owns.
 
@@ -717,6 +720,8 @@ def make_pp_layer_name_filter(
     load_weights(), so it can be applied before the tensor is read from disk.
     Anything that is not a main decoder layer weight (embeddings, final norm,
     lm_head, vision tower, MTP) is kept and left to the model to handle.
+    ``extra_suffixes`` keeps out-of-range weights the model still reads, e.g.
+    the next stage's first-layer tensors needed at a stage boundary.
     """
 
     def keep(name: str) -> bool:
@@ -725,6 +730,8 @@ def make_pp_layer_name_filter(
             return True
         layer_id = int(match.group(1))
         if layer_id >= num_hidden_layers:
+            return True
+        if name.endswith(extra_suffixes):
             return True
         return start_layer <= layer_id < end_layer
 

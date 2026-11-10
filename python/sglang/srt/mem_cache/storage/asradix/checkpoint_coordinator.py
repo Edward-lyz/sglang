@@ -788,7 +788,9 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
             return None
 
         try:
-            page_ids = _contiguous_page_ids(alloc_indices, cache.page_size)
+            page_ids = full_allocation.host_value
+            if page_ids is None:
+                page_ids = _contiguous_page_ids(alloc_indices, cache.page_size)
         except ValueError as exc:
             value_transaction.close()
             cache._log_as_failure(
