@@ -170,13 +170,14 @@ class _PreparedSlot:
 def _request_block_hash_ids(
     req, token_ids: Sequence[int], page_size: int, page_count: int
 ) -> tuple[int, ...]:
-    """Reuse request block hashes when they cover the written prefix."""
-    # Padding preserves length, so a length check alone would let the scheduler's
-    # multimodal substitution (which rebinds origin_input_ids) hash away the image.
-    if (
-        req.as_block_hashs is not None
-        and req.origin_input_ids is req.origin_input_ids_unpadded
-    ):
+    """Reuse scheduler-canonical request hashes when they cover the write prefix.
+
+    Scheduler refreshes req.as_block_hashs after any input-id rewrite, so these
+    hashes describe the same canonical token sequence used for AS matching. Only
+    writes beyond that request-hash horizon (for example generated output tokens)
+    fall back to hashing the concrete write token sequence.
+    """
+    if req.as_block_hashs is not None:
         request_hashes = req.as_block_hashs.hash_ids
         if len(request_hashes) >= page_count:
             return tuple(map(int, request_hashes[:page_count]))
