@@ -17,6 +17,56 @@ class AttentionStoreEndpointRole(str, Enum):
 
 
 @dataclass(frozen=True)
+class AttentionStorePipelineMember:
+    """Describe one Agent participating in a PP endpoint group."""
+
+    member_id: int
+    pp_stage_start: int
+    pp_stage_end: int
+    agent_address: str
+    bytes_per_block: int
+    desired_block_count: int
+
+
+@dataclass(frozen=True)
+class AttentionStoreEndpointRegistration:
+    """Carry a pre-negotiated PP endpoint capacity into SDK registration."""
+
+    group_id: str
+    generation: int
+    endpoint_name: str
+    endpoint_role: AttentionStoreEndpointRole
+    local_member_id: int
+    desired_block_count: int
+    members: Sequence[AttentionStorePipelineMember]
+    coordinator_member_id: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "members", tuple(self.members))
+        if not isinstance(self.endpoint_role, AttentionStoreEndpointRole):
+            raise ValueError("AttentionStore PP endpoint role must be explicit")
+        if not self.group_id or self.generation <= 0 or not self.endpoint_name:
+            raise ValueError("AttentionStore PP endpoint identity must be complete")
+        if self.desired_block_count <= 0 or not self.members:
+            raise ValueError("AttentionStore endpoint requires shared capacity")
+        member_ids = {member.member_id for member in self.members}
+        if len(member_ids) != len(self.members):
+            raise ValueError("AttentionStore PP endpoint member IDs must be unique")
+        if self.local_member_id not in member_ids:
+            raise ValueError("local AttentionStore PP member is absent")
+        if self.coordinator_member_id not in member_ids:
+            raise ValueError("AttentionStore PP coordinator member is absent")
+        ordered = sorted(self.members, key=lambda member: member.pp_stage_start)
+        if ordered[0].pp_stage_start != 0 or any(
+            current.pp_stage_start != previous.pp_stage_end
+            for previous, current in zip(ordered, ordered[1:])
+        ):
+            raise ValueError(
+                "AttentionStore PP stage ranges must be contiguous from zero"
+            )
+
+
+@dataclass(frozen=True)
 class AttentionStoreInitContext:
     """Provide runtime resources used to construct an AttentionStore binding."""
 
@@ -47,6 +97,9 @@ class AttentionStoreInitContext:
     state_shard_num: int = 0
     state_layer_num: int = 0
     endpoint_schema: Mapping[str, int] = field(default_factory=dict)
+    endpoint_registrations: Mapping[str, AttentionStoreEndpointRegistration] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -60,12 +113,19 @@ class AttentionStoreEndpointBinding:
     layout_id: str
     bytes_per_block: int
     payload_fields: Sequence[str]
+    registration_name: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Normalize and validate the endpoint contract."""
         object.__setattr__(self, "payload_fields", tuple(self.payload_fields))
+        if self.registration_name is None:
+            object.__setattr__(self, "registration_name", self.name)
         if not self.name:
             raise ValueError("AttentionStore endpoint name must not be empty")
+        if not self.registration_name:
+            raise ValueError(
+                "AttentionStore endpoint registration name must not be empty"
+            )
         if not self.namespace:
             raise ValueError(f"AttentionStore endpoint {self.name} has no namespace")
         if self.bytes_per_block <= 0:
@@ -86,6 +146,9 @@ class AttentionStoreBinding:
     plan_name: str
     cache_store: Any
     endpoints: Sequence[AttentionStoreEndpointBinding]
+    endpoint_registrations: Mapping[str, AttentionStoreEndpointRegistration] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         """Normalize and validate the endpoint collection."""
@@ -93,6 +156,9 @@ class AttentionStoreBinding:
             raise ValueError("AttentionStore cache plan name must not be empty")
         endpoints = tuple(self.endpoints)
         object.__setattr__(self, "endpoints", endpoints)
+        object.__setattr__(
+            self, "endpoint_registrations", dict(self.endpoint_registrations)
+        )
         names = [endpoint.name for endpoint in endpoints]
         if len(names) != len(set(names)):
             raise ValueError(f"duplicate AttentionStore endpoint names: {names}")

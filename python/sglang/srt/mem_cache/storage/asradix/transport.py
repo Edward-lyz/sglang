@@ -33,10 +33,46 @@ def _sdk_pod_config(
     ctx: AttentionStoreInitContext,
     namespace: str,
     *,
+    endpoint_name: Optional[str] = None,
     model_version: Optional[str] = None,
     gpu_count: Optional[int] = None,
 ):
     from attentionstore_sdk.sdk import PodConfig
+    from attentionstore_sdk.types import (
+        PipelineCacheEndpointRole,
+        PipelineCacheGroupDescriptor,
+        PipelineCacheMember,
+    )
+
+    endpoint_registration = (
+        None if endpoint_name is None else ctx.endpoint_registrations.get(endpoint_name)
+    )
+    pipeline_cache_group = None
+    desired_block_count = 0
+    pipeline_cache_member_id = 0
+    if endpoint_registration is not None:
+        desired_block_count = endpoint_registration.desired_block_count
+        pipeline_cache_member_id = endpoint_registration.local_member_id
+        pipeline_cache_group = PipelineCacheGroupDescriptor(
+            group_id=endpoint_registration.group_id,
+            generation=endpoint_registration.generation,
+            endpoint_name=endpoint_registration.endpoint_name,
+            endpoint_role=PipelineCacheEndpointRole[
+                endpoint_registration.endpoint_role.name
+            ],
+            coordinator_member_id=endpoint_registration.coordinator_member_id,
+            members=tuple(
+                PipelineCacheMember(
+                    member_id=member.member_id,
+                    pp_stage_start=member.pp_stage_start,
+                    pp_stage_end=member.pp_stage_end,
+                    agent_address=member.agent_address,
+                    bytes_per_block=member.bytes_per_block,
+                    desired_block_count=member.desired_block_count,
+                )
+                for member in endpoint_registration.members
+            ),
+        )
 
     return PodConfig(
         namespace=namespace,
@@ -45,6 +81,9 @@ def _sdk_pod_config(
         device_id=ctx.device_id,
         dp_id=ctx.dp_rank,
         gpu_count=ctx.gpu_count if gpu_count is None else gpu_count,
+        desired_block_count=desired_block_count,
+        pipeline_cache_group=pipeline_cache_group,
+        pipeline_cache_member_id=pipeline_cache_member_id,
     )
 
 
@@ -166,10 +205,13 @@ class _BufferPageIO:
 class CheckpointedPageStore:
     """Page stream plus an independently stored endpoint checkpoint."""
 
-    def __init__(self, page_store, checkpoint_store):
+    def __init__(
+        self, page_store, checkpoint_store, *, page_match_is_joint: bool = False
+    ):
         """Combine a page store with its terminal checkpoint store."""
         self.page_store = page_store
         self.checkpoint_store = checkpoint_store
+        self.page_match_is_joint = page_match_is_joint
         self.layout = checkpoint_store.layout
 
     def match(self, block_hash_ids: Sequence[int], timeout: float = 1.0) -> int:
@@ -177,6 +219,13 @@ class CheckpointedPageStore:
         page_match_started = time.perf_counter()
         page_count = self.page_store.match(block_hash_ids, timeout=timeout)
         page_match_ms = (time.perf_counter() - page_match_started) * 1000
+
+        # A group-bound page endpoint asks the Agent group for the common terminal
+        # checkpoint and pins both endpoint payloads. This also applies to a
+        # singleton non-PP group. Re-querying the checkpoint endpoint would create
+        # a second transaction for the same logical Match and double lease pressure.
+        if self.page_match_is_joint:
+            return page_count
 
         checkpoint_match_started = time.perf_counter()
         checkpoint_probes = 0

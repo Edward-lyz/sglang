@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from array import array
 import time
+from array import array
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -188,9 +188,8 @@ class PrefillBootstrapQueue:
         layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
         transfer_draft_cache = (
-            (self.pp_size <= 1 or self.pp_rank == self.pp_size - 1)
-            and (not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1)
-        )
+            self.pp_size <= 1 or self.pp_rank == self.pp_size - 1
+        ) and (not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1)
         kv_args.prefill_start_layer = (
             getattr(
                 self.token_to_kv_pool,
@@ -235,7 +234,9 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = kv_layer_ids if len(kv_layer_ids) == len(kv_data_ptrs) else []
+        kv_args.kv_layer_ids = (
+            kv_layer_ids if len(kv_layer_ids) == len(kv_data_ptrs) else []
+        )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
@@ -462,9 +463,7 @@ class PrefillBootstrapQueue:
             self.scheduler.attn_cp_cpu_group,
             self.scheduler.attn_tp_cpu_group,
         )
-        metadata_credits = (
-            self.req_to_metadata_buffer_idx_allocator.available_size()
-        )
+        metadata_credits = self.req_to_metadata_buffer_idx_allocator.available_size()
 
         for req, poll in zip(self.queue, polls):
             if poll == KVPoll.Failed:
@@ -1101,16 +1100,33 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         last_batch: Optional[ScheduleBatch],
         running_batch: ScheduleBatch,
+        planned_chunked_action: Optional[str] = None,
     ) -> None:
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
             maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
-            if not self.check_bootstrap(req):
-                if is_aborted(req):
-                    # bootstrap failed
-                    self.chunked_req = None
+            if planned_chunked_action == "abort":
+                if not is_aborted(req):
+                    self.handle_bootstrap_failure(req)
+                self.chunked_req = None
+                bootstrap_ready = False
+            else:
+                bootstrap_ready = self.check_bootstrap(req)
+
+            if not bootstrap_ready and is_aborted(req):
+                # bootstrap failed
+                self.chunked_req = None
+            elif planned_chunked_action == "yield":
+                # Replay PP0's scheduler transition. Local bootstrap readiness
+                # must not select a different request for this microbatch.
+                self.chunked_req = None
+                if not self.enable_overlap:
+                    self.optimistic_release_and_requeue(req)
+            elif not bootstrap_ready:
+                if planned_chunked_action in ("resume", "hold"):
+                    pass
                 elif self.has_bootstrapped_waiting_req():
                     # optimistic request yields to waiting requests
                     self.chunked_req = None

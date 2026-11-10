@@ -99,8 +99,13 @@ def get_dp_size(base_url: str) -> int:
 
 def flush_cache(base_url: str):
     """只清理 GPU/device KV cache，保留各节点的内存 cache。"""
-    resp = requests.post(f"{base_url}/flush_cache", timeout=60)
-    resp.raise_for_status()
+    resp = requests.post(
+        f"{base_url}/flush_cache",
+        params={"timeout": 5},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"flush_cache returned HTTP {resp.status_code}: {resp.text}")
 
 
 def clear_memory_cache(base_url: str):
@@ -579,7 +584,10 @@ async def run_one_hit_rate(
 
         if not successful_all:
             return {"target_hit_rate": target_hit_rate, "error": "All requests failed"}
-        if warmup_len > 0 and any(r.get("_no_cache_report") for r in successful_all):
+        # With cache reporting enabled, zero-hit responses omit
+        # prompt_tokens_details. A reported hit from any response proves the
+        # feature is enabled; missing details on the others mean zero hits.
+        if warmup_len > 0 and all(r.get("_no_cache_report") for r in successful_all):
             return {
                 "target_hit_rate": target_hit_rate,
                 "error": (
@@ -797,7 +805,7 @@ async def run_one_hit_rate(
 
     if not successful_all:
         return {"target_hit_rate": target_hit_rate, "error": "All requests failed"}
-    if warmup_len > 0 and any(r.get("_no_cache_report") for r in successful_all):
+    if warmup_len > 0 and all(r.get("_no_cache_report") for r in successful_all):
         return {
             "target_hit_rate": target_hit_rate,
             "error": (

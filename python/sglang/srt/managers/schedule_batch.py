@@ -121,6 +121,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.io_struct import TraceReq
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -456,6 +457,10 @@ class MultimodalProcessorOutput:
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
 
+    # EPD: pinned-pool buffer addresses backing zero-copy precomputed-embedding
+    # views (first attn-tp rank only; None elsewhere).
+    pool_buffer_addrs: Optional[List[int]] = None
+
     @staticmethod
     def from_dict(d: dict) -> MultimodalProcessorOutput:
         return MultimodalProcessorOutput(
@@ -476,6 +481,7 @@ class MultimodalProcessorOutput:
             vision_position_ids=d.get("vision_position_ids"),
             media_nums_per_sample=d.get("media_nums_per_sample"),
             visible_frame_counts=d.get("visible_frame_counts"),
+            pool_buffer_addrs=d.get("pool_buffer_addrs"),
         )
 
     @staticmethod
@@ -534,10 +540,38 @@ class MultimodalInputs:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
+    # EPD: pinned-pool buffer addresses backing zero-copy precomputed-embedding
+    # views (first attn-tp rank only). See release_pool_buffers().
+    pool_buffer_addrs: Optional[List[int]] = None
+
     def release_features(self):
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
             item.feature = None
+
+    def release_pool_buffers(self):
+        """Return pinned-pool pages backing precomputed embeddings once prefill
+        has consumed them. Idempotent; a no-op on ranks without a pool."""
+        addrs = self.pool_buffer_addrs
+        if not addrs:
+            return
+        self.pool_buffer_addrs = None
+        for item in self.mm_items:
+            item.precomputed_embeddings = None
+        from sglang.srt.disaggregation.embedding_transfer.mooncake_transport import (
+            _MooncakeBufferManager,
+        )
+
+        buf_mgr = _MooncakeBufferManager.get_instance_if_exists()
+        if buf_mgr is None:
+            return
+        for addr in addrs:
+            try:
+                buf_mgr.release_buffer(addr)
+            except Exception as e:
+                logger.warning(
+                    "release_pool_buffers: failed to free addr=%s: %s", addr, e
+                )
 
     @staticmethod
     def from_processor_output(obj: MultimodalProcessorOutput):
@@ -603,6 +637,7 @@ class MultimodalInputs:
             "vision_position_ids",
             "media_nums_per_sample",
             "visible_frame_counts",
+            "pool_buffer_addrs",
         ]
         for arg in optional_args:
             val = getattr(obj, arg, None)
@@ -761,11 +796,10 @@ class Req(ReqDllmMixin):
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
-        is_warmup=False,
-        trace_config=None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
+        trace_config=None,
     ):
         # Input and output info
         self.rid = rid
@@ -938,15 +972,19 @@ class Req(ReqDllmMixin):
         self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
-        # Whether this is a warmup request (used to control trace behavior)
-        self.is_warmup: bool = is_warmup
+        # for trace
         self.trace_config: Optional[Dict[str, Any]] = trace_config
+        self.to_trace_req: Optional[TraceReq] = self.build_trace_req()
+        self.trace_info: Optional[Dict[str, Any]] = None
         # AttentionStore (AS) parameters
         self.as_block_hashs = None
         self.as_kv_cache_params = None
         self.as_max_hit_host_ip: list = []
         self.as_max_hit_token_len: list = []
         self.ever_read_as: bool = False
+        # A short/failed AttentionStore read is fatal for this request under PP;
+        # allowing forward with a different prefix would desynchronize stages.
+        self._as_cache_read_abort_reason: Optional[str] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1128,6 +1166,28 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+
+    def build_trace_req(self):
+        """Build TraceReq from trace_config at init time.
+
+        Parses trace_config to create a TraceReq. Returns None if tracing is
+        not enabled or trace_type is missing.
+        """
+        from sglang.srt.content_detection.config import DETECTION_CONFIG
+        from sglang.srt.managers.io_struct import TraceReq, TraceTrigger, TraceType
+
+        cfg = self.trace_config or {}
+        if not cfg.get("enable_trace") or not cfg.get("trace_type"):
+            return None
+        return TraceReq(
+            rid=self.rid,
+            trace_type=cfg.get("trace_type", TraceType.METADATA),
+            dump_dir=cfg.get("dump_dir") or DETECTION_CONFIG.trace_dump_dir,
+            trigger=cfg.get("trigger", TraceTrigger.ON_FINISH),
+            payload=cfg.get("payload"),
+            return_logprob=cfg.get("return_logprob", False),
+            return_online=cfg.get("online", False),
+        )
 
     @property
     def seqlen(self) -> int:
@@ -1796,6 +1856,8 @@ class Req(ReqDllmMixin):
     def set_finish_with_abort(self, error_msg: str):
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs.release_pool_buffers()
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = array(
@@ -1806,6 +1868,30 @@ class Req(ReqDllmMixin):
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
+
+    def init_continuation_reasoning_state(self, think_end_ids) -> None:
+        """Restore reasoning state from continuation tokens.
+
+        They bypass ``update_reasoning_tokens``, so replay the think-end matcher,
+        including a marker split across requests.
+        """
+        if (
+            not self.require_reasoning
+            or not think_end_ids
+            or not self.continuation_token_ids
+        ):
+            return
+
+        matcher = TokenSequenceMatcher(think_end_ids)
+        match = 0
+        for token_id in self.continuation_token_ids:
+            match = matcher.advance(match, token_id)
+            if match == len(matcher):
+                self._is_reasoning_over = True
+                self._think_end_match_len = 0
+                return
+
+        self._think_end_match_len = match
 
     def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:

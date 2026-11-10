@@ -91,6 +91,7 @@ def _create_mha_page_endpoint(
     pool: Any,
     namespace: str,
     gpu_count: int,
+    registration_endpoint_name: str | None = None,
 ) -> AttentionStoreEndpointBinding:
     """Bind an MHA K/V endpoint to a full-attention pool."""
     from attentionstore_sdk.sdk import (
@@ -129,7 +130,8 @@ def _create_mha_page_endpoint(
         _sdk_pod_config(
             ctx,
             namespace,
-            model_version=f"{ctx.model_version}-layout-{layout_id[:16]}",
+            endpoint_name=registration_endpoint_name,
+            model_version=ctx.model_version,
             gpu_count=gpu_count,
         ),
         MHAConfig(
@@ -144,6 +146,7 @@ def _create_mha_page_endpoint(
     )
     return AttentionStoreEndpointBinding(
         name="mha",
+        registration_name=registration_endpoint_name,
         role=AttentionStoreEndpointRole.PAGE,
         store=_BufferPageIO(sdk, bindings, range(ctx.page_layer_num)),
         namespace=namespace,
@@ -159,6 +162,7 @@ def _create_mla_page_endpoint(
     pool: Any,
     namespace: str,
     gpu_count: int,
+    registration_endpoint_name: str | None = None,
 ) -> AttentionStoreEndpointBinding:
     """Bind an MLA latent-KV endpoint to a full-attention pool."""
     from attentionstore_sdk.sdk import (
@@ -189,7 +193,8 @@ def _create_mla_page_endpoint(
         _sdk_pod_config(
             ctx,
             namespace,
-            model_version=f"{ctx.model_version}-layout-{layout_id[:16]}",
+            endpoint_name=registration_endpoint_name,
+            model_version=ctx.model_version,
             gpu_count=gpu_count,
         ),
         MLAConfig(
@@ -203,6 +208,7 @@ def _create_mla_page_endpoint(
     )
     return AttentionStoreEndpointBinding(
         name="mla",
+        registration_name=registration_endpoint_name,
         role=AttentionStoreEndpointRole.PAGE,
         store=_BufferPageIO(sdk, bindings, range(ctx.page_layer_num)),
         namespace=namespace,

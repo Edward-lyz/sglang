@@ -1009,7 +1009,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     as_kv_cache_params: Optional[dict] = None  # From request
     as_max_hit_host_ip: Optional[List[str]] = None  # From request
     as_max_hit_token_len: Optional[List[int]] = None  # From request
-
     # Function call continuation: token IDs to replay for grammar state recovery
     continuation_token_ids: Optional[List[int]] = None
 
@@ -1956,9 +1955,9 @@ class AbortReq(BaseReq, kw_only=True):
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
 
+
 class TraceType:
-    """Trace action types.
-    """
+    """Trace action types."""
 
     KV = "kv"
     METADATA = "metadata"
@@ -1967,11 +1966,13 @@ class TraceType:
     LOGPROBS = "logprobs"
     ALL = "all"
 
+
 class TraceTrigger:
     """When to trigger a trace action."""
 
     IMMEDIATE = "immediate"
     ON_FINISH = "on_finish"
+
 
 class TraceReq(BaseReq):
     """Request to trigger KV cache or metadata tracing."""
@@ -1992,6 +1993,7 @@ class TraceReq(BaseReq):
     def __post_init__(self):
         if self.rid is None:
             self.rid = ""
+
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     """Report asynchronous Elastic EP scale completion or failure."""

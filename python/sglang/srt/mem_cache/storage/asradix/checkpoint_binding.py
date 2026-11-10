@@ -10,14 +10,21 @@ from typing import Callable, Mapping, Optional, Sequence
 
 import torch
 
-from .page_binding import _create_mha_page_endpoint, _create_mla_page_endpoint
+from .page_binding import (
+    _create_mha_page_endpoint,
+    _create_mla_page_endpoint,
+    _key_buffer,
+    _uniform_page_bytes,
+    _value_buffer,
+)
 from .schema import pad_component_major_pointers, pad_pointer_buffers
 from .state_layout import PackedStateLayout, StateTensorSpec
+from .topology import attention_store_kda_namespaces
 from .transport import (
     CheckpointedPageStore,
     _BufferPageIO,
-    _PassiveStore,
     _once,
+    _PassiveStore,
     _sdk_pod_config,
     _standard_namespace,
 )
@@ -335,6 +342,60 @@ def _split_kda_namespace_chunks(total_chunks: int) -> tuple[int, int]:
     return total_chunks - checkpoint_chunks, checkpoint_chunks
 
 
+def describe_kda_local_endpoint_bytes(
+    kv_cache,
+    req_to_token_pool,
+    page_size: int,
+    *,
+    page_active: bool,
+    state_active: bool,
+) -> tuple[int, int]:
+    """Return local per-layer byte sizes before any SDK registration."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if not isinstance(kv_cache, HybridLinearKVPool):
+        raise ValueError("KDA endpoint sizing requires HybridLinearKVPool")
+
+    page_bytes_per_layer = 0
+    if page_active:
+        pool = kv_cache.full_kv_pool
+        local_layer_ids = tuple(range(int(pool.layer_num)))
+        if not local_layer_ids:
+            raise ValueError("active KDA page endpoint has no local layers")
+        key_buffers = [_key_buffer(pool, layer_id) for layer_id in local_layer_ids]
+        key_bytes = _uniform_page_bytes(
+            key_buffers,
+            [pool] * len(key_buffers),
+            page_size,
+            "KDA page K",
+        )
+        if kv_cache.use_mla:
+            page_bytes_per_layer = key_bytes
+        else:
+            value_buffers = [
+                _value_buffer(pool, layer_id) for layer_id in local_layer_ids
+            ]
+            value_bytes = _uniform_page_bytes(
+                value_buffers,
+                [pool] * len(value_buffers),
+                page_size,
+                "KDA page V",
+            )
+            page_bytes_per_layer = key_bytes + value_bytes
+
+    state_bytes_per_layer = 0
+    if state_active:
+        checkpoint_pool = getattr(req_to_token_pool, "mamba_ckpt_pool", None)
+        state_binding = (
+            make_kda_checkpoint_layout(checkpoint_pool)
+            if checkpoint_pool is not None
+            else make_kda_active_state_layout(kv_cache.mamba_pool)
+        )
+        state_bytes_per_layer = state_binding.bytes_per_layer
+
+    return page_bytes_per_layer, state_bytes_per_layer
+
+
 def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
     """Create independent KDA page and recurrent-checkpoint stores."""
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -346,8 +407,9 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
     if not page_active and not state_active:
         raise ValueError("KDA AttentionStore node role has no page or state layers")
 
-    page_namespace = _standard_namespace(ctx, "kda-page", ctx.page_shard_num)
-    checkpoint_namespace = _standard_namespace(ctx, "kda-state", ctx.state_shard_num)
+    page_namespace, checkpoint_namespace = attention_store_kda_namespaces(
+        ctx.namespace_base, ctx.node_pp_start
+    )
     if page_active and state_active:
         page_chunks, checkpoint_chunks = _split_kda_namespace_chunks(ctx.gpu_count)
     elif page_active:
@@ -369,10 +431,12 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
             pool=ctx.kv_cache.full_kv_pool,
             namespace=page_namespace,
             gpu_count=page_chunks,
+            registration_endpoint_name="kda-page",
         )
     else:
         page_endpoint = AttentionStoreEndpointBinding(
             name="mla" if ctx.kv_cache.use_mla else "mha",
+            registration_name="kda-page",
             role=AttentionStoreEndpointRole.PAGE,
             store=_PassiveStore(),
             namespace=page_namespace,
@@ -384,7 +448,7 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
     checkpoint_store = None
     try:
         if ctx.state_shard_id >= 0:
-            from attentionstore_sdk.sdk import AttentionStoreSDK, KDAConfig, PodConfig
+            from attentionstore_sdk.sdk import AttentionStoreSDK, KDAConfig
 
             checkpoint_pool = getattr(ctx.req_to_token_pool, "mamba_ckpt_pool", None)
             checkpoint_binding = (
@@ -410,12 +474,10 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
                 unpack_hook=checkpoint_binding.unpack_hook,
             )
             checkpoint_sdk = AttentionStoreSDK(
-                PodConfig(
-                    namespace=checkpoint_namespace,
-                    pod_name=ctx.pod_name,
-                    model_version=ctx.model_version,
-                    device_id=ctx.device_id,
-                    dp_id=ctx.dp_rank,
+                _sdk_pod_config(
+                    ctx,
+                    checkpoint_namespace,
+                    endpoint_name="kda-state",
                     gpu_count=checkpoint_chunks,
                 ),
                 KDAConfig(
@@ -445,10 +507,18 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
     except Exception:
         page_endpoint.store.stop()
         raise
-    cache_store = CheckpointedPageStore(page_endpoint.store, checkpoint_store)
+    cache_store = CheckpointedPageStore(
+        page_endpoint.store,
+        checkpoint_store,
+        page_match_is_joint=(
+            "kda-page" in ctx.endpoint_registrations
+            and "kda-state" in ctx.endpoint_registrations
+        ),
+    )
     try:
         checkpoint_endpoint = AttentionStoreEndpointBinding(
             name="checkpoint",
+            registration_name="kda-state",
             role=AttentionStoreEndpointRole.CHECKPOINT,
             store=checkpoint_store,
             namespace=checkpoint_namespace,
@@ -460,6 +530,7 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
             plan_name="KDA",
             cache_store=cache_store,
             endpoints=(page_endpoint, checkpoint_endpoint),
+            endpoint_registrations=ctx.endpoint_registrations,
         )
     except Exception:
         cache_store.stop()

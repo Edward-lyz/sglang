@@ -436,6 +436,7 @@ class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
+    ABORT = auto()  # Fatal cache-read inconsistency; never run forward
 
 
 class PrefillAdder:
@@ -950,6 +951,22 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
+    def _sync_attention_store_read_abort(
+        self, req: Req, result: AddReqResult
+    ) -> AddReqResult:
+        """Synchronize one request's AS read outcome across PP stages.
+
+        Every request considered by ``add_one_req`` must reach this helper
+        exactly once, including local admission early returns, so the PP
+        collective cannot be left unmatched by another rank.
+        """
+        sync_read_abort = getattr(
+            type(self.tree_cache), "sync_attention_store_read_abort", None
+        )
+        if callable(sync_read_abort) and sync_read_abort(self.tree_cache, req):
+            return AddReqResult.ABORT
+        return result
+
     def add_one_req_ignore_eos(self, req: Req):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
@@ -959,7 +976,7 @@ class PrefillAdder:
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
-            return AddReqResult.NO_TOKEN
+            return self._sync_attention_store_read_abort(req, AddReqResult.NO_TOKEN)
         if self.is_hybrid_swa:
             if (
                 self._swa_budget_for_req(
@@ -967,7 +984,7 @@ class PrefillAdder:
                 )
                 > self.rem_swa_tokens
             ):
-                return AddReqResult.NO_TOKEN
+                return self._sync_attention_store_read_abort(req, AddReqResult.NO_TOKEN)
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
@@ -1015,7 +1032,9 @@ class PrefillAdder:
                 min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
                 # reserve tokens for corner cases
                 if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
-                    return AddReqResult.NO_TOKEN
+                    return self._sync_attention_store_read_abort(
+                        req, AddReqResult.NO_TOKEN
+                    )
                 tokens_freed += tokens_occupied
 
         if (self.prefill_delayer_single_pass is not None) and (
@@ -1023,11 +1042,11 @@ class PrefillAdder:
                 local_prefillable=True
             )
         ):
-            return AddReqResult.OTHER
+            return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
-                return AddReqResult.OTHER
+                return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
             self._add_dllm_req(req, 0)
         elif (
@@ -1049,7 +1068,7 @@ class PrefillAdder:
             )
         else:
             if self.rem_chunk_tokens <= 0:
-                return AddReqResult.OTHER
+                return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
@@ -1069,7 +1088,7 @@ class PrefillAdder:
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             )
 
-        return self.budget_state()
+        return self._sync_attention_store_read_abort(req, self.budget_state())
 
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
@@ -1078,10 +1097,10 @@ class PrefillAdder:
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
         if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
-            return AddReqResult.OTHER
+            return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
-            return AddReqResult.OTHER
+            return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
@@ -1107,7 +1126,7 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
+            return self._sync_attention_store_read_abort(req, AddReqResult.NO_TOKEN)
 
         chunk_tokens_limit = self.rem_chunk_tokens
         if self.is_hybrid_swa:
@@ -1124,7 +1143,9 @@ class PrefillAdder:
                     self._swa_new_tokens(req), req.swa_host_hit_length
                 )
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
-                    return AddReqResult.NO_TOKEN
+                    return self._sync_attention_store_read_abort(
+                        req, AddReqResult.NO_TOKEN
+                    )
                 chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
         if (
@@ -1135,14 +1156,14 @@ class PrefillAdder:
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
-            return AddReqResult.OTHER
+            return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
         logger.info(
             f"before lock, for req {req.rid} current rem_total_tokens: "
             f"{self.rem_total_tokens}, "
             f"local rem total: "
             f"{self.token_to_kv_pool_allocator.available_size() + self._log_evictable_size()}, "
-            f"avaliable: {self.token_to_kv_pool_allocator.available_size()}, "
+            f"available: {self.token_to_kv_pool_allocator.available_size()}, "
             f"evictable: {self._log_evictable_size()}, "
             f"extend_input_len: {cand_extend_input_len}, "
             f"prefix len {prefix_len}, "
@@ -1155,7 +1176,7 @@ class PrefillAdder:
                 f"{self.rem_total_tokens}, "
                 f"local rem total: "
                 f"{self.token_to_kv_pool_allocator.available_size() + self._log_evictable_size()}, "
-                f"avaliable: {self.token_to_kv_pool_allocator.available_size()}, "
+                f"available: {self.token_to_kv_pool_allocator.available_size()}, "
                 f"evictable: {self._log_evictable_size()}, "
                 f"extend_input_len: {cand_extend_input_len}, "
                 f"prefix len {prefix_len}, "
@@ -1163,7 +1184,7 @@ class PrefillAdder:
             )
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
-                return AddReqResult.NO_TOKEN
+                return self._sync_attention_store_read_abort(req, AddReqResult.NO_TOKEN)
 
             if self.is_hybrid_swa:
                 # self.rem_swa_tokens may decrease after the lock acquisition
@@ -1177,7 +1198,9 @@ class PrefillAdder:
                         self._swa_new_tokens(req), req.swa_host_hit_length
                     )
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
-                        return AddReqResult.NO_TOKEN
+                        return self._sync_attention_store_read_abort(
+                            req, AddReqResult.NO_TOKEN
+                        )
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
@@ -1192,16 +1215,23 @@ class PrefillAdder:
                     waiting_queue_len=self.waiting_queue_len,
                 )
             ):
-                return AddReqResult.OTHER
+                return self._sync_attention_store_read_abort(req, AddReqResult.OTHER)
 
             if req.needs_host_load_back():
-                new_indices, req.last_node = self.tree_cache.init_load_back(
-                    InitLoadBackParams(
-                        best_match_node=req.best_match_node,
-                        host_hit_length=req.host_hit_length,
-                        req=req,
+                try:
+                    new_indices, req.last_node = self.tree_cache.init_load_back(
+                        InitLoadBackParams(
+                            best_match_node=req.best_match_node,
+                            host_hit_length=req.host_hit_length,
+                            req=req,
+                        )
                     )
-                )
+                except Exception as exc:
+                    req._as_cache_read_abort_reason = (
+                        f"AttentionStore cache read raised: {exc}"
+                    )
+                    logger.exception("AS load_back raised for req=%s", req.rid)
+                    new_indices = req.prefix_indices[:0]
                 actual_loaded = len(new_indices)
                 logger.info(
                     f"AS load_back: req:{req.rid}, "
@@ -1211,6 +1241,12 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+
+            read_result = self._sync_attention_store_read_abort(
+                req, AddReqResult.CONTINUE
+            )
+            if read_result == AddReqResult.ABORT:
+                return read_result
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
+import struct
 import time
 from typing import Any, Optional, Tuple
 
@@ -13,8 +15,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
+    zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 from .coordinator import AttentionStoreCoordinator
@@ -61,6 +65,11 @@ class AttentionStoreIntegrationMixin:
             torch.distributed.get_world_size(group=self.pp_group)
             if self.pp_group is not None
             else 1
+        )
+        self.pp_rank = (
+            torch.distributed.get_rank(group=self.pp_group)
+            if self.pp_group is not None
+            else 0
         )
         attention_group_sizes = [self.tp_world_size]
         for group in (self.attn_cp_group, self.attn_tp_group):
@@ -125,7 +134,7 @@ class AttentionStoreIntegrationMixin:
         return int(tensor.item())
 
     def _as_topology_min(self, value: int) -> int:
-        """Reduce an initialization decision across attention shards and PP."""
+        """Reduce one cache decision across attention shards and all PP stages."""
         tensor = torch.tensor(self._as_min(value), dtype=torch.int64)
         if self.pp_world_size > 1:
             torch.distributed.all_reduce(
@@ -134,6 +143,27 @@ class AttentionStoreIntegrationMixin:
                 group=self.pp_group,
             )
         return int(tensor.item())
+
+    def _as_topology_max(self, value: int) -> int:
+        """Return the largest cache decision across attention shards and PP."""
+        tensor = torch.tensor(value, dtype=torch.int64)
+        self._all_reduce_attn_groups(tensor, torch.distributed.ReduceOp.MAX)
+        if self.pp_world_size > 1:
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.pp_group,
+            )
+        return int(tensor.item())
+
+    def sync_attention_store_read_abort(self, req) -> bool:
+        """Return whether this stage failed to read the request from cache.
+
+        PP stages do not call request admission in lockstep, so this path must
+        not issue a PP collective. Cross-stage cache matching is synchronized
+        earlier, while a stage-local read failure aborts that stage's request.
+        """
+        return bool(getattr(req, "_as_cache_read_abort_reason", None))
 
     def _tp_min(self, value: int) -> int:
         """Reduce a write-retirement value across local attention shards."""
@@ -148,6 +178,58 @@ class AttentionStoreIntegrationMixin:
         if req is not None and hasattr(req, "_as_load_info"):
             del req._as_load_info
         return anchor, load_info, req
+
+    @staticmethod
+    def _pipeline_prefix_digest(block_hash_ids) -> str:
+        digest = hashlib.sha256()
+        digest.update(struct.pack(">Q", len(block_hash_ids)))
+        for block_hash_id in block_hash_ids:
+            digest.update(struct.pack(">Q", int(block_hash_id)))
+        return digest.hexdigest()
+
+    def _pipeline_generation_key(self) -> tuple:
+        if self.binding is None:
+            return ()
+        return tuple(
+            sorted(
+                (
+                    registration.group_id,
+                    registration.endpoint_name,
+                    int(registration.generation),
+                )
+                for registration in self.binding.endpoint_registrations.values()
+            )
+        )
+
+    def _validate_authoritative_match_decision(
+        self, req, hashes, requested: int
+    ) -> int:
+        decision = getattr(req, "_as_pp_match_decision", None)
+        if not isinstance(decision, dict):
+            raise RuntimeError(
+                f"missing PP0 AttentionStore match decision for rid={req.rid}"
+            )
+        expected_digest = self._pipeline_prefix_digest(hashes)
+        expected_generation = self._pipeline_generation_key()
+        if (
+            decision.get("version") != 1
+            or decision.get("rid") != req.rid
+            or int(decision.get("requested", -1)) != requested
+            or decision.get("hash_digest") != expected_digest
+            or tuple(decision.get("generation", ())) != expected_generation
+        ):
+            raise RuntimeError(
+                "invalid PP0 AttentionStore match decision: "
+                f"rid={req.rid} requested={requested} "
+                f"digest={expected_digest} generation={expected_generation} "
+                f"decision={decision}"
+            )
+        matched = int(decision.get("matched", -1))
+        if matched < 0 or matched > requested:
+            raise RuntimeError(
+                f"invalid PP0 AttentionStore match count rid={req.rid}: {matched}"
+            )
+        return matched
 
     def _match_checkpointed_page_prefix(
         self,
@@ -166,29 +248,61 @@ class AttentionStoreIntegrationMixin:
 
         local_hit_len = len(local_result.device_indices)
         max_hit_len = len(params.key) // self.page_size * self.page_size
-        if local_hit_len == max_hit_len:
+        joint_pp_match = self.pp_world_size > 1
+        if local_hit_len == max_hit_len and not joint_pp_match:
             return None
 
         start_block = local_hit_len // self.page_size
-        hashes = req.as_block_hashs.hash_ids[start_block:]
+        # Every PP stage must submit the same absolute prefix to its local Agent.
+        # Submitting only the suffix after a stage-local HBM hit would preserve
+        # the very PP-stage divergence this path is meant to eliminate.
+        match_start_block = 0 if joint_pp_match else start_block
+        max_end_block = max_hit_len // self.page_size
+        hashes = req.as_block_hashs.hash_ids[match_start_block:max_end_block]
         # A checkpoint match is valid only for the hash at its returned endpoint.
         # Apply the request's prefix limit before matching so a later checkpoint
         # cannot be matched and then relabeled as an earlier prefix by truncation.
-        max_blocks = max((max_hit_len - local_hit_len) // self.page_size, 0)
-        hashes = hashes[:max_blocks]
         if not hashes:
-            return None
+            return zero_match_result(self, local_result) if joint_pp_match else None
 
         requested = len(hashes)
         started = time.perf_counter()
         match_error = None
-        try:
-            match_count = self.ascli.match(hashes, timeout=1.0)
-        except Exception as exc:
-            match_error = exc
-            match_count = 0
-
-        match_count = min(self._as_min(match_count), requested)
+        authoritative_pp_match = (
+            joint_pp_match
+            and self.pp_rank != 0
+            and bool(getattr(req, "_as_pp_match_decision_required", False))
+        )
+        if authoritative_pp_match:
+            # Later PP stages consume PP0's keyed decision. They must not create
+            # a second storage snapshot while independently rebuilding the batch.
+            match_count = self._validate_authoritative_match_decision(
+                req, hashes, requested
+            )
+        else:
+            # The public SDK deadline encloses the Agent coordinator budget,
+            # which in turn encloses its two bounded peer-RPC rounds.
+            match_timeout = 3.0 if joint_pp_match else 1.0
+            try:
+                # A pipeline-registered Agent endpoint already probes all members,
+                # computes the common terminal checkpoint, and pins both payloads.
+                match_count = self.ascli.match(hashes, timeout=match_timeout)
+            except Exception as exc:
+                match_error = exc
+                match_count = 0
+        # The pipeline Agent match is already joint across all PP members.
+        # Dynamic request matching is not lockstep across PP stages, so only
+        # reduce across the attention ranks in this stage.
+        match_count = max(0, min(int(self._as_min(match_count)), requested))
+        if joint_pp_match and self.pp_rank == 0:
+            req._as_pp_match_decision = {
+                "version": 1,
+                "rid": req.rid,
+                "requested": requested,
+                "matched": match_count,
+                "hash_digest": self._pipeline_prefix_digest(hashes),
+                "generation": self._pipeline_generation_key(),
+            }
         if match_error is None:
             self._log_as_result(
                 "match",
@@ -206,14 +320,34 @@ class AttentionStoreIntegrationMixin:
                 started=started,
             )
         if match_count <= 0:
-            return None
+            return zero_match_result(self, local_result) if joint_pp_match else None
+
+        terminal_block = match_count if joint_pp_match else start_block + match_count
+        if terminal_block <= start_block:
+            if terminal_block == start_block:
+                return local_result
+            terminal_tokens = terminal_block * self.page_size
+            capped_params = MatchPrefixParams(
+                key=RadixKey(
+                    params.key.token_ids,
+                    params.key.extra_key,
+                    is_bigram=params.key.is_bigram,
+                    limit=terminal_tokens,
+                ),
+                cow_mamba=params.cow_mamba,
+                req=req,
+            )
+            return super().match_prefix(capped_params)
+
+        read_hashes = req.as_block_hashs.hash_ids[start_block:terminal_block]
+        read_count = terminal_block - start_block
 
         anchor = local_result.last_device_node
         req._as_load_info = {
             "rid": req.rid,
             "start_block": start_block,
-            "block_count": match_count,
-            "hashes": hashes[:match_count],
+            "block_count": read_count,
+            "hashes": read_hashes,
             "remote_addrs": (req.as_max_hit_host_ip or [] if self.pp_size <= 1 else []),
         }
         return MatchResult(
@@ -221,7 +355,7 @@ class AttentionStoreIntegrationMixin:
             last_device_node=anchor,
             last_host_node=anchor,
             best_match_node=anchor,
-            host_hit_length=match_count * self.page_size,
+            host_hit_length=read_count * self.page_size,
         )
 
     def configure_attention_store(self, plan: AttentionStoreCachePlan) -> None:
@@ -372,7 +506,22 @@ class AttentionStoreUnifiedRadixCache(
 
     def init_load_back(self, params: InitLoadBackParams) -> Tuple[torch.Tensor, Any]:
         """Delegate type-specific payload restoration to the plan coordinator."""
-        return self.attention_store_coordinator.init_load_back(self, params)
+        new_indices, restored_node = self.attention_store_coordinator.init_load_back(
+            self, params
+        )
+        if (
+            self.pp_world_size > 1
+            and params.host_hit_length > 0
+            and len(new_indices) != params.host_hit_length
+        ):
+            reason = (
+                "AttentionStore PP read length mismatch: "
+                f"expected={params.host_hit_length} actual={len(new_indices)}"
+            )
+            params.req._as_cache_read_abort_reason = reason
+            logger.error("%s rid=%s", reason, params.req.rid)
+            return params.req.prefix_indices[:0], self.root_node
+        return new_indices, restored_node
 
 
 def create_attention_store_cache(

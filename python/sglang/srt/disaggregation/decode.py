@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from torch.distributed import ProcessGroup
-from sglang.srt.managers.utils import is_health_check_rid
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -470,7 +469,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = kv_layer_ids if len(kv_layer_ids) == len(kv_data_ptrs) else []
+        kv_args.kv_layer_ids = (
+            kv_layer_ids if len(kv_layer_ids) == len(kv_data_ptrs) else []
+        )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
@@ -759,6 +760,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _update_handshake_waiters(
         self, rids_to_check: Optional[List[str]] = None
     ) -> None:
+        group_size = torch.distributed.get_world_size(group=self.gloo_group)
+        if group_size > 1:
+            local_queue_size = torch.tensor([len(self.queue)], dtype=torch.int64)
+            queue_sizes = torch.empty(group_size, dtype=torch.int64)
+            torch.distributed.all_gather_into_tensor(
+                queue_sizes, local_queue_size, group=self.gloo_group
+            )
+            # Request fanout to TP ranks is asynchronous. Polling before every
+            # rank has the same queue would split their collective sequence.
+            if not torch.all(queue_sizes == queue_sizes[0]).item():
+                return
+
         if not self.queue:
             return
 

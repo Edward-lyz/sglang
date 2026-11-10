@@ -807,16 +807,22 @@ class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
     ) -> Tuple[torch.Tensor, Any]:
         local_hit_len = load_info["start_block"] * cache.page_size
         total_prefix_len = local_hit_len + len(loaded_indices)
-        assert len(req.prefix_indices) == local_hit_len, (
-            f"prefix_indices length {len(req.prefix_indices)} != "
-            f"local_hit_len {local_hit_len} (start_block={load_info['start_block']}, "
-            f"page_size={cache.page_size})"
-        )
-        token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
-        values = torch.cat([req.prefix_indices, loaded_indices]).to(
-            dtype=torch.int64, copy=True
-        )
+        if len(req.prefix_indices) != local_hit_len:
+            logger.error(
+                "AS cache insert rejected: cache_plan=%s rid=%s "
+                "reason=prefix_length_mismatch expected=%d actual=%d",
+                cache.attention_store_plan.name,
+                req.rid,
+                local_hit_len,
+                len(req.prefix_indices),
+            )
+            value_transaction.close()
+            return loaded_indices[:0], anchor
         try:
+            token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
+            values = torch.cat([req.prefix_indices, loaded_indices]).to(
+                dtype=torch.int64, copy=True
+            )
             result = cache.insert(
                 InsertParams(
                     key=RadixKey(token_ids, req.extra_key),

@@ -121,8 +121,8 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
     ) -> Optional[MatchResult]:
         local_hit_len = len(local_result.device_indices)
         start_block = local_hit_len // cache.page_size
-        # Router hints describe one namespace/host. PP may span several
-        # node-role namespaces, so every stage must perform its own match.
+        # Router hints describe one namespace/host. Multi-node PP requests use
+        # an Agent-coordinated quote before this coordinator is entered.
         remote_addrs = req.as_max_hit_host_ip if cache.pp_size <= 1 else []
         remote_len = req.as_max_hit_token_len if cache.pp_size <= 1 else []
 
@@ -314,11 +314,17 @@ class FullPageCacheCoordinator(AttentionStoreCoordinator):
     ) -> Tuple[torch.Tensor, Any]:
         local_hit_len = load_info["start_block"] * cache.page_size
         total_prefix_len = local_hit_len + len(loaded_indices)
-        assert len(req.prefix_indices) == local_hit_len, (
-            f"prefix_indices length {len(req.prefix_indices)} != "
-            f"local_hit_len {local_hit_len} (start_block={load_info['start_block']}, "
-            f"page_size={cache.page_size})"
-        )
+        if len(req.prefix_indices) != local_hit_len:
+            logger.error(
+                "AS cache insert rejected: cache_plan=%s rid=%s "
+                "reason=prefix_length_mismatch expected=%d actual=%d",
+                cache.attention_store_plan.name,
+                req.rid,
+                local_hit_len,
+                len(req.prefix_indices),
+            )
+            cache.token_to_kv_pool_allocator.free(loaded_indices)
+            return loaded_indices[:0], anchor
         token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
         bigram_len = max(0, len(token_ids) - 1) if cache.is_eagle else len(token_ids)
         final_key_len = bigram_len // cache.page_size * cache.page_size

@@ -19,7 +19,8 @@ FROM iregistry.baidu-int.com/hac-aiacc/aiak-inference-sglang:kimi-k3
 ## ===========================================================================================
 
 
-COPY aiak_sglang /tmp/aiak_sglang
+RUN rm -rf /sgl-workspace/sglang
+COPY aiak_sglang /sgl-workspace/sglang
 
 RUN cat >/etc/apt/apt.conf.d/proxy.conf <<EOF
 Acquire::http::Proxy "http://agent.baidu.com:8891/";
@@ -28,8 +29,9 @@ EOF
 
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
-# 新增copy单测用例：scripts/ci/ci_tests.json
-RUN rm -rf /sgl-workspace/sglang/python && cp -r /tmp/aiak_sglang/python /sgl-workspace/sglang/python && rm -r /tmp/aiak_sglang
+# Keep every shell helper under scripts/ directly executable in the image.
+# New scripts are picked up automatically without another Dockerfile edit.
+RUN find /sgl-workspace/sglang/scripts -type f -name '*.sh' -exec chmod +x {} +
 
 # RUN pip install --upgrade tokenspeed-mla --break-system-packages --proxy http://agent.baidu.com:8891
 

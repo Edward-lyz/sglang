@@ -43,6 +43,14 @@ if TYPE_CHECKING:
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
+class PPBatchPlanMessage:
+    """Carry one PP0 batch plan in the existing DP-local request relay."""
+
+    mb_id: int
+    plan: Any
+
+
+@dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
     recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
     recv_from_rpc: Optional[zmq.Socket]
@@ -276,6 +284,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    PPBatchPlanMessage,
                 ),
             )
         ]
@@ -289,6 +298,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    PPBatchPlanMessage,
                 ),
             )
         ]
