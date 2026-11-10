@@ -927,6 +927,21 @@ class Envs:
     # kernels/ops/quantization/mla_qkv_fp8_cast.py:quantize_mla_qkv_fp8_triton.
     SGLANG_OPT_USE_TRITON_MLA_QKV_FP8_CAST = EnvBool(False)
 
+    # MLA FP8 decode prepare: fuse concat_mla_absorb_q plus the three bf16 ->
+    # fp8_e4m3fn Tensor.to calls in mla_quantize_without_rope_for_fp8 into one
+    # Triton launch. The unfused chain materialises a bf16 [tokens, heads, 576]
+    # concat buffer and reads it straight back to cast it, so a Kimi-K3 decode
+    # step pays two extra full-size HBM trips (11.06 MB written + 11.07 MB read
+    # at cuda-graph-bs=200) plus three extra launches; isolated CUDA-graph replay
+    # on B200 measures 12.805 us -> 3.369 us (3.80x) at 800 tokens x 12 heads,
+    # and 3.63x / 3.98x at 256 / 4 tokens.
+    # Bit-exact, including PyTorch's non-saturating overflow encoding (|x| > 464
+    # and every inf/nan become 0x7f with the sign kept, not the hardware clamp to
+    # 448). Unsupported inputs (non-bf16, non-unit inner stride, dims other than
+    # kv_lora_rank=512 / qk_rope_head_dim=64) fall back to the original chain.
+    # See kernels/ops/attention/fused_mla_prepare_fp8.py:fused_mla_prepare_fp8.
+    SGLANG_OPT_USE_FUSED_MLA_PREPARE_FP8 = EnvBool(False)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
@@ -1184,6 +1199,16 @@ class Envs:
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
     SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
+    # ====================================================================
+
+    # ====================================================================
+    # Decode context parallel (DCP)
+    # Stage the a2a payload of dcp_a2a_lse_reduce with one fused Triton pack
+    # (kernels/ops/attention/dcp_fused_pack.py) instead of four elementwise
+    # launches. Off by default: the packed bytes are identical, but the combine
+    # kernel is re-specialised on the new strides and can differ from the
+    # original path on elements where the rank partials nearly cancel.
+    SGLANG_OPT_USE_FUSED_DCP_A2A_PACK = EnvBool(False)
     # ====================================================================
 
     # ====================================================================

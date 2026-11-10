@@ -25,6 +25,11 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dcp_fused_pack import (
+    dcp_fused_pack,
+    dcp_fused_pack_recv_views,
+    dcp_fused_pack_supported,
+)
 from sglang.kernels.ops.attention.dcp_kernels import (
     CPTritonContext,
     _lse_pack_dim,
@@ -35,6 +40,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -470,6 +476,18 @@ def dcp_a2a_lse_reduce(
     reshaped_out = cp_attn_out.view(B, N, H_per_rank, D).permute(1, 0, 2, 3)
     reshaped_lse = cp_attn_lse.view(B, N, H_per_rank).permute(1, 0, 2)
 
+    if (
+        cuda_graph_buffers is None
+        and envs.SGLANG_OPT_USE_FUSED_DCP_A2A_PACK.get()
+        and dcp_fused_pack_supported(cp_attn_out, cp_attn_lse, N)
+    ):
+        # Opt-in replacement of the four staging launches below by one fused
+        # Triton pack. The original path is preserved verbatim; unsupported
+        # inputs and the cuda-graph-buffer path fall through to it.
+        return _dcp_a2a_lse_reduce_fused_pack(
+            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
+        )
+
     if cuda_graph_buffers is not None:
         # CUDA graph path with pre-allocated fused buffers.
         send_combined = cuda_graph_buffers["send_combined"]
@@ -529,6 +547,43 @@ def dcp_a2a_lse_reduce(
         )
         recv_lse = recv_lse_stg
 
+    combined, _ = dcp_lse_combine_triton(
+        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+    )
+    return combined
+
+
+def _dcp_a2a_lse_reduce_fused_pack(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool,
+) -> torch.Tensor:
+    """a2a DCP reduce whose staging is one fused Triton pack.
+
+    Same wire bytes and same per-rank chunk size as the original eager path, so
+    the collective is unchanged; the chunk is laid out as
+    ``[payload block | fp32 lse block]`` instead of interleaving the LSE into
+    every row, which turns the payload copy into a permutation of contiguous
+    head-block runs and lets the fp32 LSE be written and read in place.
+    Gated by ``SGLANG_OPT_USE_FUSED_DCP_A2A_PACK`` (default off).
+    """
+    N = cp_group.world_size
+    B, H, D = cp_attn_out.shape
+    H_per_rank = H // N
+
+    send_combined = dcp_fused_pack(cp_attn_out, cp_attn_lse, N)
+    recv_combined = torch.empty_like(send_combined)
+
+    # Transport as raw bytes (uint8), exactly as the original path does.
+    cp_group.all_to_all_single(
+        recv_combined.reshape(-1).view(torch.uint8),
+        send_combined.reshape(-1).view(torch.uint8),
+    )
+
+    recv_output, recv_lse = dcp_fused_pack_recv_views(
+        recv_combined.reshape(-1), N, B, H_per_rank, D
+    )
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
     )
