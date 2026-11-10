@@ -263,7 +263,7 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_cooldowns: dict[str, float] = {}  # 【新增】专门用于记录失败时间戳的字典
-            self.session_cooldown_seconds = float(os.getenv("SGLANG_MOONCAKE_COOLDOWN", "120.0"))
+            self.session_cooldown_seconds = envs.SGLANG_MOONCAKE_COOLDOWN.get()
             self.session_lock = threading.Lock()
             # Two independent knobs, both off by default; see
             # mooncake/target_parallel_transfer.py.
@@ -2204,53 +2204,24 @@ class MooncakeKVManager(CommonKVManager):
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
-                        # Early exit if the request has failed
-                        with self.session_lock:
-                            if req.mooncake_session_id in self.failed_sessions:
-                                # Check cooldown: if the failed session's cooldown has
-                                # expired, release the session and continue transferring;
-                                # otherwise keep treating it as failed.
-                                continue_transfer = False
-                                if req.mooncake_session_id in self.session_cooldowns:
-                                    time_since_fail = (
-                                        time.time()
-                                        - self.session_cooldowns[req.mooncake_session_id]
-                                    )
-                                    if time_since_fail >= self.session_cooldown_seconds:
-                                        self.failed_sessions.remove(
-                                            req.mooncake_session_id
-                                        )
-                                        del self.session_cooldowns[
-                                            req.mooncake_session_id
-                                        ]
-                                        self.session_failures[
-                                            req.mooncake_session_id
-                                        ] = 0
-                                        logger.info(
-                                            f"Session {req.mooncake_session_id} "
-                                            f"cooldown expired, released."
-                                        )
-                                        continue_transfer = True
-                                    else:
-                                        logger.info(
-                                            f"Session {req.mooncake_session_id} is "
-                                            f"still cooling down, will check again later."
-                                        )
-                                if not continue_transfer:
-                                    self.record_failure(
-                                        kv_chunk.room,
-                                        f"Decode instance could be dead, remote mooncake "
-                                        f"session {req.mooncake_session_id} is not alive",
-                                    )
-                                    self.update_status(kv_chunk.room, KVPoll.Failed)
-                                    self.sync_status_to_decode_endpoint(
-                                        req.endpoint,
-                                        req.dst_port,
-                                        req.room,
-                                        KVPoll.Failed,
-                                        prefill_unique_rank,
-                                    )
-                                    break
+                        # Early exit if the request has failed: release the session
+                        # once its cooldown expires (or, fail-open, when it was
+                        # blacklisted without a timestamp), otherwise fail the room.
+                        if not self._check_session_cooldown(req.mooncake_session_id):
+                            self.record_failure(
+                                kv_chunk.room,
+                                f"Decode instance could be dead, remote mooncake "
+                                f"session {req.mooncake_session_id} is not alive",
+                            )
+                            self.update_status(kv_chunk.room, KVPoll.Failed)
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                            break
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
@@ -2456,20 +2427,7 @@ class MooncakeKVManager(CommonKVManager):
                                 elapsed=time.perf_counter() - start_ts,
                                 is_dcp_transfer=is_dcp_transfer,
                             )
-                            with self.session_lock:
-                                self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
-                                    # 【新增】记录第一次失败的时间戳
-                                    if req.mooncake_session_id not in self.session_cooldowns:
-                                        self.session_cooldowns[req.mooncake_session_id] = time.time()
-                                        logger.error(
-                                            f"Session {req.mooncake_session_id} failed, cooldown started."
-                                        )
-                                    logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
-                                    )
+                            self._blacklist_session(req.mooncake_session_id)
                             self.record_failure(
                                 kv_chunk.room,
                                 f"Failed to send kv chunk of {kv_chunk.room} to "
@@ -2494,13 +2452,11 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info,
                                 )
                                 if state_rc != 0:
-                                    with self.session_lock:
-                                        self.session_failures[
-                                            req.mooncake_session_id
-                                        ] += 1
-                                        self.failed_sessions.add(
-                                            req.mooncake_session_id
-                                        )
+                                    # Same blacklist contract as the KV failure
+                                    # above; this branch used to forget the
+                                    # cooldown timestamp, blacklisting the
+                                    # session forever (no self-release).
+                                    self._blacklist_session(req.mooncake_session_id)
                                     self.record_failure(
                                         kv_chunk.room,
                                         f"Failed to send state components of {kv_chunk.room} to "
@@ -2630,6 +2586,7 @@ class MooncakeKVManager(CommonKVManager):
                 finally:
                     # Clean up transfer_infos to prevent memory leak
                     self.transfer_infos.pop(kv_chunk.room, None)
+                    self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -2970,7 +2927,9 @@ class MooncakeKVManager(CommonKVManager):
                             if bootstrap_addr in self.session_pool:
                                 del self.session_pool[bootstrap_addr]
 
-        threading.Thread(target=decode_thread).start()
+        threading.Thread(
+            target=decode_thread, name="MooncakeDecodeThread", daemon=True
+        ).start()
         self._start_heartbeat_checker_thread()
 
     def add_transfer_request(
@@ -3074,6 +3033,70 @@ class MooncakeKVManager(CommonKVManager):
             if bootstrap_room not in self.request_status:
                 self.addr_to_rooms_tracker[bootstrap_addr].discard(bootstrap_room)
 
+    def _blacklist_session(self, session_id: str) -> None:
+        """Record one transfer failure against a decode session and blacklist it.
+
+        INVARIANT: every session in ``failed_sessions`` must carry a timestamp in
+        ``session_cooldowns`` -- that timestamp is what lets the cooldown
+        self-heal. A failure branch that forgets to register it blacklists the
+        session forever (incident: state-transfer failure left the session in
+        ``failed_sessions`` without a cooldown entry, so the 120s self-release
+        never fired and one decode peer stayed down for 16h). ``_check_session_cooldown``
+        repairs such historical states fail-open, but new writes must keep the
+        invariant. Runs with ``session_lock`` held internally.
+        """
+        with self.session_lock:
+            self.session_failures[session_id] += 1
+            # Failures should never happen if the session is not dead, if the
+            # session fails once, mark it as failed
+            if self.session_failures[session_id] >= 1:
+                self.failed_sessions.add(session_id)
+                if session_id not in self.session_cooldowns:
+                    self.session_cooldowns[session_id] = time.time()
+                    logger.error(
+                        f"Session {session_id} failed, cooldown started."
+                    )
+                logger.error(f"Session {session_id} failed.")
+
+    def _check_session_cooldown(self, session_id: str) -> bool:
+        """Return True if `session_id` may transfer, False while it cools down.
+
+        Consolidates the once-duplicated "blacklisted / still cooling / expired"
+        ladder from the worker loops. Fail-open: a blacklisted session *without*
+        a cooldown timestamp (a failure branch forgot to register one) counts as
+        already expired and is released here instead of staying blacklisted
+        forever. Runs with ``session_lock`` held internally.
+        """
+        with self.session_lock:
+            if session_id not in self.failed_sessions:
+                return True
+            if session_id in self.session_cooldowns:
+                time_since_fail = (
+                    time.time() - self.session_cooldowns[session_id]
+                )
+                if time_since_fail < self.session_cooldown_seconds:
+                    logger.info(
+                        f"Session {session_id} is still cooling down, will check again later."
+                    )
+                    return False
+                # Cooldown expired: release the session and continue transferring.
+                self.failed_sessions.remove(session_id)
+                del self.session_cooldowns[session_id]
+                self.session_failures[session_id] = 0
+                logger.info(f"Session {session_id} cooldown expired, released.")
+                return True
+            # Fail-open: blacklisted without a cooldown timestamp. Treat it as
+            # already expired -- release, re-register the timestamp and reset the
+            # count so a genuine immediate re-failure restarts the cooldown.
+            self.failed_sessions.remove(session_id)
+            self.session_cooldowns[session_id] = time.time()
+            self.session_failures[session_id] = 0
+            logger.info(
+                f"Session {session_id} blacklisted without a cooldown timestamp, "
+                f"released fail-open."
+            )
+            return True
+
     def _run_one_probe_pass(self) -> None:
         with self.session_lock:
             snapshot = list(self.failed_sessions)
@@ -3091,6 +3114,11 @@ class MooncakeKVManager(CommonKVManager):
                 with self.session_lock:
                     was_blacklisted = session_id in self.failed_sessions
                     self.failed_sessions.discard(session_id)
+                    # Drop the cooldown timestamp too, otherwise a stale entry
+                    # survives a probe recovery and makes the *next* failure
+                    # (which re-registers) skip refreshing it, so its cooldown
+                    # would expire almost immediately.
+                    self.session_cooldowns.pop(session_id, None)
                     self.session_failures.pop(session_id, None)
                 if was_blacklisted:
                     logger.info(
@@ -3194,10 +3222,11 @@ class MooncakeKVSender(CommonKVSender):
         # needs it again, and a room that stalled below pp_size reports would
         # otherwise leak its entry.
         self.kv_mgr.clear_pp_ready(self.bootstrap_room)
-        if self.bootstrap_room in self.kv_mgr.request_status:
-            self.kv_mgr.request_status.pop(self.bootstrap_room)
-
-            # self.kv_mgr.transfer_finish_times.pop(self.bootstrap_room, None)
+        # Base clear also pops request_status / req_to_decode_prefix_len /
+        # transfer_infos for this room (hasattr-guarded, idempotent) -- this is
+        # what drains the bookkeeping on failure paths too, since
+        # failure_exception() calls clear().
+        super().clear()
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank

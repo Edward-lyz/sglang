@@ -316,41 +316,20 @@ def _transfer_one_target(
     failure only contributes a False poll (the room then concludes Failed once
     every sibling has reported).
     """
-    # Early exit if the request has failed
-    with mgr.session_lock:
-        if req.mooncake_session_id in mgr.failed_sessions:
-            # Check cooldown: if the failed session's cooldown has expired,
-            # release the session and continue transferring; otherwise keep
-            # treating it as failed.
-            continue_transfer = False
-            if req.mooncake_session_id in mgr.session_cooldowns:
-                time_since_fail = (
-                    time.time() - mgr.session_cooldowns[req.mooncake_session_id]
-                )
-                if time_since_fail >= mgr.session_cooldown_seconds:
-                    mgr.failed_sessions.remove(req.mooncake_session_id)
-                    del mgr.session_cooldowns[req.mooncake_session_id]
-                    mgr.session_failures[req.mooncake_session_id] = 0
-                    logger.info(
-                        f"Session {req.mooncake_session_id} cooldown expired, released."
-                    )
-                    continue_transfer = True
-                else:
-                    logger.info(
-                        f"Session {req.mooncake_session_id} is still cooling down, "
-                        f"will check again later."
-                    )
-            if not continue_transfer:
-                _fail_room(
-                    mgr,
-                    room=kv_chunk.room,
-                    reason=(
-                        f"Decode instance could be dead, remote mooncake "
-                        f"session {req.mooncake_session_id} is not alive"
-                    ),
-                    prefill_unique_rank=prefill_unique_rank,
-                )
-                return (_ROOM_FAILED, False)
+    # Early exit if the request has failed: release the session once its
+    # cooldown expires (or, fail-open, when it was blacklisted without a
+    # timestamp), otherwise fail the room.
+    if not mgr._check_session_cooldown(req.mooncake_session_id):
+        _fail_room(
+            mgr,
+            room=kv_chunk.room,
+            reason=(
+                f"Decode instance could be dead, remote mooncake "
+                f"session {req.mooncake_session_id} is not alive"
+            ),
+            prefill_unique_rank=prefill_unique_rank,
+        )
+        return (_ROOM_FAILED, False)
 
     target_rank_registration_info: "KVArgsRegisterInfo" = mgr.decode_kv_args_table[
         req.mooncake_session_id
@@ -438,7 +417,7 @@ def _transfer_one_target(
         )
 
     if ret != 0:
-        _blacklist_session(mgr, req.mooncake_session_id)
+        mgr._blacklist_session(req.mooncake_session_id)
         _fail_room(
             mgr,
             room=kv_chunk.room,
@@ -461,9 +440,9 @@ def _transfer_one_target(
             target_rank_registration_info,
         )
         if state_rc != 0:
-            with mgr.session_lock:
-                mgr.session_failures[req.mooncake_session_id] += 1
-                mgr.failed_sessions.add(req.mooncake_session_id)
+            # Same blacklist contract as the KV failure above; this branch used
+            # to forget the cooldown timestamp, blacklisting the session forever.
+            mgr._blacklist_session(req.mooncake_session_id)
             _fail_room(
                 mgr,
                 room=kv_chunk.room,
@@ -639,20 +618,6 @@ def _fail_room(
                 f"{room} failed",
                 exc_info=True,
             )
-
-
-def _blacklist_session(mgr: "MooncakeKVManager", session_id: str) -> None:
-    """Legacy session bookkeeping on a transfer failure, lifted as-is."""
-    with mgr.session_lock:
-        mgr.session_failures[session_id] += 1
-        # Failures should never happen if the session is not dead, if the session
-        # fails once, mark it as failed
-        if mgr.session_failures[session_id] >= 1:
-            mgr.failed_sessions.add(session_id)
-            if session_id not in mgr.session_cooldowns:
-                mgr.session_cooldowns[session_id] = time.time()
-                logger.error(f"Session {session_id} failed, cooldown started.")
-            logger.error(f"Session {session_id} failed.")
 
 
 def _cleanup_finished_room(mgr: "MooncakeKVManager", room: int) -> None:

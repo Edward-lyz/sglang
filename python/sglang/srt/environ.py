@@ -653,6 +653,10 @@ class Envs:
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
+    # Seconds a decode session stays blacklisted after a transfer failure before
+    # the cooldown self-release re-admits it (see MooncakeKVManager session
+    # bookkeeping in disaggregation/mooncake/conn.py).
+    SGLANG_MOONCAKE_COOLDOWN = EnvFloat(120.0)
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
