@@ -68,8 +68,16 @@ RUN SGLK="$(python3 -c 'import sysconfig,os;print(os.path.join(sysconfig.get_pat
     grep -q is_mxfp4_kvcache "$SGLK/flash_mla.py"
 
 
-# Install deepgemm cache
-RUN cd /root && wget https://ai-data.bj.bcebos.com/mae/cache_glm5.1_0620_merged.tar.gz  && tar -xzvf cache_glm5.1_0620_merged.tar.gz && rm /root/.cache -rf && mv cache_glm5.1_0620_merged/.cache /root/.cache && rm cache_glm5.1_0620_merged.tar.gz
+# Install operator JIT cache (deep_gemm / tvm-ffi / flashinfer / triton / torchinductor)
+# glm53_qbo_nvfp4_bzz2_cache_1031_v2: 以 cache_glm5.1_0620_merged 为基础（旧包文件是其子集、同路径内容一致），
+# 叠加 GLM-5.3 qbo-NVFP4 权重 + v15.4.8.5 1P1D(MTP7, P: CP8 asradix, D: DP8 cuda graph) 经 AS 链路
+# glm-53-cache-1026 数据集压测后 P/D 两侧运行时编译的产物。包内路径为 root/.cache、root/triton_cache、
+# tmp/torchinductor_root，必须 -C / 解压。线上 YAML 设置 TRITON_CACHE_DIR=/root/triton_cache，这里同步为镜像默认值。
+RUN wget -nv -O /tmp/cache.tar.gz http://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/glm53_qbo_nvfp4_bzz2_cache_1031_v2.tar.gz && \
+    rm -rf /root/.cache /root/triton_cache /tmp/torchinductor_root && \
+    tar -xzf /tmp/cache.tar.gz -C / && \
+    rm -f /tmp/cache.tar.gz
+ENV TRITON_CACHE_DIR=/root/triton_cache
 
 RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/msit_llm-8.3.2-py3-none-any.whl
 
