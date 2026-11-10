@@ -68,7 +68,15 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if not forward_batch.forward_mode.is_context_parallel_extend():
             return False
         cp_size = self.cp_size
-        seq_len = sum(forward_batch.extend_seq_lens_cpu)
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        seq_len = sum(extend_lens) if extend_lens is not None else int(num_tokens)
+        # With DP>1 every extend forward on every DP rank MUST take the same CP
+        # path -- including short prompts and the empty dp-sync / bootstrap
+        # batches. A rank that fell back to the non-CP layout would gather over a
+        # different group size than its CP peers and desync the collectives.
+        # Short / empty prompts are handled by padding empty CP shards.
+        if get_parallel().attn_dp_size > 1:
+            return cp_size > 1
         return seq_len > 0 and seq_len >= cp_size and cp_size > 1
 
     def build_metadata(

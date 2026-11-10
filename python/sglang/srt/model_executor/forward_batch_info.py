@@ -1386,11 +1386,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
+        # Under CP the MoE/engram gather all-gathers each rank's CP shard over
+        # the full TP group, so every DP group must pad to the same DP-global
+        # per-rank length. Align the per-DP-group token count to
+        # attn_cp_size * cp_padding_align so max_num_tokens is an exact multiple
+        # of attn_cp_size AND the per-rank physical length is align-aligned
+        # (keeps the CP metadata physical length == max_num_tokens / cp_size).
+        token_align = attn_tp_size
+        if get_parallel().attn_cp_size > 1 and get_parallel().attn_dp_size > 1:
+            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+            token_align = (
+                attn_tp_size
+                * get_parallel().attn_cp_size
+                * get_cp_padding_align_size()
+            )
 
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], token_align)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1421,6 +1436,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and max(global_num_tokens) <= max(prefill_cg.bs)
             and not prefill_graph_tolerates_sum_len()
         ):
+            dp_padding_mode = DpPaddingMode.MAX_LEN
+        # Prefill CP together with DP>1: the MoE gather/scatter and engram lookup
+        # all-gather each rank's CP shard over the full TP group, which requires
+        # a rank-invariant per-rank size. Force MAX_LEN so every DP group pads to
+        # the same token count and the CP shards are equal across all TP ranks.
+        if get_parallel().attn_cp_size > 1 and get_parallel().attn_dp_size > 1:
             dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
 
