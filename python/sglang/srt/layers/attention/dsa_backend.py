@@ -56,6 +56,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
+    is_k3_mla_prefill_cp,
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
@@ -310,6 +311,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         ke_offset: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
+        num_q_rows: Optional[int] = None,
         row_range: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         if topk_indices_offset_override is not None:
@@ -385,8 +387,12 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
-        self.num_q_heads = (
-            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
+        # K3 MLA prefill CP replicates the MLA heads on every attn-TP rank.
+        mla_heads_replicated = (
+            is_k3_mla_prefill_cp() and not model_runner.is_draft_worker
+        )
+        self.num_q_heads = model_runner.model_config.num_attention_heads // (
+            1 if mla_heads_replicated else get_parallel().attn_tp_size
         )
         # DCP: target layers attend on the DCP group's gathered query heads over
         # this rank's KV shard and return the LSE for the cross-rank merge.
@@ -2978,6 +2984,24 @@ class DeepseekSparseAttnBackend(
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
+        elif is_prefill and dsa_use_prefill_cp(forward_batch) and (
+            is_dsa_prefill_cp_in_seq_split() or is_k3_mla_prefill_cp()
+        ):
+            # CP-local q rows are [prev block of each seq, next block of each
+            # seq]; map every block through its own sequence's page-table row.
+            cp_meta = forward_batch.attn_cp_metadata
+            block_lens = cp_meta.actual_seq_q_prev_list + cp_meta.actual_seq_q_next_list
+            if cp_meta.bs == 1:
+                seq_page_table = metadata.page_table_1[:1].expand(2, -1)
+            else:
+                seq_page_table = metadata.page_table_1[: cp_meta.bs].repeat(2, 1)
+            page_table_1 = transform_index_page_table_prefill(
+                page_table=seq_page_table,
+                topk_indices=topk_indices,
+                extend_lens_cpu=block_lens,
+                page_size=1,
+                output_num_tokens=q.shape[0],
+            )
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
                 page_table=metadata.page_table_1,
@@ -3047,10 +3071,13 @@ class DeepseekSparseAttnBackend(
 
         if (
             dsa_use_prefill_cp(forward_batch)
-            and is_dsa_prefill_cp_in_seq_split()
+            and (is_dsa_prefill_cp_in_seq_split() or is_k3_mla_prefill_cp())
             and forward_batch.attn_cp_metadata is not None
         ):
             cp_meta = forward_batch.attn_cp_metadata
+            # Per-token seq_lens may carry mlp-sync pad rows past the real
+            # tokens that the CP split covers.
+            seq_lens = seq_lens[: cp_meta.total_seq_lens]
             seq_chunks = list(torch.split(seq_lens, cp_meta.split_list, dim=0))
             seq_lens = torch.cat([seq_chunks[i] for i in cp_meta.zigzag_index], dim=0)
 
@@ -3158,6 +3185,7 @@ class DeepseekSparseAttnBackend(
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
+                and (not is_k3_mla_prefill_cp())
                 and (self.hisparse_coordinator is None)
             )
         else:

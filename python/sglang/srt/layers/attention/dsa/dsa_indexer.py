@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
     is_graph_dsa_split_op_surface,
+    is_k3_mla_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
@@ -488,7 +489,7 @@ class Indexer(MultiPlatformOp):
         # SGLANG_K31_INDEXER_KW_MERGE / SGLANG_K31_INDEXER_EARLY_K state.
         self._kw_weight: Optional[torch.Tensor] = None
         self._early_k_weights: Optional[torch.Tensor] = None
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp() or is_k3_mla_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
             self.cp_rank = get_parallel().attn_cp_rank
@@ -1923,6 +1924,177 @@ class Indexer(MultiPlatformOp):
             return None
         return raw_topk_result
 
+    def _k3_cp_row_plan(self, forward_batch: ForwardBatch, metadata) -> Optional[dict]:
+        """Per-forward plan of the batched K3 MLA CP indexer, shared by every
+        DSA layer: each local row's K window inside the concatenated index-K
+        of the batch, its key count, its page-table row, and the row chunks
+        the logits are computed in. None when the fused v2 top-k cannot run."""
+        cp_meta = forward_batch.attn_cp_metadata
+        attn_metadata = metadata.attn_metadata
+        cached = getattr(cp_meta, "_k3_indexer_plan", None)
+        if cached is not None and cached["attn_metadata"] is attn_metadata:
+            return cached["plan"]
+
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+            TopkTransformMethod,
+        )
+
+        page_table = metadata.get_page_table_64()
+        plan = None
+        if (
+            not _is_hip
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and envs.SGLANG_DSA_PREFILL_TOPK_V2.get()
+            and not metadata.force_unfused_topk
+            and metadata.topk_transform_method == TopkTransformMethod.PAGED
+            and 0 < self.index_topk <= 2048
+            and page_table.dtype == torch.int32
+        ):
+            plan = self._build_k3_cp_row_plan(forward_batch, cp_meta, page_table)
+        cp_meta._k3_indexer_plan = {"attn_metadata": attn_metadata, "plan": plan}
+        return plan
+
+    def _build_k3_cp_row_plan(self, forward_batch, cp_meta, page_table) -> dict:
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+
+        bs = len(cp_meta.actual_seq_q_prev_list)
+        prefix = [
+            int(forward_batch.seq_lens_cpu[b]) - int(forward_batch.extend_seq_lens_cpu[b])
+            for b in range(bs)
+        ]
+        blocks = (
+            (cp_meta.kv_len_prev_list, cp_meta.actual_seq_q_prev_list),
+            (cp_meta.kv_len_next_list, cp_meta.actual_seq_q_next_list),
+        )
+        # Index-K each sequence needs: up to the end of its last local block.
+        need = []
+        for b in range(bs):
+            end = 0
+            for ends, lens in blocks:
+                if lens[b] > 0:
+                    end = max(end, ends[b])
+            need.append(prefix[b] + end if end > 0 else 0)
+        col = [0]
+        for n in need[:-1]:
+            col.append(col[-1] + n)
+        # Local rows are [prev block of every sequence, next block of every
+        # sequence]; row i of block (end, n) of sequence b sees keys
+        # [0, prefix + end - n + 1 + i) of that sequence.
+        starts, lengths, row_batch = [], [], []
+        for ends, lens in blocks:
+            for b in range(bs):
+                n = lens[b]
+                if n == 0:
+                    continue
+                first = prefix[b] + ends[b] - n + 1
+                starts.append(torch.full((n,), col[b], dtype=torch.int32))
+                lengths.append(torch.arange(first, first + n, dtype=torch.int32))
+                row_batch.append(torch.full((n,), b, dtype=torch.int32))
+        host = torch.stack(
+            [torch.cat(starts), torch.cat(lengths), torch.cat(row_batch)]
+        ).pin_memory()
+        rows_dev = host.to(page_table.device, non_blocking=True)
+        ks, lens_dev, row_batch_dev = rows_dev[0], rows_dev[1], rows_dev[2]
+        num_rows = int(host.shape[1])
+        # Compact logits: every row's scores start at its own sequence's K.
+        width = (max(need) + 3) // 4 * 4
+        need_chunk, budget = self._should_chunk_mqa_logits(
+            num_rows, width, page_table.device.index
+        )
+        max_rows = num_rows
+        if need_chunk:
+            max_rows = max(
+                1, min(num_rows, int(budget // (width * self._MQA_LOGITS_BYTES_PER_ELEM)))
+            )
+        chunks = []
+        for start in range(0, num_rows, max_rows):
+            end = min(start + max_rows, num_rows)
+            rows_pt = (
+                page_table[:1].expand(end - start, -1)
+                if bs == 1
+                else page_table.index_select(0, row_batch_dev[start:end])
+            )
+            chunks.append(
+                (start, end, rows_pt, plan_topk_v2(lens_dev[start:end]))
+            )
+        return {
+            "need": torch.tensor(need, dtype=torch.int32).pin_memory().to(
+                page_table.device, non_blocking=True
+            ),
+            "need_sum": sum(need),
+            "need_max": max(need),
+            "ks": ks,
+            "lengths": lens_dev,
+            "width": width,
+            "num_rows": num_rows,
+            "chunks": chunks,
+        }
+
+    def _get_topk_ragged_cp_batched(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_quant,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        plan: dict,
+    ) -> torch.Tensor:
+        """K3 MLA CP indexer for the whole batch: one index-K gather, and one
+        MQA-logits + one top-k launch per row chunk (a single chunk unless the
+        logits exceed the memory budget), instead of one set per sequence."""
+        from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512_v2
+
+        pool = get_token_to_kv_pool()
+        use_fp4_kv = bool(getattr(pool, "use_fp4_indexer", False))
+        weights = weights.squeeze(-1)
+        k_quant, k_scale = pool.get_index_k_scale_buffer(
+            layer_id,
+            plan["need"],
+            metadata.get_page_table_64(),
+            plan["need_sum"],
+            plan["need_max"],
+        )
+        kv_quant = self._view_cp_kv(k_quant, k_scale, use_fp4_kv)
+        ks, lengths, width = plan["ks"], plan["lengths"], plan["width"]
+        out = torch.full(
+            (plan["num_rows"], self.index_topk), -1, dtype=torch.int32, device=ks.device
+        )
+        for start, end, rows_pt, topk_plan in plan["chunks"]:
+            ks_c = ks[start:end]
+            lens_c = lengths[start:end]
+            with self._with_real_sm_count():
+                if use_fp4_kv:
+                    q_in, w_padded = self._prepare_fp4_q(q_quant, weights, start, end)
+                    logits = deep_gemm.fp8_fp4_mqa_logits(
+                        q_in,
+                        kv_quant,
+                        w_padded,
+                        ks_c,
+                        ks_c + lens_c,
+                        clean_logits=False,
+                        max_seqlen_k=width,
+                    )
+                else:
+                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                        q_quant[start:end], weights[start:end]
+                    )
+                    logits = deep_gemm.fp8_mqa_logits(
+                        q_padded,
+                        kv_quant,
+                        w_padded,
+                        ks_c,
+                        ks_c + lens_c,
+                        clean_logits=False,
+                        max_seqlen_k=width,
+                    )
+            # v2 loads scores 16 B at a time from each row start.
+            assert logits.stride(1) == 1 and logits.stride(0) % 4 == 0
+            self._mask_init_and_local_tokens(logits, lens_c)
+            topk_transform_512_v2(
+                logits, lens_c, rows_pt, out[start:end], pool.page_size, topk_plan
+            )
+        return out
+
     def _get_topk_ragged_with_cp(
         self,
         forward_batch: ForwardBatch,
@@ -1933,7 +2105,13 @@ class Indexer(MultiPlatformOp):
         kv_len: int,
         actual_seq_q: int,
         cp_index: List[Tuple[int, int, int]] = None,
+        batch_idx: int = 0,
+        segments: Optional[List[Tuple[int, int]]] = None,
     ) -> torch.Tensor:
+        """segments: [(kv_end, n_rows), ...] — several q blocks of the same
+        sequence handled in one logits + top-k call; kv_end is the block's
+        exclusive end within this extend (prefix added below). When given,
+        kv_len / actual_seq_q are ignored."""
         assert not _is_in_piecewise_or_breakable_cuda_graph(), (
             "DSA context parallel (_get_topk_ragged_with_cp) not supported under "
             "piecewise/breakable CUDA graph"
@@ -2046,67 +2224,105 @@ class Indexer(MultiPlatformOp):
                 batch_idx_list=batch_idx_list,
             )
         else:
-            kv_len = (
-                forward_batch.seq_lens_cpu[0].item()
-                - forward_batch.extend_seq_lens_cpu[0]
-                + kv_len
+            prefix_len = (
+                forward_batch.seq_lens_cpu[batch_idx].item()
+                - forward_batch.extend_seq_lens_cpu[batch_idx]
             )
-            k_fp8 = get_token_to_kv_pool().get_index_k_continuous(
+            if segments is None:
+                segments = [(kv_len, actual_seq_q)]
+            kv_len = prefix_len + max(end for end, _ in segments)
+            actual_seq_q = sum(n for _, n in segments)
+            # Fused K+scale gather with a device-side length: the separate
+            # GetK/GetS kernels specialize on seq_len, so every new kv_len
+            # (each chunk) recompiled and loaded two Triton kernels (~60 ms
+            # host, and the module load synchronizes the device).
+            k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
                 layer_id,
+                torch.full((1,), kv_len, dtype=torch.int32, device="cuda"),
+                block_tables[batch_idx : batch_idx + 1],
                 kv_len,
-                block_tables[0],
-            )
-            k_scale = get_token_to_kv_pool().get_index_k_scale_continuous(
-                layer_id,
                 kv_len,
-                block_tables[0],
             )
 
             kv_quant = self._view_cp_kv(k_fp8, k_scale, use_fp4_kv)
-            ks = torch.full((actual_seq_q,), offset, dtype=torch.int32, device="cuda")
-            ke_offset = torch.arange(
-                (kv_len - actual_seq_q) + 1,
-                kv_len + 1,
-                dtype=torch.int32,
-                device="cuda",
+            ke_offset = torch.cat(
+                [
+                    torch.arange(
+                        prefix_len + end - n + 1,
+                        prefix_len + end + 1,
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    for end, n in segments
+                ]
             )
-            ke = ks + ke_offset
-
-            with self._with_real_sm_count():
-                if use_fp4_kv:
-                    q_len = q_quant[0].shape[0] if use_fp4_q else q_quant.shape[0]
-                    q_in, w_padded = self._prepare_fp4_q(
-                        q_quant, weights, 0, q_len
-                    )
-                    logits = deep_gemm.fp8_fp4_mqa_logits(
-                        q_in,
-                        kv_quant,
-                        w_padded,
-                        ks,
-                        ke,
-                        clean_logits=False,
-                    )
-                else:
-                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_quant, weights
-                    )
-                    logits = deep_gemm.fp8_mqa_logits(
-                        q_padded,
-                        kv_quant,
-                        w_padded,
-                        ks,
-                        ke,
-                        clean_logits=False,
-                    )
-            actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
-                device="cuda", non_blocking=True
+            # Row-chunk the [rows, kv_len] logits like _get_topk_ragged: a
+            # long-context CP block would otherwise allocate rows x 500K fp32.
+            q_data = q_quant[0] if use_fp4_q else q_quant
+            need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
+                actual_seq_q, kv_len, q_data.device.index
             )
-            topk_result = metadata.topk_transform(
-                logits,
-                self.index_topk,
-                ks=ks,
-                cu_seqlens_q=actual_seq_q,
-                ke_offset=ke_offset,
+            max_rows = actual_seq_q
+            if need_chunk:
+                bytes_per_row = kv_len * self._MQA_LOGITS_BYTES_PER_ELEM
+                max_rows = max(
+                    1, min(actual_seq_q, int(logits_budget_bytes // bytes_per_row))
+                )
+            topk_chunks = []
+            for start in range(0, actual_seq_q, max_rows):
+                end = min(start + max_rows, actual_seq_q)
+                ke_chunk = ke_offset[start:end]
+                ks = torch.full(
+                    (end - start,), offset, dtype=torch.int32, device="cuda"
+                )
+                with self._with_real_sm_count():
+                    if use_fp4_kv:
+                        q_in, w_padded = self._prepare_fp4_q(
+                            q_quant, weights, start, end
+                        )
+                        logits = deep_gemm.fp8_fp4_mqa_logits(
+                            q_in,
+                            kv_quant,
+                            w_padded,
+                            ks,
+                            ks + ke_chunk,
+                            clean_logits=False,
+                        )
+                    else:
+                        q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                            q_quant[start:end], weights[start:end]
+                        )
+                        logits = deep_gemm.fp8_mqa_logits(
+                            q_padded,
+                            kv_quant,
+                            w_padded,
+                            ks,
+                            ks + ke_chunk,
+                            clean_logits=False,
+                        )
+                self._mask_init_and_local_tokens(logits, ke_chunk, ks)
+                topk_chunks.append(
+                    metadata.topk_transform(
+                        logits,
+                        self.index_topk,
+                        # Every row of this sequence starts at column 0, which
+                        # lets the fused top-k take the v2 kernel with the
+                        # sequence's own page-table row.
+                        ks=None,
+                        # Device-side fill: a pageable H2D copy here would
+                        # stall the host once per sequence block per layer.
+                        cu_seqlens_q=torch.full(
+                            (1,), end - start, dtype=torch.int32, device="cuda"
+                        ),
+                        ke_offset=ke_chunk,
+                        num_q_rows=end - start,
+                        batch_idx_list=[batch_idx],
+                    )
+                )
+            topk_result = (
+                topk_chunks[0]
+                if len(topk_chunks) == 1
+                else torch.cat(topk_chunks, dim=0)
             )
 
         return topk_result
@@ -2664,58 +2880,82 @@ class Indexer(MultiPlatformOp):
                     )
                 if (
                     forward_batch.attn_cp_metadata is not None
-                    and is_dsa_prefill_cp_in_seq_split()
+                    and (is_dsa_prefill_cp_in_seq_split() or is_k3_mla_prefill_cp())
                 ):
-                    kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev_list[0]
-                    kv_len_next = forward_batch.attn_cp_metadata.kv_len_next_list[0]
-                    actual_seq_q_prev = (
-                        forward_batch.attn_cp_metadata.actual_seq_q_prev_list[0]
-                    )
-                    actual_seq_q_next = (
-                        forward_batch.attn_cp_metadata.actual_seq_q_next_list[0]
-                    )
+                    # Local q rows are [prev block of every sequence, next block
+                    # of every sequence] (prepare_context_parallel_metadata);
+                    # each sequence's block runs its own ragged top-k against
+                    # that sequence's index-K.
+                    cp_meta = forward_batch.attn_cp_metadata
+                    plan = self._k3_cp_row_plan(forward_batch, metadata)
+                    if plan is not None:
+                        topk_result = self._get_topk_ragged_cp_batched(
+                            forward_batch, layer_id, q_quant, weights, metadata, plan
+                        )
+                        # CP ranks hold different q rows: no rank-0 broadcast.
+                        return maybe_capture_indexer_topk(layer_id, topk_result)
+                    n_prev = cp_meta.actual_seq_q_prev_list
+                    n_next = cp_meta.actual_seq_q_next_list
+                    bs = len(n_prev)
+                    # Row offsets of each sequence's prev / next block.
+                    prev_off = [sum(n_prev[:b]) for b in range(bs)]
+                    next_off = [cp_meta.total_q_prev_tokens + sum(n_next[:b]) for b in range(bs)]
 
-                    # TODO support mutil-batch
-                    # cp_batch_seq_index_prev = forward_batch.attn_cp_metadata["cp_batch_seq_index_prev"]
-                    # cp_batch_seq_index_next = forward_batch.attn_cp_metadata["cp_batch_seq_index_next"]
-                    # TODO prev, next, combined into a single call
-                    if use_fp4_q:
-                        q_data_prev, q_data_next = torch.split(
-                            q_quant[0], (q_quant[0].shape[0] + 1) // 2, dim=0
+                    def _rows(t, b):
+                        a = t[prev_off[b] : prev_off[b] + n_prev[b]]
+                        c = t[next_off[b] : next_off[b] + n_next[b]]
+                        # bs == 1: prev and next are already adjacent.
+                        return t if bs == 1 else torch.cat([a, c], dim=0)
+
+                    per_seq = []
+                    for b in range(bs):
+                        if n_prev[b] + n_next[b] == 0:
+                            # Sequence shorter than 2*cp: no rows on this rank.
+                            per_seq.append(
+                                torch.empty(
+                                    (0, self.index_topk),
+                                    dtype=torch.int32,
+                                    device=weights.device,
+                                )
+                            )
+                            continue
+                        q_b = (
+                            (_rows(q_quant[0], b), _rows(q_quant[1], b))
+                            if use_fp4_q
+                            else _rows(q_quant, b)
                         )
-                        q_sf_prev, q_sf_next = torch.split(
-                            q_quant[1], (q_quant[1].shape[0] + 1) // 2, dim=0
+                        # One logits + top-k call covers both blocks of the
+                        # sequence (K gathered once up to the next block's end).
+                        per_seq.append(
+                            self._get_topk_ragged_with_cp(
+                                forward_batch,
+                                layer_id,
+                                q_b,
+                                _rows(weights, b),
+                                metadata,
+                                None,
+                                None,
+                                batch_idx=b,
+                                # An empty block contributes no rows.
+                                segments=[
+                                    seg
+                                    for seg in (
+                                        (cp_meta.kv_len_prev_list[b], n_prev[b]),
+                                        (cp_meta.kv_len_next_list[b], n_next[b]),
+                                    )
+                                    if seg[1] > 0
+                                ],
+                            )
                         )
-                        q_prev = (q_data_prev, q_sf_prev)
-                        q_next = (q_data_next, q_sf_next)
+                    if bs == 1:
+                        topk_result = per_seq[0]
                     else:
-                        q_prev, q_next = torch.split(
-                            q_quant, (q_quant.shape[0] + 1) // 2, dim=0
+                        topk_result = torch.cat(
+                            [r[: n_prev[b]] for b, r in enumerate(per_seq)]
+                            + [r[n_prev[b] :] for b, r in enumerate(per_seq)],
+                            dim=0,
                         )
-                    weights_prev, weights_next = torch.split(
-                        weights, (weights.shape[0] + 1) // 2, dim=0
-                    )
-                    topk_result_prev = self._get_topk_ragged_with_cp(
-                        forward_batch,
-                        layer_id,
-                        q_prev,
-                        weights_prev,
-                        metadata,
-                        kv_len_prev,
-                        actual_seq_q_prev,
-                    )
-
-                    topk_result_next = self._get_topk_ragged_with_cp(
-                        forward_batch,
-                        layer_id,
-                        q_next,
-                        weights_next,
-                        metadata,
-                        kv_len_next,
-                        actual_seq_q_next,
-                    )
-                    topk_result = torch.cat([topk_result_prev, topk_result_next], dim=0)
-                    topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+                    # CP ranks hold different q rows: no rank-0 broadcast.
                     return maybe_capture_indexer_topk(layer_id, topk_result)
                 else:
                     # In-graph (PCG/BCG) non-CP prefill is handled earlier by the

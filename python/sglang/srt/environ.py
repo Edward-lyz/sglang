@@ -1060,6 +1060,16 @@ class Envs:
     # bank write run on the local shard, then only the normalized attention
     # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # K3.1 MLA/DSA layers run prefill context parallel over the attn-TP group
+    # while KDA layers stay attn-TP: MLA weights are replicated, each
+    # sequence of an extend is zigzag-split across the group, and KV / index-K are
+    # all-gathered into every rank's cache. Batches with any sequence shorter
+    # than 2*cp tokens run the replicated MLA on the full batch.
+    SGLANG_K3_MLA_PREFILL_CP = EnvBool(False)
+    # Run MLA prefill CP only when the extend batch has at least this many
+    # new tokens in total; smaller (host-launch-bound) batches use the
+    # replicated MLA on the full batch.
+    SGLANG_K3_MLA_PREFILL_CP_MIN_TOKENS = EnvInt(0)
     # Fused o_proj GEMM + all-reduce (bf16, TP 2..8, SM100+): one
     # kernel computes the TP-local o_proj partial and the cross-rank sum over
     # a P2P comm region, replacing the GEMM + NCCL AR pair at M <= 512.

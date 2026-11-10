@@ -56,6 +56,15 @@ class ContextParallelMetadata:
     total_seq_lens: int = 0
     bs: int = 1
 
+    # Optional precomputed device permutations (set by Kimi-K3 MLA prefill CP)
+    # so the split / all-gather rerange is one index_select instead of
+    # per-block split + cat on the host:
+    #   local_index[i]  = original token of this rank's i-th local row
+    #   gather_index[t] = row of original token t in the padded all-gather
+    #                     buffer [cp_size * max_rank_len]
+    local_index: torch.Tensor = None
+    gather_index: torch.Tensor = None
+
 
 def is_prefill_context_parallel_enabled():
     return get_server_args().enable_prefill_context_parallel
@@ -138,6 +147,8 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
         return dsa_cp_round_robin_split_data(input_)
 
+    if forward_batch.attn_cp_metadata.local_index is not None:
+        return input_.index_select(0, forward_batch.attn_cp_metadata.local_index)
     input_list = list(
         torch.split(input_, forward_batch.attn_cp_metadata.split_list, dim=0)
     )
@@ -161,6 +172,8 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         )
         return dsa_cp_round_robin_split_data(positions)
 
+    if forward_batch.attn_cp_metadata.local_index is not None:
+        return positions.index_select(-1, forward_batch.attn_cp_metadata.local_index)
     position_id_list = list(
         torch.split(positions, forward_batch.attn_cp_metadata.split_list, dim=-1)
     )
@@ -193,6 +206,27 @@ def cp_round_robin_input_ids(input_ids):
     else:
         input_ids = input_ids[cp_rank::cp_size].contiguous()
     return input_ids
+
+
+def _cp_all_gather_index_select(input_tensor, cp_size, forward_batch):
+    """Padded all-gather over attn-CP, then one index_select back to the
+    original token order (uses the precomputed gather_index)."""
+    meta = forward_batch.attn_cp_metadata
+    max_len = meta.max_rank_len[0]
+    pad_size = max_len - input_tensor.shape[0]
+    if pad_size > 0:
+        padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_size]
+        input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
+    group = get_parallel().attn_cp_group
+    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+        full = torch.empty(
+            max_len * cp_size,
+            *input_tensor.shape[1:],
+            device=input_tensor.device,
+            dtype=input_tensor.dtype,
+        )
+    group.all_gather_into_tensor(full, input_tensor.contiguous())
+    return full.index_select(0, meta.gather_index)
 
 
 def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, stream):
@@ -334,6 +368,8 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         )
         return output_tensor
 
+    if forward_batch.attn_cp_metadata.gather_index is not None:
+        return _cp_all_gather_index_select(input_tensor, cp_size, forward_batch)
     # TODO: Do we need to remove the padding here?
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_all_gather_reorganized_into_tensor(
@@ -373,6 +409,8 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
     |   +-------------------------+
     """
+    if forward_batch.attn_cp_metadata.gather_index is not None:
+        return _cp_all_gather_index_select(input_tensor, cp_size, forward_batch)
     output_tensor = cp_all_gather_reorganized_into_tensor_kv_cache(
         input_tensor,
         cp_size,
@@ -589,9 +627,12 @@ def prepare_context_parallel_metadata(
     # Per-sequence cumulatives used for FA cache_seqlens.
     #   kv_len_prev[s] = sum of seq s's blocks [0..cp_rank] (inclusive).
     #   kv_len_next[s] = sum of seq s's blocks [0..cp_segment_num-cp_rank-1] (inclusive).
-    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_enable_prefill_cp,
+        is_k3_mla_prefill_cp,
+    )
 
-    nsa_mode = is_dsa_enable_prefill_cp()
+    nsa_mode = is_dsa_enable_prefill_cp() or is_k3_mla_prefill_cp()
     kv_len_prev_list: List[int] = []
     kv_len_next_list: List[int] = []
     actual_seq_q_prev_list: List[int] = []

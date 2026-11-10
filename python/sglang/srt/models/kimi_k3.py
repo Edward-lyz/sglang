@@ -6,6 +6,7 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import contextlib
 import logging
 from collections.abc import Iterable
 from functools import cached_property, lru_cache
@@ -309,6 +310,95 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     group = get_parallel().attn_tp_group
     lo = group.rank_in_group * hidden_states.shape[0]
     return slice(lo, lo + hidden_states.shape[0])
+
+
+# ---------------------------------------------------------------------------
+# MLA prefill CP (SGLANG_K3_MLA_PREFILL_CP): MLA/DSA layers replicate their
+# weights and zigzag-split a bs=1 extend over the attn-TP group, which the
+# DSA CP code reaches as the attn-CP group. KDA layers keep attn-TP.
+# ---------------------------------------------------------------------------
+
+
+def _mla_cp_view():
+    """Parallel view seen by MLA layers: attn-TP 1, attn-CP = attn-TP group."""
+    parallel = get_parallel()
+    group = parallel.attn_tp_group
+    return parallel.override(
+        attn_tp_size=1,
+        attn_tp_rank=0,
+        attn_cp_size=group.world_size,
+        attn_cp_rank=group.rank_in_group,
+        attn_cp_group=group,
+    )
+
+
+def _maybe_prepare_mla_cp_metadata(forward_batch: ForwardBatch) -> None:
+    from sglang.srt.layers.utils.cp_utils import prepare_context_parallel_metadata
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    forward_batch.attn_cp_metadata = None
+    group = get_parallel().attn_tp_group
+    cp_size = group.world_size
+    mode = forward_batch.forward_mode
+    extend_lens = forward_batch.extend_seq_lens_cpu
+    if (
+        cp_size <= 1
+        or not mode.is_context_parallel_extend()
+        or mode == ForwardMode.MIXED
+        or extend_lens is None
+        or len(extend_lens) == 0
+        # Sequences shorter than 2*cp leave some zigzag blocks empty; the
+        # indexer skips those and a rank with no rows at all only joins the
+        # KV all-gathers (forward_mla_cp_empty_rank).
+        or sum(int(x) for x in extend_lens) == 0
+        or sum(int(x) for x in extend_lens)
+        < envs.SGLANG_K3_MLA_PREFILL_CP_MIN_TOKENS.get()
+    ):
+        return
+    extend_lens = [int(x) for x in extend_lens]
+    meta = prepare_context_parallel_metadata(
+        sum(extend_lens),
+        group.rank_in_group,
+        cp_size,
+        forward_batch.seq_lens_cpu.tolist(),
+        extend_seqs_len=extend_lens,
+    )
+    meta.local_index, meta.gather_index = _mla_cp_permutations(
+        meta, group.rank_in_group, cp_size
+    )
+    forward_batch.attn_cp_metadata = meta
+
+
+def _mla_cp_permutations(meta, cp_rank: int, cp_size: int):
+    """Device permutations for the zigzag layout, so every CP split is one
+    index_select and every all-gather rerange is pad + AG + one index_select
+    (24 MLA layers x 4 rearranges per forward; the per-block split/cat
+    version is host-bound on short extends)."""
+    seg = 2 * cp_size
+    sizes = meta.split_list
+    starts = [0]
+    for n in sizes[:-1]:
+        starts.append(starts[-1] + n)
+
+    def rank_blocks(r):
+        return [b * seg + r for b in range(meta.bs)] + [
+            b * seg + seg - 1 - r for b in range(meta.bs)
+        ]
+
+    max_len = meta.max_rank_len[0]
+    gather = torch.empty(meta.total_seq_lens, dtype=torch.int64)
+    local = None
+    for r in range(cp_size):
+        parts = [torch.arange(starts[i], starts[i] + sizes[i]) for i in rank_blocks(r)]
+        tokens = torch.cat(parts)
+        gather[tokens] = torch.arange(r * max_len, r * max_len + tokens.numel())
+        if r == cp_rank:
+            local = tokens
+    device = torch.cuda.current_device()
+    return (
+        local.pin_memory().to(device, non_blocking=True),
+        gather.pin_memory().to(device, non_blocking=True),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2385,6 +2475,45 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             targets.append("g_proj")
         return targets
 
+    def forward_mla_cp_empty_rank(self, forward_batch: ForwardBatch) -> None:
+        """MLA prefill CP on a rank that owns no rows of this batch: take part
+        in the layer's index-K and latent-KV all-gathers, in the order the
+        other ranks issue them, and store the gathered chunk so this rank's
+        caches stay complete for later chunks."""
+        from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+        from sglang.srt.layers.attention.dsa_backend import (
+            _all_gather_dsa_trtllm_fp8_kv,
+        )
+        from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+        from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+        device = forward_batch.out_cache_loc.device
+        if self.use_dsa and self.should_run_indexer(None):
+            key = cp_all_gather_rerange_output(
+                torch.empty(
+                    (0, self.indexer.head_dim), dtype=torch.bfloat16, device=device
+                ),
+                get_parallel().attn_cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+            self.indexer._store_index_k_cache(
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+                key=key,
+                act_quant=act_quant,
+            )
+        # The trtllm DSA prefill path gathers the FP8-quantized latent KV.
+        fp8 = torch.float8_e4m3fn
+        k_nope, k_rope = _all_gather_dsa_trtllm_fp8_kv(
+            forward_batch,
+            torch.empty((0, self.kv_lora_rank), dtype=fp8, device=device),
+            torch.empty((0, self.qk_rope_head_dim), dtype=fp8, device=device),
+        )
+        get_token_to_kv_pool().set_mla_kv_buffer(
+            self.attn_mqa, forward_batch.out_cache_loc, k_nope, k_rope
+        )
+
     def _precompute_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Issue the output-gate GEMM on the alt stream so it overlaps the
         attention core; the lazy path in the o_proj wrap otherwise computes
@@ -2494,8 +2623,14 @@ class KimiK3DecoderLayer(nn.Module):
         # o_proj in the plain deferred-reduce config (reduce_results forced off
         # below) and reduce-scatters instead.
         attn_tp_size = get_parallel().attn_tp_size
+        self._mla_cp = (
+            envs.SGLANG_K3_MLA_PREFILL_CP.get()
+            and attn_tp_size > 1
+            and not config.is_kda_layer(layer_idx)
+        )
         self.all_reduce_fusion = (
             not self._sp_moe
+            and not self._mla_cp
             and attn_tp_size > 1
             and attn_tp_size == get_tensor_model_parallel_world_size()
             and config.attn_res_block_size is not None
@@ -2516,15 +2651,20 @@ class KimiK3DecoderLayer(nn.Module):
                 bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
             )
         else:
-            self.self_attn = KimiK3MLAAttention(
-                config=config,
-                layer_idx=layer_idx,
-                quant_config=quant_config,
-                prefix=f"{prefix}.self_attn",
-                all_reduce_fusion=self.all_reduce_fusion,
-                alt_stream=alt_streams[1] if alt_streams is not None else None,
-                gate_alt_stream=alt_streams[2] if alt_streams is not None else None,
-            )
+            # MLA prefill CP builds the MLA with replicated weights (all heads
+            # on every attn-TP rank); its output is then already complete.
+            with _mla_cp_view() if self._mla_cp else contextlib.nullcontext():
+                self.self_attn = KimiK3MLAAttention(
+                    config=config,
+                    layer_idx=layer_idx,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.self_attn",
+                    all_reduce_fusion=self.all_reduce_fusion,
+                    alt_stream=alt_streams[1] if alt_streams is not None else None,
+                    gate_alt_stream=(
+                        alt_streams[2] if alt_streams is not None else None
+                    ),
+                )
 
         # MLP / MoE
         if self._is_moe_layer:
@@ -2601,7 +2741,8 @@ class KimiK3DecoderLayer(nn.Module):
             o_proj = getattr(self.self_attn, "o_proj", None)
             assert o_proj is not None, "SP-MoE requires attention exposing o_proj"
             o_proj.reduce_results = False
-            if k3_sp_collective.enabled():
+            # MLA prefill CP: o_proj output is complete, nothing to reduce.
+            if k3_sp_collective.enabled() and not self._mla_cp:
                 # The table selects NVLS pull RS for larger token buckets.
                 # Allocate only those o_proj outputs in multicast symmetric
                 # memory; small push RS keeps the regular graph allocator.
@@ -2691,6 +2832,21 @@ class KimiK3DecoderLayer(nn.Module):
         Returns (reduced tensor, shard row offset, residual_fused); offset is
         -1 when the result covers the full batch (non-SP mode, or fallback
         all-reduce for row counts not divisible by attn_tp)."""
+        if self._mla_cp:
+            # Replicated MLA: every rank holds the complete output, so the
+            # SP-MoE shard is a plain row slice.
+            group = get_parallel().attn_tp_group
+            num_tokens = attn_out.shape[0]
+            if (
+                self._sp_moe
+                and allow_scatter
+                and num_tokens > 0
+                and num_tokens % group.world_size == 0
+            ):
+                shard = num_tokens // group.world_size
+                lo = group.rank_in_group * shard
+                return attn_out[lo : lo + shard], lo, False
+            return attn_out, -1, False
         if not self._sp_moe:
             return attn_out, -1, False
         group = get_parallel().attn_tp_group
@@ -2741,6 +2897,10 @@ class KimiK3DecoderLayer(nn.Module):
             extend_lens = forward_batch.extend_seq_lens_cpu
             if extend_lens is not None:
                 num_real = min(int(sum(extend_lens)), num_padded)
+        if self._mla_cp:
+            return self._run_self_attn_mla_cp(
+                hidden_states, positions, forward_batch, zero_allocator, num_real
+            )
         if num_real != num_padded:
             with k3_sp_collective.o_proj_output_rows(num_padded):
                 attn_out = self._run_self_attn_inner(
@@ -2760,6 +2920,57 @@ class KimiK3DecoderLayer(nn.Module):
         return self._run_self_attn_inner(
             hidden_states, positions, forward_batch, zero_allocator
         )
+
+    def _run_self_attn_mla_cp(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        num_real: int,
+    ) -> torch.Tensor:
+        """Replicated MLA; zigzag-split the real rows over the attn-TP group
+        when the batch carries MLA CP metadata, then all-gather the complete
+        output back into token order."""
+        from sglang.srt.layers.utils.cp_utils import (
+            cp_all_gather_rerange_output,
+            cp_split_and_rebuild_data,
+            cp_split_and_rebuild_position,
+        )
+
+        num_padded = hidden_states.shape[0]
+        hs, pos = hidden_states[:num_real], positions[:num_real]
+        with _mla_cp_view():
+            if forward_batch.attn_cp_metadata is not None:
+                cp_size = get_parallel().attn_cp_size
+                cp_meta = forward_batch.attn_cp_metadata
+                if cp_meta.per_rank_actual_token[get_parallel().attn_cp_rank] == 0:
+                    # Short batch: this rank owns no zigzag rows but must still
+                    # join the layer's all-gathers and store the whole chunk.
+                    self.self_attn.forward_mla_cp_empty_rank(forward_batch)
+                    attn_out = hs.new_empty((0, self.hidden_size))
+                else:
+                    attn_out = self._run_self_attn_inner(
+                        cp_split_and_rebuild_data(forward_batch, hs),
+                        cp_split_and_rebuild_position(forward_batch, pos),
+                        forward_batch,
+                        zero_allocator,
+                    )
+                attn_out = cp_all_gather_rerange_output(
+                    attn_out.contiguous(),
+                    cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+            else:
+                attn_out = self._run_self_attn_inner(
+                    hs, pos, forward_batch, zero_allocator
+                )
+        if num_real == num_padded:
+            return attn_out
+        out = hidden_states.new_zeros(num_padded, attn_out.shape[-1])
+        out[:num_real] = attn_out
+        return out
 
     def _run_self_attn_inner(
         self,
@@ -2903,6 +3114,7 @@ class KimiK3DecoderLayer(nn.Module):
         push_rs_rows = None
         if (
             self._sp_moe
+            and not self._mla_cp
             and k3_sp_collective.push_rs_supported(
                 hidden_states.shape[0], prefix_sum, hidden_states.device
             )
@@ -2924,7 +3136,8 @@ class KimiK3DecoderLayer(nn.Module):
         if self._sp_moe:
             group = get_parallel().attn_tp_group
             if (
-                hidden_states.shape[0] > 0
+                not self._mla_cp
+                and hidden_states.shape[0] > 0
                 and hidden_states.shape[0] % group.world_size == 0
             ):
                 shard = hidden_states.shape[0] // group.world_size
@@ -3373,9 +3586,19 @@ class KimiK3LinearForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         embeds = input_embeds if input_embeds is not None else inputs_embeds
-        hidden_states = self.model(
-            input_ids, positions, forward_batch, embeds, pp_proxy_tensors
+        mla_cp = (
+            envs.SGLANG_K3_MLA_PREFILL_CP.get() and get_parallel().attn_tp_size > 1
         )
+        if mla_cp:
+            _maybe_prepare_mla_cp_metadata(forward_batch)
+        try:
+            hidden_states = self.model(
+                input_ids, positions, forward_batch, embeds, pp_proxy_tensors
+            )
+        finally:
+            if mla_cp:
+                # The draft worker reuses this batch; keep its MLA non-CP.
+                forward_batch.attn_cp_metadata = None
         if self.pp_group.is_last_rank:
             aux_hidden_states = None
             if self.capture_aux_hidden_states:

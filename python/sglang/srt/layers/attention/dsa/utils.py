@@ -79,6 +79,15 @@ def is_dsa_enable_prefill_cp():
     return get_server_args().enable_dsa_prefill_context_parallel
 
 
+def is_k3_mla_prefill_cp():
+    """K3.1 MLA-only prefill CP (SGLANG_K3_MLA_PREFILL_CP): in-seq-split over
+    the attn-TP group, entered per MLA layer by kimi_k3.py. Kept out of
+    is_dsa_prefill_cp_in_seq_split() so the scheduler's one-request-per-batch
+    limit and CP padding for the global DSA CP do not apply; the DSA layer
+    call sites check both."""
+    return envs.SGLANG_K3_MLA_PREFILL_CP.get()
+
+
 def is_dsa_prefill_cp_in_seq_split():
     return (
         is_dsa_enable_prefill_cp()
@@ -274,7 +283,7 @@ def dsa_cp_round_robin_split_q_seqs(
 
 def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
     if dsa_enable_prefill_cp is None:
-        dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        dsa_enable_prefill_cp = is_dsa_enable_prefill_cp() or is_k3_mla_prefill_cp()
     if (
         forward_batch.attn_cp_metadata is not None
         and dsa_enable_prefill_cp

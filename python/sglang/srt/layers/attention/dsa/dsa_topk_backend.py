@@ -114,19 +114,32 @@ class DSATopKBackend(Enum):
         # Single-request PAGED prefill: every row shares the one page-table row
         # and its scores start at column 0 (ks == 0), so the v2 kernel can read
         # a stride-0 broadcast of that row. batch_idx_list, if any, is all zeros.
+        # A one-request slice of a larger batch (the K3 MLA CP indexer, which
+        # passes no row_starts because its K starts at column 0) uses its own
+        # page-table row the same way.
+        page_table = getattr(attn_metadata, "real_page_table", None)
+        single_row = None
+        if page_table is not None and page_table.shape[0] == 1:
+            single_row = 0
+        elif (
+            page_table is not None
+            and row_starts is None
+            and batch_idx_list is not None
+            and len(batch_idx_list) == 1
+        ):
+            single_row = int(batch_idx_list[0])
         if (
             envs.SGLANG_DSA_PREFILL_TOPK_V2.get()
             and topk_transform_method == TopkTransformMethod.PAGED
             and 0 < topk <= 2048
-            and getattr(attn_metadata, "real_page_table", None) is not None
-            and attn_metadata.real_page_table.shape[0] == 1
-            and attn_metadata.real_page_table.dtype == torch.int32
+            and single_row is not None
+            and page_table.dtype == torch.int32
             and logits.dtype == torch.float32
             and logits.stride(1) == 1
             and logits.stride(0) % 4 == 0
         ):
             return _topk_transform_v2_paged_prefill(
-                logits, lengths, topk, attn_metadata
+                logits, lengths, topk, attn_metadata, single_row
             )
 
         # Multi-request PAGED prefill: rows of request b are contiguous and its
@@ -348,10 +361,12 @@ def _topk_transform_v2_paged_prefill(
     lengths: torch.Tensor,
     topk: int,
     attn_metadata,
+    page_table_row: int = 0,
 ) -> torch.Tensor:
-    """Prefill variant of :func:`_topk_transform_v2_paged` for a batch of one
+    """Prefill variant of :func:`_topk_transform_v2_paged` for rows of one
     request: the plan is built from this call's row lengths (prefill metadata
-    carries no ``topk_v2_plan``) and the page table is broadcast per row."""
+    carries no ``topk_v2_plan``) and the request's page-table row is broadcast
+    per row."""
     from sglang.kernels.ops.attention.dsv4.topk import (
         plan_topk_v2,
         topk_transform_512_v2,
@@ -360,7 +375,9 @@ def _topk_transform_v2_paged_prefill(
 
     num_rows = logits.shape[0]
     lengths_i32 = lengths.to(torch.int32)
-    page_table = attn_metadata.real_page_table.expand(num_rows, -1)
+    page_table = attn_metadata.real_page_table[
+        page_table_row : page_table_row + 1
+    ].expand(num_rows, -1)
     plan = plan_topk_v2(lengths_i32)
     out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
     topk_transform_512_v2(

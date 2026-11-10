@@ -17,6 +17,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_graph_dsa_split_op_surface,
+    is_k3_mla_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -256,7 +257,9 @@ def _should_defer_dsa_cp_kv_gather(
     dsa_prefill_cp: bool,
     fuse_rope_for_trtllm_mla: bool,
 ) -> bool:
-    return dsa_prefill_cp and fuse_rope_for_trtllm_mla
+    # K3.1 MLA prefill CP is rope-less and FP8: the DSA trtllm path gathers
+    # the quantized latent KV itself before saving it.
+    return dsa_prefill_cp and (fuse_rope_for_trtllm_mla or is_k3_mla_prefill_cp())
 
 
 class DeepseekMLAForwardMixin:
