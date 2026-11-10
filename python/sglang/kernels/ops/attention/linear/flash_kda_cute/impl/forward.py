@@ -907,6 +907,39 @@ def _plan(
     approximate: bool,
     store_final_state: bool,
 ):
+    return _plan_impl(cu_seqlens, H, T, dev, approximate, store_final_state)
+
+
+def _prime_plan_from_cpu(cu_seqlens, H, T, dev, lengths_cpu):
+    """Prime the ordinary plan from the producer's existing CPU lengths.
+
+    GPU-only/inference metadata keeps the original planner. Keep the original
+    storage/version key and per-plan scratch ownership across batches/streams.
+    No launch epochs, state buffers or scheduling arithmetic change here.
+    """
+    if (
+        cu_seqlens is None
+        or cu_seqlens.dtype != torch.int32
+        or cu_seqlens.is_inference()
+        or not isinstance(lengths_cpu, (list, tuple))
+        or len(lengths_cpu) + 1 != cu_seqlens.numel()
+        or any(type(length) is not int or length <= 0 for length in lengths_cpu)
+        or sum(lengths_cpu) != T
+    ):
+        return False
+    _plan_impl(cu_seqlens, H, T, dev, False, True, _cpu_lengths=tuple(lengths_cpu))
+    return True
+
+
+def _plan_impl(
+    cu_seqlens,
+    H: int,
+    T: int,
+    dev: torch.device,
+    approximate: bool,
+    store_final_state: bool,
+    _cpu_lengths=None,
+):
     """Cached per-cu/H piece plan + midstate ring + epoch counter."""
     key = (
         0 if cu_seqlens is None else cu_seqlens.data_ptr(),
@@ -934,7 +967,11 @@ def _plan(
         lens = [T]
         cu32 = torch.tensor([0, T], dtype=torch.int32, device=dev)
     else:
-        lens = torch.diff(cu_seqlens).tolist()  # one host sync per distinct cu
+        lens = (
+            torch.diff(cu_seqlens).tolist()
+            if _cpu_lengths is None
+            else list(_cpu_lengths)
+        )
         cu32 = cu_seqlens.to(torch.int32)
     nslots = _sm_count(dev)
     if approximate:

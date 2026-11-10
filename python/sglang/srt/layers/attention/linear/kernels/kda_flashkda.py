@@ -1,4 +1,5 @@
-""" flashkda backend """
+"""flashkda backend"""
+
 from typing import Optional, Union
 
 import torch
@@ -224,6 +225,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
             lower_bound=lower_bound,
             native_checkpoint_offsets=offsets if native_checkpoint_used else None,
             cute_checkpoint_plan=cute_plan if native_checkpoint_used else None,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
         )
         if isinstance(out, KDANativeCheckpointResult):
             return out
@@ -374,6 +376,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         native_checkpoint_offsets: Optional[torch.Tensor] = None,
         cute_checkpoint_plan: Optional[CuTeCheckpointPlan] = None,
+        extend_seq_lens_cpu: Optional[list] = None,
     ) -> Union[torch.Tensor, KDANativeCheckpointResult]:
         flash_kda = _load_flash_kda()
 
@@ -404,8 +407,30 @@ class FlashKDAKernel(LinearAttnKernelBase):
         if dt_bias is not None:
             dt_bias = dt_bias.reshape(num_heads, -1).float().contiguous()
 
-        # cu_seqlens must be int64 for flash_kda (FLA casts to long).
-        cu_seqlens = query_start_loc.to(torch.int64)
+        if isinstance(self._native_checkpoint_adapter, CuTeCheckpointAdapter):
+            # The in-tree CuTe planner accepts int32 and keys its plan on
+            # the shared metadata tensor's storage/version (or values for
+            # inference tensors). Keep one identity across this batch's
+            # layers instead of allocating a fresh int64 vector per layer.
+            cu_seqlens = query_start_loc
+        else:
+            # The external FlashKDA ABI continues to receive int64.
+            cu_seqlens = query_start_loc.to(torch.int64)
+
+        if native_checkpoint_offsets is None and isinstance(
+            self._native_checkpoint_adapter, CuTeCheckpointAdapter
+        ):
+            from sglang.kernels.ops.attention.linear.flash_kda_cute.impl.forward import (
+                _prime_plan_from_cpu,
+            )
+
+            _prime_plan_from_cpu(
+                cu_seqlens,
+                num_heads,
+                q.shape[0] * q.shape[1],
+                q.device,
+                extend_seq_lens_cpu,
+            )
 
         # flash_kda varlen state is [N, H, V, K] -- the SAME layout as sglang's
         # KDA pool, so no transpose is needed. Advanced indexing copies, so the
