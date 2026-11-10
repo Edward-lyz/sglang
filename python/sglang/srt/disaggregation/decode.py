@@ -2271,6 +2271,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
+            self.iter_start_time = time.perf_counter()
+            self.metrics_reporter.iter_start_time = self.iter_start_time
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -2310,6 +2312,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
+            self.iter_start_time = time.perf_counter()
+            self.metrics_reporter.iter_start_time = self.iter_start_time
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
