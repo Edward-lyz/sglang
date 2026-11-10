@@ -28,6 +28,9 @@ from .transport import (
     _PassiveStore,
     _sdk_pod_config,
     _standard_namespace,
+    cache_digest_enabled,
+    cache_digest_logger,
+    page_digest,
 )
 from .types import (
     AttentionStoreBinding,
@@ -120,6 +123,57 @@ class KDACheckpointStore:
             )
         return dict(slot_map), int(slot_map[self._slot_group])
 
+    def _snapshot_digests(self, slot_id: int) -> Optional[list]:
+        """Hash one KDA state slot in HBM, first and last layer per component.
+
+        State buffers are ``[layer, slot, ...]``, so the slot has to be indexed
+        inside a layer row. Only the first and last component (temporal head,
+        conv tail) and the first and last layer are hashed: hashing every
+        component of every layer costs a D2H copy each and adds nothing when the
+        point is to compare a write against its read-back.
+        """
+        if not cache_digest_enabled():
+            return None
+        try:
+            tensors = getattr(self.layout, "tensors", ())
+            if not tensors:
+                return None
+            names = getattr(self.layout, "payload_fields", ())
+            components = [0] if len(tensors) == 1 else [0, len(tensors) - 1]
+            snapshot = []
+            for component in components:
+                tensor = tensors[component]
+                layer_num = int(tensor.shape[0])
+                layers = [0] if layer_num == 1 else [0, layer_num - 1]
+                name = names[component] if component < len(names) else str(component)
+                for layer in layers:
+                    snapshot.append((name, layer, page_digest(tensor[layer], slot_id)))
+            return snapshot
+        except Exception as exc:  # diagnostic only, never break the transfer
+            cache_digest_logger.warning("AS kda digest snapshot failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _emit_digests(
+        action: str,
+        snapshot: Optional[list],
+        block_hash_id: int,
+        slot_id: int,
+        transferred: int,
+    ) -> None:
+        """Print a captured KDA state digest so read-back can be compared."""
+        if not snapshot:
+            return
+        cache_digest_logger.info(
+            "AS %s digest: family=kda_state slot=%d block_hash_id=%d "
+            "transferred=%s digests=%s",
+            action,
+            int(slot_id),
+            int(block_hash_id),
+            transferred,
+            snapshot,
+        )
+
     def match(self, block_hash_ids: Sequence[int], timeout: float = 1.0) -> int:
         """Return the matched KDA checkpoint prefix length."""
         from attentionstore_sdk.sdk import MatchRequest
@@ -161,10 +215,14 @@ class KDACheckpointStore:
             params=params or {},
         )
         self._acquire_sdk_lock(remaining, "write")
+        # Snapshot before the SDK call: this is the state content the Agent gets.
+        snapshot = self._snapshot_digests(slot_id)
         try:
-            return self._sdk.write(request)
+            written = self._sdk.write(request)
         finally:
             self._sdk_lock.release()
+        self._emit_digests("write", snapshot, block_hash_id, slot_id, written)
+        return written
 
     def read(
         self,
@@ -200,6 +258,9 @@ class KDACheckpointStore:
                 self._unpack_hook([slot_map])
         finally:
             self._sdk_lock.release()
+        self._emit_digests(
+            "read", self._snapshot_digests(slot_id), block_hash_id, slot_id, count
+        )
         return count
 
     def stop(self) -> None:
@@ -506,21 +567,17 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
             )
             if checkpoint_binding.layer_num != len(ctx.state_layer_ids):
                 raise ValueError("KDA state manifest and local buffer counts differ")
-            checkpoint_binding = _KDACheckpointBinding(
-                layer_num=ctx.state_layer_num,
-                temporal_bytes=checkpoint_binding.temporal_bytes,
-                conv_bytes=checkpoint_binding.conv_bytes,
-                state_ptrs=pad_component_major_pointers(
-                    checkpoint_binding.state_ptrs,
-                    checkpoint_binding.layer_num,
-                    ctx.state_layer_num,
-                ),
-                tensors=checkpoint_binding.tensors,
-                payload_fields=checkpoint_binding.payload_fields,
-                device=checkpoint_binding.device,
-                pack_validator=checkpoint_binding.pack_validator,
-                unpack_hook=checkpoint_binding.unpack_hook,
+            is_kda_single_shard = "kda-state" in ctx.endpoint_registrations
+            state_layer_ids = (
+                tuple(ctx.state_layer_ids)
+                if is_kda_single_shard
+                else tuple(range(ctx.state_layer_num))
             )
+            state_layer_num = len(state_layer_ids)
+            # The request carries this client's compact layer IDs and must
+            # carry exactly this client's component-major pointers.  Padding
+            # with the last pointer would alias another PP client's layer and
+            # also make the SDK's layer/pointer count inconsistent.
             checkpoint_sdk = AttentionStoreSDK(
                 _sdk_pod_config(
                     ctx,
@@ -529,9 +586,12 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
                     gpu_count=checkpoint_chunks,
                 ),
                 KDAConfig(
-                    layer_num=ctx.state_layer_num,
-                    shard_id=ctx.state_shard_id,
-                    shard_num=ctx.state_shard_num,
+                    # The Agent namespace is shared by all PP clients on the
+                    # node.  Register its complete layer geometry, while the
+                    # checkpoint store retains only this client's pointers.
+                    layer_num=ctx.state_layer_num if is_kda_single_shard else state_layer_num,
+                    shard_id=0 if is_kda_single_shard else ctx.state_shard_id,
+                    shard_num=1 if is_kda_single_shard else ctx.state_shard_num,
                     block_token_size=ctx.block_size,
                     temporal_bytes=checkpoint_binding.temporal_bytes,
                     conv_bytes=checkpoint_binding.conv_bytes,
@@ -542,10 +602,12 @@ def create_kda_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
                 checkpoint_sdk,
                 checkpoint_binding,
                 slot_group="checkpoint",
-                layer_ids=range(ctx.state_layer_num),
+                layer_ids=state_layer_ids,
             )
             checkpoint_layout_id = "kda-state"
-            checkpoint_bytes = checkpoint_binding.bytes_per_layer * ctx.state_layer_num
+            checkpoint_bytes = (
+                checkpoint_binding.bytes_per_layer * ctx.state_layer_num
+            )
             checkpoint_fields = checkpoint_binding.payload_fields
         else:
             checkpoint_store = _PassiveStore()

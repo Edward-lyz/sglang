@@ -1210,6 +1210,42 @@ class Scheduler(
                 "AttentionStore manifest preparation failed on another cache-group rank"
             )
 
+        cache_member_count, _ = attention_store_agent_group_membership(
+            self.ps.pp_size, server_args.nnodes, server_args.node_rank
+        )
+        if init_error is None and cache_plan.name == "KDA":
+            # Agent memory/indexes use a compact layer coordinate
+            # (0..layer_num-1), while the model pools expose global layer IDs.
+            # KDA clients on one node share one shard, so derive that
+            # coordinate once from the node-wide layer union and give every
+            # PP client its own compact IDs.  Keeping this conversion at the
+            # manifest boundary leaves the local buffer order untouched.
+            compact_manifests = list(pp_manifests)
+            for member_id in range(cache_member_count):
+                member_start, member_end = attention_store_node_pp_range(
+                    self.ps.pp_size, cache_member_count, member_id
+                )
+                member_manifests = compact_manifests[member_start:member_end]
+                for layer_key in ("page_layer_ids", "state_layer_ids"):
+                    layer_union = []
+                    seen_layer_ids = set()
+                    for manifest in member_manifests:
+                        for layer_id in manifest[layer_key]:
+                            layer_id = int(layer_id)
+                            if layer_id not in seen_layer_ids:
+                                seen_layer_ids.add(layer_id)
+                                layer_union.append(layer_id)
+                    compact_ids = {
+                        layer_id: compact_id
+                        for compact_id, layer_id in enumerate(layer_union)
+                    }
+                    for manifest in member_manifests:
+                        manifest[layer_key] = tuple(
+                            compact_ids[int(layer_id)]
+                            for layer_id in manifest[layer_key]
+                        )
+            pp_manifests = compact_manifests
+
         def create_binding_from_manifests():
             cache_member_count, local_cache_member_id = (
                 attention_store_agent_group_membership(
@@ -1228,6 +1264,13 @@ class Scheduler(
                     "AttentionStore PP rank is outside its computed node role: "
                     f"rank={pp_rank}, role=[{node_pp_start}, {node_pp_end})"
                 )
+            local_manifest = node_manifests[local_pp_offset]
+            # The registration geometry and the I/O binding must use the same
+            # compact coordinate.  The original page/state variables above
+            # are model-global IDs and are only valid for indexing local
+            # SGLang pools, not for the shared-shard Agent protocol.
+            page_layer_ids = tuple(local_manifest["page_layer_ids"])
+            state_layer_ids = tuple(local_manifest["state_layer_ids"])
 
             def endpoint_geometry(endpoint_index: int):
                 endpoint_key = (
@@ -1239,6 +1282,7 @@ class Scheduler(
                     local_pp_offset,
                     self.ps.attn_tp_rank,
                     self.ps.attn_tp_size,
+                    single_shard=cache_plan.name == "KDA",
                 )
 
             page_shard_id, page_shard_num, page_layer_num = endpoint_geometry(0)
@@ -1338,6 +1382,7 @@ class Scheduler(
                                 [manifest[layer_key] for manifest in member_manifests],
                                 per_layer_sizes.pop(),
                                 endpoint_tp_size,
+                                single_shard=cache_plan.name == "KDA",
                             )
                         )
                         members.append(

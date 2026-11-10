@@ -108,17 +108,15 @@ def _create_mha_page_endpoint(
     local_layer_ids = tuple(range(int(pool.layer_num)))
     if not local_layer_ids:
         raise ValueError("MHA page endpoint requires at least one attention layer")
-    key_buffers = pad_layer_buffers(
-        [_key_buffer(pool, layer_id) for layer_id in local_layer_ids],
-        ctx.page_layer_num,
-        "MHA K",
-    )
-    value_buffers = pad_layer_buffers(
-        [_value_buffer(pool, layer_id) for layer_id in local_layer_ids],
-        ctx.page_layer_num,
-        "MHA V",
-    )
-    buffer_pools = [pool] * ctx.page_layer_num
+    is_kda = registration_endpoint_name == "kda-page"
+    layer_ids = tuple(ctx.page_layer_ids) if is_kda else local_layer_ids
+    target_layer_num = len(layer_ids) if is_kda else ctx.page_layer_num
+    key_buffers = [_key_buffer(pool, layer_id) for layer_id in local_layer_ids]
+    value_buffers = [_value_buffer(pool, layer_id) for layer_id in local_layer_ids]
+    if not is_kda:
+        key_buffers = pad_layer_buffers(key_buffers, target_layer_num, "MHA K")
+        value_buffers = pad_layer_buffers(value_buffers, target_layer_num, "MHA V")
+    buffer_pools = [pool] * target_layer_num
     block_size = (
         ctx.block_size if registration_endpoint_name == "kda-page" else ctx.page_size
     )
@@ -132,7 +130,7 @@ def _create_mha_page_endpoint(
         "MHA",
         block_size,
         {"k": key_buffers, "v": value_buffers},
-        range(ctx.page_layer_num),
+        layer_ids,
     )
     sdk = AttentionStoreSDK(
         _sdk_pod_config(
@@ -143,7 +141,10 @@ def _create_mha_page_endpoint(
             gpu_count=gpu_count,
         ),
         MHAConfig(
-            layer_num=ctx.page_layer_num,
+            # KDA clients share one namespace on the node.  Register the
+            # complete node geometry; the request still contains only this
+            # client's layer_ids and matching buffers.
+            layer_num=ctx.page_layer_num if is_kda else target_layer_num,
             shard_id=ctx.page_shard_id,
             shard_num=ctx.page_shard_num,
             block_token_size=block_size,
@@ -159,7 +160,7 @@ def _create_mha_page_endpoint(
         store=_BufferPageIO(
             sdk,
             bindings,
-            range(ctx.page_layer_num),
+            layer_ids,
             buffer_tensors={"k": key_buffers, "v": value_buffers},
             buffer_pools={"k": buffer_pools, "v": buffer_pools},
             local_page_size=ctx.page_size,
@@ -167,7 +168,8 @@ def _create_mha_page_endpoint(
         ),
         namespace=namespace,
         layout_id=layout_id,
-        bytes_per_block=(k_bytes + v_bytes) * ctx.page_layer_num,
+        bytes_per_block=(k_bytes + v_bytes)
+        * (ctx.page_layer_num if is_kda else target_layer_num),
         payload_fields=("k", "v"),
     )
 
@@ -190,12 +192,13 @@ def _create_mla_page_endpoint(
     local_layer_ids = tuple(range(int(pool.layer_num)))
     if not local_layer_ids:
         raise ValueError("MLA page endpoint requires at least one attention layer")
-    kv_buffers = pad_layer_buffers(
-        [_key_buffer(pool, layer_id) for layer_id in local_layer_ids],
-        ctx.page_layer_num,
-        "MLA latent KV",
-    )
-    buffer_pools = [pool] * ctx.page_layer_num
+    is_kda = registration_endpoint_name == "kda-page"
+    layer_ids = tuple(ctx.page_layer_ids) if is_kda else local_layer_ids
+    target_layer_num = len(layer_ids) if is_kda else ctx.page_layer_num
+    kv_buffers = [_key_buffer(pool, layer_id) for layer_id in local_layer_ids]
+    if not is_kda:
+        kv_buffers = pad_layer_buffers(kv_buffers, target_layer_num, "MLA latent KV")
+    buffer_pools = [pool] * target_layer_num
     kv_bytes = _uniform_page_bytes(
         kv_buffers, buffer_pools, ctx.block_size, "MLA latent KV"
     )
@@ -204,7 +207,7 @@ def _create_mla_page_endpoint(
         "MLA",
         ctx.block_size,
         {"kv_latent": kv_buffers},
-        range(ctx.page_layer_num),
+        layer_ids,
     )
     sdk = AttentionStoreSDK(
         _sdk_pod_config(
@@ -216,7 +219,11 @@ def _create_mla_page_endpoint(
             pod_name=f"{ctx.pod_name}-tp{ctx.tp_rank}" if ctx.tp_size > 1 else None,
         ),
         MLAConfig(
-            layer_num=ctx.page_layer_num,
+            # For KDA shared-shard registration this is the complete
+            # node-local layer geometry.  target_layer_num remains the local
+            # pointer/buffer count so a PP client does not fabricate buffers
+            # for layers owned by another client.
+            layer_num=ctx.page_layer_num if is_kda else target_layer_num,
             shard_id=ctx.page_shard_id // ctx.tp_size,
             shard_num=ctx.page_shard_num // ctx.tp_size,
             block_token_size=ctx.block_size,
@@ -231,7 +238,7 @@ def _create_mla_page_endpoint(
         store=_BufferPageIO(
             sdk,
             bindings,
-            range(ctx.page_layer_num),
+            layer_ids,
             buffer_tensors={"k": kv_buffers},
             buffer_pools={"k": buffer_pools},
             local_page_size=ctx.page_size,
@@ -239,7 +246,7 @@ def _create_mla_page_endpoint(
         ),
         namespace=namespace,
         layout_id=layout_id,
-        bytes_per_block=kv_bytes * ctx.page_layer_num,
+        bytes_per_block=kv_bytes * (ctx.page_layer_num if is_kda else target_layer_num),
         payload_fields=("kv_latent",),
     )
 
