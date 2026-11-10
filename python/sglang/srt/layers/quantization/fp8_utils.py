@@ -834,6 +834,30 @@ def set_prequantized_input(
     _PREQUANTIZED_INPUT = (x, q, scale)
 
 
+def consumes_prequantized_input(layer: torch.nn.Module) -> bool:
+    """Whether ``layer`` is a DeepGEMM block-FP8 linear (group 128, UE8M0)
+    that picks up a registered pre-quantized input."""
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    method = getattr(layer, "quant_method", None)
+    weight = getattr(layer, "weight", None)
+    return (
+        isinstance(method, Fp8LinearMethod)
+        and method.block_quant
+        and not method.use_marlin
+        and not method.use_mxfp8
+        and method.w8a8_block_fp8_linear is deepgemm_w8a8_block_fp8_linear_with_fallback
+        and list(method.weight_block_size) == [128, 128]
+        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and not _is_musa
+        and weight is not None
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.shape[0] % 64 == 0
+        and weight.shape[1] % 128 == 0
+    )
+
+
 def _lookup_prequantized_input(
     x: torch.Tensor,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:

@@ -37,6 +37,10 @@ from sglang.srt.layers import (
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.quantization.fp8_utils import (
+    consumes_prequantized_input,
+    set_prequantized_input,
+)
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -306,6 +310,8 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
 
 # One-shot log guard: proves the fused SiTU+quant MLP path is live.
 _ACT_QUANT_LOGGED = False
+# One-shot log guard: proves the fused MLA output gate + o_proj quant is live.
+_MLA_GATE_QUANT_LOGGED = False
 
 
 class KimiK3MLP(nn.Module):
@@ -2198,7 +2204,18 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     )
                     from sglang.kernels.ops.kimi_k3 import mla_output_gate
 
-                    if mla_output_gate.covered(x, gate):
+                    if (
+                        mla_output_gate.covered(x, gate)
+                        and mla_output_gate.quant_covered(x)
+                        and self._o_proj_takes_prequant_input()
+                    ):
+                        # Gate and the o_proj input quant in one kernel; the
+                        # DeepGEMM o_proj picks the pair up for this x.
+                        x, q, q_scale = mla_output_gate.kimi_k3_mla_output_gate_quant(
+                            x, gate
+                        )
+                        set_prequantized_input(x, q, q_scale)
+                    elif mla_output_gate.covered(x, gate):
                         # One kernel for x * sigmoid(gate); double rounding
                         # matches the unfused pair bit-for-bit.
                         x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
@@ -2207,6 +2224,22 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
+            self._o_proj_takes_prequant = None
+
+    def _o_proj_takes_prequant_input(self) -> bool:
+        """o_proj is a DeepGEMM block-FP8 linear, so the output gate can hand
+        it a pre-quantized input. Resolved on first use (after weight load)."""
+        takes = self._o_proj_takes_prequant
+        if takes is None:
+            takes = envs.SGLANG_K3_MLA_GATE_QUANT.get() and consumes_prequantized_input(
+                self.o_proj
+            )
+            self._o_proj_takes_prequant = takes
+            global _MLA_GATE_QUANT_LOGGED
+            if takes and not _MLA_GATE_QUANT_LOGGED:
+                _MLA_GATE_QUANT_LOGGED = True
+                logger.info("K3 MLA output gate + o_proj quant fusion active")
+        return takes
 
     def weight_shard_targets(self) -> List[str]:
         """Dotted paths of MLA weights that runtime weight sharding may split.

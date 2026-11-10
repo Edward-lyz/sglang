@@ -426,6 +426,9 @@ class Envs:
     # route_radix also stores the top-k ids as int64 for DeepEP dispatch,
     # saving the int32 -> int64 cast kernel.
     SGLANG_K3_ROUTE_RADIX_INT64_IDS = EnvBool(False)
+    # MLA output gate kernel also emits the DeepGEMM block-FP8 input quant
+    # that o_proj consumes.
+    SGLANG_K3_MLA_GATE_QUANT = EnvBool(False)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
