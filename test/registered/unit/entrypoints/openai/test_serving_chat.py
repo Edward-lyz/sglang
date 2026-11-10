@@ -2569,5 +2569,59 @@ class InklingReasoningEffortTest(unittest.TestCase):
         )
 
 
+class EPDTaskResultsValidationTest(unittest.TestCase):
+    """An EPD server must refuse media it cannot encode."""
+
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.chat = OpenAIServingChat(self.tm, _MockTemplateManager())
+
+    def _set_epd(self, enabled: bool):
+        self.tm.server_args.epd_requires_task_results.return_value = enabled
+
+    def _media_request(self, **kwargs):
+        return ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "http://img"}},
+                        {"type": "text", "text": "What is this?"},
+                    ],
+                }
+            ],
+            **kwargs,
+        )
+
+    def test_rejects_media_without_task_results(self):
+        self._set_epd(True)
+        error = self.chat._validate_request(self._media_request())
+        self.assertIn("task_results", error)
+
+    def test_rejects_media_with_empty_task_results(self):
+        self._set_epd(True)
+        error = self.chat._validate_request(self._media_request(task_results=[]))
+        self.assertIn("task_results", error)
+
+    def test_accepts_media_with_task_results(self):
+        self._set_epd(True)
+        request = self._media_request(
+            is_mm_request=True, task_results=[{"task_id": "t0"}]
+        )
+        self.assertIsNone(self.chat._validate_request(request))
+
+    def test_accepts_text_only_request(self):
+        self._set_epd(True)
+        request = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        self.assertIsNone(self.chat._validate_request(request))
+
+    def test_pd_server_still_encodes_media_locally(self):
+        self._set_epd(False)
+        self.assertIsNone(self.chat._validate_request(self._media_request()))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -49,6 +49,7 @@ class SchedulerRequestReceiver:
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
+    disagg_prefill_mm_prealloc_queue: Any
     ps: ParallelState
     tp_group: Any
     tp_cpu_group: Any
@@ -224,7 +225,11 @@ class SchedulerRequestReceiver:
             and self.server_args.encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
         ):
-            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            recv_reqs, mm_waiting_reqs, abort_reqs = (
+                self.mm_receiver.process_waiting_requests(recv_reqs)
+            )
+            if mm_waiting_reqs:
+                self.disagg_prefill_mm_prealloc_queue.extend(mm_waiting_reqs)
             for req, error_msg, error_code in abort_reqs:
                 if error_code is None:
                     status_code = HTTPStatus.INTERNAL_SERVER_ERROR

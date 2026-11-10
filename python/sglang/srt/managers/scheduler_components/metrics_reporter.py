@@ -525,6 +525,17 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
+    def _mm_queue_stats(self) -> str:
+        """Per-stage EPD embedding queue depths, or "" when EPD is off."""
+        prealloc_queue = self.scheduler.disagg_prefill_mm_prealloc_queue
+        transfer_queue = self.scheduler.disagg_prefill_mm_transfer_queue
+        if prealloc_queue is None or transfer_queue is None:
+            return ""
+        return (
+            f"#mm-prealloc-req: {len(prealloc_queue.queue)}, "
+            f"#mm-transfer-req: {len(transfer_queue.queue)}, "
+        )
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
@@ -575,14 +586,7 @@ class SchedulerMetricsReporter:
             num_optimistic = sum(1 for r in batch.reqs if r.pending_bootstrap)
             msg += f"#optimistic-req: {num_optimistic}, "
 
-        if (
-            self.scheduler.server_args.language_only
-            and self.scheduler.server_args.encoder_transfer_backend
-            == "zmq_to_scheduler"
-        ):
-            msg += (
-                f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
-            )
+        msg += self._mm_queue_stats()
 
         msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
@@ -820,14 +824,7 @@ class SchedulerMetricsReporter:
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
 
-        if (
-            self.scheduler.server_args.language_only
-            and self.scheduler.server_args.encoder_transfer_backend
-            == "zmq_to_scheduler"
-        ):
-            msg += (
-                f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
-            )
+        msg += self._mm_queue_stats()
 
         msg += (
             f"{self._graph_backend_label}: {can_run_cuda_graph}, "

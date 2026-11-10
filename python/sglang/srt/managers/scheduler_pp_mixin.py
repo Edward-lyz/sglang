@@ -6,7 +6,8 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -14,7 +15,11 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.embedding_transfer.request import metadata_only_recv_req
+from sglang.srt.disaggregation.utils import (
+    poll_and_all_reduce_attn_cp_tp_group,
+    prepare_abort,
+)
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -45,6 +50,9 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
+PPTransferStatus = Tuple[List[str], List[str]]
+PPReleasePayload = Union[List[str], PPTransferStatus]
+
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
@@ -58,9 +66,39 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
+def _pp_ordered_intersection(left: List[str], right: List[str]) -> List[str]:
+    right_set = set(right)
+    return [rid for rid in left if rid in right_set]
+
+
+def _pp_ordered_union(left: List[str], right: List[str]) -> List[str]:
+    seen = set(left)
+    merged = list(left)
+    for rid in right:
+        if rid not in seen:
+            seen.add(rid)
+            merged.append(rid)
+    return merged
+
+
+def _pp_merge_transfer_status(
+    previous: PPTransferStatus,
+    current: PPTransferStatus,
+) -> PPTransferStatus:
+    previous_success, previous_failed = previous
+    current_success, current_failed = current
+    failed = _pp_ordered_union(previous_failed, current_failed)
+    success = _pp_ordered_intersection(previous_success, current_success)
+    if failed:
+        failed_set = set(failed)
+        success = [rid for rid in success if rid not in failed_set]
+    return success, failed
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
+    forward_done: torch.Event
 
 
 class SchedulerPPMixin:
@@ -217,8 +255,8 @@ class SchedulerPPMixin:
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
         consensus_bootstrapped_rids: Optional[List[str]] = None
-        transferred_rids: List[str] = []
-        release_rids: Optional[List[str]] = None
+        transferred_rids: PPTransferStatus = ([], [])
+        release_rids: Optional[PPTransferStatus] = None
         send_bootstrapped_work = []
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
@@ -240,6 +278,7 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+                recv_reqs = self._pp_pd_get_mm_ready_reqs(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -319,6 +358,9 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
+                    # d2h_event misses forward_stream, which reads the pinned pages.
+                    if self.disagg_prefill_mm_prealloc_queue is not None:
+                        self.mb_metadata[next_mb_id].forward_done.synchronize()
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -816,18 +858,50 @@ class SchedulerPPMixin:
                 )
             )
             self.waiting_queue.extend(good_reqs)
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
+            return [
+                [req.rid for req in good_reqs],
+                _pp_ordered_union(
+                    bad_consensus_bootstrapped_rids,
+                    [req.rid for req in failed_reqs],
+                ),
+            ]
         return None
+
+    def _pp_pd_get_mm_ready_reqs(self: Scheduler, recv_reqs: List) -> List:
+        """Admit EPD requests locally and append the copies to relay downstream."""
+        mm_ready = self.process_disagg_prefill_mm_queues()
+        if not mm_ready:
+            return recv_reqs
+
+        relayed = []
+        admitted = []
+        for req in mm_ready:
+            if not self.pp_group.is_last_rank:
+                try:
+                    relayed.append(metadata_only_recv_req(req))
+                except ValueError as e:
+                    logger.error("EPD relay rejected %s: %s", req.rid, e)
+                    self._pp_abort_unrelayable_mm_req(req, str(e))
+                    continue
+            admitted.append(req)
+
+        if admitted:
+            self.process_input_requests(admitted)
+        if not relayed:
+            return recv_reqs
+        return recv_reqs + relayed
+
+    def _pp_abort_unrelayable_mm_req(self: Scheduler, recv_req, error_msg: str) -> None:
+        """Fail one un-relayable EPD request instead of every rank."""
+        req = self.mm_receiver.create_req(recv_req)
+        prepare_abort(req, error_msg, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
-            # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            good_bootstrapped_rids, bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
@@ -835,42 +909,34 @@ class SchedulerPPMixin:
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
+            good_bootstrapped_rids = _pp_ordered_intersection(
+                prev_good_bootstrapped_rids,
+                curr_good_bootstrapped_rids,
             )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
+            bad_bootstrapped_rids = _pp_ordered_union(
+                prev_bad_bootstrapped_rids,
+                curr_bad_bootstrapped_rids,
             )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
-    def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
+    def _pp_pd_get_prefill_transferred_ids(
+        self: Scheduler,
+    ) -> PPTransferStatus:
         # get the current stage transfer success
+        current_status = self.get_transferred_rids()
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = current_status
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
+            previous_status = self._pp_recv_pyobj_from_prev_stage()
+            transferred_rids = _pp_merge_transfer_status(
+                previous=previous_status,
+                current=current_status,
             )
         return transferred_rids
 
@@ -899,10 +965,10 @@ class SchedulerPPMixin:
 
     def _pp_pd_send_consensus_release_ids(
         self: Scheduler,
-        tmbs: List[List[str]],
+        tmbs: List[Optional[PPReleasePayload]],
         next_first_rank_mb_id: int,
-        release_rids: List[str],
-        transferred_rids: List[str],
+        release_rids: Optional[PPReleasePayload],
+        transferred_rids: PPReleasePayload,
     ):
         send_release_work = []
         if self.pp_group.is_last_rank:
@@ -1135,13 +1201,40 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        # PP outputs may be on CPU after result processing, while draft state is
+        # filtered with device-resident batch indices.
+        next_token_ids = pp_outputs["next_token_ids"].to(
+            device=batch.device,
+            dtype=torch.int64,
+            non_blocking=True,
+        )
+        # Fail loud on a PP batch divergence: if the last stage sampled a
+        # different number of tokens than this rank's batch holds, the relay
+        # below would either raise an opaque broadcast error or, when the two
+        # sizes happen to match with different members, silently write tokens
+        # into the wrong slots.
+        assert next_token_ids.shape[0] == batch.req_pool_indices.shape[0], (
+            "PP batch size mismatch between stages: "
+            f"next_token_ids={next_token_ids.shape[0]} "
+            f"req_pool_indices={batch.req_pool_indices.shape[0]}"
+        )
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
         self.future_map.stash(
             batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
         )
+        next_draft_input = None
+        if batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+
+            next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            batch.spec_info = next_draft_input
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
@@ -1150,6 +1243,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
         )
         return output_result
 
@@ -1285,11 +1379,12 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
-                mb_metadata[mb_id] = PPBatchMetadata(
-                    can_run_cuda_graph=result.can_run_cuda_graph,
-                )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                mb_metadata[mb_id] = PPBatchMetadata(
+                    can_run_cuda_graph=result.can_run_cuda_graph,
+                    forward_done=event,
+                )
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(

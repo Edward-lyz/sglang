@@ -46,7 +46,13 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.encode_receiver_aiak import create_mm_receiver
+from sglang.srt.disaggregation.encode_utils import (
+    expand_media_placeholders_with_offsets,
+    num_tokens_from_grid,
+    original_image_sizes_from_task_results,
+    update_raw_text,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -77,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     SessionParams,
     ShutdownReq,
+    TokenizeReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -125,6 +132,7 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
+from sglang.srt.utils.common import load_image
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     collect_scheduler_processes,
     pyspy_dump_schedulers,
@@ -145,6 +153,33 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _reject_missing_dispatched_encoder_embedding(server_args, request_obj, mm_inputs):
+    """Do not silently turn a failed EPD request into local vision work."""
+    if (
+        mm_inputs is None
+        and server_args.language_only
+        and server_args.encoder_transfer_backend == "zmq_to_tokenizer"
+        and request_obj.need_wait_for_mm_inputs
+    ):
+        raise fastapi.HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            detail=(
+                "The encoder did not return multimodal embeddings. "
+                "The request was not run locally in language-only mode."
+            ),
+        )
+
+
+def _read_image_size(image) -> Tuple[int, int]:
+    """Return an image's ``(width, height)`` without decoding its pixels.
+
+    ``load_image`` with GPU decode disabled hands back a lazily opened PIL
+    image, so the size comes from the header alone.
+    """
+    image, size = load_image(image, gpu_image_decode=False)
+    return tuple(size) if size is not None else (image.width, image.height)
 
 
 @lru_cache(maxsize=1)
@@ -327,6 +362,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init request dispatcher
         self.init_request_dispatcher()
+        if envs.AIAK_ENABLE_TRACE.get():
+            from msit_llm.sglang import encoder_tracer
+
+            self.msit_request_logger = encoder_tracer.RequestTracer(
+                self.tokenizer, envs.AIAK_MSIT_TRACE_DIR.get(), self.server_args
+            )
 
     def init_model_config(self):
         server_args = self.server_args
@@ -447,6 +488,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.tokenize_req_futures: Dict[str, asyncio.Future] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -609,6 +651,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             [
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (TokenizeReqOutput, self._handle_tokenize_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
@@ -631,23 +674,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        tokenizer_rev_request_time: Optional[float] = None,
     ):
         self.auto_create_handle_loop()
+
+        # Record the time when the tokenizer receives the request, used to
+        # observe `sglang:request_time_to_tokenizer_ready_seconds`.
+        if tokenizer_rev_request_time is None:
+            tokenizer_rev_request_time = time.time()
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
 
-        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            dp_size = self.elastic_worker_count
-            if dp_size <= 1 and obj.routed_dp_rank == 0:
-                logger.debug(
-                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
-                )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
-                raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
-                )
+        logger.info(f"[trace] tokenizer received request rid={obj.rid}")
+
+        self._validate_routed_dp_rank(obj)
 
         self._init_req_state(obj, request)
         try:
@@ -685,6 +727,110 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # path are left untouched (pop is a no-op).
             self._discard_pending_req_states(obj)
             raise
+
+    def _validate_routed_dp_rank(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
+            dp_size = self.elastic_worker_count
+            if dp_size <= 1 and obj.routed_dp_rank == 0:
+                logger.debug(
+                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
+                )
+            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+                raise ValueError(
+                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
+                )
+
+    async def tokenize_request(
+        self,
+        obj: GenerateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Union[List[int], List[List[int]]]:
+        """Return the prompt IDs that the scheduler would use for generation."""
+        self.auto_create_handle_loop()
+
+        obj.normalize_batch_and_arguments()
+        self._set_default_priority(obj)
+        self._validate_routed_dp_rank(obj)
+
+        logger.info(f"[trace] tokenizer received tokenize-only request rid={obj.rid}")
+
+        self._init_req_state(obj, request)
+        lora_acquired = False
+        try:
+            if self.server_args.language_only:
+                self._handle_epd_disaggregation_encode_request(obj)
+
+            self.request_logger.log_received_request(obj, self.tokenizer, request)
+
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+            async with self.model_update_lock.reader_lock:
+                await self._validate_and_resolve_lora(obj)
+                lora_acquired = bool(obj.lora_path)
+
+                if obj.is_single:
+                    tokenized_obj = await self._tokenize_one_request(obj)
+                    return await self._send_tokenize_only_request(tokenized_obj)
+
+                batch_size = obj.batch_size
+                if getattr(obj, "parallel_sample_num", 1) == 1 and (
+                    self._should_use_batch_tokenization(batch_size, obj)
+                ):
+                    tokenized_objs = await self._batch_tokenize_and_process(
+                        batch_size, obj
+                    )
+                else:
+                    tokenized_objs = await asyncio.gather(
+                        *(self._tokenize_one_request(obj[i]) for i in range(batch_size))
+                    )
+
+                return await asyncio.gather(
+                    *(
+                        self._send_tokenize_only_request(tokenized_obj)
+                        for tokenized_obj in tokenized_objs
+                    )
+                )
+        finally:
+            try:
+                if lora_acquired:
+                    await self.lora_registry.release(obj.lora_id)
+            finally:
+                self._finish_tokenize_request_states(obj)
+
+    async def _send_tokenize_only_request(
+        self, tokenized_obj: TokenizedGenerateReqInput
+    ) -> List[int]:
+        rid = tokenized_obj.rid
+        if rid in self.tokenize_req_futures:
+            raise ValueError(f"Duplicate tokenize-only request ID: {rid}")
+
+        future = asyncio.get_running_loop().create_future()
+        self.tokenize_req_futures[rid] = future
+        tokenized_obj.tokenize_only = True
+
+        try:
+            self._send_one_request(tokenized_obj)
+            output: TokenizeReqOutput = await future
+        finally:
+            self.tokenize_req_futures.pop(rid, None)
+
+        if output.error_message is not None:
+            raise fastapi.HTTPException(
+                status_code=output.status_code,
+                detail=output.error_message,
+            )
+        return output.input_ids
+
+    def _finish_tokenize_request_states(self, obj: GenerateReqInput) -> None:
+        rids = [obj.rid] if obj.is_single else obj.rid
+        for rid in rids:
+            state = self.rid_to_state.get(rid)
+            if state is not None and not state.time_stats.finished_time:
+                state.time_stats.set_finished_time()
+        self._discard_pending_req_states(obj)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -831,9 +977,129 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids, token_type_ids, input_format, original_batch_size
         )
 
+    def _expand_decode_input_ids(
+        self, input_ids: List[int], task_results: Optional[List[Dict]]
+    ) -> Optional[List[int]]:
+        """Expand multimodal placeholder tokens for decode disaggregation.
+
+        Decode nodes skip image/video downloading and never run the vision
+        encoder. Instead, use img_grid_thw from task_results (provided by the
+        router from the Encoder) to expand each placeholder token so that
+        origin_input_ids has the correct length for KV cache allocation.
+
+        One task_result == one media item. Each row of
+        ``encoder_addr.img_grid_thw`` maps to exactly one placeholder token in
+        the prompt (image: 1 row; video: N rows, one per chunk). KimiK25 pools
+        the temporal dim away, so each row counts as ``(h//merge_h)*(w//merge_w)``.
+
+        Returns ``None`` when ``task_results`` carries no usable grids, so the
+        caller can fall back to reading the image dimensions locally.
+
+        Kimi-K3 additionally frames each image span with its original
+        resolution, so when ``encoder_addr.original_image_sizes`` is present the
+        placeholder is expanded through the same helper the prefill node uses,
+        keeping both nodes' origin_input_ids identical. That helper skips already
+        framed video placeholders, so sizes are needed only for the images.
+        """
+        if not task_results:
+            return None
+
+        grid_thws = []
+        for task_result in task_results:
+            encoder_addr = task_result.get("encoder_addr", {}) or {}
+            thw_rows = encoder_addr.get("img_grid_thw")
+            if thw_rows:
+                grid_thws.extend(thw_rows)
+
+        merge_kernel_size = self.mm_processor.hf_config.vision_config.merge_kernel_size
+        token_counts = [
+            num_tokens_from_grid(grid_thw, merge_kernel_size=merge_kernel_size)
+            for grid_thw in grid_thws
+        ]
+        if not token_counts:
+            return None
+
+        media_token_id = self.mm_processor.IM_TOKEN_ID
+        image_sizes = original_image_sizes_from_task_results(task_results)
+        if image_sizes is not None:
+            from sglang.srt.multimodal.processors.kimi_k3 import (
+                _expand_k3_media_prompt_token_ids,
+            )
+
+            expanded_ids = (
+                _expand_k3_media_prompt_token_ids(
+                    input_ids,
+                    media_token_id,
+                    token_counts,
+                    [tuple(size) for size in image_sizes],
+                    self.tokenizer,
+                )
+                .flatten()
+                .tolist()
+            )
+            logger.debug(
+                f"Decode expanded input_ids via task_results img_grid_thw "
+                f"+ original_image_sizes: {len(expanded_ids)} tokens"
+            )
+            return expanded_ids
+
+        expanded_ids, _ = expand_media_placeholders_with_offsets(
+            input_ids, token_counts, media_token_id
+        )
+        logger.debug(
+            f"Decode expanded input_ids via task_results "
+            f"img_grid_thw: {len(expanded_ids)} tokens"
+        )
+        return expanded_ids
+
+    async def _expand_decode_input_ids_from_image_sizes(
+        self, input_ids: List[int], obj: GenerateReqInput
+    ) -> List[int]:
+        """Expand placeholders on a decode node without any vision work.
+
+        A PD-disaggregated deployment does not necessarily route encoder
+        metadata (``task_results``) to the decode node, but the decode node
+        still sizes its KV allocation from ``origin_input_ids`` and must agree
+        with prefill token for token. For models whose media token count is a
+        function of the uploaded image dimensions, reading each image's header
+        is enough: no pixel decode, no resize, no vision tower.
+        """
+        if not obj.image_data and not getattr(obj, "video_data", None):
+            return input_ids
+
+        expand = getattr(self.mm_processor, "expand_input_ids_from_image_sizes", None)
+        if expand is None or getattr(obj, "video_data", None):
+            # Silently keeping the unexpanded prompt would mis-size the decode
+            # KV allocation and only surface much later as a KV-transfer
+            # failure, so refuse the request here instead.
+            raise ValueError(
+                "Decode-side multimodal prompt expansion is unavailable for "
+                f"{type(self.mm_processor).__name__}: the request carries no "
+                "encoder task_results and only image inputs can be expanded "
+                "from their dimensions. The decode node cannot size its KV "
+                "cache for this request."
+            )
+
+        loop = asyncio.get_running_loop()
+        image_sizes = await asyncio.gather(
+            *(
+                loop.run_in_executor(
+                    self.mm_processor.io_executor, _read_image_size, image
+                )
+                for image in obj.image_data
+            )
+        )
+        expanded_ids = expand(input_ids, image_sizes)
+        logger.debug(
+            f"Decode expanded input_ids via local image sizes {image_sizes}: "
+            f"{len(expanded_ids)} tokens"
+        )
+        return expanded_ids
+
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        tokenizer_rev_request_time: Optional[float] = None,
     ):
         """Tokenize one request."""
         # Tokenize
@@ -843,6 +1109,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
+
+        # Decode/Prefill disaggregation: the video placeholder
+        # (<|kimi_k25_video_placeholder|>) is not a real special token, so it
+        # must be replaced with the per-chunk media prompt text (from
+        # task_results) BEFORE tokenization; otherwise the tokenizer mangles it.
+        # Image placeholders are already real tokens.
+        #   - decode: expansion happens later in _expand_decode_input_ids.
+        #   - prefill: expansion happens in the scheduler's get_mm_data path
+        #     (KimiK2_5VLImageProcessor.build_input_ids).
+        if (
+            self.disaggregation_mode
+            in (DisaggregationMode.DECODE, DisaggregationMode.PREFILL)
+            and input_text
+            and getattr(obj, "task_results", None)
+        ):
+            video_placeholder = getattr(
+                self.model_config.hf_config, "video_placeholder", None
+            )
+            if video_placeholder:
+                video_prompts = []
+                for task_result in obj.task_results:
+                    encoder_addr = task_result.get("encoder_addr", {}) or {}
+                    chunk_timestamps = encoder_addr.get("chunk_timestamps")
+                    if chunk_timestamps:
+                        video_prompts.append("".join(chunk_timestamps))
+                input_text = update_raw_text(
+                    input_text, video_prompts, video_placeholder
+                )
+
         if obj.input_embeds is not None:
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
@@ -872,6 +1167,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_text, is_cross_encoder_request
                 )
 
+        # Append continuation_token_ids after input_ids is resolved (whether
+        # from obj.input_ids directly or from tokenization of text).  This
+        # handles the multimodal-model case where serving_chat sends text
+        # instead of pre-built input_ids.
+        if getattr(obj, "continuation_token_ids", None) and input_ids is not None:
+            orig_len = len(input_ids)
+            input_ids = input_ids + obj.continuation_token_ids
+            logger.info(
+                "FC continuation in tokenizer_manager (rid=%s): appended %d tokens "
+                "(input_ids %d -> %d)",
+                obj.rid,
+                len(obj.continuation_token_ids),
+                orig_len,
+                len(input_ids),
+            )
+
+        # Record tokenize request ready time
+        tokenizer_ready_time = time.time()
+        if (
+            tokenizer_rev_request_time is not None
+            and tokenizer_rev_request_time > 0
+            and self.enable_metrics
+        ):
+            self.metrics_collector.observe_request_time_to_tokenizer_ready(
+                tokenizer_ready_time - tokenizer_rev_request_time
+            )
+
         contains_mm_input = obj.contains_mm_input()
         is_mossvl = (
             "MossVLForConditionalGeneration"
@@ -892,6 +1214,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._validate_mm_limits(obj)
 
             mm_inputs = None
+            mm_processor_input = (
+                input_ids
+                if self.mm_processor.prefer_tokenized_input and input_ids is not None
+                else (input_text or input_ids)
+            )
 
             if (
                 not self.server_args.language_only
@@ -901,22 +1228,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     mm_inputs = await self.mm_receiver.recv_mm_data(
                         request_obj=obj,
                         mm_processor=self.mm_processor,
-                        prompt=(input_text or input_ids),
+                        prompt=mm_processor_input,
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
-                if mm_inputs is None:
-                    if self.server_args.language_only:
-                        logger.warning(
-                            "Encoder embedding not available, "
-                            "falling back to local mm processing"
-                        )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=(input_text or input_ids),
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
+                    _reject_missing_dispatched_encoder_embedding(
+                        self.server_args, obj, mm_inputs
                     )
+                if mm_inputs is None:
+                    if self.server_args.disaggregation_mode == "decode":
+                        expanded_ids = self._expand_decode_input_ids(
+                            input_ids, getattr(obj, "task_results", None)
+                        )
+                        if expanded_ids is None:
+                            expanded_ids = (
+                                await self._expand_decode_input_ids_from_image_sizes(
+                                    input_ids, obj
+                                )
+                            )
+                        input_ids = expanded_ids
+                    else:
+                        if self.server_args.language_only:
+                            logger.warning(
+                                "Encoder embedding not available, "
+                                "falling back to local mm processing"
+                            )
+                        mm_inputs = await self.mm_processor.process_mm_data_async(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text=(input_text or input_ids),
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
             elif (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend
@@ -928,7 +1270,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 mm_inputs = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,
                     audio_data=obj.audio_data,
-                    input_text=(input_text or input_ids),
+                    input_text=mm_processor_input,
                     request_obj=obj,
                     max_req_input_len=self.max_req_input_len,
                 )
@@ -963,7 +1305,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         if not isinstance(item, MultimodalDataItem):
                             continue
                         try:
-                            item.hash = int(hex_hash, 16)
+                            item.set_hash(int(hex_hash, 16))
                         except (TypeError, ValueError):
                             logger.warning(
                                 "Ignoring malformed mm_hashes entry %r; "
@@ -1170,6 +1512,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
+        sampling_kwargs = dict(sampling_kwargs)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and sampling_kwargs.get("thinking_budget") is not None
+            and obj.custom_logit_processor
+            and isinstance(sampling_kwargs.get("custom_params"), dict)
+            and "thinking_budget" in sampling_kwargs["custom_params"]
+        ):
+            logger.warning(
+                "Detected both scheduler-level thinking_budget and custom_logit_processor with "
+                "custom_params['thinking_budget']; scheduler injection takes precedence and the "
+                "custom_params['thinking_budget'] will be ignored."
+            )
+            sampling_kwargs["custom_params"] = dict(sampling_kwargs["custom_params"])
+            sampling_kwargs["custom_params"].pop("thinking_budget", None)
+        if (
+            sampling_kwargs.get("thinking_budget") is not None
+            and sampling_kwargs.get("thinking_budget") >= 0
+            and sampling_kwargs.get("thinking_prompt_token_ids") is None
+        ):
+            sampling_kwargs["thinking_prompt_token_ids"] = self.tokenizer.encode(
+                "思考已达上限，请开始回答", add_special_tokens=False
+            )
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
@@ -1204,6 +1569,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                skip_radix_cache_insert=obj.skip_radix_cache_insert,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
@@ -1223,10 +1589,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
+                task_results=obj.task_results,
+                # AttentionStore parameters
+                as_kv_cache_params=obj.as_kv_cache_params,
+                as_max_hit_host_ip=obj.as_max_hit_host_ip,
+                as_max_hit_token_len=obj.as_max_hit_token_len,
+                is_warmup=obj.is_warmup,
+                trace_config=obj.trace_config,
+                continuation_token_ids=obj.continuation_token_ids,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 mm_data_mooncake=obj.mm_data_mooncake,
                 encoder_urls=obj.encoder_urls,
             )
+
+            # Generate as_block_hashs from input_ids
+            if self.server_args.enable_asradix_cache:
+                try:
+                    from attentionstore_sdk.sdk import Tokens
+                except ImportError:
+                    logger.warning(
+                        "attentionstore_sdk not available, skipping as_block_hashs generation"
+                    )
+                else:
+                    try:
+                        tokenized_obj.as_block_hashs = Tokens(
+                            input_ids, self.server_args.page_size
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "failed to generate as_block_hashs, skipping AS matching: %s",
+                            e,
+                        )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
             positional_embed_overrides = obj.positional_embed_overrides
@@ -1403,6 +1796,43 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
             tokenized_obj.time_stats = time_stat
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+
+    def _should_reject_missing_bootstrap_room(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> bool:
+        if self.server_args.load_balance_method != "follow_bootstrap_room":
+            return False
+        if self.server_args.disaggregation_decode_enable_fake_auto:
+            return False
+        if getattr(tokenized_obj, "bootstrap_room", None) is not None:
+            return False
+        if getattr(tokenized_obj, "data_parallel_rank", None) is not None:
+            return False
+        return True
+
+    def _reject_missing_bootstrap_room(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        created_time: Optional[float] = None,
+    ) -> ReqState:
+        error_msg = (
+            "Invalid request: Disaggregated request received without bootstrap room id."
+        )
+        logger.warning(f"{error_msg} {obj.rid=}")
+        state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+        self.rid_to_state[obj.rid] = state
+        self._handle_abort_req(
+            AbortReq(
+                rid=obj.rid,
+                finished_reason={
+                    "type": "abort",
+                    "message": error_msg,
+                    "status_code": HTTPStatus.BAD_REQUEST,
+                },
+            )
+        )
+        return state
 
     def _coalesce_streaming_chunks(
         self,
@@ -2168,6 +2598,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
+                if not rid.startswith("HEALTH_CHECK"):
+                    logger.info(
+                        f"[trace] req {rid} finished in {meta_info['e2e_latency']:.3f}s"
+                    )
+
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
@@ -2425,6 +2860,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_num_correct_drafts"] = num_correct_drafts
                 meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+                logger.info(
+                    f"[MTP] rid={meta_info.get('id')} "
+                    f"accept_len={meta_info['spec_accept_length']:.3f} "
+                    f"accept_rate={meta_info['spec_accept_rate']:.3f} "
+                    f"accepted={num_correct_drafts} "
+                    f"drafted={num_proposed_drafts} "
+                    f"verify_ct={meta_info['spec_verify_ct']}"
+                )
 
                 if (
                     getattr(recv_obj, "spec_num_cap_tokens", None) is not None
@@ -2494,10 +2937,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             priority = getattr(state.obj, "priority", None)
             if priority is not None:
                 labels["priority"] = str(priority)
-        if (
-            not state.ttft_observed
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
+        if not state.ttft_observed:
             state.ttft_observed = True
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
@@ -2505,9 +2945,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.get_first_token_latency(),
                 stream=getattr(state.obj, "stream", False),
             )
-        else:
+        elif self.disaggregation_mode != DisaggregationMode.PREFILL:
+            # ITL is a decode-side metric; skip it on PREFILL nodes to avoid
+            # negative observations (PREFILL has no inter-token semantics).
             num_new_tokens = completion_tokens - state.last_completion_tokens
-            if num_new_tokens:
+            if num_new_tokens > 0:
                 self.metrics_collector.observe_inter_token_latency(
                     labels,
                     state.time_stats.get_interval(),
@@ -2540,9 +2982,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.cached_tokens[i],
                 state.time_stats.get_e2e_latency(),
                 self._request_has_grammar(state.obj),
+                state.obj.contains_mm_input(),
                 cached_tokens_details,
                 spec_verify_ct=spec_verify_ct,
             )
+
+            finish_reason_type = (
+                recv_obj.finished_reasons[i].get("type")
+                if recv_obj.finished_reasons[i]
+                else None
+            )
+            if finish_reason_type == "abort":
+                self.metrics_collector.observe_one_aborted_request(labels)
+
+        if recv_obj.detokenize_completed_time is not None:
+            zmq_cost = real_time() - recv_obj.detokenize_completed_time
+            self.metrics_collector.observe_detokenizer_to_tokenizer_time(zmq_cost)
 
     def dump_requests(self, state: ReqState, out_dict: dict):
         if self.dump_requests_exclude_meta_keys and isinstance(
@@ -2781,6 +3236,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         pass
 
     def _handle_abort_req(self, recv_obj: AbortReq):
+        if not recv_obj.rid.startswith("HEALTH_CHECK"):
+            logger.info(
+                f"[trace] tokenizer received aborted {recv_obj.rid} from detokenizer"
+            )
         if is_health_check_generate_req(recv_obj):
             return
         # Two scheduler messages can race in handle_loop for the same rid: a
@@ -2904,6 +3363,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not future.done():
             future.set_result(recv_obj.session_id if recv_obj.success else None)
+
+    def _handle_tokenize_req_output(self, recv_obj: TokenizeReqOutput) -> None:
+        future = self.tokenize_req_futures.get(recv_obj.rid)
+        if future is None:
+            logger.warning(
+                "Tokenize-only response arrived after waiter cleanup: %s",
+                recv_obj.rid,
+            )
+            return
+        if not future.done():
+            future.set_result(recv_obj)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.model_update_expected_workers == 1:
@@ -3085,16 +3555,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _handle_epd_disaggregation_encode_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
-    ):
-        """Handle EPD-disaggregation mode encoding request."""
-        if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
-            # dispatch to encoder by default
+    ) -> Optional["ReqState"]:
+        """Handle EPD-disaggregation mode encoding request.
+
+        Returns a ReqState if the request should be short-circuited (error path),
+        or None to continue normal processing.
+        """
+        if not isinstance(obj, GenerateReqInput):
+            return None
+
+        # Pull mode: task_results provided by router
+        if self.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+            if obj.task_results:
+                obj.need_wait_for_mm_inputs = True
+                return None
+            if obj.contains_mm_input():
+                raise ValueError(
+                    "Multi-modal request requires task_results from IC when "
+                    "encoder_transfer_backend=zmq_to_scheduler (pull mode)"
+                )
+            return None
+
+        # Push mode: adaptive dispatch + mm_receiver.send_encode_request
+        if obj.contains_mm_input():
             should_dispatch = True
             if self.server_args.enable_adaptive_dispatch_to_encoder:
                 should_dispatch = self._should_dispatch_to_encoder(obj)
 
-            # Set need_wait_for_mm_inputs flag based on whether we dispatch to encoder
-            # This flag will be used in _tokenize_one_request to determine processing path
             if should_dispatch:
                 obj.need_wait_for_mm_inputs = True
                 if self.server_args.encoder_transfer_backend in [
@@ -3112,6 +3599,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
             else:
                 obj.need_wait_for_mm_inputs = False
+
+        return None
 
     def convert_to_span_attrs(
         self,

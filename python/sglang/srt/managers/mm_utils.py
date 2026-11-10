@@ -11,7 +11,17 @@ from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Tuple,
+)
 
 import numpy as np
 import torch
@@ -412,12 +422,87 @@ def get_embedding_chunk(
     return embedding_chunk, start_index, end_index
 
 
+def _iter_chunk_embedding_rows(
+    items: List[MultimodalDataItem],
+    items_size: List[int],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+) -> Iterator[Tuple[MultimodalDataItem, int, int]]:
+    """Yield ``(item, row_start, row_end)`` for the rows this chunk consumes.
+
+    An item covers token positions ``items_offset[i]``, inclusive on both ends;
+    the chunk covers ``[prefix_len, prefix_len + seq_len)``.  The yielded range
+    is their intersection, rebased to the item's own first row, so the sequence
+    is exactly the chunk's row layout in order.
+    """
+    for i in range(min(len(items_size) - 1, len(prefix_length))):
+        if items_size[i] == items_size[i + 1]:
+            continue
+        items_per_req = items[items_size[i] : items_size[i + 1]]
+        items_offset = items_offset_list[i]
+        assert len(items_per_req) == len(items_offset), (
+            f"expected one offset per item, got {len(items_per_req)} items "
+            f"vs {len(items_offset)} offsets"
+        )
+        chunk_start = prefix_length[i]
+        chunk_end = (
+            chunk_start + (extend_length[i] if i < len(extend_length) else 0) - 1
+        )
+        for item, (start, end) in zip(items_per_req, items_offset):
+            if end < chunk_start or start > chunk_end:
+                continue
+            yield item, max(start, chunk_start) - start, min(end, chunk_end) - start + 1
+
+
+def _get_precomputed_chunk_for_req(
+    items_per_req: List[MultimodalDataItem],
+    items_offset: List[Tuple[int, int]],
+    extend_prefix_len: int,
+    extend_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Per-item variant of get_embedding_chunk: each item carries a single offset
+    (1:1 with items_offset), so only items overlapping the current chunk are
+    sliced on CPU and uploaded to device.
+    """
+    assert len(items_per_req) == len(items_offset), (
+        f"expected one offset per item, got {len(items_per_req)} items "
+        f"vs {len(items_offset)} offsets"
+    )
+
+    extend_start_index = extend_prefix_len
+    extend_end_index = extend_prefix_len + extend_seq_len - 1
+
+    embedding_chunks = []
+    for item, (start, end) in zip(items_per_req, items_offset):
+        if end < extend_start_index or start > extend_end_index:
+            continue
+        embedding = item.precomputed_embeddings
+        # some models' embedding is 3-dim, reshape it to 2-dim
+        embedding = embedding.reshape(-1, embedding.shape[-1])
+        start_index = max(start, extend_start_index) - start
+        end_index = min(end, extend_end_index) - start + 1
+        embedding_chunks.append(embedding[start_index:end_index])
+
+    if not embedding_chunks:
+        embedding = items_per_req[0].precomputed_embeddings
+        return embedding.reshape(-1, embedding.shape[-1])[0:0].to(
+            device, non_blocking=True
+        )
+    if len(embedding_chunks) == 1:
+        return embedding_chunks[0].to(device, non_blocking=True)
+    return torch.cat(embedding_chunks, dim=0).to(device, non_blocking=True)
+
+
 def _get_precomputed_embedding(
     items: List[MultimodalDataItem],
     items_size: List[int],
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    device: torch.device,
 ) -> Optional[torch.Tensor]:
     """
     If all items have precomputed_embeddings, return their concatenation.
@@ -438,14 +523,10 @@ def _get_precomputed_embedding(
         if any(item.precomputed_embeddings is None for item in items_per_req):
             chunk = None
         else:
-            req_embeddings = torch.concat(
-                [item.precomputed_embeddings for item in items_per_req]
-            )
-            chunk, _, _ = get_embedding_chunk(
-                embedding=req_embeddings,
-                extend_prefix_len=prefix_length[i],
-                extend_seq_len=extend_len,
-                items_offset=items_offset,
+            # Chunk-aware per-item slicing (avoids full-embedding concat per
+            # chunk). See _get_precomputed_chunk_for_req.
+            chunk = _get_precomputed_chunk_for_req(
+                items_per_req, items_offset, prefix_length[i], extend_len, device
             )
 
         if chunk is None and len(items_per_req) > 1:
@@ -472,6 +553,60 @@ def _get_precomputed_embedding(
         result = result.reshape(-1, result.shape[-1])
         return result
     return None
+
+
+def _broadcast_precomputed_embedding(
+    items: List[MultimodalDataItem],
+    items_size: List[int],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+    input_embeds: torch.Tensor,
+) -> torch.Tensor:
+    """Copy this chunk's embedding rows H2D on attn-tp rank 0 and broadcast them.
+
+    Only rank 0 pulled the embedding from the encoder, and it sits in host
+    pinned memory (the Mooncake pool).  The other ranks receive the rows
+    straight into device memory and never touch host memory.
+
+    Deadlock safety: ``row_ranges`` is derived from CPU metadata that is already
+    identical on every rank — never from a device-side reduction — so all ranks
+    agree on the broadcast shape and on skipping it entirely.
+    """
+    parallel = get_parallel()
+
+    row_ranges = list(
+        _iter_chunk_embedding_rows(
+            items, items_size, prefix_length, extend_length, items_offset_list
+        )
+    )
+    num_rows = sum(row_end - row_start for _, row_start, row_end in row_ranges)
+    mm_embedding = input_embeds.new_empty((num_rows, input_embeds.shape[-1]))
+    if num_rows == 0:
+        # Same decision on every rank: skip the broadcast entirely.
+        return mm_embedding
+
+    if parallel.attn_tp_rank == 0:
+        offset = 0
+        for item, row_start, row_end in row_ranges:
+            src = item.precomputed_embeddings
+            assert src is not None, (
+                "attn-tp rank 0 lost its precomputed embeddings mid-chunk; "
+                "a pool buffer was released before prefill finished"
+            )
+            # H2D straight from the pinned pool into the destination slice.
+            # Going through a CPU torch.cat would cost a single-threaded memcpy
+            # of the whole chunk and land it in pageable memory, which silently
+            # makes the H2D synchronous.
+            src = src.reshape(-1, src.shape[-1])
+            num_copy_rows = row_end - row_start
+            mm_embedding[offset : offset + num_copy_rows].copy_(
+                src[row_start:row_end], non_blocking=True
+            )
+            offset += num_copy_rows
+
+    parallel.attn_tp_group.broadcast(mm_embedding, src=0)
+    return mm_embedding
 
 
 # A modality's embedding function. May return the combined [tokens, hidden]
@@ -904,6 +1039,18 @@ def _get_multimodal_mask(
     return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
 
 
+def _mm_embedding_needs_broadcast() -> bool:
+    """True when this rank must get its multimodal rows from attn-tp rank 0.
+
+    ``language_only`` is the concrete marker for the EPD prefill server, where
+    only the first attn-tp rank pulls embeddings from the encoder.  With a single
+    attn-tp rank there is nobody to broadcast to.
+    """
+    if not get_server_args().language_only:
+        return False
+    return get_parallel().attn_tp_size > 1
+
+
 def _adjust_embedding_length(
     embedding: torch.Tensor,
     mask: torch.Tensor,
@@ -967,7 +1114,12 @@ def get_embedding_and_mask(
     """
     # 1. Get embedding
     embedding = _get_precomputed_embedding(
-        embedding_items, items_size, prefix_length, extend_length, items_offset_list
+        embedding_items,
+        items_size,
+        prefix_length,
+        extend_length,
+        items_offset_list,
+        input_ids.device,
     )
     if embedding is None:
         embedding, input_ids = _get_chunked_prefill_embedding(
@@ -988,6 +1140,20 @@ def get_embedding_and_mask(
     # 3. Adjust embedding length if needed
     embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
     return embedding, special_multimodal_mask, input_ids
+
+
+class _PendingBroadcast(NamedTuple):
+    """A modality whose embedding rows must be broadcast from attn-tp rank 0.
+
+    Recorded in the modality loop, where the mask is still computable, and
+    drained once ``input_embeds`` exists.  ``index`` is the position in
+    ``embed_mm_inputs``' parallel ``embeddings`` / ``masks`` lists.
+    """
+
+    index: int
+    items: List[MultimodalDataItem]
+    items_size: List[int]
+    items_offsets: List[List[Tuple[int, int]]]
 
 
 def embed_mm_inputs(
@@ -1027,6 +1193,10 @@ def embed_mm_inputs(
 
     # deepstack_embeddings: per-modality
     modalities, embeddings, masks, deepstack_embeddings = [], [], [], []
+    # Modalities whose rows are broadcast from attn-tp rank 0 once input_embeds
+    # exists; drained in step 3b below.
+    pending_broadcasts: List[_PendingBroadcast] = []
+    needs_broadcast = _mm_embedding_needs_broadcast()
 
     # 2. Get multimodal embedding separately
     # Try get mm embedding if any
@@ -1044,7 +1214,12 @@ def embed_mm_inputs(
             modality_id = modality.name.lower()
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
-            assert embedder is not None, f"no embedding method found for {modality}"
+            broadcast_this_modality = needs_broadcast and all(
+                item.is_precomputed_embedding() for item in items
+            )
+            assert (
+                embedder is not None or broadcast_this_modality
+            ), f"no embedding method found for {modality}"
             placeholder_tensor = torch.as_tensor(
                 [item.pad_value for item in items],
                 device=input_ids.device,
@@ -1063,24 +1238,42 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
 
-            embedding, mask, input_ids = get_embedding_and_mask(
-                data_embedding_func=embedder,
-                embedding_items=items,
-                placeholder_tensor=placeholder_tensor,
-                input_ids=input_ids,
-                items_size=items_size,
-                prefix_length=extend_prefix_lens,
-                extend_length=extend_seq_lens,
-                items_offset_list=items_offsets,
-            )
-
-            if use_deepstack.get(modality, None) and embedding is not None:
-                embedding, deepstack_embedding = (
-                    multimodal_model.separate_deepstack_embeds(embedding)
+            if broadcast_this_modality:
+                assert not use_deepstack.get(
+                    modality, None
+                ), "deepstack is not supported with the EPD in-forward broadcast"
+                # The mask must be derived before input_ids.clamp_ below wipes
+                # out the pad_value sentinels; it does not need the embedding.
+                mask = _get_multimodal_mask(input_ids, placeholder_tensor)
+                pending_broadcasts.append(
+                    _PendingBroadcast(
+                        index=len(modalities),
+                        items=items,
+                        items_size=items_size,
+                        items_offsets=items_offsets,
+                    )
                 )
-                deepstack_embeddings += [deepstack_embedding]
-            else:
+                embedding = None
                 deepstack_embeddings += [None]
+            else:
+                embedding, mask, input_ids = get_embedding_and_mask(
+                    data_embedding_func=embedder,
+                    embedding_items=items,
+                    placeholder_tensor=placeholder_tensor,
+                    input_ids=input_ids,
+                    items_size=items_size,
+                    prefix_length=extend_prefix_lens,
+                    extend_length=extend_seq_lens,
+                    items_offset_list=items_offsets,
+                )
+
+                if use_deepstack.get(modality, None) and embedding is not None:
+                    embedding, deepstack_embedding = (
+                        multimodal_model.separate_deepstack_embeds(embedding)
+                    )
+                    deepstack_embeddings += [deepstack_embedding]
+                else:
+                    deepstack_embeddings += [None]
             modalities += [modality]
             embeddings += [embedding]
             masks += [mask]
@@ -1093,6 +1286,22 @@ def embed_mm_inputs(
     # There values are useless because their embeddings will be replaced by vision embeddings anyway.
     input_ids.clamp_(min=0, max=vocab_size - 1)
     input_embeds = input_embedding(input_ids)
+
+    # 3b. EPD: broadcast this chunk's mm rows from attn-tp rank 0.  Deferred to
+    # here so the buffer is shaped from input_embeds, which rules out a mismatch
+    # with the scatter below.
+    for pending in pending_broadcasts:
+        embedding = _broadcast_precomputed_embedding(
+            pending.items,
+            pending.items_size,
+            extend_prefix_lens,
+            extend_seq_lens,
+            pending.items_offsets,
+            input_embeds,
+        )
+        embeddings[pending.index] = _adjust_embedding_length(
+            embedding, masks[pending.index], logger
+        )
 
     # deepstack embedding
     if use_deepstack:
@@ -1327,19 +1536,6 @@ def general_mm_embed_routine(
                             feature = getattr(mm_item, "feature", None)
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_server_args().language_only:
-                                precomputed_embeddings = getattr(
-                                    mm_item, "precomputed_embeddings", None
-                                )
-                                if (
-                                    isinstance(precomputed_embeddings, torch.Tensor)
-                                    and precomputed_embeddings.is_cuda
-                                ):
-                                    mm_item.precomputed_embeddings = (
-                                        precomputed_embeddings.to(
-                                            "cpu", non_blocking=True
-                                        )
-                                    )
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = input_embeds
         else:

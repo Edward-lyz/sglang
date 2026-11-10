@@ -451,6 +451,10 @@ class MultimodalProcessorOutput:
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
 
+    # EPD: pinned-pool buffer addresses backing zero-copy precomputed-embedding
+    # views (first attn-tp rank only; None elsewhere).
+    pool_buffer_addrs: Optional[List[int]] = None
+
     @staticmethod
     def from_dict(d: dict) -> MultimodalProcessorOutput:
         return MultimodalProcessorOutput(
@@ -471,6 +475,7 @@ class MultimodalProcessorOutput:
             vision_position_ids=d.get("vision_position_ids"),
             media_nums_per_sample=d.get("media_nums_per_sample"),
             visible_frame_counts=d.get("visible_frame_counts"),
+            pool_buffer_addrs=d.get("pool_buffer_addrs"),
         )
 
     @staticmethod
@@ -529,10 +534,38 @@ class MultimodalInputs:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
+    # EPD: pinned-pool buffer addresses backing zero-copy precomputed-embedding
+    # views (first attn-tp rank only). See release_pool_buffers().
+    pool_buffer_addrs: Optional[List[int]] = None
+
     def release_features(self):
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
             item.feature = None
+
+    def release_pool_buffers(self):
+        """Return pinned-pool pages backing precomputed embeddings once prefill
+        has consumed them. Idempotent; a no-op on ranks without a pool."""
+        addrs = self.pool_buffer_addrs
+        if not addrs:
+            return
+        self.pool_buffer_addrs = None
+        for item in self.mm_items:
+            item.precomputed_embeddings = None
+        from sglang.srt.disaggregation.embedding_transfer.mooncake_transport import (
+            _MooncakeBufferManager,
+        )
+
+        buf_mgr = _MooncakeBufferManager.get_instance_if_exists()
+        if buf_mgr is None:
+            return
+        for addr in addrs:
+            try:
+                buf_mgr.release_buffer(addr)
+            except Exception as e:
+                logger.warning(
+                    "release_pool_buffers: failed to free addr=%s: %s", addr, e
+                )
 
     @staticmethod
     def from_processor_output(obj: MultimodalProcessorOutput):
@@ -598,6 +631,7 @@ class MultimodalInputs:
             "vision_position_ids",
             "media_nums_per_sample",
             "visible_frame_counts",
+            "pool_buffer_addrs",
         ]
         for arg in optional_args:
             val = getattr(obj, arg, None)
@@ -760,12 +794,21 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_ids = origin_input_ids
-        self.origin_input_ids_unpadded = (
-            origin_input_ids_unpadded
-            if origin_input_ids_unpadded
-            else self.origin_input_ids
-        )  # Before image padding
+        self.origin_input_ids = (
+            origin_input_ids
+            if isinstance(origin_input_ids, array)
+            else array("q", origin_input_ids)
+        )
+        if not origin_input_ids_unpadded:
+            self.origin_input_ids_unpadded = self.origin_input_ids
+        elif origin_input_ids_unpadded is origin_input_ids:
+            self.origin_input_ids_unpadded = self.origin_input_ids
+        else:
+            self.origin_input_ids_unpadded = (
+                origin_input_ids_unpadded
+                if isinstance(origin_input_ids_unpadded, array)
+                else array("q", origin_input_ids_unpadded)
+            )
         # Each decode stage's output ids. Append-only by contract:
         # _refresh_fill_ids infers how many output tokens are already in
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
@@ -1643,6 +1686,8 @@ class Req(ReqDllmMixin):
     def set_finish_with_abort(self, error_msg: str):
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs.release_pool_buffers()
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = array(
@@ -2278,7 +2323,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             multimodal_inputs.append(req.multimodal_inputs)
 
-            # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
             # flag will always True
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed

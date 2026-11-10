@@ -69,6 +69,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
+    from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -540,6 +541,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            self.process_input_requests(self.process_disagg_prefill_mm_queues())
+
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -579,6 +583,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            self.process_input_requests(self.process_disagg_prefill_mm_queues())
+
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -620,6 +627,28 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+    def process_disagg_prefill_mm_queues(
+        self: Scheduler,
+    ) -> List[TokenizedGenerateReqInput]:
+        """
+        Advance the EPD embedding receive pipeline one non-blocking step and return its ready requests
+        """
+        if self.disagg_prefill_mm_prealloc_queue is None:
+            return []
+        self.disagg_prefill_mm_transfer_queue.extend(
+            self.disagg_prefill_mm_prealloc_queue.pop_preallocated()
+        )
+        mm_ready, mm_abort = self.disagg_prefill_mm_transfer_queue.pop_transferred()
+        for req, error_msg, error_code in mm_abort:
+            status_code = (
+                HTTPStatus.BAD_REQUEST
+                if error_code == HTTPStatus.BAD_REQUEST
+                else HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            prepare_abort(req, error_msg, status_code=status_code)
+            self.output_streamer.stream_output([req], req.return_logprob)
+        return mm_ready
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -684,6 +713,10 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
+                if req.multimodal_inputs is not None:
+                    req.multimodal_inputs.release_pool_buffers()
+
+                # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)

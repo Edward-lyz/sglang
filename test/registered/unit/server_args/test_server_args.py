@@ -1781,5 +1781,34 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestEpdRequiresTaskResults(CustomTestCase):
+    """Which servers may only serve media through encoder task_results."""
+
+    def _args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_language_only_pull_mode(self):
+        args = self._args(
+            language_only=True, encoder_transfer_backend="zmq_to_scheduler"
+        )
+        self.assertTrue(args.epd_requires_task_results())
+
+    def test_language_only_push_mode_can_encode_locally(self):
+        args = self._args(
+            language_only=True, encoder_transfer_backend="zmq_to_tokenizer"
+        )
+        self.assertFalse(args.epd_requires_task_results())
+
+    def test_plain_pd_server(self):
+        self.assertFalse(self._args().epd_requires_task_results())
+
+    def test_explicit_opt_in(self):
+        args = self._args(require_encoder_task_results=True)
+        self.assertTrue(args.epd_requires_task_results())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3097,6 +3097,12 @@ class ServerArgs:
         bool,
         "Enable task results pull mode for EPD.",
     ] = False
+    require_encoder_task_results: A[
+        bool,
+        "Reject multimodal requests that carry no encoder task_results instead "
+        "of encoding them locally. Set this on the EPD decode server.",
+        NS("disagg"),
+    ] = False
     enable_mooncake_in_zmq_mode: A[
         bool,
         "Enable mooncake transfer in zmq mode for EPD.",
@@ -3726,19 +3732,6 @@ class ServerArgs:
         """Resolve model/tokenizer paths backed by remote object stores."""
         if is_runai_obj_uri(self.model_path):
             ObjectStorageModel.download_and_get_path(self.model_path)
-        # Check msit trace setting
-        self._handle_msit_trace_settting()
-
-    def _handle_msit_trace_settting(self):
-        if envs.AIAK_ENABLE_TRACE.get():
-            if self.speculative_algorithm is not None:
-                raise RuntimeError(
-                    "AIAK_ENABLE_TRACE is not enabled with speculative decoding."
-                )
-            if not self.disable_cuda_graph:
-                raise RuntimeError(
-                    "AIAK_ENABLE_TRACE is not enabled with CUDA graph."
-                )
 
     def _handle_pd_disaggregation(self):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -6145,10 +6138,15 @@ class ServerArgs:
                         f"verify={verify!r}. Use SGLANG_RAGGED_VERIFY_MODE=static."
                     )
             if self.disaggregation_mode == "prefill":
-                raise ValueError(
-                    "--enable-linear-replayssm-spec is not supported on a PD "
-                    "prefill server: the ring is spec-verify-only scratch and "
-                    "the prefill server never runs spec verify."
+                if _algo != "DSPARK":
+                    raise ValueError(
+                        "--enable-linear-replayssm-spec is not supported on a PD "
+                        "prefill server: the ring is spec-verify-only scratch and "
+                        "the prefill server never runs spec verify."
+                    )
+                logger.warning(
+                    "--enable-linear-replayssm-spec is ignored on a DSPARK PD "
+                    "prefill server; spec verify runs on the decode server."
                 )
             if self.linear_replayssm_cache_len < 1:
                 raise ValueError(
@@ -7368,6 +7366,17 @@ class ServerArgs:
                 f"Model type {model_arch} is not supported for encoder disaggregation. "
                 f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
             )
+
+    def epd_requires_task_results(self) -> bool:
+        """Whether media can only be served through encoder ``task_results``.
+
+        The EPD prefill server derives it from its own flags. The EPD decode
+        server is indistinguishable from a plain PD decode server, which may
+        legitimately expand media placeholders locally, so it must opt in.
+        """
+        return self.require_encoder_task_results or (
+            self.language_only and self.encoder_transfer_backend == "zmq_to_scheduler"
+        )
 
     def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
         """
@@ -8648,8 +8657,13 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
+            pp_dspark_pd = (
+                (self.speculative_algorithm or "").upper() == "DSPARK"
+                and self.disaggregation_mode in ("prefill", "decode")
+            )
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
+                self.disable_overlap_schedule
+                and (self.speculative_algorithm is None or pp_dspark_pd)
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
 
         assert not (

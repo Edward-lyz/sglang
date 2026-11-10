@@ -1693,7 +1693,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         finally:
             response.close()
         return result
-    if image_file.startswith(("file://", "/")):
+    if image_file.startswith("file://"):
         with open(image_file, "rb") as f:
             return f.read()
     if isinstance(image_file, str) and image_file.startswith("data:"):

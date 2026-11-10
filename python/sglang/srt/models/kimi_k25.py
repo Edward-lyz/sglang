@@ -1,4 +1,5 @@
 import logging
+import os
 from copy import deepcopy
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -6,25 +7,29 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers.activations import PytorchGELUTanh
+from transformers import activations
 
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.attention.vision import (
-    VisionAttention,
-    VisionAttentionMetadata,
-    prepare_vision_attention_metadata,
-)
 from sglang.srt.layers.conv import Conv2dLayer
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
+
+try:
+    from transformers.activations import PytorchGELUTanh
+except ImportError:
+    from transformers.activations import GELUTanh
+
+    activations.PytorchGELUTanh = GELUTanh
+    PytorchGELUTanh = GELUTanh
+
+from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -35,14 +40,16 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.multimodal.mm_utils import (
-    materialize_multimodal_features,
-    run_dp_sharded_mrope_vision_model,
-)
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
+KIMIV_VT_INFER_MAX_PATCH_NUM = int(os.environ.get("SGLANG_ENCODER_EMBED_MAX_TOKENS", 16328))
 logger = logging.getLogger(__name__)
+
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+logger.info(f"use KIMIV_VT_INFER_MAX_PATCH_NUM: {KIMIV_VT_INFER_MAX_PATCH_NUM}")
 
 _is_npu = is_npu()
 
@@ -148,8 +155,6 @@ class MoonViTEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         rope_freqs_cis: torch.Tensor | None = None,
-        forward_metadata: Optional[VisionAttentionMetadata] = None,
-        sequence_lengths: torch.Tensor | None = None,
     ):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
@@ -158,9 +163,7 @@ class MoonViTEncoderLayer(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
-            forward_metadata=forward_metadata,
             max_seqlen=max_seqlen,
-            sequence_lengths=sequence_lengths,
         )
 
         hidden_states = residual + hidden_states
@@ -283,6 +286,8 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
+                if self.time_weight.device != pos_emb_2d.device or self.time_weight.dtype != pos_emb_2d.dtype:
+                    self.time_weight = self.time_weight.to(device=pos_emb_2d.device, dtype=pos_emb_2d.dtype)
                 pos_emb_3d = (
                     pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[0:t]
                 )
@@ -473,34 +478,19 @@ class MoonViT3dEncoder(nn.Module):
             grid_thws=grid_thws, device=hidden_states.device
         )
 
-        sequence_lengths = (grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]).to(
-            device=hidden_states.device, dtype=torch.int32
-        )
         lengths = torch.cat(
             (
-                torch.zeros(1, dtype=torch.int32, device=hidden_states.device),
-                sequence_lengths,
+                torch.zeros(1, dtype=grid_thws.dtype, device=grid_thws.device),
+                grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
             )
         )
 
-        # FlashAttention needs a host integer.  Compute it once per MoonViT
-        # forward and pass it to every encoder block instead of synchronizing
-        # once per block inside the attention backend.
         max_seqlen = int(lengths.max().item())
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
-        forward_metadata = prepare_vision_attention_metadata(
-            cu_seqlens, device=hidden_states.device
-        )
-
         for block in self.blocks:
             hidden_states = block(
-                hidden_states,
-                cu_seqlens,
-                max_seqlen,
-                rope_freqs_cis=rope_freqs_cis,
-                forward_metadata=forward_metadata,
-                sequence_lengths=sequence_lengths,
+                hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis=rope_freqs_cis
             )
 
         hidden_states = self.final_layernorm(hidden_states)
@@ -659,21 +649,29 @@ class KimiK25ForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
-        # Create vision tower
-        self.vision_tower = MoonViT3dPretrainedModel(
-            config.vision_config,
-            use_data_parallel=self.use_data_parallel,
-            quant_config=(
-                quant_config if isinstance(quant_config, ModelSlimConfig) else None
-            ),
-            prefix="vision_tower",
-        )
-        # Create mm projector
-        self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+        self.encoder_only = getattr(config, "encoder_only", False)
+        self.language_only = getattr(config, "language_only", False)
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        # Decode nodes in EPD disaggregation only receive KV cache from prefill
+        # and don't need the vision tower.
+        server_args = get_global_server_args()
+        self.skip_vision_tower = self.language_only or server_args.disaggregation_mode == "decode"
 
         self.language_model = None
-        if not config.encoder_only:
+        if not self.skip_vision_tower:
+            # Create vision tower
+            self.vision_tower = MoonViT3dPretrainedModel(
+                config.vision_config,
+                use_data_parallel=self.use_data_parallel,
+                quant_config=(
+                    quant_config if isinstance(quant_config, ModelSlimConfig) else None
+                ),
+                prefix="vision_tower",
+            )
+            # Create mm projector
+            self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+
+        if not self.encoder_only:
             self.language_model = DeepseekV3ForCausalLM(
                 config.text_config,
                 quant_config,
@@ -684,92 +682,40 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 ),
             )
 
+            self.model = self.language_model.model
+
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
-        if self.language_model is not None and hasattr(self.language_model, "dtype"):
+        if (
+            not self.skip_vision_tower
+            and self.language_model is not None
+            and hasattr(self.language_model, "dtype")
+        ):
             target_dtype = self.language_model.dtype
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
-    @property
-    def model(self):
-        # Alias .model to .language_model so this class satisfies the piecewise
-        # CUDA graph gate, which checks `hasattr(model, "model")`.
-        return self.language_model
-
-    def __setattr__(self, name, value):
-        # Skip redundant self.model.model assignment in runner to avoid duplicate
-        # nn.Module registration.
-        if name == "model":
-            return
-        super().__setattr__(name, value)
-
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        image_grid_thws = []
-        for item in items:
-            grid_thw = item.model_specific_data.get("image_grid_thw")
-            if grid_thw is None:
-                grid_thw = item.model_specific_data["grid_thws"]
-            image_grid_thws.append(grid_thw)
-        grid_thws = torch.concat(image_grid_thws, dim=0)
-
-        def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
-            """Move only this encoder-DP rank's images to its local GPU.
-
-            CUDA IPC features are intentionally reconstructed after the image
-            assignment.  Each image therefore crosses the tokenizer/scheduler
-            boundary once instead of once per TP rank.  The selected consumer
-            acknowledges the entire TP group so the bounded IPC pool remains
-            recyclable.
-            """
-            parallel = get_parallel()
-            server_args = get_server_args()
-            # Match MmItemMemoryPool.try_to_recycle(), which waits for the
-            # server TP size rather than the attention subgroup size.
-            ipc_consumer_count = max(
-                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
-            )
-            device_index = device.index
-            if device.type == "cuda" and device_index is None:
-                device_index = torch.cuda.current_device()
-
-            features = []
-            for image_index in image_indices:
-                item = items[image_index]
-                if device.type == "cuda":
-                    item.reconstruct(
-                        device_index, ipc_consumer_count=ipc_consumer_count
-                    )
-                feature = item.feature
-                if not isinstance(feature, torch.Tensor):
-                    raise TypeError(
-                        "Kimi-K2.5/K2.7 image feature must be a torch.Tensor, "
-                        f"got {type(feature)}"
-                    )
-                features.append(feature)
-            return materialize_multimodal_features(
-                features, device=device, dtype=target_dtype
-            )
+        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
+            device=device, dtype=target_dtype
+        )
+        grid_thws = torch.concat([item.image_grid_thw for item in items], dim=0).to(
+            device
+        )
 
         if self.use_data_parallel:
             image_embeds = run_dp_sharded_mrope_vision_model(
                 self.vision_tower,
-                None,
+                pixel_values,
                 grid_thws.tolist(),
-                # MoonViT3d uses 2D RoPE and returns packed patch embeddings.
-                # Its grid metadata is a positional argument, unlike Kimi-VL.
-                rope_type="rope_2d_packed",
-                load_local_pixel_values=materialize_item_features,
-                pixel_values_device=device,
-                pixel_values_dtype=target_dtype,
+                rope_type="rope_2d",
             )
             image_features = self.mm_projector(image_embeds)
             return image_features
 
-        pixel_values = materialize_item_features(list(range(len(items))))
-        image_embeds = self.vision_tower(pixel_values, grid_thws.to(device))
+        image_embeds = self.vision_tower(pixel_values, grid_thws)
         proj_out = mm_projection_auto(self.mm_projector, image_embeds)
         return torch.cat(proj_out, dim=0)
 
@@ -794,35 +740,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.language_model._routed_experts_weights_of_layer.value
             if self.language_model is not None
             else {}
-        )
-
-    def prepare_context_parallel_metadata_for_dcp(
-        self,
-        seq_lens: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        extend_prefix_lens_cpu: torch.Tensor,
-        extend_seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        req_to_token: torch.Tensor,
-        seq_lens_sum: int,
-        kv_buffer_shape: torch.Size,
-        kv_cache_dtype,
-        kv_cache_device,
-        create_chunked_prefix_cache_kv_indices_fn,
-    ):
-        # DCP metadata is built on the inner DeepSeek-V3 language model.
-        return self.language_model.prepare_context_parallel_metadata_for_dcp(
-            seq_lens=seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-            extend_seq_lens=extend_seq_lens,
-            req_pool_indices=req_pool_indices,
-            req_to_token=req_to_token,
-            seq_lens_sum=seq_lens_sum,
-            kv_buffer_shape=kv_buffer_shape,
-            kv_cache_dtype=kv_cache_dtype,
-            kv_cache_device=kv_cache_device,
-            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
         )
 
     def forward(
@@ -857,9 +774,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if mapper is not None:
             weights = mapper.apply(weights)
 
+        # Vision params are only needed when the vision tower exists. When
+        # skip_vision_tower is True (language_only or disaggregation decode),
+        # vision weights are dropped inline to avoid buffer-clobber issues with
+        # RunAI's reused tensor backing.
         vision_params = (
             None
-            if self.config.language_only
+            if self.skip_vision_tower
             else dict(self.named_parameters(remove_duplicate=False))
         )
 
@@ -884,30 +805,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
                     continue
                 yield name.replace("language_model.", ""), loaded_weight
 
-        if self.language_model is not None:
+        # Load language model weights (skipped in encoder_only mode); in that
+        # case we still need to drain the generator so vision weights get
+        # loaded inline.
+        if not self.encoder_only and self.language_model is not None:
             self.language_model.load_weights(stream_language_weights())
         else:
-            # encoder-only: drain the generator so inline vision-weight loading fires.
             for _ in stream_language_weights():
                 pass
-
-    def post_load_weights(self):
-        if self.language_model is not None:
-            self.language_model.post_load_weights()
-
-    @property
-    def stacked_params_mapping(self):
-        return getattr(self.language_model, "stacked_params_mapping", [])
-
-    @property
-    def expert_params_mapping(self):
-        return getattr(self.language_model, "expert_params_mapping", [])
-
-    def mutate_weight_preload(self, name):
-        return self.language_model.mutate_weight_preload(name)
-
-    def custom_scale_remap(self, name):
-        return self.language_model.custom_scale_remap(name)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config: KimiK25Config):
