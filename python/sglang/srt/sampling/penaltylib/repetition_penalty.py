@@ -1,6 +1,9 @@
 import torch
 
-from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
+from sglang.srt.sampling.penaltylib.orchestrator import (
+    _BatchedPenalizer,
+    host_to_device,
+)
 from sglang.srt.utils import get_compiler_backend, is_npu
 
 _is_npu = is_npu()
@@ -34,15 +37,13 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
             dtype=torch.float32,
             device=self.orchestrator.device,
         )
-        self.repetition_penalties = (
-            torch.tensor(
-                data=[
-                    req.sampling_params.repetition_penalty
-                    for req in self.orchestrator.reqs()
-                ],
-                dtype=torch.float32,
-                device=self.orchestrator.device,
-            )
+        self.repetition_penalties = host_to_device(
+            [
+                req.sampling_params.repetition_penalty
+                for req in self.orchestrator.reqs()
+            ],
+            dtype=torch.float32,
+            device=self.orchestrator.device,
         ).unsqueeze_(1)
 
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):

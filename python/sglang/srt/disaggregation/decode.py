@@ -2018,7 +2018,35 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
+    def _queue_lengths_aligned(self) -> bool:
+        """Check that every rank in the gloo group sees the same transfer
+        queue length before entering the status-poll collective.
+
+        Request fanout to the attn-tp ranks is asynchronous, so a rank may
+        momentarily hold a different transfer queue than its peers. Polling
+        in that state splits the group's collective sequence: ranks with a
+        non-empty queue block in poll_and_all_reduce while empty-queue ranks
+        skip it and move on to the next (different) collective, deadlocking
+        the whole group. Mirrors the guard in
+        DecodePreallocQueue._update_handshake_waiters.
+        """
+        group_size = torch.distributed.get_world_size(group=self.gloo_group)
+        if group_size <= 1:
+            return True
+        local_queue_size = torch.tensor([len(self.queue)], dtype=torch.int64)
+        queue_sizes = torch.empty(group_size, dtype=torch.int64)
+        torch.distributed.all_gather_into_tensor(
+            queue_sizes, local_queue_size, group=self.gloo_group
+        )
+        return bool(torch.all(queue_sizes == queue_sizes[0]).item())
+
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+        # Every rank of the gloo group must run this guard collective, even
+        # ranks whose queue is currently empty; skip the poll for this round
+        # until the whole group agrees on the queue length.
+        if not self._queue_lengths_aligned():
+            return []
+
         if not self.queue:
             return []
 
@@ -2395,7 +2423,19 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
+        # If any rank still holds retracted requests, all ranks of the gloo
+        # group must skip allocation together. A rank returning here on its
+        # own while its peers proceed into the prealloc/transfer collectives
+        # splits the group's collective sequence and deadlocks the group.
+        has_retracted = len(self.disagg_decode_prealloc_queue.retracted_queue) > 0
+        gloo_group = self.disagg_decode_prealloc_queue.gloo_group
+        if torch.distributed.get_world_size(group=gloo_group) > 1:
+            retracted_flag = torch.tensor([int(has_retracted)], dtype=torch.int64)
+            torch.distributed.all_reduce(
+                retracted_flag, op=torch.distributed.ReduceOp.MAX, group=gloo_group
+            )
+            has_retracted = bool(retracted_flag.item())
+        if has_retracted:
             # if there are still retracted requests, we do not allocate new requests
             return
 

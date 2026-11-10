@@ -1,6 +1,11 @@
 import torch
 
-from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
+from sglang.srt.sampling.penaltylib.orchestrator import (
+    _BatchedPenalizer,
+    host_to_device,
+    pad_rows_host,
+)
+from sglang.srt.utils.common import is_pin_memory_available
 
 
 class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
@@ -14,36 +19,34 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         )
 
     def _prepare(self):
-        self.min_new_tokens = torch.tensor(
-            data=[
-                req.sampling_params.min_new_tokens for req in self.orchestrator.reqs()
-            ],
+        device = self.orchestrator.device
+        self.min_new_tokens = host_to_device(
+            [req.sampling_params.min_new_tokens for req in self.orchestrator.reqs()],
             dtype=torch.int32,
-            device=self.orchestrator.device,
+            device=device,
         ).unsqueeze_(1)
 
-        padded_stop_token_ids = torch.nn.utils.rnn.pad_sequence(
-            sequences=[
-                torch.tensor(
-                    data=(
-                        list(
-                            (req.sampling_params.stop_token_ids or set())
-                            | (req.tokenizer.additional_stop_token_ids or set())
-                            | (
-                                {req.tokenizer.eos_token_id}
-                                if req.tokenizer.eos_token_id is not None
-                                else set()
-                            )
-                        )
-                    ),
-                    dtype=torch.int64,
-                    device=self.orchestrator.device,
+        # One pinned buffer + one async copy for the whole batch: the former
+        # per-request `torch.tensor(..., device=cuda)` + pad_sequence paid a
+        # pageable H2D per request.
+        stop_token_id_rows = [
+            list(
+                (req.sampling_params.stop_token_ids or set())
+                | (req.tokenizer.additional_stop_token_ids or set())
+                | (
+                    {req.tokenizer.eos_token_id}
+                    if req.tokenizer.eos_token_id is not None
+                    else set()
                 )
-                for req in self.orchestrator.reqs()
-            ],
-            batch_first=True,
+            )
+            for req in self.orchestrator.reqs()
+        ]
+        padded_stop_token_ids = pad_rows_host(
+            stop_token_id_rows,
             padding_value=self.orchestrator.vocab_size,
-        )
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(device),
+        ).to(device, non_blocking=True)
         self.stop_token_penalties = torch.zeros(
             size=(len(self.orchestrator.reqs()), self.orchestrator.vocab_size + 1),
             dtype=torch.float32,

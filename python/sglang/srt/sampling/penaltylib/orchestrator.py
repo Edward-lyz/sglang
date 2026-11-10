@@ -6,8 +6,45 @@ from typing import TYPE_CHECKING, Optional, Set, Type
 
 import torch
 
+from sglang.srt.utils.common import is_pin_memory_available
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+
+def host_to_device(data, *, dtype: torch.dtype, device) -> torch.Tensor:
+    """Build a device tensor from host data without blocking the host.
+
+    ``torch.tensor(data, device=cuda)`` copies from pageable memory, which makes
+    the host wait out the copy (``cudaMemcpyAsync`` + ``cudaStreamSynchronize``);
+    staging through pinned memory keeps it asynchronous. The pinned staging
+    buffer stays alive until the copy completes via torch's caching host
+    allocator, so returning right after the copy is safe.
+    """
+    host = torch.tensor(
+        data, dtype=dtype, pin_memory=is_pin_memory_available(device)
+    )
+    return host.to(device, non_blocking=True)
+
+
+def pad_rows_host(
+    rows, *, padding_value: int, dtype: torch.dtype, pin_memory: bool
+) -> torch.Tensor:
+    """Pad ragged host-side id lists into one ``(len(rows), max_len)`` tensor.
+
+    Replaces a per-row ``torch.tensor(..., device=cuda)`` +
+    ``torch.nn.utils.rnn.pad_sequence`` chain: that paid one pageable H2D per
+    row plus a pad kernel; this fills one pinned buffer on the host so the
+    caller needs a single async copy.
+    """
+    max_len = max((len(row) for row in rows), default=0)
+    out = torch.full(
+        (len(rows), max_len), padding_value, dtype=dtype, pin_memory=pin_memory
+    )
+    for i, row in enumerate(rows):
+        if row:
+            out[i, : len(row)] = torch.tensor(row, dtype=dtype)
+    return out
 
 
 class BatchedPenalizerOrchestrator:

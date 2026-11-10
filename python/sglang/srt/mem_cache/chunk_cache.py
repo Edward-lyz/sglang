@@ -84,7 +84,16 @@ class ChunkCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
         ]
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        allocator = self.token_to_kv_pool_allocator
+        # Sync-free page release on the decode node: the segment starts at the
+        # protected prefix, which is 0 here (chunk cache shares no prefix), so
+        # page representatives are a stride slice instead of a torch.unique.
+        from sglang.srt.mem_cache.common import use_segment_free
+
+        if use_segment_free() and req.cache_protected_len % allocator.page_size == 0:
+            allocator.free_segment(kv_indices, start_pos=req.cache_protected_len)
+        else:
+            allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
