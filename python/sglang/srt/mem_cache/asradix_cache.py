@@ -39,23 +39,6 @@ logger = logging.getLogger(__name__)
 AS_MIN_MATCH_BLOCKS = 5
 
 
-def page_align_keys(key: list, page_size) -> list:
-    if page_size == 1:
-        return key
-    page_aligned_len = len(key) // page_size * page_size
-    return key[:page_aligned_len]
-
-
-def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
-    # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
-    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
-    if len(tokens) and isinstance(tokens[0], tuple):
-        return tokens
-    if len(tokens) < 2:
-        return []
-    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
-
-
 @dataclass
 class _AsWriteTask:
     """Encapsulates state for one async AS write operation."""
@@ -439,53 +422,85 @@ class AsRadixCache(RadixCache):
             f"page_size={self.page_size})"
         )
 
-        # Build key: token_ids covering local prefix + AS loaded portion
+        # Build key: pass raw token_ids and let RadixKey/RadixCache handle the
+        # bigram view + page alignment internally. Pre-bigram-converting here
+        # and then setting is_bigram=True is a bug — RadixKey treats token_ids
+        # as raw whenever is_bigram=True, so feeding it pre-paired tuples
+        # double-applies the bigram transform (child_key becomes pairs-of-tuples,
+        # creating a phantom sibling under root distinct from cache_finished_req's
+        # correctly-keyed insert and double-counting the same KV slots).
         token_ids = req.fill_ids[:total_prefix_len]
-        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
-        keys = page_align_keys(keys, self.page_size)
-        if len(keys) == 0:
+
+        # Compute the final tree-key length the way RadixCache.insert will:
+        # bigram view shrinks raw N to N-1, then page-align.
+        bigram_len = (
+            max(0, len(token_ids) - 1) if self.is_eagle else len(token_ids)
+        )
+        final_key_len = bigram_len // self.page_size * self.page_size
+
+        if final_key_len == 0:
             # No keys after page alignment — free all loaded indices
             self.token_to_kv_pool_allocator.free(loaded_indices)
             return torch.empty((0,), dtype=loaded_indices.dtype, device=loaded_indices.device), last_host_node
 
-        # Build value: local prefix kv_indices + AS loaded kv_indices
+        # Build value: local prefix kv_indices + AS loaded kv_indices, sized
+        # to the actual tree-key length so RadixCache.insert won't truncate.
         full_values = torch.cat([req.prefix_indices, loaded_indices])
-        values = full_values[: len(keys)].to(dtype=torch.int64, copy=True)
+        values = full_values[:final_key_len].to(dtype=torch.int64, copy=True)
 
-        # Free the unaligned tail of loaded_indices that won't be inserted
-        # into the tree. With EAGLE bigram keys (N tokens -> N-1 keys) and
-        # page alignment, len(keys) can be up to page_size fewer than
-        # total_prefix_len, leaving a tail of KV indices untracked.
-        tail_start = max(len(keys) - local_hit_len, 0)
+        # Free the tail of loaded_indices that won't be tracked by the tree
+        # (EAGLE bigram drops 1 token + page alignment may drop up to one page).
+        tail_start = max(final_key_len - local_hit_len, 0)
         if tail_start < len(loaded_indices):
             self.token_to_kv_pool_allocator.free(loaded_indices[tail_start:])
             loaded_indices = loaded_indices[:tail_start]
 
         # Insert into tree — _insert_helper walks existing local prefix nodes
         # and creates new nodes for the AS portion only.
-        # evictable_size_ is updated automatically for new nodes.
         self.insert(
             InsertParams(
-                key=RadixKey(keys, req.extra_key, is_bigram=self.is_eagle),
+                key=RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle),
                 value=values,
             )
         )
 
-        # Re-match to get the correct last_node after insertion.
-        # Pre-converted keys with is_bigram flag avoid double conversion
-        # inside match_prefix's maybe_bigram_convert.
+        # Re-match to get the correct last_node + the tree-owned slot indices
+        # for every key we just (tried to) insert. Needed because if the tree
+        # already held part of the AS portion, _insert_helper walked past
+        # those keys without adopting our freshly allocated loaded_indices —
+        # they would leak. Switch loaded_indices to the tree's slot indices
+        # and free our displaced slots.
         match_result = super().match_prefix(
             MatchPrefixParams(
-                key=RadixKey(keys, req.extra_key, is_bigram=self.is_eagle),
+                key=RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle),
             )
         )
 
         if match_result.last_device_node is None:
             logger.warning(
                 "AS insert_loaded: re-match returned no last_node, "
-                f"loaded={len(loaded_indices)}, keys={len(keys)}"
+                f"loaded={len(loaded_indices)}, final_key_len={final_key_len}"
             )
             return loaded_indices, last_host_node
+
+        # Reconcile loaded_indices with the tree's actually-owned slots.
+        # tree_full_indices covers `final_key_len` tokens (prefix + AS portion).
+        # The AS portion is `tree_full_indices[local_hit_len:]`.
+        # _insert_helper walks matched nodes WITHOUT replacing their values,
+        # creating new nodes for the unmatched suffix using our loaded_indices.
+        # Free only positions where the tree's slot differs from ours.
+        tree_full_indices = match_result.device_indices
+        if len(tree_full_indices) >= final_key_len:
+            tree_as_indices = tree_full_indices[local_hit_len:].to(
+                dtype=loaded_indices.dtype
+            )
+            if tree_as_indices.numel() == loaded_indices.numel():
+                displaced_mask = tree_as_indices != loaded_indices
+                if bool(displaced_mask.any()):
+                    self.token_to_kv_pool_allocator.free(
+                        loaded_indices[displaced_mask]
+                    )
+                    loaded_indices = tree_as_indices
 
         logger.debug(
             f"AS insert_loaded: inserted {len(loaded_indices)} tokens into radix tree"
@@ -794,13 +809,15 @@ class AsRadixCache(RadixCache):
             # Default to empty dict if None – SDK requires a python/numpy/pytorch object
             write_params = getattr(req, "as_kv_cache_params", None) or {}
 
-            # Find the node covering the written range for lock_ref management
-            # Use match_prefix to find the node that holds our KV data
-            keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
-            keys = page_align_keys(keys, self.page_size)
+            # Find the node covering the written range for lock_ref management.
+            # NOTE: pass RAW token_ids to RadixKey with is_bigram=self.is_eagle; do NOT
+            # pre-convert via convert_to_bigram_key — RadixKey assumes raw tokens when
+            # is_bigram=True and computes bigrams on-the-fly. Pre-converting causes a
+            # double-bigram (pairs-of-pairs) child_key namespace mismatch with
+            # cache_finished_req's insert path, leaking KV slots.
             match_result = super().match_prefix(
                 MatchPrefixParams(
-                    key=RadixKey(keys, req.extra_key, is_bigram=self.is_eagle),
+                    key=RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle),
                 )
             )
             last_node = match_result.last_device_node
