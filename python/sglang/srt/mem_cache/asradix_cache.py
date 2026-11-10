@@ -104,6 +104,33 @@ class _AsWriteTask:
     num_pages: int
 
 
+def _get_as_load_group():
+    """Return the group across which AS-cached KV is replicated.
+
+    An AS load is sharded across this group (each rank reads 1/world of the hit
+    blocks from its local AttentionStore shard) and then all-gathered over NVLink.
+    Upstream 0.5.17 split attention parallelism into ATTN_TP x ATTN_CP. With NSA
+    prefill context parallel (attn_cp_size == tp_size) the attn-TP group has a
+    single rank, while every CP rank stores the full KV (latent cache and indexer
+    keys are CP-all-gathered before being written to the pool). Using attn-TP there
+    degenerates to world=1: every rank reads the whole prefix over PCIe in one
+    synchronous shot, with no sharding, no pynccl allgather and no read/allgather
+    pipelining. Use the attn-CP group in that case.
+    """
+    from sglang.srt.distributed import get_attn_tp_group
+
+    attn_tp = get_attn_tp_group()
+    if attn_tp.world_size > 1:
+        return attn_tp
+    try:
+        from sglang.srt.distributed import get_attn_cp_group
+
+        attn_cp = get_attn_cp_group()
+    except (AssertionError, ImportError):
+        return attn_tp
+    return attn_cp if attn_cp.world_size > 1 else attn_tp
+
+
 class AsRadixCache(RadixCache):
     """RadixCache subclass with AttentionStore secondary cache integration."""
 
@@ -270,10 +297,8 @@ class AsRadixCache(RadixCache):
         only compiles, so dummy tensors suffice. VECTOR_BYTES is per-request, so
         pre-compile all widths.
         """
-        from sglang.srt.distributed import get_attn_tp_group
-
         try:
-            attn_tp = get_attn_tp_group()
+            attn_tp = _get_as_load_group()
             world = attn_tp.world_size
         except Exception as e:
             logger.warning(
@@ -1338,9 +1363,14 @@ class AsRadixCache(RadixCache):
         """
         _t0 = time.perf_counter()
         pynccl_comm = nccl_tp.pynccl_comm
-        if stream is not None and pynccl_comm is not None and pynccl_comm.available:
-            # PyNccl is disabled by default outside graph capture; enable it only
-            # for this AS enqueue so the load stream stays async, then restore state.
+        if (
+            stream is not None
+            and pynccl_comm is not None
+            and pynccl_comm.available
+            and hasattr(nccl_tp, "cp_all_gather_into_tensor_async")
+        ):
+            # Legacy (pre-0.5.17) API: change_state() takes the stream and the
+            # group exposes stream-explicit async allgathers.
             with pynccl_comm.change_state(enable=True, stream=stream):
                 if plan.inplace_pairs is not None:
                     nccl_tp.cp_batch_all_gather_into_tensor_async(
@@ -1352,6 +1382,21 @@ class AsRadixCache(RadixCache):
                         plan.local_scratch,
                         stream=stream,
                     )
+        elif stream is not None and pynccl_comm is not None and pynccl_comm.available:
+            # 0.5.17 API: PyNcclCommunicator issues on the current stream and
+            # change_state() only toggles enablement. Enter the load stream so the
+            # allgather stays async with respect to the forward stream, and fuse
+            # the in-place pairs into one NCCL group launch.
+            with pynccl_comm.change_state(enable=True), torch.cuda.stream(stream):
+                if plan.inplace_pairs is not None:
+                    pynccl_comm.nccl.ncclGroupStart()
+                    try:
+                        for output, input_ in plan.inplace_pairs:
+                            pynccl_comm.all_gather(output, input_)
+                    finally:
+                        pynccl_comm.nccl.ncclGroupEnd()
+                else:
+                    pynccl_comm.all_gather(plan.gathered_scratch, plan.local_scratch)
         else:
             nccl_tp.all_gather_into_tensor(plan.gathered_scratch, plan.local_scratch)
         _nccl_ms = (time.perf_counter() - _t0) * 1000
@@ -1531,9 +1576,9 @@ class AsRadixCache(RadixCache):
         # _allgather_loaded_kv collective), otherwise the per-rank shard offsets and
         # the all-gather layout disagree when dp_size > 1 (global tp_rank 0..15 with
         # an attn-TP world of 8 would over-shard and index out of range).
-        from sglang.srt.distributed import get_attn_tp_group
-
-        attn_tp = get_attn_tp_group()
+        # Under NSA prefill CP the attn-TP group is size 1; shard over the group
+        # that actually holds KV replicas (see _get_as_load_group).
+        attn_tp = _get_as_load_group()
         n_blocks = page_rows.numel()
         world = attn_tp.world_size
         rank = attn_tp.rank_in_group
