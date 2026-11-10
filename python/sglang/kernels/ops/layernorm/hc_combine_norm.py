@@ -1,5 +1,7 @@
 """Collapse the hyper-connection streams and normalize the sublayer input."""
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -93,16 +95,22 @@ def _hc_combine_norm_mxfp8(
     EPS: tl.constexpr,
     PARTS: tl.constexpr,
     QEPS: tl.constexpr,
+    COPY0: tl.constexpr = False,
 ):
     # _hc_combine_norm plus the per-32 ue8m0 cast of its bf16 output in DeepGEMM's
     # layout (sglang_per_token_group_quant_fp8, column-major TMA-aligned scales).
+    # COPY0: the combine is copy 0 as is (pre = one-hot [1, 0, 0, 0]); only that
+    # copy is read and P is ignored.
     row, part = tl.program_id(0), tl.program_id(1)
     h = tl.arange(0, 8192)
     value = tl.full((8192,), 0, tl.float32)
-    for c in tl.static_range(4):
-        pre = tl.load(P + row * SP + c).to(tl.float32)
-        x = tl.load(X + row * SX + c * 5120 + h, h < 5120, 0).to(tl.float32)
-        value += x * pre
+    if COPY0:
+        value = tl.load(X + row * SX + h, h < 5120, 0).to(tl.float32)
+    else:
+        for c in tl.static_range(4):
+            pre = tl.load(P + row * SP + c).to(tl.float32)
+            x = tl.load(X + row * SX + c * 5120 + h, h < 5120, 0).to(tl.float32)
+            value += x * pre
     value = value.to(tl.bfloat16).to(tl.float32)
     inv_rms = tl.rsqrt(tl.sum(value * value, 0) / 5120 + EPS)
     mask = (h >= part * (5120 // PARTS)) & (h < (part + 1) * (5120 // PARTS))
@@ -124,14 +132,18 @@ def _hc_combine_norm_mxfp8(
 
 
 def hc_combine_norm_mxfp8(
-    x: torch.Tensor, pre: torch.Tensor, weight: torch.Tensor, eps: float
+    x: torch.Tensor,
+    pre: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    eps: float,
 ):
     """hc_combine_norm that also returns its output cast to MXFP8 for a DeepGEMM
     linear: ``(y_bf16 [m, 5120], (y_fp8 [m, 5120], scales int32 [m, 40] view))``.
     Decode-sized batches only (the split-row grid); None for m >= 4096."""
     m = x.shape[0]
     assert x.shape == (m, 20480)
-    assert pre.shape == (m, 4) and pre.stride(1) == 1
+    # pre None: copy 0 only (the one-hot combine), see COPY0 in the kernel.
+    assert pre is None or (pre.shape == (m, 4) and pre.stride(1) == 1)
     assert weight.shape == (5120,) and weight.is_contiguous()
     assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
     if m >= 4096:
@@ -143,7 +155,8 @@ def hc_combine_norm_mxfp8(
     if m > 0:
         parts = 4 if m <= 8 else (2 if m <= 48 else 1)
         _hc_combine_norm_mxfp8[(m, parts)](
-            x, pre, weight, y, q, sf.view(torch.uint8), m_pad,
-            x.stride(0), pre.stride(0), eps, parts, 1e-10, num_warps=8,
+            x, x if pre is None else pre, weight, y, q, sf.view(torch.uint8), m_pad,
+            x.stride(0), 0 if pre is None else pre.stride(0), eps, parts, 1e-10,
+            COPY0=pre is None, num_warps=8,
         )
     return y, (q, sf.mT[:m])

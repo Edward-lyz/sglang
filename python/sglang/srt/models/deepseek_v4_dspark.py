@@ -151,7 +151,9 @@ class DSparkAttention(MqaAttentionBase):
 
         self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
         self.alt_streams = alt_streams
-        self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
+        self._multi_stream_bs_limit = envs.SGLANG_OPT_DSPARK_MULTI_STREAM_TOKEN_LIMIT.get() or (
+            128 if get_platform().is_blackwell else 64
+        )
         if _is_npu:
             self.register_buffer(
                 "_q_post_norm_weight",

@@ -1955,11 +1955,22 @@ class Envs:
     # per_token_group_quant before the shared expert. MegaMoE still reads the bf16
     # copy. Decode and target verify only.
     SGLANG_FUSE_MEGA_MHC_FP8_SHARED_INPUT = EnvBool(False)
+    # [fusion-opt] When the shared expert's gate_up takes a prequantized input (the
+    # flag above, or the fused hc_combine_norm mxfp8 path), launch it after the
+    # MegaMoE router gate on the side stream: without the quant in front, gate_up
+    # grabs the SMs first and the gate (the critical path into MegaMoE) runs ~2x
+    # longer. Decode / verify CUDA graphs only.
+    SGLANG_OPT_SHARED_EXPERT_AFTER_GATE = EnvBool(False)
     # [fusion-opt] Where an mHC boundary is not served by mega_mhc (fused
     # hc_combine_norm path, e.g. around Engram layers), the same Triton launch also
     # writes the sublayer input as DeepGEMM mxfp8 for wqkv_a / the shared expert's
     # gate_up. Decode and target verify only.
     SGLANG_FUSE_HC_COMBINE_NORM_MXFP8 = EnvBool(False)
+    # [fusion-opt] With SGLANG_FUSE_HC_COMBINE_NORM_MXFP8: the copy-0 sublayer input
+    # (no pre-mix yet: DSpark draft stage 0, target layer 0) also goes through that
+    # launch with a one-hot pre, so its consumers skip contiguous() + RMSNorm + one
+    # per_token_group_quant each. Same math; RMSNorm reduction order may differ.
+    SGLANG_FUSE_HC_COPY0_NORM_MXFP8 = EnvBool(False)
     # [fusion-opt] FlashMLA fused-o decode: the wo_a fp8 einsum uses DeepGEMM's FP8
     # (d, sfd) output (per-32 ue8m0 over d.flatten(1, 2)) so wo_b takes it directly,
     # dropping the per_token_group_quant between wo_a and wo_b. The cast is taken from
@@ -2136,6 +2147,11 @@ class Envs:
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
+    # [fusion-opt] Token cap of the DSpark draft's multi-stream attention (wkv + KV
+    # cache write on a side stream next to wq_a / q_norm / wq_b). 0 keeps the
+    # platform default (128 on Blackwell, 64 elsewhere); the draft block carries
+    # bs * block tokens, so bs > 25 at block 5 runs single-stream by default.
+    SGLANG_OPT_DSPARK_MULTI_STREAM_TOKEN_LIMIT = EnvInt(0)
 
     # ===================================================================
     # Inkling

@@ -300,9 +300,21 @@ def forward_mega_moe(
             "(tokens=%d)",
             num_tokens,
         )
+    # [fusion-opt] SGLANG_OPT_SHARED_EXPERT_AFTER_GATE: with the prequantized shared
+    # input there is no per_token_group_quant ahead of gate_up, so gate_up reaches
+    # the GPU before the router gate on the side stream and takes its SMs (gate
+    # ~10 -> ~24 us, MegaMoE starts that much later). Issue the routed branch first
+    # and start the shared expert after the gate's event instead.
+    gate_done_event = (
+        torch.cuda.Event()
+        if shared_x_quant is not None
+        and sbo_overlap_flag
+        and envs.SGLANG_OPT_SHARED_EXPERT_AFTER_GATE.get()
+        else None
+    )
     shared_output = (
         None
-        if fused_shared
+        if fused_shared or gate_done_event is not None
         else moe._forward_shared_experts(hidden_states, pre_quant_input=shared_x_quant)
     )
 
@@ -313,7 +325,7 @@ def forward_mega_moe(
     # topk and a shared output exists. Default OFF (SGLANG_FUSE_SHARED_SCALE_ADD).
     fuse_scale_add = (
         envs.SGLANG_FUSE_SHARED_SCALE_ADD.get()
-        and shared_output is not None
+        and (shared_output is not None or gate_done_event is not None)
         and _device_sm != 90
         and not moe.experts.should_fuse_routed_scaling_factor_in_topk
     )
@@ -327,6 +339,15 @@ def forward_mega_moe(
             num_tokens,
             apply_routed_scaling=not fuse_scale_add,
             fuse_shared=fused_shared,
+            gate_done_event=gate_done_event,
+        )
+
+    if gate_done_event is not None:
+        # The shared expert launches only after the router gate: its gate_up GEMM
+        # (all SMs, persistent) no longer races the gate for SMs at the boundary.
+        current_stream.wait_event(gate_done_event)
+        shared_output = moe._forward_shared_experts(
+            hidden_states, pre_quant_input=shared_x_quant
         )
 
     if sbo_overlap_flag:
@@ -572,6 +593,7 @@ def _run_mega_routed(
     fuse_shared: bool = False,
     zero_routed: bool = False,
     routed_scale_in_weights: bool = False,
+    gate_done_event: Optional[torch.cuda.Event] = None,
 ) -> torch.Tensor:
     # zero_routed / routed_scale_in_weights only serve _selfcheck_fused_shared:
     # zero every routed weight (ids stay valid, so the dispatch is unchanged and
@@ -647,6 +669,8 @@ def _run_mega_routed(
     else:
         topk_ids = None
         topk_weights = None
+    if gate_done_event is not None:
+        gate_done_event.record()
 
     ep_group = get_moe_ep_group().device_group
     num_experts = moe.experts.num_experts

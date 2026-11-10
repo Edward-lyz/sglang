@@ -3689,7 +3689,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         if stats_stream is not None and not tiny:
             stats_stream.wait_stream(torch.cuda.current_stream())
         if apply_pre is None:
-            y = norm(x[:, 0, :].contiguous())
+            fused8 = (
+                self._hc_copy0_norm_mxfp8(x, norm)
+                if want_fp8 and envs.SGLANG_FUSE_HC_COPY0_NORM_MXFP8.get()
+                else None
+            )
+            if fused8 is not None:
+                y, (yq, ys) = fused8
+                y_quant = Mxfp8DeepGemmInput(yq, ys)
+            else:
+                y = norm(x[:, 0, :].contiguous())
         else:
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
@@ -3748,6 +3757,44 @@ class DeepseekV4DecoderLayer(nn.Module):
         if stats_stream is not None and tiny:
             stats_stream.wait_stream(torch.cuda.current_stream())
         return (y, y_quant) if return_quant else y
+
+    def _hc_copy0_norm_mxfp8(self, x: torch.Tensor, norm: RMSNorm):
+        """[fusion-opt] SGLANG_FUSE_HC_COPY0_NORM_MXFP8: the ``apply_pre is None``
+        sublayer input (copy 0, RMS-normalized; the DSpark draft's first stage and
+        the target's first layer) through hc_combine_norm_mxfp8's copy-0 form: one
+        launch reads copy 0, RMS-normalizes it and writes the DeepGEMM mxfp8 cast,
+        replacing contiguous() + RMSNorm + one per_token_group_quant per consumer.
+        None when the kernel does not apply."""
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        if not (
+            x.is_cuda
+            and get_platform().is_blackwell
+            and 0 < x.shape[0]
+            and self.hc_mult == 4
+            and x.dim() == 3
+            and x.shape[1] * x.shape[2] == 20480
+            and x.is_contiguous()
+            and x.dtype == norm.weight.dtype == torch.bfloat16
+            and not norm.cast_x_before_out_mul
+            and norm.variance_size_override is None
+            and not is_batch_invariant_mode_enabled()
+        ):
+            return None
+        from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm_mxfp8
+
+        # pre=None: the kernel's copy-0 form (reads copy 0 only).
+        fused8 = hc_combine_norm_mxfp8(x.flatten(1), None, norm.weight, norm.variance_epsilon)
+        if fused8 is not None:
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "fusion-opt hc_copy0_norm_mxfp8",
+                "copy-0 RMSNorm + DeepGEMM mxfp8 cast in one launch (layer=%d, rows=%d)",
+                self.layer_id,
+                x.shape[0],
+            )
+        return fused8
 
     def _hc_mix_stats(
         self,
