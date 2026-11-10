@@ -63,4 +63,9 @@ RUN pip install PyNvVideoCodec
 RUN python3 -c "from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module; get_trtllm_moe_sm100_module()" || \
     echo "[warn] flashinfer trtllm-gen MoE warmup failed (non-SM100 build env?); will fall back to runtime init"
 
+# ci测试部分命令使用sglang命令
+# SETUPTOOLS_SCM_PRETEND_VERSION keeps the version aligned with the base image.
+RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.5.15.post1 \
+    pip install -e /sgl-workspace/sglang/python --no-deps --no-build-isolation
+
 WORKDIR /sgl-workspace/sglang
