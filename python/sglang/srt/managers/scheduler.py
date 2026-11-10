@@ -126,6 +126,7 @@ from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    decode_scheduler_input,
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
@@ -266,6 +267,13 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.scheduler_components.prefill_admission import (
+    PrefillAdmission,
+    clamped_chunk_budget,
+)
+from sglang.srt.managers.scheduler_components.prefill_cost_model import (
+    PrefillCostScheduler,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -274,6 +282,9 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 )
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
+)
+from sglang.srt.managers.scheduler_components.request_ring import (
+    maybe_create_request_ring,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
@@ -884,6 +895,7 @@ class Scheduler(
 
         self.load_snapshot_writer = None
         self.recv_from_tokenizer = None
+        self.scheduler_input_ipc_name = port_args.scheduler_input_ipc_name
 
         if not is_rank_zero:
             return
@@ -2745,7 +2757,17 @@ class Scheduler(
         return get_serving().tokenizer_path
 
     def init_request_receiver(self) -> None:
+        """Build the request receiver (and the shared-memory request ring if enabled)."""
+        request_ring = maybe_create_request_ring(
+            ps=self.ps,
+            tp_group=self.tp_group,
+            tp_cpu_group=self.tp_cpu_group,
+            recv_from_tokenizer=self.recv_from_tokenizer,
+            scheduler_input_endpoint=self.scheduler_input_ipc_name,
+            decode=decode_scheduler_input,
+        )
         self.request_receiver = SchedulerRequestReceiver(
+            request_ring=request_ring,
             recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
@@ -4342,6 +4364,79 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        admission = self._open_prefill_admission(
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
+            running_batch=running_batch,
+        )
+        if admission.adder is None:
+            return None, admission.running_batch
+        self._admit_prefill_candidates(
+            admission, admission.initial_candidates, allow_refill=True
+        )
+        return self._seal_prefill_admission(admission)
+
+    def begin_new_batch_prefill(
+        self,
+        running_batch: ScheduleBatch,
+        *,
+        cost_scheduler: Optional[PrefillCostScheduler] = None,
+    ) -> PrefillAdmission:
+        """Open an admission that later candidates can still join (continuous mode)."""
+        prefill_delayer_single_pass = None
+        if self.prefill_delayer:
+            max_pool_usage = (
+                self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
+            )
+            prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
+                self.prefill_delayer, token_usage=max_pool_usage
+            )
+        admission = self._open_prefill_admission(
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
+            running_batch=running_batch,
+            cost_scheduler=cost_scheduler,
+        )
+        if admission.adder is not None:
+            self._admit_prefill_candidates(
+                admission, admission.initial_candidates, allow_refill=True
+            )
+        return admission
+
+    def admit_late_prefill_candidates(
+        self, admission: PrefillAdmission, candidate_reqs: List[Req]
+    ) -> None:
+        """Offer requests that became ready after the admission was opened."""
+        if (
+            admission.closed
+            or admission.adder is None
+            # The mamba slot group is sized by the candidates known at open time.
+            or admission.mamba_allocator is not None
+        ):
+            return
+        self._admit_prefill_candidates(admission, candidate_reqs, allow_refill=False)
+
+    def finish_new_batch_prefill(self, admission: PrefillAdmission) -> NextBatchPlan:
+        """Seal a continuous-mode admission; mirrors get_new_batch_prefill."""
+        if admission.adder is None:
+            ret, running_batch = None, admission.running_batch
+        else:
+            ret, running_batch = self._seal_prefill_admission(admission)
+        if self.prefill_delayer and admission.prefill_delayer_single_pass is not None:
+            observed_prefill_bs = admission.prefill_delayer_single_pass.finalize(
+                actual_prefill_bs=ret.batch_size() if ret is not None else 0
+            )
+            if observed_prefill_bs > 0:
+                self.max_prefill_bs = self.prefill_bs_tracker.observe_attempt(
+                    observed_prefill_bs
+                )
+        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _open_prefill_admission(
+        self,
+        *,
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+        running_batch: ScheduleBatch,
+        cost_scheduler: Optional[PrefillCostScheduler] = None,
+    ) -> PrefillAdmission:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -4366,7 +4461,10 @@ class Scheduler(
         ) and self.chunked_req is None:
             if ADMISSION_DIAG is not None:
                 ADMISSION_DIAG.reason("no_queue_or_batch_full")
-            return None, running_batch
+            return PrefillAdmission(
+                running_batch=running_batch,
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+            )
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
@@ -4382,7 +4480,10 @@ class Scheduler(
         ):
             if ADMISSION_DIAG is not None:
                 ADMISSION_DIAG.reason("min_free_slots_delay")
-            return None, running_batch
+            return PrefillAdmission(
+                running_batch=running_batch,
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+            )
 
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
@@ -4397,7 +4498,10 @@ class Scheduler(
             running_batch.batch_is_full = True
             if ADMISSION_DIAG is not None:
                 ADMISSION_DIAG.reason("no_allocatable_req_slots")
-            return None, running_batch
+            return PrefillAdmission(
+                running_batch=running_batch,
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+            )
 
         # Get priority queue
         self.policy.calc_priority(
@@ -4405,12 +4509,17 @@ class Scheduler(
             running_batch,
             processed_tokens=self.processed_tokens_counter,
         )
+        if cost_scheduler is not None:
+            cost_scheduler.order(self.waiting_queue)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
-            return None, running_batch
+            return PrefillAdmission(
+                running_batch=running_batch,
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+            )
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
@@ -4452,7 +4561,19 @@ class Scheduler(
         skip_waiting_admission = False
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            with clamped_chunk_budget(
+                adder,
+                self._cost_chunk_cap(
+                    cost_scheduler,
+                    adder,
+                    context_len=len(self.chunked_req.prefix_indices),
+                    extend_len=len(self.chunked_req.full_untruncated_fill_ids)
+                    - len(self.chunked_req.prefix_indices),
+                ),
+            ):
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            # Still mid-prompt: it holds this batch's only partial-chunk slot.
+            adder.allow_new_chunk = self.chunked_req is None
             post_chunk_budget_state = adder.budget_state()
             # NO_TOKEN takes precedence over chunk exhaustion in budget_state(),
             # so inspect the chunk budget explicitly.
@@ -4484,6 +4605,7 @@ class Scheduler(
                 else:
                     running_batch.batch_is_full = True
 
+        running_loras = None
         if self.enable_lora:
             running_loras = {
                 req.lora_id for req in running_batch.reqs if not req.finished()
@@ -4507,10 +4629,60 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(candidate_reqs))
+        return PrefillAdmission(
+            running_batch=running_batch,
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
+            adder=adder,
+            initial_candidates=candidate_reqs,
+            running_loras=running_loras,
+            mamba_allocator=mamba_allocator,
+            cost_scheduler=cost_scheduler,
+            closed=skip_waiting_admission,
+        )
+
+    def _cost_chunk_cap(
+        self,
+        cost_scheduler: Optional[PrefillCostScheduler],
+        adder: PrefillAdder,
+        *,
+        context_len: int,
+        extend_len: int,
+    ) -> Optional[int]:
+        if (
+            cost_scheduler is None
+            or adder.rem_chunk_tokens is None
+            or extend_len <= cost_scheduler.config.min_long_chunk
+        ):
+            return None
+        return cost_scheduler.chunk_cap(
+            context_len=context_len,
+            waiting_queue=self.waiting_queue,
+            hi=adder.rem_chunk_tokens,
+            used_seconds=sum(
+                cost_scheduler.model.req_cost(
+                    q=r.extend_range.length, p=len(r.prefix_indices)
+                )
+                for r in adder.can_run_list
+            ),
+        )
+
+    def _admit_prefill_candidates(
+        self,
+        admission: PrefillAdmission,
+        candidate_reqs,
+        *,
+        allow_refill: bool,
+    ) -> None:
+        adder = admission.adder
+        running_batch = admission.running_batch
+        running_loras = admission.running_loras
+        cost_scheduler = admission.cost_scheduler
         refill_passes = 0
         while True:
+            stopped = False
             # Get requests from the waiting queue to a new prefill batch
             for req in candidate_reqs:
+                admission.offered.add(req.rid)
                 if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                     if ADMISSION_DIAG is not None:
                         ADMISSION_DIAG.skip("lora")
@@ -4545,6 +4717,7 @@ class Scheduler(
                     ):
                         if ADMISSION_DIAG is not None:
                             ADMISSION_DIAG.reason("req_slots_limit", adder, req)
+                        stopped = True
                         break
 
                 if self.enable_hicache_storage:
@@ -4593,14 +4766,40 @@ class Scheduler(
                         req.storage_hit_length = 0
                         req.storage_hit_start = None
                         req.host_hit_is_storage = False
+                cand_extend_len = len(req.full_untruncated_fill_ids) - len(
+                    req.prefix_indices
+                )
+                if (
+                    not adder.allow_new_chunk
+                    and adder.rem_chunk_tokens is not None
+                    and cand_extend_len > adder.rem_chunk_tokens
+                ):
+                    # The partial-chunk slot is taken (possible once a clamped
+                    # chunk leaves budget behind): only requests that finish fit.
+                    continue
                 previous_count = len(adder.can_run_list)
                 if ADMISSION_DIAG is not None:
                     ADMISSION_DIAG.candidate(req, adder)
-                res = adder.add_one_req(
-                    req,
-                    has_chunked_req=(self.chunked_req is not None),
-                    truncation_align_size=self.truncation_align_size,
-                )
+                with clamped_chunk_budget(
+                    adder,
+                    self._cost_chunk_cap(
+                        cost_scheduler,
+                        adder,
+                        context_len=len(req.prefix_indices),
+                        extend_len=cand_extend_len,
+                    ),
+                ) as clamped:
+                    res = adder.add_one_req(
+                        req,
+                        has_chunked_req=(self.chunked_req is not None),
+                        truncation_align_size=self.truncation_align_size,
+                    )
+                if adder.new_chunked_req is not None:
+                    adder.allow_new_chunk = False
+                if clamped and res == AddReqResult.OTHER and adder.can_run_list and (
+                    req is adder.can_run_list[-1]
+                ):
+                    res = adder.budget_state()
                 if ADMISSION_DIAG is not None:
                     ADMISSION_DIAG.candidate(req, adder, res, previous_count)
 
@@ -4634,15 +4833,27 @@ class Scheduler(
                                 req.kv.mamba_pool_idx.unsqueeze(-1)
                             )
                             req.kv.mamba_pool_idx = None
+                    stopped = True
                     break
 
+            if not allow_refill:
+                admission.closed = admission.closed or stopped
+                break
             candidate_reqs = self._ascache_ready_refill_candidates(
                 adder, running_batch, refill_passes
             )
             if not candidate_reqs:
+                admission.closed = admission.closed or stopped
                 break
             refill_passes += 1
 
+    def _seal_prefill_admission(
+        self, admission: PrefillAdmission
+    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        admission.closed = True
+        adder = admission.adder
+        running_batch = admission.running_batch
+        mamba_allocator = admission.mamba_allocator
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
 
@@ -6071,6 +6282,13 @@ class Scheduler(
         to_del = []
         for i, req in enumerate(self.waiting_queue):
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if req.rid in self.open_prefill_admission_rids:
+                    # Already admitted into the prefill batch being assembled:
+                    # it runs this forward and is retired with the aborted results.
+                    prepare_abort(req, "Aborted by AbortReq.")
+                    if req.disagg_kv_sender is not None:
+                        req.disagg_kv_sender.abort()
+                    continue
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -6551,7 +6769,14 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:
             if envs.SGLANG_ENABLE_PREFILL_FWD_THREAD.get():
-                scheduler.event_loop_overlap_disagg_prefill_threaded()
+                if envs.SGLANG_PREFILL_FWD_THREAD_AHEAD.get() and (
+                    envs.SGLANG_ENABLE_PREFILL_CONTINUOUS_ADMISSION.get()
+                    or envs.SGLANG_ENABLE_PREFILL_COST_SCHEDULING.get()
+                    or envs.SGLANG_LOG_PREFILL_SCHED_STATS_INTERVAL.get() > 0
+                ):
+                    scheduler.event_loop_overlap_disagg_prefill_continuous()
+                else:
+                    scheduler.event_loop_overlap_disagg_prefill_threaded()
             else:
                 scheduler.event_loop_overlap_disagg_prefill()
         else:

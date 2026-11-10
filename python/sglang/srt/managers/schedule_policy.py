@@ -580,6 +580,9 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        # A batch carries at most one partial chunk (the scheduler's single
+        # chunked_req slot); cleared once that slot is taken in this batch.
+        self.allow_new_chunk = True
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_device_hit_tokens = 0
@@ -1252,6 +1255,9 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
+            if not self.allow_new_chunk:
+                return admission_result(self, AddReqResult.OTHER, "chunk_slot_taken", req)
+
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
 
@@ -1505,6 +1511,10 @@ class PrefillAdder:
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
             else:
+                if not self.allow_new_chunk:
+                    return admission_result(
+                        self, AddReqResult.OTHER, "chunk_slot_taken", req
+                    )
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from contextlib import contextmanager
@@ -40,6 +41,16 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     staging_grid_tokens,
 )
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
+from sglang.srt.disaggregation.prefill_continuous import (
+    ContinuousPrefillController,
+    make_try_get,
+)
+from sglang.srt.managers.scheduler_components.prefill_admission import (
+    PrefillAdmission,
+)
+from sglang.srt.managers.scheduler_components.prefill_cost_model import (
+    CostScheduleConfig,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -574,6 +585,10 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    # rids admitted into the prefill batch the continuous loop is assembling;
+    # abort_request must not pop them from the waiting queue.
+    open_prefill_admission_rids: frozenset = frozenset()
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -848,6 +863,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         self._fwd_in_q: _queue.Queue = _queue.Queue(maxsize=1)
         self._fwd_out_q: _queue.Queue = _queue.Queue(maxsize=1)
+        # A result the continuous-admission poll already took off _fwd_out_q.
+        self._fwd_stashed = None
+        # (start, end) timing events of each forward, in submission order;
+        # recorded only while _fwd_record_events is set.
+        self._fwd_events: deque = deque()
+        self._fwd_record_events = False
         self._fwd_thread = _threading.Thread(
             target=self._prefill_fwd_thread_main, name="prefill_fwd", daemon=True
         )
@@ -871,6 +892,13 @@ class SchedulerDisaggregationPrefillMixin:
             if item is None:  # shutdown sentinel
                 return
             batch, early_send_prefix, extend_input_len_per_req = item
+            events = None
+            if self._fwd_record_events:
+                events = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                events[0].record(self.forward_stream)
             try:
                 # inference_mode skips autograd version/view bookkeeping per op; the
                 # eager prefill body is host launch bound at small chunks.
@@ -882,6 +910,9 @@ class SchedulerDisaggregationPrefillMixin:
                         early_send_prefix=early_send_prefix,
                         extend_input_len_per_req=extend_input_len_per_req,
                     )
+                if events is not None:
+                    events[1].record(self.forward_stream)
+                    self._fwd_events.append(events)
                 if batch_write_fence:
                     batch.as_kv_ready_event = self.device_module.Event()
                     batch.as_kv_ready_event.record(stream=self.forward_stream)
@@ -908,7 +939,10 @@ class SchedulerDisaggregationPrefillMixin:
     def _fwd_collect(self: Scheduler):
         """Block for the oldest submitted forward; return (result, batch_copy)
         or re-raise its error."""
-        result, batch_copy, exc = self._fwd_out_q.get()
+        stashed, self._fwd_stashed = self._fwd_stashed, None
+        result, batch_copy, exc = (
+            stashed if stashed is not None else self._fwd_out_q.get()
+        )
         if exc is not None:
             raise exc
         if batch_copy.as_kv_ready_event is not None:
@@ -1092,6 +1126,233 @@ class SchedulerDisaggregationPrefillMixin:
             # Admission state only (no forward result); the next iter's
             # get_next_batch must see this batch as last_batch.
             self.last_batch = batch
+
+    def begin_next_disagg_prefill_batch(
+        self: Scheduler,
+        *,
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch],
+        deferred_finalize: DeferredFinalize,
+        cost_scheduler,
+    ) -> PrefillAdmission:
+        """First half of get_next_disagg_prefill_batch_to_run: open, do not seal."""
+        self.process_pending_chunked_abort(deferred_release=deferred_finalize)
+        running_batch.batch_is_full = False
+        self.resolve_waiting_queue_bootstrap()
+        self.process_prefill_chunk(
+            last_batch=last_batch,
+            running_batch=running_batch,
+            deferred_finalize=deferred_finalize,
+        )
+        return self.begin_new_batch_prefill(
+            running_batch, cost_scheduler=cost_scheduler
+        )
+
+    def finish_next_disagg_prefill_batch(
+        self: Scheduler, admission: PrefillAdmission
+    ) -> NextBatchPlan:
+        """Second half of get_next_disagg_prefill_batch_to_run: seal the batch."""
+        plan = self.finish_new_batch_prefill(admission)
+        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(plan.batch_to_run)
+        if batch:
+            set_schedule_time_batch(batch)
+        return NextBatchPlan(batch_to_run=batch, running_batch=plan.running_batch)
+
+    def _make_continuous_prefill_controller(self: Scheduler) -> ContinuousPrefillController:
+        cost_config = None
+        if envs.SGLANG_ENABLE_PREFILL_COST_SCHEDULING.get():
+            cost_config = CostScheduleConfig(
+                target_step_seconds=envs.SGLANG_PREFILL_COST_TARGET_STEP_MS.get() / 1000.0,
+                aging_seconds=envs.SGLANG_PREFILL_COST_AGING_MS.get() / 1000.0,
+                min_long_chunk=envs.SGLANG_PREFILL_COST_MIN_LONG_CHUNK.get(),
+                short_seconds=envs.SGLANG_PREFILL_COST_SHORT_MS.get() / 1000.0,
+            )
+        return ContinuousPrefillController(
+            is_leader=self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            poll_s=max(1e-4, envs.SGLANG_PREFILL_ADMISSION_POLL_MS.get() / 1000.0),
+            stats_interval_s=envs.SGLANG_LOG_PREFILL_SCHED_STATS_INTERVAL.get(),
+            cost_config=cost_config,
+            continuous=envs.SGLANG_ENABLE_PREFILL_CONTINUOUS_ADMISSION.get(),
+        )
+
+    def _pop_bootstrapped_into_waiting(
+        self: Scheduler, ctl: ContinuousPrefillController
+    ) -> None:
+        ready = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        if ready:
+            self.waiting_queue.extend(ready)
+            ctl.note_ready(ready)
+
+    def _late_prefill_candidates(
+        self: Scheduler, admission: PrefillAdmission, ctl: ContinuousPrefillController
+    ) -> List[Req]:
+        """Waiting requests this admission has not seen, plus finished load-backs.
+
+        A request whose AttentionStore load-back was submitted or still pending
+        when offered is offered once more after the read committed.
+        """
+        admitted = set(admission.adder.can_run_list) if admission.adder is not None else set()
+        candidates = []
+        for r in self.waiting_queue:
+            if r.rid not in admission.offered:
+                candidates.append(r)
+            elif (
+                r.rid not in admission.reoffered
+                and r not in admitted
+                and r._as_pending_load_back is None
+                and r.as_read_pending_lock
+            ):
+                admission.reoffered.add(r.rid)
+                candidates.append(r)
+        if ctl.cost_scheduler is not None and len(candidates) > 1:
+            ctl.cost_scheduler.order(candidates, prune=False)
+        return candidates
+
+    def _admit_while_forward_runs(
+        self: Scheduler,
+        admission: PrefillAdmission,
+        ctl: ContinuousPrefillController,
+        try_get: Callable[[float], bool],
+    ) -> PrefillAdmission:
+        """Keep the next batch open until the in-flight forward returns.
+
+        Stops early once the admission is closed (budget or slots exhausted):
+        nothing more can join, so sealing right away keeps the AHEAD overlap.
+        Every poll runs the same collectives on every rank (the leader decides
+        when the forward is done; ``closed`` is a deterministic admission
+        result), so ingest, bootstrap polls and admission stay in lockstep.
+        """
+        while not admission.closed and not ctl.poll_forward_done(try_get):
+            started = time.perf_counter()
+            self.ingest_requests()
+            self._pop_bootstrapped_into_waiting(ctl)
+            if self.enable_asradix_cache:
+                # The pending list is rank-consistent; collectives inside follow it.
+                self.tree_cache.commit_ascache_load_backs()
+            if self._engine_paused:
+                continue
+            candidates = self._late_prefill_candidates(admission, ctl)
+            if not candidates:
+                continue
+            before = len(admission.adder.can_run_list) if admission.adder is not None else 0
+            if admission.adder is None:
+                admission = self.begin_new_batch_prefill(
+                    admission.running_batch, cost_scheduler=ctl.cost_scheduler
+                )
+                # Nothing admissible (slots, delayer): retry at the next loop top.
+                admission.closed = admission.closed or admission.adder is None
+            else:
+                self.admit_late_prefill_candidates(admission, candidates)
+            if admission.adder is not None:
+                self.open_prefill_admission_rids = frozenset(
+                    r.rid for r in admission.adder.can_run_list
+                )
+                ctl.note_late_admitted(
+                    len(admission.adder.can_run_list) - before,
+                    time.perf_counter() - started,
+                )
+        return admission
+
+    @torch.no_grad()
+    def event_loop_overlap_disagg_prefill_continuous(self: Scheduler) -> None:
+        """The threaded AHEAD loop with an open next batch.
+
+        The AHEAD loop seals batch N+1 right after submitting N, so a request
+        that becomes ready during N's forward waits for N+2. Here N+1 keeps
+        admitting (ingest, bootstrap, load-back commits) while N runs and is
+        sealed only when N's result is back. With SGLANG_ENABLE_PREFILL_COST_SCHEDULING
+        the queue is ordered by predicted cost and long chunks are throttled.
+        """
+        self._ensure_prefill_fwd_thread()
+        ctl = self._make_continuous_prefill_controller()
+        self._fwd_record_events = ctl.needs_events
+        try_get = make_try_get(self._fwd_out_q, self._stash_fwd_result)
+        self.result_queue = deque()
+        inflight = None
+        inflight_step = 0
+
+        while True:
+            self.retire_ascache_writes()
+            self.ingest_requests()
+            if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
+                continue
+            ctl.sync_clock()
+            self._pop_bootstrapped_into_waiting(ctl)
+
+            deferred_finalize: DeferredFinalize = []
+            admission = self.begin_next_disagg_prefill_batch(
+                running_batch=self.running_batch,
+                last_batch=self.last_batch,
+                deferred_finalize=deferred_finalize,
+                cost_scheduler=ctl.cost_scheduler,
+            )
+            if inflight is not None and ctl.continuous:
+                if admission.adder is not None:
+                    self.open_prefill_admission_rids = frozenset(
+                        r.rid for r in admission.adder.can_run_list
+                    )
+                admission = self._admit_while_forward_runs(admission, ctl, try_get)
+
+            # Seal: as in the AHEAD loop this may run while the previous forward
+            # is still in flight (admission closed early, or continuous off).
+            seal_started = time.perf_counter()
+            plan = self.finish_next_disagg_prefill_batch(admission)
+            self.open_prefill_admission_rids = frozenset()
+            ctl.note_seal(time.perf_counter() - seal_started)
+
+            prev_result = None
+            if inflight is not None:
+                prev_snap = inflight
+                prev_result, prev_result_copy = self._fwd_collect()
+                self.launch_batch_sample_if_needed(prev_result, prev_snap)
+            self.running_batch = plan.running_batch
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                plan.batch_to_run, chunked_req=self.chunked_req
+            )
+            self.cur_batch_for_debug = batch
+
+            # Same ordering as the AHEAD loop: chunk finalize after the previous
+            # forward is collected and before the next one reads req_to_token.
+            overlap_finalize = self._run_serial_deferred_finalize(deferred_finalize)
+
+            new_step = 0
+            if batch:
+                if self.enable_staging:
+                    self.maybe_prefetch_staging_for_batch(batch)
+                snap = self._snapshot_batch_for_forward(batch)
+                for req in snap.reqs:
+                    self.maybe_send_cached_prefix_chunk(req)
+                self._fwd_submit(
+                    snap,
+                    early_send_prefix=False,
+                    extend_input_len_per_req=self._snapshot_extend_input_lens(snap),
+                )
+                new_inflight = snap
+                new_step = ctl.on_submit(snap, events=None)
+            else:
+                new_inflight = None
+
+            for item in overlap_finalize:
+                self._finalize_prefill_chunk(item.req, chunk_range=item.chunk_range)
+
+            if prev_result is not None:
+                self.process_batch_result(prev_result_copy, prev_result)
+                ctl.attach_events(inflight_step, self._fwd_events.popleft() if self._fwd_events else None)
+                ctl.on_result_processed(inflight_step)
+            elif new_inflight is None:
+                self.on_idle()
+
+            self.process_disagg_prefill_inflight_queue()
+
+            inflight = new_inflight
+            inflight_step = new_step
+            self.last_batch = batch
+
+    def _stash_fwd_result(self: Scheduler, item) -> None:
+        self._fwd_stashed = item
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,

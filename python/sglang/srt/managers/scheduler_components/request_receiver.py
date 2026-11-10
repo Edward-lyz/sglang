@@ -46,6 +46,9 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.scheduler_components.request_ring import (
+        RequestRingIntake,
+    )
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
@@ -79,6 +82,7 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    request_ring: Optional[RequestRingIntake] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -102,12 +106,15 @@ class SchedulerRequestReceiver:
             if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
 
-        recv_reqs = self._pull_raw_reqs()
+        if self.request_ring is not None:
+            recv_reqs = self._recv_from_ring(local_reqs)
+        else:
+            recv_reqs = self._pull_raw_reqs()
 
-        if self.input_blocker is not None:
-            recv_reqs = self.input_blocker.handle(recv_reqs)
+            if self.input_blocker is not None:
+                recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
+            recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
 
         if self.ps.pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)
@@ -117,6 +124,24 @@ class SchedulerRequestReceiver:
         self._finalize_shm_features(recv_reqs)
 
         return recv_reqs
+
+    def _recv_from_ring(self, local_reqs: Optional[List]) -> List:
+        extra = None
+        if self.request_ring.is_leader:
+            extra = self._pull_rpc_reqs()
+            extra.extend(local_reqs or [])
+        return self.request_ring.recv(
+            max_count=max(0, self.max_recv_per_poll), leader_extra=extra
+        )
+
+    def _pull_rpc_reqs(self) -> List:
+        reqs = []
+        while not self.recv_limit_reached(len(reqs)):
+            try:
+                reqs.append(sock_recv(self.recv_from_rpc, zmq.NOBLOCK))
+            except zmq.ZMQError:
+                break
+        return reqs
 
     def _pull_raw_reqs(self) -> Optional[List]:
         if self.ps.pp_rank == 0:

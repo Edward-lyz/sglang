@@ -826,6 +826,36 @@ class Envs:
     # current forward is in flight (the actual overlap win). Only read when
     # SGLANG_ENABLE_PREFILL_FWD_THREAD is set.
     SGLANG_PREFILL_FWD_THREAD_AHEAD = EnvBool(False)
+    # Continuous admission on top of the AHEAD loop: while a forward is in
+    # flight the scheduler keeps ingesting, bootstrapping and admitting requests
+    # into the still-open next batch, which is sealed when the forward returns.
+    # Requires SGLANG_ENABLE_PREFILL_FWD_THREAD and SGLANG_PREFILL_FWD_THREAD_AHEAD.
+    SGLANG_ENABLE_PREFILL_CONTINUOUS_ADMISSION = EnvBool(False)
+    # Rank-0 poll period of the forward-wait loop; each period costs one tiny
+    # gloo broadcast on the attention group. Arbitrary; 1ms keeps the added
+    # admission latency far below one prefill step.
+    SGLANG_PREFILL_ADMISSION_POLL_MS = EnvFloat(1.0)
+    # Cost-aware prefill ordering + dynamic chunk sizing (predicted step time).
+    SGLANG_ENABLE_PREFILL_COST_SCHEDULING = EnvBool(False)
+    # Step-time target used to cap the chunk of a long prompt while cheaper
+    # requests are waiting or expected; 0 = never throttle. Not derived from
+    # observed steps: throttled steps would lower the target that throttles them.
+    SGLANG_PREFILL_COST_TARGET_STEP_MS = EnvFloat(0.0)
+    # A request waiting longer than this is served FCFS ahead of cheaper ones.
+    SGLANG_PREFILL_COST_AGING_MS = EnvFloat(1000.0)
+    # Smallest chunk a long prompt gets per step while being throttled.
+    SGLANG_PREFILL_COST_MIN_LONG_CHUNK = EnvInt(8192)
+    # Requests whose predicted marginal step cost is below this count as short.
+    SGLANG_PREFILL_COST_SHORT_MS = EnvFloat(60.0)
+    # Interval (s) of the prefill scheduling stats log line; 0 disables the
+    # per-step CUDA events and timers entirely.
+    SGLANG_LOG_PREFILL_SCHED_STATS_INTERVAL = EnvFloat(0.0)
+    # Tokenizer->scheduler intake through a native background thread that drains
+    # the zmq socket into a shared-memory ring read by every rank of the group,
+    # replacing the per-iteration gloo broadcast of request payloads.
+    SGLANG_ENABLE_REQUEST_SHM_RING = EnvBool(False)
+    # Data capacity of that ring; larger messages spill to their own segment.
+    SGLANG_REQUEST_SHM_RING_MB = EnvInt(1024)
 
     # ===================================================================
     # PD disaggregation runtime
