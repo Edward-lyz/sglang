@@ -1322,6 +1322,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        # ROOT-FIX(luno-dcp-spec-consistency): DCP shards verify SAME reqs and
+        # MUST reach SAME accept decision; broadcast it from DCP local-rank 0 so
+        # every shard commits identical tokens/lengths -> no batch drift -> no hang.
+        from sglang.srt.distributed.parallel_state import get_dcp_group_no_assert
+        _dcp = get_dcp_group_no_assert()
+        if _dcp is not None and _dcp.world_size > 1:
+            for _t in (accept.correct_len, accept.bonus, accept.cap_trim_lens,
+                       accept.commit_lens, accept.new_seq_lens, accept.out_tokens):
+                if _t is not None:
+                    _dcp.broadcast(_t, src=0)
         if batch.return_logprob:
             compute_spec_v2_logprobs(
                 batch,

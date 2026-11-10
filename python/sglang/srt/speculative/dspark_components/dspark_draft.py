@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import vocab_dp_static_rows
+from sglang.srt.speculative.dflash_utils import get_spec_sample_generator
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -153,6 +154,12 @@ class DsparkDraftSampler:
 
         def _step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             del step_idx
+            # NOTE: this runs INSIDE the draft cuda graph, where only the default
+            # (capture-registered) generator is legal. Cross-rank determinism for
+            # sampling rows is instead guaranteed by forcing the EAGER draft path
+            # (see propose(): folding is gated on all_greedy). For all-greedy
+            # folded batches this noise is drawn but unused (argmax), so the
+            # default generator here is harmless.
             noise = self.exp_noise[:bs].exponential_()
             return SampleStepTokens.execute(
                 step_logits=step_logits,
@@ -274,7 +281,7 @@ def sample_draft_block(
             if fast_sampling:
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
-                ).exponential_(1)
+                ).exponential_(1, generator=get_spec_sample_generator(step_logits.device))
                 return SampleStepTokens.execute(
                     step_logits=step_logits,
                     temperatures=temperatures,
@@ -287,7 +294,11 @@ def sample_draft_block(
                 )
                 probs = expect(_DRAFT_PROBS, probs)
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
-                sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                sampled_tokens = torch.multinomial(
+                    probs,
+                    num_samples=1,
+                    generator=get_spec_sample_generator(probs.device),
+                ).squeeze(-1)
                 return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
 
     draft_tokens, corrected_logits = markov_head.sample_block(
@@ -469,7 +480,14 @@ class DraftBlockProposer:
         folded_confidence = None
         confidence_tap = None
         folded = False
-        if draft_sampler is not None and fwd.can_run_graph:
+        # ROOT-FIX(luno-dcp-spec-rng): only fold the draft sampler into the graph
+        # for all-greedy batches (deterministic argmax). Any sampling row must
+        # take the EAGER draft path below so its coins come from the shared
+        # cross-rank generator (get_spec_sample_generator); the in-graph sampler
+        # can only use the default per-rank generator, which desyncs DCP shards.
+        # all_greedy is a per-batch flag identical across shards, so every rank
+        # takes the same branch (no collective divergence).
+        if draft_sampler is not None and fwd.can_run_graph and all_greedy:
             folded = True
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),

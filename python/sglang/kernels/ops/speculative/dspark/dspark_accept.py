@@ -16,6 +16,7 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_dflash_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
+    get_spec_sample_generator,
 )
 
 
@@ -117,8 +118,13 @@ def _accept_sampling_core(
         draft_token_num=verify_num_draft_tokens,
         device=device,
     )
-    uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
-    uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
+    _spec_gen = get_spec_sample_generator(device)
+    uniform_samples = torch.rand(
+        (bs, gamma), dtype=torch.float32, device=device, generator=_spec_gen
+    )
+    uniform_samples_final = torch.rand(
+        (bs,), dtype=torch.float32, device=device, generator=_spec_gen
+    )
     chain_speculative_sampling_triton(
         predicts=predicts,
         accept_index=accept_index,
