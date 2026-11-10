@@ -863,11 +863,17 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
-    # Keep only one TP rank's slice of Kimi K3's replicated latent-MoE and TP1
-    # shared-expert weights, reconstructing them with a lookahead AllGather.
-    SGLANG_ENABLE_K3_MOE_WEIGHT_SHARD = EnvBool(False)
-    # Layer selection: "all", comma-separated ids, or inclusive ranges.
-    SGLANG_K3_MOE_WEIGHT_SHARD_LAYERS = EnvStr("all")
+    # Keep only one shard-group rank's row slice of Kimi K3's replicated
+    # weights, reconstructing each layer's full set with one lookahead
+    # AllGather. Covers latent-MoE, TP1 shared-expert, and DP-attention
+    # projections when the attention TP narrow is identity. Trades NVLink
+    # bandwidth for HBM capacity.
+    SGLANG_ENABLE_K3_WEIGHT_SHARD = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_K3_MOE_WEIGHT_SHARD"
+    )
+    # Layer selection: comma-separated ids or inclusive ranges. K3 weight
+    # sharding applies to transformer layers 1-92; layer 0 is never sharded.
+    SGLANG_K3_WEIGHT_SHARD_LAYERS = EnvStr("1-92")
     # Fuse the K3 KDA short_conv q/k/v width-4 depthwise causal conv1d + SiLU,
     # plus the in-place conv-state update, into one CUDA launch, replacing the
     # three serial Triton causal_conv1d_fn calls in KDAAttnBackend.forward_extend.

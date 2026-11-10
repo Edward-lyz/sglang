@@ -1,7 +1,14 @@
-"""Runtime sharding for replicated Kimi K3 MoE weights.
+"""Runtime sharding for replicated Kimi K3 weights (attention + MoE).
+
+Any weight that ends up byte-identical on every rank of the shard group is a
+candidate: the latent-MoE / TP1 shared-expert weights, and — when DP attention
+degenerates the attention TP narrow to identity (`attn_tp_size == 1`) — the KDA
+and MLA attention weights too. Each rank keeps only its 1/N slice of dim 0 and
+the full weight is rebuilt per forward by one flat AllGather, trading HBM
+capacity for NVLink bandwidth.
 
 Provides:
-- Kimi K3 MoE weight-shard configuration.
+- Weight-shard configuration (enable switch + layer selection).
 - ShardedWeight: holds (shard, full_buffer, ready_event) for one weight.
 - FlatAGScheduler: launches a single flat all_gather on a side stream and tracks per-layer events.
 
@@ -10,7 +17,7 @@ Compatibility constraints:
   graph state; all decisions baked at __init__).
 - All collective calls go through `torch.distributed` (NCCL backend).
 - Side stream: a single shared `torch.cuda.Stream` leased from RuntimeContext
-  via `get_moe_sharding_side_stream`; all MoE-sharded layers'
+  via `get_weight_sharding_side_stream`; all sharded layers'
   AllGather runs on the same stream, kept separate from model-level
   alt_streams to avoid sharing slots with other consumers.
 """
@@ -37,26 +44,24 @@ _K3_CE_GROUP_SIZE = 8
 
 
 @dataclass(frozen=True)
-class MoeShardingConfig:
-    """Snapshot of Kimi K3 MoE weight-shard settings.
+class WeightShardingConfig:
+    """Snapshot of Kimi K3 weight-shard settings.
 
     Frozen so cuda graph capture sees consistent state.
     """
     enabled: bool = False
-    # Comma-separated list of layer ids, or "all". Stored as raw string here;
-    # use `targets(num_layers)` to materialise to set[int].
-    layer_idx_spec: str = "all"
+    # Layer 0 is dense and is never a K3 weight-sharding target.
+    layer_idx_spec: str = "1-92"
 
     @classmethod
-    def from_env(cls) -> "MoeShardingConfig":
-        """Build a config from the SGLANG MoE weight-shard env vars."""
+    def from_env(cls) -> "WeightShardingConfig":
+        """Build a config from the SGLANG weight-shard env vars."""
         from sglang.srt.environ import envs
 
         return cls(
-            enabled=envs.SGLANG_ENABLE_K3_MOE_WEIGHT_SHARD.get(),
-            layer_idx_spec=envs.SGLANG_K3_MOE_WEIGHT_SHARD_LAYERS.get(),
+            enabled=envs.SGLANG_ENABLE_K3_WEIGHT_SHARD.get(),
+            layer_idx_spec=envs.SGLANG_K3_WEIGHT_SHARD_LAYERS.get(),
         )
-
 
     def targets(self, num_layers: int) -> List[int]:
         """Materialise spec → sorted list of layer ids in [0, num_layers).
@@ -97,9 +102,9 @@ def _parse_layer_spec(spec: str) -> Optional[List[int]]:
     return out
 
 
-def get_moe_sharding_config() -> MoeShardingConfig:
-    """Return the MoE sharding config resolved from the environment."""
-    return MoeShardingConfig.from_env()
+def get_weight_sharding_config() -> WeightShardingConfig:
+    """Return the weight sharding config resolved from the environment."""
+    return WeightShardingConfig.from_env()
 
 
 @dataclass
@@ -162,7 +167,7 @@ def _weight_shard_resources() -> _WeightShardResources:
     return get_buffer("k3_weight_shard_manager", _WeightShardResources)
 
 
-def get_moe_sharding_group_info() -> Tuple[Optional[dist.ProcessGroup], int, int, str]:
+def get_weight_sharding_group_info() -> Tuple[Optional[dist.ProcessGroup], int, int, str]:
     """Resolve a node-local CE-capable subgroup of the tensor-parallel group."""
     resources = _weight_shard_resources()
     if resources.shard_size is not None:
@@ -239,7 +244,7 @@ def get_moe_sharding_group_info() -> Tuple[Optional[dist.ProcessGroup], int, int
     )
 
 
-def get_moe_sharding_side_stream() -> torch.cuda.Stream:
+def get_weight_sharding_side_stream() -> torch.cuda.Stream:
     """Lease the K3 weight-shard AllGather stream from RuntimeContext."""
     from sglang.srt.runtime_context import get_stream
 
@@ -363,7 +368,7 @@ def _load_nccl_ce_ext():
     init_error = resources.nccl_ce_ext_init_error
     if init_error is not None:
         raise RuntimeError(
-            f"[MoeSharding CE] nccl_ce_ext previously failed to build/load: {init_error!r}"
+            f"[WeightShard CE] nccl_ce_ext previously failed to build/load: {init_error!r}"
         )
 
     try:
@@ -391,7 +396,7 @@ def _load_nccl_ce_ext():
     except Exception as e:  # pragma: no cover - depends on local toolchain
         resources.nccl_ce_ext_init_error = e
         logger.error(
-            "[MoeSharding CE] failed to JIT-build nccl_ce_ext: %r. Ensure NCCL "
+            "[WeightShard CE] failed to JIT-build nccl_ce_ext: %r. Ensure NCCL "
             "headers/libs are discoverable (set NCCL_HOME, or "
             "NCCL_INCLUDE_DIR / NCCL_LIB_DIR) and a CUDA toolchain (nvcc) is "
             "available. NCCL >= 2.28.3 is required for CE/Symmetric-Memory "
@@ -404,7 +409,7 @@ def _load_nccl_ce_ext():
     _cta_policy = os.environ.get("NCCL_CTA_POLICY")
     if _cta_policy != "2":
         raise RuntimeError(
-            "[MoeSharding CE] NCCL_CTA_POLICY=2 is required for the NCCL 2.28.3+ Copy "
+            "[WeightShard CE] NCCL_CTA_POLICY=2 is required for the NCCL 2.28.3+ Copy "
             "Engine / Symmetric Memory AllGather algorithm to be selected, "
             f"but got NCCL_CTA_POLICY={_cta_policy!r}. Set it in the worker "
             "environment BEFORE the NCCL communicator is created (i.e. before "
@@ -414,10 +419,10 @@ def _load_nccl_ce_ext():
         ver = nccl_ce_ext.version()
     except Exception:
         ver = -1
-    logger.info(f"[MoeSharding CE] nccl_ce_ext loaded; NCCL packed version = {ver}")
+    logger.info(f"[WeightShard CE] nccl_ce_ext loaded; NCCL packed version = {ver}")
     if ver != -1 and ver < 22803:
         logger.warning(
-            f"[MoeSharding CE] NCCL version {ver} < 22803; AllGather over symmetric "
+            f"[WeightShard CE] NCCL version {ver} < 22803; AllGather over symmetric "
             f"memory may not select Copy Engine algorithms. Consider NCCL >= 2.28.3."
         )
     return resources.nccl_ce_ext
@@ -446,7 +451,7 @@ def get_ncclcomm_from_pg(group: Optional[dist.ProcessGroup]) -> int:
         dist.all_reduce(probe, group=group)
         torch.cuda.synchronize()
     except Exception as e:
-        logger.warning(f"[MoeSharding CE] probe all_reduce on shard group failed: {e!r}")
+        logger.warning(f"[WeightShard CE] probe all_reduce on shard group failed: {e!r}")
 
     backend = None
     try:
@@ -457,7 +462,7 @@ def get_ncclcomm_from_pg(group: Optional[dist.ProcessGroup]) -> int:
             backend = group._get_backend(backend)  # type: ignore[attr-defined]
         except Exception as e:
             raise RuntimeError(
-                f"[MoeSharding CE] Cannot resolve ProcessGroupNCCL backend from group: {e!r}"
+                f"[WeightShard CE] Cannot resolve ProcessGroupNCCL backend from group: {e!r}"
             )
 
     last_err: Optional[BaseException] = None
@@ -480,7 +485,7 @@ def get_ncclcomm_from_pg(group: Optional[dist.ProcessGroup]) -> int:
             if isinstance(comm, int) and comm != 0:
                 resources.comm_cache[cache_key] = int(comm)
                 logger.info(
-                    f"[MoeSharding CE] ncclComm_t resolved via backend.{attr} -> "
+                    f"[WeightShard CE] ncclComm_t resolved via backend.{attr} -> "
                     f"0x{int(comm):x}"
                 )
                 return int(comm)
@@ -497,10 +502,10 @@ def get_ncclcomm_from_pg(group: Optional[dist.ProcessGroup]) -> int:
         and not a.startswith("__")
     )
     raise RuntimeError(
-        "[MoeSharding CE] Failed to extract ncclComm_t from torch ProcessGroupNCCL "
+        "[WeightShard CE] Failed to extract ncclComm_t from torch ProcessGroupNCCL "
         f"(backend={type(backend).__name__}, tried={tried}, "
         f"last_err={last_err!r}, comm-like attrs on backend={diag}). "
-        f"Consider upgrading PyTorch; MoE sharding requires CE AllGather."
+        f"Consider upgrading PyTorch; weight sharding requires CE AllGather."
     )
 
 
@@ -639,8 +644,8 @@ def ce_register_window(
 
     All ranks in `group` MUST call this on equivalent tensors in the same
     order with the same byte size; the calling code is responsible for
-    enforcing that ordering (the model-level finalize loop walks MoE-sharded
-    layers in sorted layer_id order).
+    enforcing that ordering (the model-level finalize loop walks
+    weight-sharded layers in sorted layer_id order).
     """
     if group is None:
         return None
@@ -688,7 +693,7 @@ def ce_register_windows_grouped(
     out: List[Optional[int]] = [None] * n
     if group is None or n == 0:
         logger.info(
-            f"[MoeSharding CE] ce_register_windows_grouped: SKIP (group is None or empty), n={n}"
+            f"[WeightShard CE] ce_register_windows_grouped: SKIP (group is None or empty), n={n}"
         )
         return out
 
@@ -716,12 +721,12 @@ def ce_register_windows_grouped(
     rank0 = (not dist.is_initialized()) or (dist.get_rank() == 0)
     if rank0:
         logger.info(
-            f"[MoeSharding CE] ce_register_windows_grouped on comm 0x{comm_ptr:x}: "
+            f"[WeightShard CE] ce_register_windows_grouped on comm 0x{comm_ptr:x}: "
             f"in={n} not_ce_backed={miss_not_ce} already_registered={miss_dup} "
             f"to_register={len(pending)}"
         )
         for line in miss_details:
-            logger.debug(f"[MoeSharding CE]{line}")
+            logger.debug(f"[WeightShard CE]{line}")
 
     if not pending:
         return out
@@ -730,7 +735,7 @@ def ce_register_windows_grouped(
     if rank0:
         sample = pending[0][1]
         logger.info(
-            f"[MoeSharding CE] registering {len(pending)} windows (per-tensor); "
+            f"[WeightShard CE] registering {len(pending)} windows (per-tensor); "
             f"sample alloc: data_ptr=0x{sample.data_ptr:x} num_bytes={sample.num_bytes}"
         )
     # NOTE: NCCL 22803 segfaults if multiple ncclCommWindowRegister calls
@@ -769,7 +774,7 @@ def ce_register_windows_grouped(
         raise
     if rank0:
         logger.info(
-            f"[MoeSharding CE] ce_register_windows_grouped DONE: registered {len(wins)} windows "
+            f"[WeightShard CE] ce_register_windows_grouped DONE: registered {len(wins)} windows "
             f"on comm 0x{comm_ptr:x} (handles: "
             f"{[hex(w) for w in wins[:4]]}{'...' if len(wins) > 4 else ''})"
         )
@@ -795,18 +800,18 @@ def _assert_ce_registered_pair(
         comm_ptr = get_ncclcomm_from_pg(group)
     except Exception as e:
         raise RuntimeError(
-            f"[MoeSharding CE] cannot resolve ncclComm_t for {name}: {e!r}"
+            f"[WeightShard CE] cannot resolve ncclComm_t for {name}: {e!r}"
         )
     for label, t in (("shard", shard), ("full_buf", full_buf)):
         alloc = _ce_alloc_for_tensor(t)
         if alloc is None:
             raise RuntimeError(
-                f"[MoeSharding CE] {name}.{label} is not CE-allocated; expected "
+                f"[WeightShard CE] {name}.{label} is not CE-allocated; expected "
                 f"ncclMemAlloc-backed storage for CE AllGather"
             )
         if not any(c == comm_ptr for c, _ in alloc.win_handles):
             raise RuntimeError(
-                f"[MoeSharding CE] {name}.{label} has no symmetric window registered "
+                f"[WeightShard CE] {name}.{label} has no symmetric window registered "
                 f"for comm 0x{comm_ptr:x}; ce_register_window must run for "
                 f"both shard and full_buf before launch"
             )
@@ -834,7 +839,7 @@ def ce_free_tensor(tensor: torch.Tensor) -> bool:
         try:
             ext.win_deregister(comm_ptr, win_handle)
         except Exception as e:
-            logger.warning(f"[MoeSharding CE] win_deregister failed during free: {e!r}")
+            logger.warning(f"[WeightShard CE] win_deregister failed during free: {e!r}")
             return False
         alloc.win_handles.remove((comm_ptr, win_handle))
         for i, (c, w, _p) in enumerate(resources.windows):
@@ -844,7 +849,7 @@ def ce_free_tensor(tensor: torch.Tensor) -> bool:
     try:
         ext.free(alloc.data_ptr)
     except Exception as e:
-        logger.warning(f"[MoeSharding CE] ncclMemFree failed during free: {e!r}")
+        logger.warning(f"[WeightShard CE] ncclMemFree failed during free: {e!r}")
         return False
     try:
         resources.allocations.remove(alloc)
@@ -873,7 +878,7 @@ class ShardedWeight:
     Layout convention:
         full weight has shape (D0, D1, ..., Dn) and dtype W.
         shard splits along ``shard_dim`` (dim 0 for the supported CP/DP engine
-        path used by MoE sharding).
+        path used by weight sharding).
         After AG, full_buf.shape == (D0, D1, ..., Dn).
 
     Caller responsibilities:
@@ -1073,57 +1078,77 @@ def build_flat_layout(
 class FlatAGStagingPool:
     """Ping-pong pool for FlatAGScheduler.
 
-    Each slot holds:
-      - flat_buf  (CE uint8, |T| bytes)         : AG output endpoint.
-      - views     (Dict[name, typed Tensor])    : narrow+view onto flat_buf.
+    The pool owns `n_buffers` CE uint8 buffers of `capacity_bytes` each and
+    nothing else. Layouts differ per layer (a KDA layer's target set is not
+    an MLA layer's), so the typed views are built per layer by
+    `attach_layout`, which carves them out of the slot that layer will use.
 
-    ``flat_buf`` is CE-allocated and registered as a symmetric window on
-    the dp comm before first AG. The AG *input* is the per-layer
+    Each slot's buffer is CE-allocated and registered as a symmetric window
+    on the dp comm before first AG. The AG *input* is the per-layer
     ``flat_shard`` (owned by ``FlatAGScheduler``, also CE-registered) —
-    the pool no longer holds a separate shard staging buffer.
+    the pool holds no shard staging buffer.
     """
 
     def __init__(
         self,
-        layout: FlatLayout,
+        capacity_bytes: int,
         device: torch.device,
         dp_size: int,
         n_buffers: int = 2,
     ):
         assert n_buffers >= 1, "need at least 1 buffer"
-        self.layout = layout
+        self.capacity_bytes = int(capacity_bytes)
         self.dp_size = int(dp_size)
         self.n_buffers = n_buffers
         self.device = device
-        self.flat_bufs: List[torch.Tensor] = []
-        self.views_per_slot: List[Dict[str, torch.Tensor]] = []
-        for _ in range(n_buffers):
-            fb = ce_alloc_tensor((layout.total_bytes,), torch.uint8, device)
-            self.flat_bufs.append(fb)
-            views: Dict[str, torch.Tensor] = {}
-            for name, off, nb, _nb_padded, shape, dtype in layout.entries:
-                seg = fb.narrow(0, off, nb)
-                typed = seg.view(dtype).view(*shape)
-                # Stash CE alloc for fast _ce_alloc_for_tensor lookup on
-                # the typed view (narrow+view drop the attribute).
-                typed._as_ce_alloc = fb._as_ce_alloc  # type: ignore[attr-defined]
-                views[name] = typed
-            self.views_per_slot.append(views)
-        total_mib = n_buffers * layout.total_bytes / (1024 ** 2)
+        self.flat_bufs: List[torch.Tensor] = [
+            ce_alloc_tensor((self.capacity_bytes,), torch.uint8, device)
+            for _ in range(n_buffers)
+        ]
+        self._flat_view: Dict[int, torch.Tensor] = {}
+        self._views: Dict[int, Dict[str, torch.Tensor]] = {}
+        total_mib = n_buffers * self.capacity_bytes / (1024**2)
         logger.info(
-            f"[MoeSharding] FlatAGStagingPool n={n_buffers} dp_size={dp_size} "
-            f"|T|={layout.total_bytes} chunk={layout.chunk_bytes} "
-            f"entries={[(n, sh, dt) for n, _, _, _, sh, dt in layout.entries]} "
-            f"total={total_mib:.1f} MiB"
+            f"[WeightShard] FlatAGStagingPool n={n_buffers} dp_size={dp_size} "
+            f"capacity={self.capacity_bytes} total={total_mib:.1f} MiB"
         )
 
+    def attach_layout(
+        self, seq_idx: int, layout: FlatLayout
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Carve one layer's AG output view + typed weight views out of its slot.
+
+        `seq_idx` is fixed per layer, so each layer maps to one slot forever
+        and its views only need building once. The AG output must be exactly
+        `chunk_bytes * dp_size` long, hence the narrow of the capacity buffer
+        rather than the buffer itself.
+        """
+        if layout.total_bytes > self.capacity_bytes:
+            raise RuntimeError(
+                f"layer layout |T|={layout.total_bytes} exceeds pool capacity "
+                f"{self.capacity_bytes}"
+            )
+        fb = self.flat_bufs[seq_idx % self.n_buffers]
+        # Stash the CE alloc on every derived tensor: narrow/view drop the
+        # attribute and `_ce_alloc_for_tensor`'s range scan is the slow path.
+        flat_view = fb.narrow(0, 0, layout.total_bytes)
+        flat_view._as_ce_alloc = fb._as_ce_alloc  # type: ignore[attr-defined]
+        views: Dict[str, torch.Tensor] = {}
+        for name, off, nb, _nb_padded, shape, dtype in layout.entries:
+            typed = fb.narrow(0, off, nb).view(dtype).view(*shape)
+            typed._as_ce_alloc = fb._as_ce_alloc  # type: ignore[attr-defined]
+            views[name] = typed
+        self._flat_view[seq_idx] = flat_view
+        self._views[seq_idx] = views
+        return flat_view, views
+
     def borrow_views(self, seq_idx: int) -> Dict[str, torch.Tensor]:
-        """Return typed full-tensor views for the staging slot."""
-        return self.views_per_slot[seq_idx % self.n_buffers]
+        """Return typed full-tensor views for the layer's staging slot."""
+        return self._views[seq_idx]
 
     def borrow_flat(self, seq_idx: int) -> torch.Tensor:
-        """Return the flat all-gather buffer for the staging slot."""
-        return self.flat_bufs[seq_idx % self.n_buffers]
+        """Return the flat all-gather output view for the layer's slot."""
+        return self._flat_view[seq_idx]
 
 
 def _redistribute_to_flat_shard(
@@ -1148,7 +1173,7 @@ def _redistribute_to_flat_shard(
     """
     slot_attrs = {
         role: sharded_attr
-        for role, sharded_attr, _target_path in layer._moe_shard_targets
+        for role, sharded_attr, _target_path in layer._weight_shard_targets
     }
     chunk = layout.chunk_bytes
     my_lo = dp_rank * chunk
@@ -1255,7 +1280,7 @@ class FlatAGScheduler:
             self._finalized = True
             return
         assert pool is not None, "FlatAGScheduler.finalize requires pool when dp_size > 1"
-        views = pool.borrow_views(seq_idx)
+        flat_view, views = pool.attach_layout(seq_idx=seq_idx, layout=self.layout)
         for w in self.weights:
             w.full_buf = views[w.name_for_pool]
         # Single AG kernel finishes all weights simultaneously, so one
@@ -1263,14 +1288,12 @@ class FlatAGScheduler:
         for w in self.weights[1:]:
             w.ready_event = self._shared_event
         logger.info(
-            "[MoeSharding] FlatAGScheduler.finalize dp_size=%d n_weights=%d "
+            "[WeightShard] FlatAGScheduler.finalize dp_size=%d n_weights=%d "
             "|T|=%d chunk=%d",
             self.dp_size, len(self.weights),
             self.layout.total_bytes, self.layout.chunk_bytes,
         )
-        _assert_ce_registered_pair(
-            self._flat_shard, pool.borrow_flat(seq_idx), self.dp_group, "flat"
-        )
+        _assert_ce_registered_pair(self._flat_shard, flat_view, self.dp_group, "flat")
         self._finalized = True
 
     def wait_ready_once(self) -> None:
@@ -1307,8 +1330,8 @@ class FlatAGScheduler:
             self._shared_event.record(self.side_stream)
 
 
-class MoeShardingForwardPlanner:
-    """Depth=1 lookahead AG dispatcher for MoE-sharded layers.
+class WeightShardForwardPlanner:
+    """Depth=1 lookahead AG dispatcher for weight-sharded layers.
 
     The Kimi K3 model caches one planner for its local pipeline-stage range.
 
@@ -1318,7 +1341,7 @@ class MoeShardingForwardPlanner:
 
     Usage::
 
-        planner = MoeShardingForwardPlanner(as_layers)  # once, then cached
+        planner = WeightShardForwardPlanner(as_layers)  # once, then cached
         planner.reset()                               # every forward
         planner.pre_dispatch(start_layer)
         for i in range(start_layer, end_layer):
@@ -1342,10 +1365,10 @@ class MoeShardingForwardPlanner:
         self._prev_done_event = None
 
     def _dispatch(self, module, gate_event: Optional[torch.cuda.Event]) -> None:
-        module._moe_shard_sched.launch(gate_event=gate_event)
+        module._weight_shard_sched.launch(gate_event=gate_event)
 
     def pre_dispatch(self, start_layer: int) -> None:
-        """Pre-launch AG for MoE-sharded layers at *start_layer*."""
+        """Pre-launch AG for weight-sharded layers at *start_layer*."""
         while (
             self._next < len(self._sharded_layers)
             and self._sharded_layers[self._next][0] == start_layer
@@ -1364,7 +1387,7 @@ class MoeShardingForwardPlanner:
 
     def maybe_dispatch(self, next_layer_idx: int) -> None:
         """Before running layer *next_layer_idx - 1*, dispatch AG for
-        *next_layer_idx* if it is the next MoE-sharded layer."""
+        *next_layer_idx* if it is the next weight-sharded layer."""
         if self._next >= len(self._sharded_layers):
             return
         nidx, module = self._sharded_layers[self._next]
@@ -1374,11 +1397,10 @@ class MoeShardingForwardPlanner:
 
     def update_done_event(self, layer_idx: int, layer) -> None:
         """After running *layer_idx*, stash its compute_done_event if it
-        is a MoE-sharded layer."""
-        module = getattr(layer, "mlp", None)
-        if module is None or getattr(module, "_moe_shard_sched", None) is None:
+        is a weight-sharded layer."""
+        if getattr(layer, "_weight_shard_sched", None) is None:
             return
-        ev = getattr(module, "_moe_shard_done_event", None)
+        ev = getattr(layer, "_weight_shard_done_event", None)
         if ev is not None:
             ev.record(torch.cuda.current_stream())
             self._prev_done_event = ev
@@ -1403,7 +1425,103 @@ def resolve_weight_module(root, path: str):
     return module
 
 
-def setup_layer_moe_sharding_weight(
+def _module_tp_size(target_mod) -> int:
+    """TP size the module was built with; 1 for replicated linears.
+
+    ``ReplicatedLinear`` never narrows and carries no ``tp_size`` attribute.
+    """
+    from sglang.srt.layers.linear import ReplicatedLinear
+
+    if isinstance(target_mod, ReplicatedLinear):
+        return 1
+    return int(target_mod.tp_size)
+
+
+def _row_sub_blocks(target_mod) -> Optional[Dict]:
+    """Global dim-0 (row) offset+size of each ``loaded_shard_id`` sub-block.
+
+    Returns None for plain (non-merged) linears, whose loader takes no
+    ``loaded_shard_id`` and always receives the whole weight.
+
+    Only valid when the module was built with ``tp_size == 1`` — the caller
+    enforces that (a target with a real TP narrow is already sharded and must
+    not be re-sharded).
+    """
+    from sglang.srt.layers.linear import (
+        MergedColumnParallelLinear,
+        QKVParallelLinear,
+    )
+
+    if isinstance(target_mod, QKVParallelLinear):
+        q = target_mod.num_heads * target_mod.head_size
+        k = target_mod.num_kv_heads * target_mod.head_size
+        v = target_mod.num_kv_heads * target_mod.v_head_size
+        return {"q": (0, q), "k": (q, k), "v": (q + k, v)}
+    if isinstance(target_mod, MergedColumnParallelLinear):
+        blocks: Dict = {}
+        off = 0
+        for index, size in enumerate(target_mod.output_sizes):
+            blocks[index] = (off, size)
+            off += size
+        return blocks
+    return None
+
+
+def _install_row_shard_loader(
+    target_mod,
+    name: str,
+    full_rows: int,
+    row_off: int,
+    n_rows: int,
+) -> None:
+    """Replace ``weight.weight_loader`` so only rows [row_off, row_off+n_rows)
+    of the logical full weight are read out of the checkpoint.
+
+    The param has already been shrunk to ``n_rows``; the framework loaders key
+    their offsets off the param shape and would silently write the wrong slice,
+    so they are replaced outright. ``loaded_weight`` lives on CPU, so the full
+    weight is never materialised in HBM.
+    """
+    sub_blocks = _row_sub_blocks(target_mod)
+    param = target_mod.weight
+
+    def _row_shard_loader(
+        param, loaded_weight: torch.Tensor, loaded_shard_id=None, **kwargs
+    ) -> None:
+        if loaded_shard_id is None:
+            block_off, block_rows = 0, full_rows
+        else:
+            if sub_blocks is None:
+                raise RuntimeError(
+                    f"{name}: got loaded_shard_id={loaded_shard_id!r} for a "
+                    f"non-merged linear ({type(target_mod).__name__})"
+                )
+            block_off, block_rows = sub_blocks[loaded_shard_id]
+        if loaded_weight.shape[0] != block_rows:
+            raise RuntimeError(
+                f"{name}: checkpoint block {loaded_shard_id!r} has "
+                f"{loaded_weight.shape[0]} rows, expected {block_rows}"
+            )
+        if tuple(loaded_weight.shape[1:]) != tuple(param.data.shape[1:]):
+            raise RuntimeError(
+                f"{name}: checkpoint block {loaded_shard_id!r} trailing shape "
+                f"{tuple(loaded_weight.shape[1:])} != param "
+                f"{tuple(param.data.shape[1:])}"
+            )
+        # Intersect the checkpoint block's global row range with this rank's.
+        lo = max(block_off, row_off)
+        hi = min(block_off + block_rows, row_off + n_rows)
+        if lo >= hi:
+            return
+        param.data.narrow(0, lo - row_off, hi - lo).copy_(
+            loaded_weight.narrow(0, lo - block_off, hi - lo)
+        )
+
+    # Plain setattr: `set_weight_attrs` asserts the key is absent.
+    param.weight_loader = _row_shard_loader
+
+
+def _setup_shard_weight(
     layer,
     target_attr: str,
     side_stream: Optional[torch.cuda.Stream] = None,
@@ -1411,13 +1529,16 @@ def setup_layer_moe_sharding_weight(
     """Install a ShardedWeight for one linear submodule.
 
     Behavior:
-        - Returns `sharded` or None if MoE sharding is disabled or the layer /
-          target module missing.
-        - Allocates `<target>_shard` (1/dp_size of out_features).
-        - Defers shard population & round-trip validation to the flat-AG
-          finalize (weights uninitialised at __init__).
+        - Returns `sharded` or None if weight sharding is disabled or the layer
+          / target module is missing.
+        - Shrinks `<target>.weight` to 1/shard_size of its rows and replaces
+          its `weight_loader`, so the full weight is NEVER materialised in HBM
+          during model load (loading the full weight on every rank is exactly
+          the OOM this feature exists to avoid).
+        - Defers `full_buf` to the flat-AG finalize, which binds it onto the
+          shared staging pool.
     """
-    cfg = get_moe_sharding_config()
+    cfg = get_weight_sharding_config()
     if not cfg.enabled:
         return None
     layer_id = _layer_id(layer)
@@ -1425,7 +1546,7 @@ def setup_layer_moe_sharding_weight(
     if ids is not None and layer_id not in set(ids):
         return None
 
-    shard_group, shard_size, shard_rank, shard_kind = get_moe_sharding_group_info()
+    shard_group, shard_size, shard_rank, shard_kind = get_weight_sharding_group_info()
 
     target_mod = resolve_weight_module(layer, target_attr)
     if target_mod is None or not hasattr(target_mod, "weight"):
@@ -1433,7 +1554,7 @@ def setup_layer_moe_sharding_weight(
         if rank0:
             logger.warning(
                 f"[K3WeightShard layer={layer_id}] target={target_attr!r} not found; "
-                f"MoE sharding disabled for this layer"
+                f"weight sharding disabled for this target"
             )
         return None
 
@@ -1454,33 +1575,20 @@ def setup_layer_moe_sharding_weight(
         )
     out_per_tp, in_dim = weight.shape
     rank0 = (not dist.is_initialized()) or (dist.get_rank() == 0)
-    module_tp_size = getattr(target_mod, "tp_size", None)
-    module_tp_rank = getattr(target_mod, "tp_rank", None)
-    input_partition = getattr(target_mod, "input_size_per_partition", None)
-    reduce_results = getattr(target_mod, "reduce_results", None)
-    input_is_parallel = getattr(target_mod, "input_is_parallel", None)
+    module_tp_size = _module_tp_size(target_mod)
+    if module_tp_size != 1:
+        raise RuntimeError(
+            f"K3 weight sharding only applies to fully replicated weights; "
+            f"{target_attr} was built with tp_size={module_tp_size} and is "
+            f"already TP-sharded"
+        )
     if rank0:
         logger.debug(
             f"[K3WeightShard layer={layer_id}] {target_attr} weight shape = "
-            f"{tuple(weight.shape)} dtype={weight.dtype} device={weight.device}"
+            f"{tuple(weight.shape)} dtype={weight.dtype} device={weight.device} "
+            f"module={type(target_mod).__name__} shard_size={shard_size} "
+            f"shard_rank={shard_rank} shard_kind={shard_kind}"
         )
-        logger.info(
-            f"[K3WeightShard layer={layer_id}] {target_attr} "
-            f"module_tp_size={module_tp_size} module_tp_rank={module_tp_rank} "
-            f"input_partition={input_partition} input_is_parallel={input_is_parallel} "
-            f"reduce_results={reduce_results}"
-        )
-        logger.debug(
-            f"[K3WeightShard layer={layer_id}] shard_size={shard_size} "
-            f"shard_rank={shard_rank} shard_kind={shard_kind} "
-            f"-> shard out_per_tp by shard_size"
-        )
-        if hasattr(target_mod, "weight_scale_inv"):
-            ws = target_mod.weight_scale_inv
-            logger.debug(
-                f"[K3WeightShard layer={layer_id}] {target_attr} "
-                f"weight_scale_inv shape = {tuple(ws.shape)}"
-            )
     if shard_size == 1:
         if rank0:
             logger.info(
@@ -1512,37 +1620,41 @@ def setup_layer_moe_sharding_weight(
 
     shard_rows = out_per_tp // shard_size
 
-    # CE AllGather is the only backend; every freshly created buffer is
-    # ncclMemAlloc-backed for symmetric-window registration.
-    use_ce = True
-
-    # Requant-then-shard: leave target_mod.weight as the FULL weight and
-    # do NOT wrap the loader. Each rank loads the full checkpoint weight +
-    # full scale, and process_weights_after_loading requants the FULL
-    # weight -> the ue8m0 weight_scale_inv is derived from the full N and
-    # stays replicated (never sharded, never AG'd). We allocate a fresh
-    # per-rank shard buffer here; finalize copies this rank's slice of the
-    # requanted full weight into it, then the flat AG reconstructs the
-    # full weight exactly as in the load-time path.
+    # Load-time sharding: shrink weight.data to this rank's row range and
+    # replace the loader so the checkpoint's other 7/8 rows are never copied
+    # to the device. This is a one-shot CE allocation: finalize redistributes
+    # it into the persistent per-layer flat shard, then explicitly frees it.
+    # Keeping these temporary shards out of PyTorch's caching allocator avoids
+    # leaving fragmented, non-releasable segments after model loading.
+    shard = ce_alloc_tensor(
+        (shard_rows, in_dim), weight.dtype, weight.device
+    )
+    target_mod.weight.data = shard
+    _install_row_shard_loader(
+        target_mod,
+        name=f"layer{layer_id}.{target_attr}",
+        full_rows=out_per_tp,
+        row_off=shard_rank * shard_rows,
+        n_rows=shard_rows,
+    )
     sharded = ShardedWeight.allocate(
         name=f"layer{layer_id}.{target_attr}",
-        full_shape=tuple(weight.shape),
+        full_shape=(out_per_tp, in_dim),
         dtype=weight.dtype,
         device=weight.device,
         dp_size=shard_size,
         dp_group=shard_group,
         shard_dim=0,
         defer_full_buf=True,
-        use_ce=use_ce,
+        shard_storage=shard,
     )
     if rank0:
         logger.info(
-            f"[K3WeightShard layer={layer_id}] shard after load: "
-            f"{target_attr}.weight kept FULL ({out_per_tp}, {in_dim}) "
-            f"dtype={weight.dtype}; per-rank shard buffer "
-            f"({shard_rows}, {in_dim}) allocated (use_ce={use_ce}); "
-            f"shard_rank={shard_rank} shard_kind={shard_kind}; "
-            f"weight_scale_inv NOT sharded"
+            f"[K3WeightShard layer={layer_id}] load-time shard: "
+            f"{target_attr}.weight ({out_per_tp}, {in_dim}) -> "
+            f"({shard_rows}, {in_dim}) rows[{shard_rank * shard_rows}:"
+            f"{(shard_rank + 1) * shard_rows}] dtype={weight.dtype} "
+            f"shard_kind={shard_kind}"
         )
 
     return sharded
@@ -1554,9 +1666,9 @@ def setup_layer_weight_shard_flat(
     side_stream: Optional[torch.cuda.Stream] = None,
 ):
     """Set up one flat AllGather for a set of replicated linear weights."""
-    if not get_moe_sharding_config().enabled:
+    if not get_weight_sharding_config().enabled:
         return None
-    _group, shard_size, _rank, _kind = get_moe_sharding_group_info()
+    _group, shard_size, _rank, _kind = get_weight_sharding_group_info()
     if shard_size <= 1:
         return None
 
@@ -1564,23 +1676,21 @@ def setup_layer_weight_shard_flat(
     weight_targets = []
     try:
         for index, (role, target_path) in enumerate(targets):
-            sharded = setup_layer_moe_sharding_weight(
+            sharded = _setup_shard_weight(
                 layer, target_path, side_stream
             )
             if sharded is None:
                 continue
-            sharded_attr = f"_moe_shard_weight_{index}"
+            sharded_attr = f"_weight_shard_weight_{index}"
             setattr(layer, sharded_attr, sharded)
             named_actives.append((role, sharded))
             weight_targets.append((role, sharded_attr, target_path))
     except Exception:
-        for _, sharded in reversed(named_actives):
-            ce_free_tensor(sharded.shard)
         for _, sharded_attr, _ in weight_targets:
             delattr(layer, sharded_attr)
         raise
 
-    layer._moe_shard_targets = weight_targets
+    layer._weight_shard_targets = weight_targets
     if not named_actives:
         return None
 
@@ -1618,14 +1728,14 @@ def setup_layer_weight_shard_flat(
         layout=layout,
         role_names=active_roles,
     )
-    layer._moe_shard_sched = flat_sched
-    layer._moe_shard_done_event = torch.cuda.Event()
+    layer._weight_shard_sched = flat_sched
+    layer._weight_shard_done_event = torch.cuda.Event()
     return flat_sched
 
 
 def prepare_layer_weight_shard_forward(layer) -> None:
     """Wait for one layer's AllGather and bind reconstructed full weights."""
-    sched = getattr(layer, "_moe_shard_sched", None)
+    sched = getattr(layer, "_weight_shard_sched", None)
     if sched is None:
         return
     if not isinstance(sched, FlatAGScheduler) or not sched._finalized:
@@ -1633,7 +1743,7 @@ def prepare_layer_weight_shard_forward(layer) -> None:
             f"K3 weight sharding layer {_layer_id(layer)} was not finalized"
         )
     sched.wait_ready_once()
-    for _role, sharded_attr, target_path in layer._moe_shard_targets:
+    for _role, sharded_attr, target_path in layer._weight_shard_targets:
         sharded = getattr(layer, sharded_attr)
         target_mod = resolve_weight_module(layer, target_path)
         if target_mod is None:
@@ -1648,22 +1758,19 @@ def finalize_layer_weight_shard_flat(
     seq_idx: int,
     pool: Optional["FlatAGStagingPool"],
 ) -> None:
-    """Finalize one Kimi K3 MoE module's flat weight shard.
+    """Finalize one layer's flat weight shard.
 
     Steps (off forward path):
-      1. Re-bind each ShardedWeight.shard to target_mod.weight.data.
-      2. One-time redistribute: per-weight 1/dp_size shards -> persistent
+      1. Verify `target_mod.weight.data` is still this rank's loaded shard.
+      2. One-time redistribute: per-weight 1/dp_size row shards -> persistent
          CE-allocated `flat_shard` (1/dp_size of T) for this layer.
       3. Register `flat_shard` as a symmetric window on the dp comm.
       4. flat_sched.finalize(pool, seq_idx, flat_shard) -> binds full_buf
          narrow+views and shared ready_event.
-      5. Free per-weight shard storage on target_mod.weight.data
-         (replaced with the same view onto the AG output for forward),
-         since the source of truth for forward reads is now full_buf.
-
-    `weight_scale_inv` is left replicated on every rank, same as concat.
+      5. Free the per-weight row shards; the source of truth for forward reads
+         is now `flat_shard` (AG input) / `full_buf` (AG output).
     """
-    sched = getattr(layer, "_moe_shard_sched", None)
+    sched = getattr(layer, "_weight_shard_sched", None)
     if sched is None:
         return
     if not isinstance(sched, FlatAGScheduler):
@@ -1678,14 +1785,13 @@ def finalize_layer_weight_shard_flat(
 
     slot_target = [
         (sharded_attr, target_path)
-        for _role, sharded_attr, target_path in layer._moe_shard_targets
+        for _role, sharded_attr, target_path in layer._weight_shard_targets
     ]
-    # 1. Re-bind shard storage.
-    #    target_mod.weight is the FULL requanted weight -> copy this rank's
-    #    slice into the freshly-allocated shard buffer, then free the full
-    #    weight (rebind target_mod.weight to the shard view so no full-sized
-    #    copy lingers; forward rebinds to full_buf anyway).
-    _, _, shard_rank, shard_kind = get_moe_sharding_group_info()
+    # 1. The row shard was loaded straight into `sharded.shard` by the
+    #    replaced weight_loader, and `target_mod.weight.data` shares that
+    #    storage. Anything that re-pointed weight.data in between (a merge
+    #    helper, a requant) would silently drop the loaded rows, so assert.
+    _, _, shard_rank, shard_kind = get_weight_sharding_group_info()
     for sharded_attr, target_attr in slot_target:
         sharded = getattr(layer, sharded_attr, None)
         target_mod = resolve_weight_module(layer, target_attr)
@@ -1694,23 +1800,13 @@ def finalize_layer_weight_shard_flat(
         if sharded.is_passthrough:
             sharded.full_buf.copy_(target_mod.weight.data)
             continue
-        full_w = target_mod.weight.data
-        shard_rows = sharded.shard.shape[0]
-        src = full_w.narrow(0, shard_rank * shard_rows, shard_rows)
-        sharded.shard.copy_(src)
-        # Drop the full weight: forward will rebind weight.data to the
-        # AG'd full_buf, so target_mod.weight only needs to hold the shard.
-        target_mod.weight.data = sharded.shard
-        if rank0:
-            logger.info(
-                f"[K3WeightShard finalize layer={_layer_id(layer)} target={target_attr}] "
-                f"requant-then-shard: sliced full {tuple(full_w.shape)} -> "
-                f"shard {tuple(sharded.shard.shape)} "
-                f"(shard_rank={shard_rank} shard_kind={shard_kind}); "
-                f"full weight released"
+        if target_mod.weight.data.data_ptr() != sharded.shard.data_ptr():
+            raise RuntimeError(
+                f"[K3WeightShard layer={_layer_id(layer)} target={target_attr}] "
+                f"weight.data was re-pointed away from the load-time shard "
+                f"(shape={tuple(target_mod.weight.data.shape)}); the loaded "
+                f"rows would be lost"
             )
-        del full_w
-
 
     # 2. Redistribute (no-op when dp_size==1).
     if sched.dp_size > 1:
@@ -1724,52 +1820,37 @@ def finalize_layer_weight_shard_flat(
             device,
         )
         # The one-shot NCCL gathers and copies above are enqueued on the
-        # current stream. Their CE-backed source shards must remain alive until
-        # every read has completed.
+        # current stream. Their source shards must remain alive until every
+        # read has completed.
         torch.cuda.current_stream().synchronize()
         # 3. Register the flat shard as a CE symmetric window on the dp comm.
         ce_register_window(flat_shard, sched.dp_group)
         # Stash on layer so caller can free old per-weight shards if
         # desired and so registration survives.
-        layer._moe_shard_flat = flat_shard
+        layer._weight_shard_flat = flat_shard
 
-        # 2b. Release the per-weight shards. They were consumed exactly
+        # 2b. Release the per-weight row shards. They were consumed exactly
         #     once by the redistribute above; forward reads the AG output
         #     (full_buf) and the AG input is the persistent flat_shard, so
-        #     these 1/dp_size per-weight buffers are now dead. They are
-        #     CE (ncclMemAlloc) buffers tracked by the resource manager for the
-        #     process lifetime, so a plain `del` would NOT reclaim them and
-        #     the 1/dp_size weight would stay permanently duplicated (the
-        #     flat_shard already holds this rank's slice), shrinking the KV
-        #     pool. `ce_free_tensor` deregisters windows + ncclMemFree's the
-        #     buffer so the memory is returned. The empty placeholder keeps
-        #     weight.data a valid tensor until forward rebinds it to full_buf.
+        #     these 1/dp_size per-weight buffers are now dead. Drop every
+        #     tensor handle before explicitly freeing the underlying CE
+        #     allocation. The empty placeholder keeps weight.data valid until
+        #     forward rebinds it to full_buf.
         for sharded_attr, target_attr in slot_target:
             sharded = getattr(layer, sharded_attr, None)
             target_mod = resolve_weight_module(layer, target_attr)
             if sharded is None or sharded.is_passthrough:
                 continue
             old_shard = sharded.shard
-            empty = torch.empty(0, dtype=old_shard.dtype, device=device)
-            # `old_shard` is the only remaining handle to the CE storage;
-            # free it (windows + ncclMemFree) then drop the handle.
-            freed = ce_free_tensor(old_shard)
-            if freed:
-                if target_mod is not None:
-                    target_mod.weight.data = empty
-                sharded.shard = empty
-            free_status = torch.tensor(
-                [int(freed)], dtype=torch.int32, device=device
-            )
-            dist.all_reduce(
-                free_status, op=dist.ReduceOp.MIN, group=sched.dp_group
-            )
-            if free_status.item() != 1:
+            empty = torch.empty(0, dtype=sharded.shard.dtype, device=device)
+            if target_mod is not None:
+                target_mod.weight.data = empty
+            sharded.shard = empty
+            if not ce_free_tensor(old_shard):
                 raise RuntimeError(
-                    f"failed to free temporary K3 weight shard "
-                    f"for layer {_layer_id(layer)} target {target_attr}"
+                    f"[K3WeightShard layer={_layer_id(layer)} target={target_attr}] "
+                    "failed to free temporary CE row shard"
                 )
-            del old_shard
     else:
         flat_shard = torch.empty(
             0, dtype=torch.uint8, device=sched.weights[0].shard.device
@@ -1777,11 +1858,8 @@ def finalize_layer_weight_shard_flat(
 
     # 4. Bind scheduler buffers.
     sched.finalize(pool=pool, seq_idx=seq_idx, flat_shard=flat_shard)
-    layer._moe_shard_seq_idx = seq_idx
+    layer._weight_shard_seq_idx = seq_idx
 
-    # 5. weight_scale_inv is left FULL and replicated on every rank: the
-    #    framework requanted the full weight at load time, so the ue8m0 scale
-    #    is already correct for the AG-reconstructed full weight. No AG needed.
     if rank0:
         logger.info(
             f"[K3WeightShard finalize layer={_layer_id(layer)}] complete"
@@ -1792,7 +1870,7 @@ def finalize_model_weight_shard(
     as_layers: Sequence,
     mode: str = "lazy",
 ) -> Optional[FlatAGStagingPool]:
-    """Build the shared staging pool and finalize every Kimi K3 MoE shard.
+    """Build the shared staging pool and finalize every weight shard.
 
     This is the top-level entry point called by the model's
     ``force_weight_shard_finalize`` / ``_run_weight_shard_finalize`` hook.
@@ -1804,8 +1882,8 @@ def finalize_model_weight_shard(
       - Calling ``torch.cuda.empty_cache()`` afterwards.
 
     Args:
-        as_layers: Kimi K3 MoE modules with ``_moe_shard_sched``, sorted by
-            ``layer_idx``.
+        as_layers: modules carrying ``_weight_shard_sched`` (Kimi K3 decoder
+            layers), sorted by ``layer_idx``.
         mode: ``"force"`` (pre-pool, driven by ModelRunner) or ``"lazy"``
             (forward fallback). Used only for logging.
 
@@ -1816,7 +1894,7 @@ def finalize_model_weight_shard(
         return None
 
     sample = as_layers[0]
-    sample_sched = sample._moe_shard_sched
+    sample_sched = sample._weight_shard_sched
     dp_size = sample_sched.dp_size
     dp_group = sample_sched.dp_group
 
@@ -1824,16 +1902,13 @@ def finalize_model_weight_shard(
         for seq_idx, sa in enumerate(as_layers):
             finalize_layer_weight_shard_flat(sa, seq_idx, pool=None)
         logger.info(
-            f"[MoeSharding] {mode} finalize (passthrough): "
+            f"[WeightShard] {mode} finalize (passthrough): "
             f"finalized {len(as_layers)} layers"
         )
         return None
-    layout = sample_sched.layout
-    for layer in as_layers[1:]:
-        if layer._moe_shard_sched.layout != layout:
-            raise RuntimeError(
-                "K3 weight sharding requires identical target layouts across layers"
-            )
+    # Layouts differ per layer (KDA vs MLA target sets, dense vs MoE), so the
+    # pool is sized by the largest and each layer narrows down to its own |T|.
+    capacity = max(l._weight_shard_sched.layout.total_bytes for l in as_layers)
 
     # Force NCCL comm init (lazy Symmetric VA setup) before ce_alloc_tensor.
     device = sample_sched.weights[0].shard.device
@@ -1842,7 +1917,7 @@ def finalize_model_weight_shard(
     torch.cuda.synchronize()
 
     pool = FlatAGStagingPool(
-        layout=layout,
+        capacity_bytes=capacity,
         device=device,
         dp_size=dp_size,
         n_buffers=1 if len(as_layers) <= 1 else 2,
@@ -1854,9 +1929,11 @@ def finalize_model_weight_shard(
     for seq_idx, sa in enumerate(as_layers):
         finalize_layer_weight_shard_flat(sa, seq_idx, pool=pool)
 
+    per_layer = [l._weight_shard_sched.layout.total_bytes for l in as_layers]
     logger.info(
         f"[K3WeightShard] {mode} finalize: "
         f"finalized {len(as_layers)} layers, "
-        f"shared flat pool n_buffers={pool.n_buffers} |T|={layout.total_bytes}"
+        f"shared flat pool n_buffers={pool.n_buffers} capacity={capacity} "
+        f"|T| min={min(per_layer)} max={max(per_layer)}"
     )
     return pool
