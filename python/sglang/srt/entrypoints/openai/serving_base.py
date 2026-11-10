@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, Tuple, Union
 
@@ -14,6 +17,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.content_detection.config import DETECTION_CONFIG
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.observability.request_trace import trace, traced_rid
@@ -24,6 +28,21 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+_convert_pool: Optional[ThreadPoolExecutor] = None
+
+
+def _get_convert_pool() -> Optional[ThreadPoolExecutor]:
+    """The process-wide request-conversion pool, or None when disabled."""
+    global _convert_pool
+    if _convert_pool is None:
+        num_threads = envs.SGLANG_OPENAI_CONVERT_THREADS.get()
+        if num_threads <= 0:
+            return None
+        _convert_pool = ThreadPoolExecutor(
+            max_workers=num_threads, thread_name_prefix="openai-convert"
+        )
+    return _convert_pool
 
 
 # Base class for specific endpoint handlers
@@ -94,7 +113,7 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
+            adapted_request, processed_request = await self._convert_off_loop(
                 request, raw_request
             )
 
@@ -162,6 +181,21 @@ class OpenAIServingBase(ABC):
     ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
         """Convert OpenAI request to internal format"""
         pass
+
+    async def _convert_off_loop(
+        self, request: OpenAIServingRequest, raw_request: Request
+    ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
+        """Run ``_convert_to_internal_request`` on the per-process convert pool
+        when SGLANG_OPENAI_CONVERT_THREADS > 0, so a long-prompt chat template +
+        encode does not block this worker's event loop (and its streams)."""
+        pool = _get_convert_pool()
+        if pool is None:
+            return self._convert_to_internal_request(request, raw_request)
+        # Carry the caller's contextvars into the pool thread.
+        ctx = contextvars.copy_context()
+        return await asyncio.get_running_loop().run_in_executor(
+            pool, ctx.run, self._convert_to_internal_request, request, raw_request
+        )
 
     async def _handle_streaming_request(
         self,
