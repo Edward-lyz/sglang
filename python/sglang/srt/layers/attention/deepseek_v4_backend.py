@@ -3637,7 +3637,30 @@ class DeepseekV4AttnBackend(
             else None
         )
         first_row = 0
-        for b, (lc, t_len) in enumerate(zip(lc_per_req, q_lens_cpu)):
+        loop_reqs = list(zip(lc_per_req, q_lens_cpu))
+        if (
+            envs.SGLANG_FUSE_INDEXER_BATCH_REQUESTS.get()
+            and len(lc_per_req) > 1
+            and all(lc > 0 and t > 0 for lc, t in loop_reqs)
+        ):
+            self._low_ratio_index_score_batched(
+                indexer=indexer,
+                q_fp4=q_fp4,
+                q_sf=q_sf,
+                k_fp4=k_fp4,
+                k_sf=k_sf,
+                weights=weights,
+                ks=ks,
+                compress_lens=compress_lens,
+                selected=selected,
+                lc_per_req=lc_per_req,
+                q_lens_cpu=q_lens_cpu,
+                publish=publish,
+                consume=consume,
+            )
+            # every request is scored: the per-request loop below has nothing to do
+            loop_reqs = []
+        for b, (lc, t_len) in enumerate(loop_reqs):
             req_start, req_stop = first_row, first_row + t_len
             first_row = req_stop
             if lc == 0 or t_len == 0:
@@ -3767,6 +3790,132 @@ class DeepseekV4AttnBackend(
             raw_indices[:num_tokens, :topk] = torch.where(
                 chosen, selected - ks[:, None], -1
             )
+
+    def _low_ratio_index_score_batched(
+        self,
+        *,
+        indexer,
+        q_fp4,
+        q_sf,
+        k_fp4,
+        k_sf,
+        weights,
+        ks,
+        compress_lens,
+        selected,
+        lc_per_req,
+        q_lens_cpu,
+        publish,
+        consume,
+    ) -> None:
+        """[fusion-opt] SGLANG_FUSE_INDEXER_BATCH_REQUESTS: the per-request score loop of
+        _low_ratio_index_topk_dense over all requests at once. Row t's score column j is
+        k[ks_t + j] whatever the tile width, and the top-k reads a row up to its own
+        compress length only, so scoring every row at the batch's widest request gives the
+        same scores, masks and selection as one request at a time -- with one logits / top-k
+        (/ mask) launch per tile instead of per request. Late-layer tail rows are ~SWA_WINDOW
+        per request, so there the per-request launches were the whole host cost."""
+        device = q_fp4.device
+        live_rows = sum(q_lens_cpu)
+        width = ceil_align(max(lc_per_req), 4)
+        step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (width * 4))
+        block_size = indexer.candidate_block_size
+        consume_blocks = None
+        if consume is not None:
+            consume_blocks = self._batched_consumer_blocks(consume, q_lens_cpu)
+        req_bounds = list(itertools.accumulate(q_lens_cpu, initial=0))
+        masks = [[] for _ in lc_per_req] if publish is not None else None
+        for start in range(0, live_rows, step):
+            rows = slice(start, min(start + step, live_rows))
+            lens = compress_lens[rows]
+            logits = _dense_fp4_mqa_logits(
+                (q_fp4[rows], q_sf[rows]),
+                (k_fp4, k_sf),
+                weights[rows],
+                ks[rows],
+                ks[rows] + lens,
+                width,
+            )
+            if masks is not None:
+                # the block selection is per request (its width is the request's own)
+                for b, lc in enumerate(lc_per_req):
+                    lo = max(req_bounds[b], rows.start)
+                    hi = min(req_bounds[b + 1], rows.stop)
+                    if lo >= hi:
+                        continue
+                    sub = slice(lo - rows.start, hi - rows.start)
+                    scores = logits[sub, :lc]
+                    sub_lens = lens[sub]
+                    if envs.SGLANG_FUSE_CANDIDATE_BLOCK_SCORE.get():
+                        from sglang.kernels.ops.attention.dsv4.candidate_block_score import (
+                            fused_select_candidate_block_ids,
+                        )
+
+                        masks[b].append(
+                            fused_select_candidate_block_ids(
+                                scores,
+                                sub_lens,
+                                lc,
+                                indexer.candidate_topk_blocks,
+                                block_size,
+                            )
+                        )
+                    else:
+                        scores.masked_fill_(
+                            torch.arange(lc, device=device) >= sub_lens[:, None],
+                            -torch.inf,
+                        )
+                        masks[b].append(
+                            select_candidate_block_ids(
+                                scores,
+                                sub_lens[:, None],
+                                topk_blocks=indexer.candidate_topk_blocks,
+                                block_size=block_size,
+                            )
+                        )
+            elif consume_blocks is not None:
+                # columns past a row's request are never read by the top-k
+                logits.masked_fill_(
+                    ~candidate_block_mask(
+                        consume_blocks[rows], width=width, block_size=block_size
+                    ),
+                    -torch.inf,
+                )
+            chunk = selected[rows]
+            topk_transform_ragged_v2(
+                logits, lens, out_offsets=ks[rows], out_indices=chunk
+            )
+            if consume_blocks is not None:
+                selected[rows] = mask_topk_scores(logits, chunk, ks[rows])
+            logits = None
+        if masks is not None:
+            for m in masks:
+                publish.append(m[0] if len(m) == 1 else torch.cat(m))
+        log_community_opt_once(
+            "fusion-opt indexer_batch_requests",
+            "low-ratio indexer scores all requests per tile (bs=%d, rows=%d, width=%d)",
+            len(lc_per_req),
+            live_rows,
+            width,
+        )
+
+    def _batched_consumer_blocks(self, consume, q_lens_cpu) -> torch.Tensor:
+        """The published per-request block ids as one [rows, max blocks] table, -1 padded
+        (candidate_block_mask drops -1). Every consumer layer of a forward reads the same
+        published blocks, so the table is built once per published set."""
+        cached = getattr(self, "_fo_batched_consumer_blocks", None)
+        if cached is not None and cached[0] is consume:
+            return cached[1]
+        blocks = consume.request_blocks
+        assert len(blocks) == len(q_lens_cpu) and all(
+            b.shape[0] == t for b, t in zip(blocks, q_lens_cpu)
+        ), "published blocks do not cover the scored rows"
+        width = max(b.shape[1] for b in blocks)
+        table = torch.cat(
+            [F.pad(b, (0, width - b.shape[1]), value=-1) for b in blocks]
+        ).contiguous()
+        self._fo_batched_consumer_blocks = (consume, table)
+        return table
 
     def _low_ratio_index_topk_prefill_graph(self, layer, pos, q, w) -> None:
         """q/w come from live rows; metadata fixes the graph's context width."""
