@@ -57,6 +57,7 @@ from sglang.srt.disaggregation.utils import (
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
+    poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
     prepare_abort,
     setup_state_kv_args,
@@ -333,6 +334,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.pp_rank = pp_rank
+        self.pp_size = scheduler.ps.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -758,35 +760,56 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return resumed_reqs
 
     def _update_handshake_waiters(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
     ) -> None:
-        group_size = torch.distributed.get_world_size(group=self.gloo_group)
-        if group_size > 1:
-            local_queue_size = torch.tensor([len(self.queue)], dtype=torch.int64)
-            queue_sizes = torch.empty(group_size, dtype=torch.int64)
-            torch.distributed.all_gather_into_tensor(
-                queue_sizes, local_queue_size, group=self.gloo_group
-            )
-            # Request fanout to TP ranks is asynchronous. Polling before every
-            # rank has the same queue would split their collective sequence.
-            if not torch.all(queue_sizes == queue_sizes[0]).item():
-                return
+        # In PP mode the states come from the PP ring consensus instead of a
+        # gloo collective, so the queue-alignment guard below (and its early
+        # return) must not gate applying an already-agreed decision.
+        if self.pp_size <= 1:
+            group_size = torch.distributed.get_world_size(group=self.gloo_group)
+            if group_size > 1:
+                local_queue_size = torch.tensor([len(self.queue)], dtype=torch.int64)
+                queue_sizes = torch.empty(group_size, dtype=torch.int64)
+                torch.distributed.all_gather_into_tensor(
+                    queue_sizes, local_queue_size, group=self.gloo_group
+                )
+                # Request fanout to TP ranks is asynchronous. Polling before every
+                # rank has the same queue would split their collective sequence.
+                if not torch.all(queue_sizes == queue_sizes[0]).item():
+                    return
 
         if not self.queue:
             return
 
         # Still poll if any receiver was aborted, otherwise it stays stuck.
-        if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
-            decode_req.kv_receiver.conclude_state == KVPoll.Failed
-            for decode_req in self.queue
+        if (
+            self.pp_size <= 1
+            and all(decode_req.waiting_for_input for decode_req in self.queue)
+            and not any(
+                decode_req.kv_receiver.conclude_state == KVPoll.Failed
+                for decode_req in self.queue
+            )
         ):
             return
 
-        polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-        )
+        if self.pp_size > 1:
+            polls = poll_and_all_reduce_pp(
+                (decode_req.req.rid for decode_req in self.queue),
+                KVPoll.WaitingForInput,
+                pp_good_rids,
+                pp_bad_rids,
+            )
+        else:
+            polls = poll_and_all_reduce(
+                [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+            )
 
-        for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+        for decode_req, poll in zip(self.queue, polls):
+            if poll is None:
+                continue
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -907,11 +930,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        is_pp_mode = self.pp_size > 1
+        if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
+            raise ValueError("PP consensus is required when pp_size > 1")
+        if is_pp_mode and rids_to_check is not None:
+            raise ValueError("rids_to_check cannot be used in PP mode")
+
         self._resolve_pending_reqs()
-        self._update_handshake_waiters(rids_to_check)
+        self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
+        if is_pp_mode:
+            rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
 
         failed_reqs = []
         preallocated_reqs: List[DecodeRequest] = []
