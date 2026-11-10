@@ -107,6 +107,26 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 IGNORE_EOS_RESERVE_TOKENS = 1
 
 
+def _align_chunk_extend_end(
+    prefix_len: int,
+    full_input_len: int,
+    proposed_extend: int,
+    alignment: Optional[int],
+) -> int:
+    """Shorten non-final chunks to an absolute checkpoint boundary.
+
+    Never increase the proposed budget or strand a resumed chunk before its
+    next checkpoint. Final chunks retain their complete, possibly ragged tail.
+    """
+    if alignment is None or alignment <= 1 or proposed_extend <= 0:
+        return proposed_extend
+    proposed_end = prefix_len + proposed_extend
+    if proposed_end >= full_input_len:
+        return proposed_extend
+    aligned_end = proposed_end // alignment * alignment
+    return aligned_end - prefix_len if aligned_end > prefix_len else proposed_extend
+
+
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
@@ -546,6 +566,7 @@ class PrefillAdder:
         cost_model=None,
         rem_cost: Optional[np.ndarray] = None,
         cost_chunk_cap: Optional[int] = None,
+        checkpoint_end_align_size: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -566,6 +587,7 @@ class PrefillAdder:
         # e.g. KDA's >16K triton fallback).
         self.cost_chunk_cap = cost_chunk_cap
         self.dllm_config = dllm_config
+        self.checkpoint_end_align_size = checkpoint_end_align_size
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -1122,8 +1144,15 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - prefix_len
         if planned_admission is None:
-            truncated = cand_extend_input_len > _rem_tokens
             new_len = min(cand_extend_input_len, _rem_tokens)
+            if self.dllm_config is None:
+                new_len = _align_chunk_extend_end(
+                    prefix_len,
+                    len(req.full_untruncated_fill_ids),
+                    new_len,
+                    self.checkpoint_end_align_size,
+                )
+            truncated = new_len < cand_extend_input_len
         else:
             self._validate_planned_admission(req, planned_admission, "chunked")
             start, end = self._validate_authoritative_extend_range(
@@ -1830,6 +1859,14 @@ class PrefillAdder:
                     cost=self._req_cost(prefix_len, input_tokens),
                 )
             else:
+                # Checkpoint alignment can leave a few pages after a partial
+                # admission. They may fit a final request, but the scheduler
+                # owns only one unfinished chunked request at a time.
+                if self.checkpoint_end_align_size is not None and (
+                    self.batch_has_partial_req or has_chunked_req
+                ):
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
@@ -1850,6 +1887,14 @@ class PrefillAdder:
                 now_input_len = trunc_len + len(req.prefix_indices)
                 now_input_len = now_input_len // self.page_size * self.page_size
                 trunc_len = now_input_len - len(req.prefix_indices)
+
+                if truncation_align_size is None:
+                    trunc_len = _align_chunk_extend_end(
+                        len(req.prefix_indices),
+                        len(req.full_untruncated_fill_ids),
+                        trunc_len,
+                        self.checkpoint_end_align_size,
+                    )
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER

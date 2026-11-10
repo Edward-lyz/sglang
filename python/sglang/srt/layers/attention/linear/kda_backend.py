@@ -13,6 +13,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.srt.configs.hybrid_arch import uses_kda_attentionstore_checkpoints
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kernels.kda_native_checkpoint import (
+    KDANativeCheckpointResult,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -289,7 +292,9 @@ class KDAKernelDispatcher:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Union[
+        torch.Tensor, Tuple[torch.Tensor, torch.Tensor], KDANativeCheckpointResult
+    ]:
         return self.extend_kernel.extend(
             q,
             k,
@@ -415,10 +420,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         verify_backend = get_linear_attn_verify_backend()
-        # KDA FlashInfer target_verify (recurrent_kda) is chain-only (no tree-ancestor
-        # traversal). Reject EAGLE tree verify (topk > 1) early at setup, keyed on the
-        # verify backend (not decode). The kernel keeps a per-call
-        # retrieve_parent_token backstop that also covers ngram tree.
         speculative_topk = model_runner.server_args.speculative_eagle_topk or 1
         if verify_backend.is_flashinfer() and speculative_topk > 1:
             raise ValueError(
@@ -427,6 +428,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
+        )
+        # Only the exact KDA backend may build native checkpoint instructions.
+        # Capability was cached during opt-in FlashKDA kernel initialization.
+        self._kda_native_checkpoint_plan_enabled = bool(
+            self.exact_checkpoint_tracking
+            and getattr(
+                self.kernel_dispatcher.extend_kernel,
+                "native_checkpoint_supported",
+                False,
+            )
         )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
@@ -633,8 +644,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
 
-        query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
+        metadata = self.forward_metadata
+        query_start_loc = metadata.query_start_loc
+        cache_indices = metadata.mamba_cache_indices
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
@@ -772,7 +784,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             track_ssm_h_src=(
                 self.forward_metadata.track_ssm_h_src if track_ssm else None
             ),
+            native_checkpoint_offsets=metadata.kda_native_checkpoint_offsets,
+            native_checkpoint_rows=metadata.kda_native_checkpoint_rows,
         )
+        if isinstance(core_attn_out, KDANativeCheckpointResult):
+            return self._scatter_native_checkpoint_result(
+                core_attn_out,
+                metadata=metadata,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+            )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
@@ -783,6 +804,36 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
 
         return core_attn_out
+
+    @staticmethod
+    def _scatter_native_checkpoint_result(
+        result: KDANativeCheckpointResult,
+        *,
+        metadata,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Commit this layer's active checkpoint rows to PHYSICAL track slots.
+
+        The kernel already copied final states to the original cache slots.
+        Offset-zero dense rows are unwritten and must never be gathered.
+        """
+        rows = metadata.kda_native_checkpoint_rows
+        dst = metadata.track_ssm_h_dst
+        checkpoints = result.checkpoint_states
+        if rows is None or dst is None or rows.numel() != dst.numel():
+            raise RuntimeError("native checkpoint result has no matching owner plan")
+        if checkpoints.shape != (cache_indices.numel(),) + tuple(ssm_states.shape[1:]):
+            raise RuntimeError("native checkpoint result geometry mismatch")
+        ssm_states[dst] = checkpoints[rows].to(ssm_states.dtype, copy=False)
+        if (
+            metadata.track_ssm_final_src is not None
+            and metadata.track_ssm_final_src.numel()
+        ):
+            ssm_states[metadata.track_ssm_final_dst] = ssm_states[
+                metadata.track_ssm_final_src
+            ]
+        return result.output
 
     def _forward_target_verify(
         self,

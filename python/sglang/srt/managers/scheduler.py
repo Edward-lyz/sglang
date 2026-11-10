@@ -2111,6 +2111,31 @@ class Scheduler(
             get_int_env_var(env_var, default_size) if env_var else None
         )
 
+    def _get_prefill_checkpoint_end_align_size(self) -> Optional[int]:
+        """Align FlashKDA prefill chunks to absolute AS checkpoints."""
+        if (
+            self.dllm_config is not None
+            or self.truncation_align_size is not None
+            or (
+                self.server_args.linear_attn_prefill_backend
+                or self.server_args.linear_attn_backend
+            )
+            != "flashkda"
+        ):
+            return None
+
+        from sglang.srt.configs.hybrid_arch import uses_kda_attentionstore_checkpoints
+
+        if not uses_kda_attentionstore_checkpoints(self.server_args, self.model_config):
+            return None
+
+        from sglang.srt.mem_cache.storage.asradix.types import AS_BLOCK_SIZE
+
+        # Preserve the existing allocator's absolute page-alignment contract.
+        if AS_BLOCK_SIZE % self.page_size:
+            return None
+        return AS_BLOCK_SIZE
+
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -4125,6 +4150,7 @@ class Scheduler(
             cost_model=cost_model if use_cost_model else None,
             rem_cost=rem_cost,
             cost_chunk_cap=self.chunked_prefill_size if use_cost_model else None,
+            checkpoint_end_align_size=self._get_prefill_checkpoint_end_align_size(),
         )
 
         cache_read_aborted_reqs = set()

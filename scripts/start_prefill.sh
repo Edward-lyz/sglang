@@ -161,13 +161,13 @@ $NSYS_PREFIX sglang serve \
     --moe-runner-backend flashinfer_mxfp4 \
     --linear-attn-prefill-backend flashkda \
     --mamba-full-memory-ratio 0.25 \
-    --max-mamba-cache-size 256 \
+    --max-mamba-cache-size 512 \
     --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' \
     --disable-flashinfer-autotune \
     --chunked-prefill-size $((16 * 1024)) \
     --max-prefill-tokens $((512 * 1024)) \
     --max-total-tokens $((4 * 1024 * 1024)) \
-    --max-running-requests 64 \
+    --max-running-requests 128 \
     --pp-async-batch-depth 2 \
     --page-size 64 \
     --mem-fraction-static 0.8 \

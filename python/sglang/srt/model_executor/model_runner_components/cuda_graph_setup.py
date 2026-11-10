@@ -275,6 +275,8 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
     """Capture device graphs."""
     no_capture = DecodeGraphCapture(runner=None, graph_mem_usage=0)
 
+    if model_runner.server_args.disaggregation_mode == "prefill":
+        return no_capture
     if not model_runner.is_generation:
         # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
         return no_capture

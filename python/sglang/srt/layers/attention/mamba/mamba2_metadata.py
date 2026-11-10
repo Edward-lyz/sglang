@@ -62,6 +62,10 @@ class ForwardMetadata:
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
+    # Read-only inputs for exact KDA native snapshots, shared across layers.
+    # Dense checkpoint/final/output buffers belong to each kernel result only.
+    kda_native_checkpoint_offsets: Optional[torch.Tensor] = None
+    kda_native_checkpoint_rows: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)

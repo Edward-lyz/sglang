@@ -11,6 +11,11 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
 )
 from sglang.srt.configs.hybrid_arch import mamba2_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.linear.kernels.kda_native_checkpoint import (
+    KDANativePlanSink,
+    fill_native_plan_from_existing_cpu_data,
+    validate_native_checkpoint_cpu_inputs,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -71,6 +76,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_dst = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
+        native_plan = None
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -193,13 +199,19 @@ class MambaAttnBackendBase(AttentionBackend):
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
                     )
+                    if getattr(self, "_kda_native_checkpoint_plan_enabled", False):
+                        native_plan = KDANativePlanSink()
 
                     (
                         track_ssm_h_src,
                         track_ssm_h_dst,
                         track_ssm_final_src,
                         track_ssm_final_dst,
-                    ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+                    ) = self._init_track_ssm_indices(
+                        mamba_cache_indices,
+                        forward_batch,
+                        native_plan_sink=native_plan,
+                    )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
 
@@ -223,6 +235,12 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
             has_mamba_track_mask=has_mamba_track_mask,
+            kda_native_checkpoint_offsets=(
+                native_plan.offsets if native_plan is not None else None
+            ),
+            kda_native_checkpoint_rows=(
+                native_plan.owner_rows if native_plan is not None else None
+            ),
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
         )
@@ -276,7 +294,25 @@ class MambaAttnBackendBase(AttentionBackend):
             if torch.any(
                 (tracked_lens < conv_state_len) | (tracked_lens > extend_lens)
             ):
-                raise ValueError("tracked conv window must be inside its own extend")
+                metadata = {
+                    "rids": forward_batch.rids,
+                    "forward_mode": str(forward_batch.forward_mode),
+                    "conv_state_len": conv_state_len,
+                    "tracked_relative_lens": tracked_lens.tolist(),
+                    "tracked_extend_lens": extend_lens.tolist(),
+                    "prefix_lens_cpu": forward_batch.extend_prefix_lens_cpu,
+                    "extend_lens_cpu": forward_batch.extend_seq_lens_cpu,
+                    "prefix_lens": forward_batch.extend_prefix_lens.tolist(),
+                    "extend_lens": forward_batch.extend_seq_lens.tolist(),
+                    "track_seqlens": forward_batch.mamba_track_seqlens.tolist(),
+                    "track_mask": forward_batch.mamba_track_mask.tolist(),
+                    "track_indices": forward_batch.mamba_track_indices.tolist(),
+                    "req_pool_indices": forward_batch.req_pool_indices.tolist(),
+                    "query_start_loc": query_start_loc.tolist(),
+                }
+                raise ValueError(
+                    "tracked conv window must be inside its own extend: " f"{metadata=}"
+                )
 
         indices = start_indices.unsqueeze(-1) + torch.arange(
             conv_state_len,
@@ -289,7 +325,10 @@ class MambaAttnBackendBase(AttentionBackend):
         return indices.clamp(0, query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(
-        self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        mamba_cache_indices: torch.Tensor,
+        forward_batch: ForwardBatch,
+        native_plan_sink: Optional[KDANativePlanSink] = None,
     ):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
@@ -310,6 +349,19 @@ class MambaAttnBackendBase(AttentionBackend):
         # while AttentionStore may checkpoint every 256 tokens. Keep the packed-h
         # offsets on the kernel grid, then map the cache boundary back to that grid.
         exact_checkpoint_tracking = getattr(self, "exact_checkpoint_tracking", False)
+        if native_plan_sink is not None:
+            if not exact_checkpoint_tracking:
+                raise ValueError("native checkpoint plans require exact KDA tracking")
+            # Reuse CPU inputs already obtained above. Validate before any layer
+            # can mutate convolution, recurrent, or physical track-slot state.
+            validate_native_checkpoint_cpu_inputs(
+                prefixes=prefix_lens,
+                extends=extend_seq_lens,
+                targets=mamba_track_seqlens,
+                track_mask=mamba_track_mask,
+                track_indices=mamba_track_indices,
+                cache_indices=mamba_cache_indices,
+            )
         state_chunk_size = (
             self.intermediate_state_chunk_size
             if exact_checkpoint_tracking
@@ -372,6 +424,19 @@ class MambaAttnBackendBase(AttentionBackend):
                 lens_masked[not_aligned] // checkpoint_chunk_size
             )
             track_ssm_h_dst = dst_masked[not_aligned]
+
+        if native_plan_sink is not None:
+            fill_native_plan_from_existing_cpu_data(
+                native_plan_sink,
+                exact_checkpoint_tracking=exact_checkpoint_tracking,
+                prefixes=prefix_lens,
+                extends=extend_seq_lens,
+                targets=mamba_track_seqlens,
+                track_mask=mamba_track_mask,
+                is_final_masked=is_final,
+                h_dst=track_ssm_h_dst,
+                device=self.device,
+            )
 
         return (
             track_ssm_h_src.to(self.device, non_blocking=True),

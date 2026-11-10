@@ -242,10 +242,11 @@ class AttentionStoreCoordinator:
     def record_device_event(device: Any, stream: Any = None):
         """Record completion of the producer stream that filled the pages.
 
-        ``stream`` should be the forward stream that produced the KV data (see
-        ``_producer_stream``); when omitted we fall back to the current stream.
+        ``stream`` selects the device context and should be the forward stream
+        that produced the KV data (see ``_producer_stream``); when omitted we
+        fall back to the current stream on ``device``.
         """
-        device = torch.device(device)
+        device = torch.device(stream.device if stream is not None else device)
         if device.type not in ("cuda", "xpu"):
             return None
         device_module = torch.get_device_module(device)
