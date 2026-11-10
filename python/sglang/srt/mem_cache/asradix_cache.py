@@ -432,8 +432,45 @@ class AsRadixCache(RadixCache):
 
         max_hit_length = len(params.key) // self.page_size * self.page_size
 
-        # Step 3: Skip AS match if HBM fully hit (all tokens matched locally)
-        if result.device_indices.numel() == max_hit_length:
+        # TP-collective agreement on the HBM-matched length before deciding
+        # whether to query AttentionStore. Async AS loads can leave per-rank
+        # device residency transiently divergent; without this agreement one TP
+        # rank may take the Step-3 full-hit skip while another enters
+        # _as_match(), making _as_match's all_reduce(MIN) non-collective and
+        # deadlocking the entire prefill TP group (observed under perf ramp).
+        # MIN-reduce the local HBM hit and cap every rank to the common prefix
+        # so Step 3, _as_match and the downstream AS load run identically on all
+        # ranks. No-op when ranks already agree (the normal case).
+        common_hit_length = int(result.device_indices.numel())
+        if self.tp_world_size > 1:
+            hit_tensor = torch.tensor(common_hit_length, dtype=torch.int)
+            torch.distributed.all_reduce(
+                hit_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            tp_min_hit = int(hit_tensor.item())
+            if tp_min_hit < common_hit_length:
+                logger.warning(
+                    f"AS match_prefix: req:{req.rid} HBM hit diverged across TP "
+                    f"(local={common_hit_length}, tp_min={tp_min_hit}); capping "
+                    f"to TP minimum for collective-safe AS match"
+                )
+                result = super().match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(
+                            token_ids=params.key.token_ids,
+                            extra_key=params.key.extra_key,
+                            limit=tp_min_hit,
+                        ),
+                        req=req,
+                        cow_mamba=getattr(params, "cow_mamba", None),
+                    )
+                )
+            common_hit_length = tp_min_hit
+
+        # Step 3: Skip AS match if HBM fully hit (now a TP-identical decision)
+        if common_hit_length == max_hit_length:
             logger.info(
                 f"AS match_prefix: req:{req.rid} hbm_hit={max_hit_length} tokens, "
                 f"as_hit=0 tokens, total={len(params.key)} tokens"
