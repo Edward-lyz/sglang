@@ -166,15 +166,44 @@ def forward_mega_moe(
         shared_output = moe._forward_shared_experts(hidden_states)
         mega_stream_ctx = nullcontext()
 
+    # Optionally fuse the routed scaling into the shared-expert residual add:
+    # one torch.add(shared, y, alpha=scale) instead of y.mul_(scale) then
+    # y.add_(shared). Only on the sm100 path (sm90 self-scales inside
+    # run_sm90_mega_routed) and only when the scaling is not already folded into
+    # topk and a shared output exists. Default OFF (SGLANG_FUSE_SHARED_SCALE_ADD).
+    fuse_scale_add = (
+        envs.SGLANG_FUSE_SHARED_SCALE_ADD.get()
+        and shared_output is not None
+        and _device_sm != 90
+        and not moe.experts.should_fuse_routed_scaling_factor_in_topk
+    )
+
     with mega_stream_ctx:
         y = _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            num_tokens,
+            apply_routed_scaling=not fuse_scale_add,
         )
 
     if sbo_overlap_flag:
         current_stream.wait_stream(moe.alt_stream)
 
-    if shared_output is not None:
+    if fuse_scale_add and (
+        y.shape == shared_output.shape
+        and y.dtype == shared_output.dtype
+        and y.is_contiguous()
+        and shared_output.is_contiguous()
+    ):
+        # Single fused elementwise kernel: y = shared_output + scale * y.
+        torch.add(shared_output, y, alpha=moe.routed_scaling_factor, out=y)
+    elif shared_output is not None:
+        if fuse_scale_add:
+            # Flag on but the fused guard rejected these tensors: _run_mega_routed
+            # skipped the scaling, so restore it before the plain add (fallback).
+            y.mul_(moe.routed_scaling_factor)
         y.add_(shared_output)
     return y
 
@@ -185,6 +214,7 @@ def _run_mega_routed(
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
+    apply_routed_scaling: bool = True,
 ) -> torch.Tensor:
     import deep_gemm
 
@@ -318,7 +348,7 @@ def _run_mega_routed(
         )
     y = y[:num_tokens]
 
-    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+    if apply_routed_scaling and not moe.experts.should_fuse_routed_scaling_factor_in_topk:
         y.mul_(moe.routed_scaling_factor)
     return y
 

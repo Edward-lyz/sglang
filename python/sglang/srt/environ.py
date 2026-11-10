@@ -303,6 +303,11 @@ class Envs:
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # Bitwise-exact, shape-guarded MLA o_proj wo_b-input fusion (DSV4.1 decode):
+    # fuse the strided wo_a output flatten copy + flashinfer cute-dsl mxfp8 swizzled
+    # quantize into one Triton launch feeding the unchanged vendor blockscaled GEMM.
+    # Unsupported shapes fall back to the original flatten + flashinfer path.
+    SGLANG_FUSE_O_PROJ_MXFP8_QUANT = EnvBool(False)
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
@@ -1278,6 +1283,12 @@ class Envs:
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
 
+    # Fuse DSV4.1-Flash shared-expert Reuse-layer silu_and_mul_clamp (op79) and the
+    # flashinfer MXFP8 swizzled activation-quant (op80) into one Triton launch, then run
+    # the UNCHANGED flashinfer blockscaled down_proj GEMM (op81) on the pre-quantized
+    # (e4m3, ue8m0 128x4-swizzled) output. Byte-identical; graph-safe. Default OFF.
+    SGLANG_FUSE_SHARED_SILU_MXFP8_QUANT = EnvBool(False)
+
     # ===================================================================
     # DeepGEMM Mega MoE
     # ===================================================================
@@ -1285,6 +1296,15 @@ class Envs:
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+    # Fuse the MegaMoE shared-expert residual combine
+    #   hidden = shared_output + routed_scaling_factor * routed_y
+    # from the two elementwise kernels the path issues today (y.mul_(scale) in
+    # _run_mega_routed + y.add_(shared_output) in forward_mega_moe) into one
+    # torch.add(shared_output, y, alpha=scale). Memory-bound; ~1.75x on the
+    # combine at the traced decode shape, single graph-safe elementwise kernel.
+    # Default OFF; falls back to the two-op path when the routed scaling is
+    # already folded into topk, or shapes/dtypes/contiguity do not match.
+    SGLANG_FUSE_SHARED_SCALE_ADD = EnvBool(False)
 
     # ===================================================================
     # MHC (mixed hidden-state compute) layernorm kernel
@@ -1614,6 +1634,36 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    # Fuse the Reuse-layer attention-input glue (sinkhorn + hc_combine + input RMSNorm)
+    # into ONE Triton launch (returns the post-norm activation, norm_fused=True drop-in).
+    # OFF by default: the fused path must first pass the live decode CUDA-graph boot gate
+    # on the target build (see record_kernel_opt/deepseekv4.1_flash_decode_kernel_mhc_0922).
+    SGLANG_FUSE_MHC_PRE_INPUT = EnvBool(False)
+    # Fuse the MLA q-path RMSNorm (op56 q_a_rmsnorm, q_lora_rank) + the wq_b input
+    # MXFP8 128x4-swizzled ue8m0 quantize (op58 q_proj_quant) into ONE Triton launch
+    # that emits the normed bf16 (for the indexer) plus Mxfp8SwizzledInput for the
+    # UNCHANGED flashinfer blockscaled wq_b GEMM. OFF by default: enable only after the
+    # fused path passes the live decode CUDA-graph boot gate on the target build
+    # (see record_kernel_opt/deepseekv4.1_flash_decode_kernel_norm_0923).
+    SGLANG_FUSE_MLA_QNORM_MXFP8 = EnvBool(False)
+    # Tuned launch for the candidate-block visibility mask (_candidate_mask_kernel),
+    # bit-exact, ~1.1x at bs256. OFF by default (must pass the live decode boot gate).
+    SGLANG_FUSE_CANDIDATE_MASK_OPT = EnvBool(False)
+    # Row-loop candidate-block visibility mask: grid=(rows,), each row loops only its
+    # live [0:seq_len] tiles and skips writing the dead page-capacity tail (the vendor
+    # paged top-k reads only [0:seq_len]). Bit-exact final top-k selection (as a set),
+    # ~6.3x on the mask / ~3.4x on the select_decode group at bs256. OFF by default
+    # (must pass the live decode CUDA-graph boot gate).
+    # (see record_kernel_opt/deepseekv4.1_flash_decode_kernel_topk_0923).
+    SGLANG_FUSE_CANDIDATE_MASK_ROWLOOP = EnvBool(False)
+    # Candidate-SOURCE (publish_decode / layer 20) optimization: row-loop block scoring
+    # (skips the dead page-capacity tail) + replaces the slow torch.topk (at::native::
+    # mbtopk) block selection with the vendor topk_transform_paged_v2 + a membership
+    # publish. ~4x on the candidate-source path. keep-mask bit-exact when live blocks
+    # <= topk_blocks (traced regime); extreme-context differences are top-k boundary
+    # ties. OFF by default (must pass the live decode boot gate).
+    # (see record_kernel_opt/deepseekv4.1_flash_decode_kernel_candsrc_0923).
+    SGLANG_FUSE_CANDIDATE_SOURCE_OPT = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),

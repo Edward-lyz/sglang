@@ -104,18 +104,57 @@ def candidate_block_logits(
     rows, width = logits.shape
     output = torch.empty((rows, width), dtype=torch.float32, device=logits.device)
     if published is not None:
-        _candidate_mask_kernel[(rows, triton.cdiv(width, 4096))](
-            logits,
-            seq_lens,
-            published,
-            output,
-            width,
-            logits.stride(0),
-            published.stride(0),
-            published.stride(1),
-            4096,
-        )
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_FUSE_CANDIDATE_MASK_ROWLOOP.get():
+            # Row-loop mask: one program per row, writes ONLY the live [0:seq_len] tiles
+            # and skips the dead page-capacity tail (the vendor paged top-k reads only
+            # [0:seq_len], so the tail is never read). Bit-exact final selection (set).
+            # ~6.3x on the mask at bs256. Default OFF (needs the live decode boot gate).
+            from sglang.kernels.ops.attention.dsv4.candidate_mask_rowloop import (
+                candidate_mask_rowloop,
+            )
+
+            candidate_mask_rowloop(
+                logits, seq_lens, published, out=output, TILE=1024, num_warps=4
+            )
+        elif envs.SGLANG_FUSE_CANDIDATE_MASK_OPT.get():
+            # Tuned launch (TILE/num_warps + contiguous-keep specialization),
+            # bit-exact with _candidate_mask_kernel; ~1.1x at bs256. Default OFF.
+            from sglang.kernels.ops.attention.dsv4.candidate_mask_opt import (
+                candidate_mask_opt,
+            )
+
+            candidate_mask_opt(
+                logits, seq_lens, published, out=output, TILE=2048, num_warps=8
+            )
+        else:
+            _candidate_mask_kernel[(rows, triton.cdiv(width, 4096))](
+                logits,
+                seq_lens,
+                published,
+                output,
+                width,
+                logits.stride(0),
+                published.stride(0),
+                published.stride(1),
+                4096,
+            )
         return output, None
+
+    from sglang.srt.environ import envs as _envs
+
+    if _envs.SGLANG_FUSE_CANDIDATE_SOURCE_OPT.get():
+        # Candidate-source opt: row-loop block scoring (skips dead tail) + vendor
+        # block top-k (replaces slow torch.topk) + membership publish. ~4x on the
+        # source path; keep-mask bit-exact when live blocks <= topk_blocks. Default OFF.
+        from sglang.kernels.ops.attention.dsv4.candidate_source_opt import (
+            candidate_source_scores_and_keep,
+        )
+
+        return candidate_source_scores_and_keep(
+            logits, seq_lens, topk_blocks, block_size, out=output
+        )
 
     blocks = triton.cdiv(width, block_size)
     scores = torch.empty((rows, blocks), dtype=torch.float32, device=logits.device)

@@ -399,6 +399,38 @@ class DeepseekV2MLP(nn.Module):
             )
             return down_output
 
+        # SGLANG_FUSE_SHARED_SILU_MXFP8_QUANT (default OFF): fuse op79 silu+clamp
+        # and op80 flashinfer MXFP8 swizzled quant into ONE Triton launch, then run
+        # the UNCHANGED flashinfer blockscaled down_proj GEMM (op81) on the
+        # pre-quantized (e4m3, ue8m0 128x4-swizzled) tuple. Conditions unmet -> exact
+        # original silu_and_mul_clamp + down_proj path below (no error masking).
+        if (
+            envs.SGLANG_FUSE_SHARED_SILU_MXFP8_QUANT.get()
+            and self.swiglu_limit is not None
+            and not self.down_proj.reduce_results
+            and not isinstance(gate_up, tuple)
+            and gate_up.dtype == torch.bfloat16
+            and gate_up.is_contiguous()
+            and (gate_up.shape[1] // 2) % 32 == 0
+            and ((gate_up.shape[1] // 2) // 32) % 4 == 0
+            and gate_up.shape[0] % 128 == 0
+        ):
+            from sglang.kernels.ops.quantization.fused_silu_mxfp8_swizzled_quant import (
+                fused_silu_and_mul_mxfp8_swizzled_quant,
+            )
+            from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+
+            q_fp8, sf_swizzled = fused_silu_and_mul_mxfp8_swizzled_quant(
+                gate_up, swiglu_limit=float(self.swiglu_limit), group=32
+            )
+            # Wrap as Mxfp8SwizzledInput (e4m3 + ue8m0 128x4) so down_proj's fp8
+            # method routes to the flashinfer mxfp8 blockscaled GEMM with the
+            # swizzled weight scale. A bare tuple could be read as block-fp8 with a
+            # different scale layout (fp8.py apply). Same pattern as the attention
+            # wo_a -> Mxfp8SwizzledInput -> wo_b path in deepseek_v4.py.
+            out, _ = self.down_proj(Mxfp8SwizzledInput(q_fp8, sf_swizzled))
+            return out
+
         if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
             from aiter.ops.triton.fusions.fused_clamp_act_mul import (
                 fused_clamp_act_mul,
