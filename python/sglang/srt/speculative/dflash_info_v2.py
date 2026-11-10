@@ -11,6 +11,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -44,6 +45,11 @@ class DFlashDraftInputV2(SpecInput):
     hidden_states: torch.Tensor
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
+    # SGLANG_OPT_DSPARK_TOPP_ROW_SKIP (set in prepare_for_decode): device indices of the
+    # sampling requests with top_p < 1 (None = renorm every row), and whether any sampling
+    # request sets top_k (greedy requests carry top_k = 1 but take the greedy accept).
+    top_p_req_rows: Optional[torch.Tensor] = None
+    need_top_k_sampling_rows: bool = True
     nxt_kv_lens_cpu: Optional[torch.Tensor] = None
     nxt_kv_lens_sum: Optional[int] = None
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
@@ -51,6 +57,8 @@ class DFlashDraftInputV2(SpecInput):
     _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
     _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+    _top_p_rows_cpu_buf: Optional[torch.Tensor] = None
+    _top_p_rows_gpu_buf: Optional[torch.Tensor] = None
 
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
@@ -100,6 +108,42 @@ class DFlashDraftInputV2(SpecInput):
             self._prepare_nxt_kv_lens_gpu_buf = torch.empty(
                 (capacity,), dtype=torch.int32, device=device
             )
+
+    def _collect_top_p_rows(self, batch: ScheduleBatch) -> Optional[List[int]]:
+        """SGLANG_OPT_DSPARK_TOPP_ROW_SKIP: rows of the sampling requests with top_p < 1,
+        or None when every row is renormed (flag off, or all rows need it)."""
+        self.need_top_k_sampling_rows = True
+        if not envs.SGLANG_OPT_DSPARK_TOPP_ROW_SKIP.get():
+            return None
+        rows = []
+        need_top_k = False
+        for i, req in enumerate(batch.reqs):
+            params = req.sampling_params
+            if params.top_k <= 1:
+                continue  # greedy row: its sampling result is replaced by the greedy accept
+            if params.top_p != 1.0:
+                rows.append(i)
+            if params.top_k != TOP_K_ALL:
+                need_top_k = True
+        self.need_top_k_sampling_rows = need_top_k
+        return None if len(rows) == len(batch.reqs) else rows
+
+    def _stage_top_p_rows(self, rows: Optional[List[int]], device) -> None:
+        if rows is None:
+            self.top_p_req_rows = None
+            return
+        n = len(rows)
+        if self._top_p_rows_cpu_buf is None or self._top_p_rows_cpu_buf.numel() < n:
+            capacity = max(n, 32, 2 * (0 if self._top_p_rows_cpu_buf is None else self._top_p_rows_cpu_buf.numel()))
+            self._top_p_rows_cpu_buf = torch.empty(
+                (capacity,), dtype=torch.int64, device="cpu",
+                pin_memory=is_pin_memory_available(device),
+            )
+            self._top_p_rows_gpu_buf = torch.empty((capacity,), dtype=torch.int64, device=device)
+        if n:
+            self._top_p_rows_cpu_buf[:n] = torch.tensor(rows, dtype=torch.int64)
+            self._top_p_rows_gpu_buf[:n].copy_(self._top_p_rows_cpu_buf[:n], non_blocking=True)
+        self.top_p_req_rows = self._top_p_rows_gpu_buf[:n]
 
     @classmethod
     def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
@@ -177,6 +221,7 @@ class DFlashDraftInputV2(SpecInput):
 
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
+        top_p_rows = self._collect_top_p_rows(batch)
 
         caller_stream = None
         if plan_stream is not None:
@@ -193,6 +238,7 @@ class DFlashDraftInputV2(SpecInput):
             nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
             cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
             nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
+            self._stage_top_p_rows(top_p_rows, batch.device)
 
             alloc_for_spec_decode(
                 batch.tree_cache,

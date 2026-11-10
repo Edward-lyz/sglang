@@ -4,7 +4,7 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -1127,14 +1127,25 @@ def build_dflash_verify_target_probs(
     max_top_k: Optional[int] = None,
     uniform_top_k_value: Optional[int] = None,
     use_sparse_topk: bool = True,
+    top_p_req_rows: Optional[torch.Tensor] = None,
+    need_top_k_sampling_rows: bool = True,
+    fused_softmax_temp: Optional[Callable[[], torch.Tensor]] = None,
 ) -> torch.Tensor:
+    """``top_p_req_rows`` / ``need_top_k_sampling_rows`` (SGLANG_OPT_DSPARK_TOPP_ROW_SKIP):
+    renorm top-p only on those request rows, and skip top-k when no sampling row sets it
+    (greedy rows carry top_k = 1 but their result is replaced by the greedy accept).
+    ``fused_softmax_temp`` (SGLANG_OPT_DSPARK_TOPP_SOFTMAX_TEMP): returns the dense
+    softmax(logits / T) in one launch; used when no top-k renorm is needed."""
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
+    need_top_k = need_top_k and need_top_k_sampling_rows
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
-    expanded_temperature = torch.repeat_interleave(
-        sampling_info.temperatures, draft_token_num, dim=0
-    )
-    scaled_logits = next_token_logits / expanded_temperature
+    use_fused_softmax = fused_softmax_temp is not None and not need_top_k
+    if not use_fused_softmax:
+        expanded_temperature = torch.repeat_interleave(
+            sampling_info.temperatures, draft_token_num, dim=0
+        )
+        scaled_logits = next_token_logits / expanded_temperature
     sparse_topk_applied = False
 
     if use_sparse_topk and need_top_k:
@@ -1174,17 +1185,34 @@ def build_dflash_verify_target_probs(
             sparse_topk_applied = True
 
     if not sparse_topk_applied:
-        target_probs = F.softmax(scaled_logits, dim=-1)
+        if use_fused_softmax:
+            target_probs = fused_softmax_temp()
+        else:
+            target_probs = F.softmax(scaled_logits, dim=-1)
         if need_top_k:
             target_probs = _dflash_top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
         if need_top_p:
-            target_probs = _dflash_top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            repeated_top_ps = torch.repeat_interleave(
+                sampling_info.top_ps, draft_token_num, dim=0
             )
+            if top_p_req_rows is None:
+                target_probs = _dflash_top_p_renorm_prob(target_probs, repeated_top_ps)
+            elif top_p_req_rows.numel() > 0:
+                rows = (
+                    top_p_req_rows.view(-1, 1) * draft_token_num
+                    + torch.arange(draft_token_num, device=device).view(1, -1)
+                ).view(-1)
+                target_probs.index_copy_(
+                    0,
+                    rows,
+                    _dflash_top_p_renorm_prob(
+                        target_probs.index_select(0, rows),
+                        repeated_top_ps.index_select(0, rows),
+                    ),
+                )
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 

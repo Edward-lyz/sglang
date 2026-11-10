@@ -571,6 +571,14 @@ class Envs:
     # ===================================================================
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
+    # Sampling verify with top-p only: build the target probs with the fused
+    # softmax(logits / T) (SoftmaxTemp) instead of divide + F.softmax.
+    SGLANG_OPT_DSPARK_TOPP_SOFTMAX_TEMP = EnvBool(False)
+    # DSpark sampling-accept target probs: run the top-p renorm only on the rows of requests
+    # with top_p < 1 (the rest are identity up to fp32 rounding of a sum that is already 1),
+    # and skip the top-k renorm when only greedy rows (top_k = 1, accepted on the greedy path)
+    # set top_k. Rows that are renormed get the same values as the full-batch call.
+    SGLANG_OPT_DSPARK_TOPP_ROW_SKIP = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_STS_COLLECT_PATH = EnvStr("")

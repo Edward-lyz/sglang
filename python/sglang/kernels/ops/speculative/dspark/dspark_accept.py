@@ -77,6 +77,20 @@ class AcceptSampling:
         )
 
 
+def _topp_softmax_temp_enabled() -> bool:
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_DSPARK_TOPP_SOFTMAX_TEMP.get():
+        return False
+    from sglang.srt.utils.community_opt import log_community_opt_once
+
+    log_community_opt_once(
+        "dspark_topp_softmax_temp",
+        "DSpark sampling verify (top-p only) uses the fused softmax(logits / T)",
+    )
+    return True
+
+
 def _accept_sampling_core(
     *,
     candidates: torch.Tensor,
@@ -97,6 +111,9 @@ def _accept_sampling_core(
             rows_per_request=verify_num_draft_tokens,
         ).view(bs, verify_num_draft_tokens, -1)
     else:
+        # SGLANG_OPT_DSPARK_TOPP_SOFTMAX_TEMP: when no top-k renorm is needed, one fused
+        # softmax(logits / T) instead of the elementwise divide + F.softmax pair, then the
+        # same top-p renorm (only on the top_p < 1 rows under SGLANG_OPT_DSPARK_TOPP_ROW_SKIP).
         target_probs = build_dflash_verify_target_probs(
             next_token_logits=target_logits,
             sampling_info=sampling_info,
@@ -104,6 +121,19 @@ def _accept_sampling_core(
             bs=bs,
             max_top_k=draft_input.max_top_k,
             uniform_top_k_value=draft_input.uniform_top_k_value,
+            top_p_req_rows=getattr(draft_input, "top_p_req_rows", None),
+            need_top_k_sampling_rows=getattr(draft_input, "need_top_k_sampling_rows", True),
+            fused_softmax_temp=(
+                (
+                    lambda: SoftmaxTemp.execute(
+                        logits=target_logits,
+                        temperatures=sampling_info.temperatures,
+                        rows_per_request=verify_num_draft_tokens,
+                    )
+                )
+                if target_logits.is_cuda and _topp_softmax_temp_enabled()
+                else None
+            ),
         )
     (
         retrieve_index,
