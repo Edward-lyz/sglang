@@ -922,6 +922,9 @@ class Envs:
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    # fake_dp prefill: register each request's dp_rank with the bootstrap server from one
+    # background thread in batches, instead of one blocking HTTP POST per request on the scheduler.
+    SGLANG_OPT_ASYNC_PREFILL_DP_RANK_REGISTER = EnvBool(False)
     # Per-state-component layout dump for DSpark PD KV transfer (diagnostic only).
     SGLANG_DSPARK_PD_DEBUG = EnvBool(False)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)

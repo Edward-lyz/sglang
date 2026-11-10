@@ -76,6 +76,55 @@ def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
     return session
 
 
+class _DpRankRegistrar:
+    """Posts prefill dp_rank registrations from one daemon thread, batched per bootstrap server.
+
+    The decode side keeps querying a room until its dp_rank shows up, so a registration that
+    lands a few ms later only delays that query; the scheduler thread no longer waits on HTTP.
+    """
+
+    def __init__(self):
+        """Start with an empty pending map; the thread starts on first submit."""
+        self._cond = threading.Condition()
+        self._pending: Dict[Tuple[str, int], List[int]] = defaultdict(list)
+        self._thread: Optional[threading.Thread] = None
+
+    def submit(self, bootstrap_server_url: str, bootstrap_room: int, dp_rank: int) -> None:
+        """Queue one registration and wake the sender thread."""
+        with self._cond:
+            self._pending[(bootstrap_server_url, dp_rank)].append(bootstrap_room)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="dp_rank_registrar", daemon=True
+                )
+                self._thread.start()
+            self._cond.notify()
+
+    def _run(self) -> None:
+        """Drain everything queued so far and post one request per (server, dp_rank)."""
+        while True:
+            with self._cond:
+                while not self._pending:
+                    self._cond.wait()
+                batch, self._pending = self._pending, defaultdict(list)
+            for (url, dp_rank), rooms in batch.items():
+                try:
+                    response = _get_bootstrap_session(url).post(
+                        f"http://{url}/register_dp_rank",
+                        json={"bootstrap_rooms": rooms, "dp_rank": dp_rank},
+                        timeout=5,
+                    )
+                    if response.status_code != 200:
+                        logger.error(
+                            f"Failed to register prefill dp_rank: {response.status_code}, {response.text}"
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to register prefill dp_rank: {e}")
+
+
+_dp_rank_registrar = _DpRankRegistrar()
+
+
 class KVTransferError(Exception):
     def __init__(
         self,
@@ -1517,6 +1566,11 @@ class CommonKVSender(BaseKVSender):
             "bootstrap_room": self.bootstrap_room,
             "dp_rank": self.kv_mgr.prefill_routing_dp()[1],
         }
+        if envs.SGLANG_OPT_ASYNC_PREFILL_DP_RANK_REGISTER.get():
+            _dp_rank_registrar.submit(
+                self.bootstrap_server_url, payload["bootstrap_room"], payload["dp_rank"]
+            )
+            return
         try:
             response = requests.post(url, json=payload, timeout=5)
             if response.status_code != 200:
@@ -2175,14 +2229,18 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()
-        bootstrap_room = int(data["bootstrap_room"])
         dp_rank = int(data["dp_rank"])
+        # Batched form from _DpRankRegistrar: {"bootstrap_rooms": [...], "dp_rank": r}.
+        rooms = data.get("bootstrap_rooms")
+        rooms = [int(r) for r in rooms] if rooms is not None else [int(data["bootstrap_room"])]
+        now = time.time()
         async with self.lock:
-            self.room_to_dp_rank[bootstrap_room] = {
-                "dp_rank": dp_rank,
-                "timestamp": time.time(),
-            }
-        logger.debug(f"Registered dp_rank={dp_rank} for {bootstrap_room=}")
+            for bootstrap_room in rooms:
+                self.room_to_dp_rank[bootstrap_room] = {
+                    "dp_rank": dp_rank,
+                    "timestamp": now,
+                }
+        logger.debug(f"Registered dp_rank={dp_rank} for {len(rooms)} rooms")
         return web.Response(text="OK", status=200)
 
     async def _handle_query_dp_ranks(self, request: web.Request):
