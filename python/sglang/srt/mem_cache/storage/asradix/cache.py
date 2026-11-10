@@ -22,9 +22,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.environ import envs
 
 from .coordinator import AttentionStoreCoordinator
 from .plans import AttentionStoreCachePlan
+from .read_diffuse import AsReadDiffuser
 from .types import (
     AttentionStoreBinding,
     AttentionStoreInitContext,
@@ -92,7 +94,36 @@ class AttentionStoreIntegrationMixin:
                     torch.distributed.get_world_size(group=group)
                 )
         self.as_world_size = max(attention_group_sizes)
+        self._as_read_diffuser: Optional[AsReadDiffuser] = None
+        self._init_as_read_diffuser()
         atexit.register(self._shutdown_attention_store)
+
+    def _init_as_read_diffuser(self) -> None:
+        """Build the sharded-read NVLink diffuser over the attention-CP group.
+
+        Runs on every rank in lockstep (collective handle exchange inside). No-op
+        unless enabled and the KV is replicated across >1 attention-CP ranks.
+        """
+        if not envs.SGLANG_ENABLE_AS_READ_DIFFUSE.get():
+            return
+        if self.attention_store_plan.name not in ("SPA", "SPAG"):
+            # Only the checkpointed-page (SPA/SPAG) read path calls the diffuser.
+            return
+        group = self.attn_cp_group
+        if group is None or torch.distributed.get_world_size(group=group) <= 1:
+            return
+        try:
+            pool = self.token_to_kv_pool_allocator.get_kvcache()
+            self._as_read_diffuser = AsReadDiffuser(
+                pool=pool,
+                cp_group=group,
+                device=self.token_to_kv_pool_allocator.device,
+            )
+        except Exception as exc:
+            logger.warning(
+                "AS read-diffuse disabled (build failed): %s", exc, exc_info=True
+            )
+            self._as_read_diffuser = None
 
     def _log_as_result(
         self,

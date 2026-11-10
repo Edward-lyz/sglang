@@ -692,6 +692,13 @@ class Envs:
     # at runtime via /set_internal_state (log_as_cache_digest/log_as_barrier_debug).
     SGLANG_LOG_AS_CACHE_DIGEST = EnvBool(False)
     SGLANG_LOG_AS_BARRIER_DEBUG = EnvBool(False)
+    # AttentionStore (asradix) read-diffuse: shard the L2 read across the
+    # attention CP ranks (each reads 1/N of the replicated blocks) then diffuse
+    # the shards over NVLink with a raw-IPC SM scatter kernel, cutting the
+    # redundant H2D to ~1/N. Off by default. BLOCKS bounds the diffuse kernel's
+    # SM footprint so it does not starve forward's latency-bound collectives.
+    SGLANG_ENABLE_AS_READ_DIFFUSE = EnvBool(False)
+    SGLANG_AS_READ_DIFFUSE_BLOCKS = EnvInt(32)
 
     # ===================================================================
     # PD disaggregation runtime

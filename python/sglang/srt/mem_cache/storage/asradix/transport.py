@@ -472,6 +472,22 @@ class _BufferPageIO:
                 digests,
             )
 
+    def emit_content_digest(
+        self, action: str, block_hash_ids: Sequence[int], page_ids: Sequence[int]
+    ) -> None:
+        """Re-hash the current HBM page content and log it (digest-gated).
+
+        Unlike the read-time digest (which only covers the blocks this rank
+        fetched from the SDK), this hashes whatever is in HBM *now* for the given
+        pages -- used after the NVLink read-diffuse to verify the peer-pulled
+        blocks landed correctly. Compared against the write digest by hash.
+        """
+        if not cache_digest_enabled():
+            return
+        self._emit_digests(
+            action, self._snapshot_digests(block_hash_ids, page_ids), len(block_hash_ids)
+        )
+
     def match(self, block_hash_ids: Sequence[int], timeout: float = 1.0) -> int:
         """Return the matched page prefix length."""
         from attentionstore_sdk.sdk import MatchRequest

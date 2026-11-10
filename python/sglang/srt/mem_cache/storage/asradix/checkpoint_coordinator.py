@@ -490,19 +490,25 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
         if cache._as_min(1) == 0:
             self._free_loaded_pages(cache, loaded, start_pos=local_hit_len)
             return empty, anchor
+        diffuser = getattr(cache, "_as_read_diffuser", None)
         read_error = None
-        try:
-            read_count = cache.ascli.read(
-                load_info["hashes"],
-                page_ids,
-                *read_args,
-                timeout=5.0,
-                remote_addrs=load_info.get("remote_addrs") or None,
-                **read_kwargs,
+        if diffuser is not None and requested > 1:
+            read_count, read_error = self._diffuse_read(
+                cache, diffuser, load_info, page_ids, read_args, read_kwargs, requested
             )
-        except Exception as exc:
-            read_error = exc
-            read_count = 0
+        else:
+            try:
+                read_count = cache.ascli.read(
+                    load_info["hashes"],
+                    page_ids,
+                    *read_args,
+                    timeout=5.0,
+                    remote_addrs=load_info.get("remote_addrs") or None,
+                    **read_kwargs,
+                )
+            except Exception as exc:
+                read_error = exc
+                read_count = 0
         read_count = cache._as_min(read_count)
         if read_error is None:
             cache._log_as_result(
@@ -565,6 +571,47 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
             )
         req.as_read_pending_lock = True
         return tree_indices, match.last_device_node
+
+    def _diffuse_read(
+        self, cache, diffuser, load_info, page_ids, read_args, read_kwargs, requested
+    ):
+        """Sharded L2 read + NVLink diffuse (returns (read_count, error)).
+
+        Each CP rank reads only its 1/N interleaved shard plus the terminal
+        block (which carries the SWA window, so every rank restores it locally),
+        then pulls the remaining peer-owned blocks over NVLink. The ``_as_min``
+        that agrees on shard success is itself a CP-group collective *after* the
+        host-synchronous shard reads, so it doubles as the pre-diffuse barrier
+        (every peer's H2D has landed) -- diffuse runs with ``peers_ready=True``.
+        """
+        terminal = requested - 1
+        read_idx = sorted(set(diffuser.local_shard(requested)) | {terminal})
+        slots = [int(x) for x in page_ids]
+        shard_hashes = [load_info["hashes"][k] for k in read_idx]
+        shard_page_ids = [slots[k] for k in read_idx]
+        read_error = None
+        try:
+            got = cache.ascli.read(
+                shard_hashes,
+                shard_page_ids,
+                *read_args,
+                timeout=5.0,
+                remote_addrs=load_info.get("remote_addrs") or None,
+                **read_kwargs,
+            )
+            shard_ok = int(got == len(read_idx))
+        except Exception as exc:  # noqa: BLE001 -- reduced across the CP group
+            read_error = exc
+            shard_ok = 0
+        if int(cache._as_min(shard_ok)) == 0:
+            return 0, read_error
+        diffuser.diffuse(
+            slots, requested, extra_local_blocks=(terminal,), peers_ready=True
+        )
+        # Verify the peer-pulled blocks landed correctly (digest-gated no-op
+        # otherwise): re-hash the FULL restored set, compared to write by hash.
+        cache.ascli.emit_content_digest("postdiffuse", load_info["hashes"], slots)
+        return requested, read_error
 
     def do_write(self, cache, task: _SPAWriteTask) -> int:
         """Write SPA pages followed by their terminal checkpoint."""
