@@ -25,6 +25,11 @@ import numpy as np
 import pytest
 import torch
 
+from types import SimpleNamespace
+
+from sglang.srt.environ import envs
+from sglang.srt.managers import scheduler_pp_mixin
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.chunk_cost_model import ChunkCostModel
 from sglang.srt.managers.chunk_flops_estimator import (
     aggregate_stage_flops,
@@ -314,3 +319,54 @@ def test_weight_walk_flops_accounting():
     )
     assert buckets["flops"] == pytest.approx(expected)
     assert buckets["mla_layers"] == 0.0
+
+
+class _FakePPGroup:
+    def __init__(self, is_first_rank):
+        self.is_first_rank = is_first_rank
+
+
+class _FakeParallelState:
+    attn_tp_size = 1
+    attn_cp_size = 1
+    pp_size = 16
+
+
+class _FakeScheduler(SchedulerPPMixin):
+    """Only the attributes profile_and_init_predictor reads before it fails."""
+
+    def __init__(self, is_first_rank=True):
+        self.pp_group = _FakePPGroup(is_first_rank)
+        self.ps = _FakeParallelState()
+        self.chunked_prefill_size = 24576
+        self.enable_dynamic_chunking = True
+        self.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(model_config=SimpleNamespace())
+        )
+        self.model_config = SimpleNamespace(hf_config=SimpleNamespace())
+
+
+def test_pp0_profiling_failure_degrades_instead_of_hanging(monkeypatch):
+    """A profiling forward can fail on a constraint only PP0 exercises, because
+    it is the only rank that runs one. If that exception escapes, every other
+    rank stays parked in the broadcast that publishes PP0's samples, which is a
+    startup hang. The failure has to come back as a disabled feature."""
+    monkeypatch.setattr(
+        envs.SGLANG_DYNAMIC_CHUNKING_COST_MODEL, "get", lambda: False
+    )
+    # Not initialized here, so the single-process path runs and the failure has
+    # to be handled without a collective.
+    assert not torch.distributed.is_initialized()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("num_experts exceeds maximum (256)")
+
+    monkeypatch.setattr(scheduler_pp_mixin, "Req", _boom)
+
+    sched = _FakeScheduler(is_first_rank=True)
+    sched.profile_and_init_predictor()  # must not raise
+
+    assert sched.enable_dynamic_chunking is False
+    assert sched.length_predictor is None
+    assert sched.chunk_cost_model is None
+
