@@ -902,6 +902,7 @@ class DeepEPDispatcher(BaseDispatcher):
 
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
+        self._deepep_combine_hooks = DeepEPPDispatchHooks()
 
         # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
         # pre_permute reroutes them to a sink slot at index num_local_experts,
@@ -950,6 +951,9 @@ class DeepEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
     ) -> torch.Tensor:
         self.combine_a(combine_input)
+        # Combine send is issued, recv not yet waited on.
+        if self._deepep_combine_hooks is not None:
+            self._deepep_combine_hooks(self)
         ret = self.combine_b()
         return ret
 
@@ -1015,3 +1019,7 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
+
+    def register_deepep_combine_hook(self, hook):
+        """register_deepep_combine_hook"""
+        return self._deepep_combine_hooks.register_hook(hook)

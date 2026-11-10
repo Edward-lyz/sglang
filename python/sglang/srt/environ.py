@@ -964,6 +964,11 @@ class Envs:
     # logs the failing predicate once. See kernels/ops/kimi_k3/kda_short_conv.py
     # and srt/layers/attention/linear/kda_backend.py. Default off.
     SGLANG_K3_KDA_SHORT_CONV = EnvBool(False)
+    # K3 DeepEP: run the shared experts on alt_stream starting right after the
+    # routed combine send is enqueued (gated on the routed GEMMs only), so they
+    # overlap combine send + recv instead of the GEMMs. DeepEP a2a only (not
+    # MegaMoE). Default off.
+    SGLANG_K3_SHARED_IN_COMBINE_HOOK = EnvBool(False)
     # KDA extend preprocessing (bit-exact fused CUDA JIT kernels; both fall back
     # to the original torch path when the tensor layout is not covered).
     # 1) beta.float().sigmoid() on the strided [f_a|b] slice -> one kernel that
