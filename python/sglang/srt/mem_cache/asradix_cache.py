@@ -472,7 +472,7 @@ class AsRadixCache(RadixCache):
         # double-applies the bigram transform (child_key becomes pairs-of-tuples,
         # creating a phantom sibling under root distinct from cache_finished_req's
         # correctly-keyed insert and double-counting the same KV slots).
-        token_ids = req.fill_ids[:total_prefix_len]
+        token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
 
         # Compute the final tree-key length the way RadixCache.insert will:
         # bigram view shrinks raw N to N-1, then page-align.
@@ -614,7 +614,9 @@ class AsRadixCache(RadixCache):
         # Without this, local_hit + AS_hit could cover all fill_ids, making
         # extend_input_len=0 and causing an empty-tensor crash in model forward.
         max_as_tokens = (
-            (len(req.fill_ids) - local_hit_len - 1) // self.page_size * self.page_size
+            (len(req.full_untruncated_fill_ids) - local_hit_len - 1)
+            // self.page_size
+            * self.page_size
         )
         if max_as_tokens <= 0:
             return None
