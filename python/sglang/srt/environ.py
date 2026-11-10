@@ -1027,6 +1027,10 @@ class Envs:
     # single downloadable archive). Needs the public flashinfer package
     # installed for the unmodified JIT sources. Unset = feature off.
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
+    # Routed SiTU MoE: pick tile_N = nextPow2(tokens*top_k/experts) (16..128)
+    # instead of the launcher default one size below it. Prefill-range MoE
+    # 18-32% faster on K3.1; see trtllm_gen_moe._CENTER_TILE_CFG.
+    SGLANG_K3_MOE_CENTER_TILE = EnvBool(False)
 
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for

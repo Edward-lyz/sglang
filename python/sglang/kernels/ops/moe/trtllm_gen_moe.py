@@ -67,6 +67,25 @@ _ROUTING_INPUT_FROM_LOGITS = 0
 # comments is documentation numbering, not the enum value.
 _ROUTING_INPUT_PACKED = 1
 
+# SGLANG_K3_MOE_CENTER_TILE: the launcher's default tactic takes the smallest
+# tile_N of its candidate set, one power of two below the per-expert token
+# count, so each expert's weights are streamed twice. In the prefill range the
+# tile at nextPow2(T * top_k / E) is faster (K3.1, 896 experts, top-16, B200:
+# T=832 3.65 -> 2.49 ms, 3584 4.69 -> 3.74 ms, 6144 4.83 -> 3.92 ms). Config
+# index per tile (best measured on the shipped cubin pool). Tiles 8 and 256
+# lose to the default and are left to it.
+_CENTER_TILE_CFG = {16: 28, 32: 24, 64: 0, 128: 0}
+_center_tile_broken = False
+
+
+def _center_tile_tactic(num_tokens: int, top_k: int, num_experts: int):
+    avg = num_tokens * top_k / num_experts
+    tile = 8
+    while tile < avg:
+        tile *= 2
+    cfg = _CENTER_TILE_CFG.get(tile)
+    return None if cfg is None else (tile, cfg)
+
 # Batched-gemm ABI headers shipped flat in the cubin pool; the launcher
 # includes them as flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/<h>.
 _BMM_EXPORT_HEADERS = [
@@ -468,6 +487,7 @@ def trtllm_fp4_block_scale_routed_moe(
     expanded_idx_to_permuted_idx [T*top_k] int32 with -1 = dropped slot)``.
     ``output`` is left unwritten in that mode.
     """
+    global _center_tile_broken
     module = _jit_trtllm_gen_moe_module()
     hidden_states = hidden_states.contiguous()
     num_tokens = packed_topk_ids.shape[0]
@@ -481,7 +501,17 @@ def trtllm_fp4_block_scale_routed_moe(
         output = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=device
         )
-    result = module.trtllm_fp4_block_scale_moe_private(
+    tactic = list(tactic)
+    fallback_tactic = None
+    if (
+        tactic == [-1, -1]
+        and not _center_tile_broken
+        and envs.SGLANG_K3_MOE_CENTER_TILE.get()
+    ):
+        center = _center_tile_tactic(num_tokens, top_k, num_experts)
+        if center is not None:
+            fallback_tactic, tactic = tactic, list(center)
+    args = [
         _ROUTING_INPUT_PACKED,
         None,  # routing_logits
         packed_topk_ids.contiguous(),
@@ -515,10 +545,24 @@ def trtllm_fp4_block_scale_routed_moe(
         True,  # enable_pdl
         activation_type,
         output,
-        list(tactic),
+        tactic,
         True,  # norm_topk_prob (unused for precomputed)
         None,  # routing_replay_out
-    )
+    ]
+    try:
+        result = module.trtllm_fp4_block_scale_moe_private(*args)
+    except Exception as exc:  # noqa: BLE001 -- host-side tactic check, pre-launch
+        if fallback_tactic is None:
+            raise
+        _center_tile_broken = True
+        logger.warning(
+            "SGLANG_K3_MOE_CENTER_TILE: tactic %s rejected (%s); using the "
+            "launcher default from now on.",
+            tactic,
+            exc,
+        )
+        args[-3] = fallback_tactic
+        result = module.trtllm_fp4_block_scale_moe_private(*args)
     if do_finalize:
         return output
     # Deferred: [gemm2_output, expert_weights (None in packed mode — the
