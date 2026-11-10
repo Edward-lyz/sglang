@@ -218,8 +218,12 @@ def _standard_namespace(
     endpoint_name: str,
     shard_num: int,
 ) -> str:
-    role = f"pp{ctx.node_pp_start}-{ctx.node_pp_end - 1}-of{ctx.pp_size}"
-    return f"{ctx.namespace_base}:{shard_num}:{role}:{endpoint_name}"
+    # Short node-local form {base}:{shard}. The {role}:{endpoint} segments are
+    # dropped, so every endpoint on one shard shares this namespace. Safe for
+    # single-endpoint plans (SPAG page). WARNING: SPA registers both page and
+    # checkpoint through this helper -- with this form they collapse to the same
+    # namespace and collide.
+    return f"{ctx.namespace_base}:{shard_num}"
 
 
 class _PassiveStore:
