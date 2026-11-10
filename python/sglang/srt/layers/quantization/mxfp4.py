@@ -104,21 +104,31 @@ def mx2_config_fields(quant_config) -> tuple[Optional[str], Optional[list]]:
     return None, None
 
 
-def check_mx2_palette_table(table) -> None:
-    """Reject a checkpoint whose palette table is not the one the kernel decodes with."""
+def set_mx2_palette_table(table) -> None:
+    """Hand the checkpoint's palette table (``w2_palette_table``) to the MX2 kernels.
+
+    Every MX2 checkpoint is encoded with its own table. DeepGEMM keeps one table per process, so
+    a second, different table in the same process is an error.
+    """
     import deep_gemm
 
-    expected = [tuple(int(v) for v in row) for row in deep_gemm.MX2_PALETTE_TABLE]
-    got = [tuple(int(v) for v in row) for row in (table or [])]
-    if not got:
+    if not hasattr(deep_gemm, "set_mx2_palette_table"):
         raise ValueError(
-            "MX2 index-format checkpoint has no w2_palette_table in config.json"
+            "this deep_gemm takes no MX2 palette table: MX2 checkpoints need a sgl-deep-gemm "
+            "with deep_gemm.set_mx2_palette_table"
         )
-    if got != expected:
+    if not table:
         raise ValueError(
-            "checkpoint w2_palette_table differs from deep_gemm.MX2_PALETTE_TABLE; "
-            "its weights cannot be decoded by this kernel"
+            "MX2 checkpoint has no w2_palette_table in config.json (palette-format checkpoints "
+            "written before 2026-11-06 were encoded with convert_w2s.py's legacy table)"
         )
+    rows = tuple(tuple(int(v) for v in row) for row in table)
+    current = deep_gemm.get_mx2_palette_table()
+    if current is not None and tuple(current) != rows:
+        raise ValueError(
+            "this process already runs an MX2 checkpoint with a different w2_palette_table"
+        )
+    deep_gemm.set_mx2_palette_table(rows)
 
 
 has_triton_kernels = is_triton_kernels_available()
@@ -307,7 +317,7 @@ class Mxfp4Config(QuantizationConfig):
         if mx2_format not in (None, MX2_FORMAT_INDEX, MX2_FORMAT_PALETTE):
             raise ValueError(f"unknown MX2 checkpoint format: {mx2_format}")
         # MX2 checkpoints: which row layout the routed experts are stored in
-        # (index / palette format) and, for the index format, the palette table.
+        # (index / palette format) and the palette table they were encoded with.
         self.mx2_format = mx2_format
         self.mx2_palette_table = mx2_palette_table
 
@@ -676,10 +686,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if self.is_mx2:
                 # Split/re-order [E, N, row_bytes] into the code/index pair the
                 # MX2 GEMMs read. Pure byte shuffle, 2-bit payload untouched;
-                # a palette checkpoint's palettes become table indices.
+                # a palette checkpoint's palettes become table indices. Both
+                # formats decode with the checkpoint's own palette table.
                 index_format = self.mx2_format == MX2_FORMAT_INDEX
-                if index_format:
-                    check_mx2_palette_table(self.mx2_palette_table)
+                set_mx2_palette_table(self.mx2_palette_table)
                 w13_code, w13_index = mx2_runtime_weights(
                     layer.w13_weight.data, self.hidden_size, index_format
                 )
