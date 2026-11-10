@@ -162,7 +162,7 @@
     ]
   },
   "nightly-1gpu-passing": {
-    "description": "CUDA nightly-1-gpu 实测通过4（8-4） 个，test_bench_serving_functionality 仅部分子测试通过）",
+    "description": "CUDA nightly-1-gpu 实测通过4（8-4） 个，test_bench_serving_functionality 仅部分子测试通过",
     "hw": "$HW",
     "nightly": true,
     "timeout": "$TIMEOUT",
