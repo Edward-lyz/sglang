@@ -170,6 +170,33 @@ def _get_valid_kv_indices_kernel(
     tl.store(kv_indices_ptr + dst_positions, indices, mask=mask)
 
 
+def act_quant_fp4(
+    x: torch.Tensor,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize 128-wide DSA indexer activations to packed FP4 E2M1.
+
+    Mirrors :func:`act_quant`, but the scale is a packed UE8M0 int32 (four
+    group exponents) consumed directly by DeepGEMM's ``fp8_fp4_*`` MQA logits
+    kernels.
+
+    Returns:
+        packed: ``(*x.shape[:-1], 64)`` int8, two FP4 nibbles per byte.
+        scale: ``(*x.shape[:-1], 1)`` int32, four packed UE8M0 bytes.
+    """
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert block_size == 128, "DSA FP4 indexer requires block_size=128"
+    assert x.size(-1) == 128, "DSA FP4 indexer requires head_dim=128"
+
+    from sglang.kernels.ops.quantization.per_token_group_quant_fp4 import (
+        per_token_cast_to_fp4_cuda,
+    )
+
+    original_shape = x.shape[:-1]
+    packed, scale = per_token_cast_to_fp4_cuda(x.view(-1, 128), gran_k=32)
+    return packed.view(*original_shape, 64), scale.view(*original_shape, 1)
+
+
 def get_valid_kv_indices(
     page_table_1: torch.Tensor,
     kv_indptr: torch.Tensor,

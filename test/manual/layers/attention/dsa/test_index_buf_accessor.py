@@ -30,6 +30,12 @@ class MockDSATokenToKVPool:
         self.index_head_dim = index_head_dim
         self.quant_block_size = quant_block_size
         self.device = device
+        # DSA index-K layout knobs (FP8 by default; FP4 halves the data bytes).
+        self.use_fp4_indexer = False
+        self.index_k_data_bytes_per_token = index_head_dim
+        self.index_k_scale_bytes_per_token = 4
+        self.index_k_bytes_per_token = index_head_dim + 4
+        self.index_k_scale_offset_in_page = page_size * index_head_dim
 
 
 def create_test_buffer(

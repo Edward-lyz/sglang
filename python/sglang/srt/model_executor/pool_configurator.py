@@ -32,7 +32,10 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    use_dsa_fp4_indexer,
+)
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
@@ -307,9 +310,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
+                index_k_data_bytes = (
+                    index_head_dim // 2
+                    if use_dsa_fp4_indexer()
+                    else index_head_dim
+                )
                 indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                    index_k_data_bytes
+                    + DSATokenToKVPool.index_k_scale_bytes_per_token
                 )
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype

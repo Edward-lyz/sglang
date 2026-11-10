@@ -77,6 +77,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_float4_e2m1fn_x2,
@@ -112,6 +113,36 @@ _is_fp8_fnuz = is_fp8_fnuz()
 # the SHUFFLE 5D pool layout has no consumer kernels, so the env var is
 # silently ignored and the legacy NHD layout is used.
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
+
+
+def use_dsa_fp4_indexer() -> bool:
+    """Whether the DSA indexer K cache is stored in FP4.
+
+    FP4 index-K needs Blackwell FP4 tensor cores and DeepGEMM's
+    ``fp8_fp4_*_mqa_logits`` kernels. Fail fast when the env is set on an
+    unsupported stack instead of silently falling back, so an A/B run cannot
+    report FP4 numbers while running the FP8 path.
+    """
+    if not _is_cuda or not envs.SGLANG_DSA_FP4_INDEXER.get():
+        return False
+    if not is_blackwell_supported():
+        raise RuntimeError(
+            "SGLANG_DSA_FP4_INDEXER requires a Blackwell (SM100/SM120) GPU."
+        )
+    try:
+        import deep_gemm
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError(
+            "SGLANG_DSA_FP4_INDEXER requires DeepGEMM with FP4 MQA logits."
+        ) from exc
+    if not hasattr(deep_gemm, "fp8_fp4_paged_mqa_logits") or not hasattr(
+        deep_gemm, "fp8_fp4_mqa_logits"
+    ):
+        raise RuntimeError(
+            "SGLANG_DSA_FP4_INDEXER requires DeepGEMM's "
+            "fp8_fp4_paged_mqa_logits / fp8_fp4_mqa_logits."
+        )
+    return True
 
 
 def conv_window_dedup_enabled(
@@ -3672,6 +3703,7 @@ class HybridLinearKVPool(KVCache):
                     index_head_dim=dsa_index_head_dim,
                     enable_memory_saver=enable_memory_saver,
                     kv_cache_dim=dsa_kv_cache_dim,
+                    use_fp4_indexer=use_dsa_fp4_indexer(),
                 )
             else:
                 self.full_kv_pool = TokenToKVPoolClass(
@@ -3711,7 +3743,7 @@ class HybridLinearKVPool(KVCache):
 
     def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
         # Hybrid layer ids are global model-layer ids, while the backing pool
-        # is dense over only full-attention layers.  Shape discovery does not
+        # is dense over only full-attention layers. Shape discovery does not
         # need a global layer lookup, so delegate it to that backing pool.
         return self.full_kv_pool.get_kv_buffer_shape()
 
@@ -3938,6 +3970,43 @@ class HybridLinearKVPool(KVCache):
     def index_head_dim(self) -> Optional[int]:
         """index_head_dim"""
         return getattr(self.full_kv_pool, "index_head_dim", None)
+
+    @property
+    def use_fp4_indexer(self) -> bool:
+        """use_fp4_indexer"""
+        return getattr(self.full_kv_pool, "use_fp4_indexer", False)
+
+    @property
+    def index_k_bytes_per_token(self) -> int:
+        """index_k_bytes_per_token"""
+        return getattr(
+            self.full_kv_pool,
+            "index_k_bytes_per_token",
+            (self.index_head_dim or 128) + 4,
+        )
+
+    @property
+    def index_k_data_bytes_per_token(self) -> int:
+        """index_k_data_bytes_per_token"""
+        return getattr(
+            self.full_kv_pool,
+            "index_k_data_bytes_per_token",
+            self.index_head_dim or 128,
+        )
+
+    @property
+    def index_k_scale_bytes_per_token(self) -> int:
+        """index_k_scale_bytes_per_token"""
+        return getattr(self.full_kv_pool, "index_k_scale_bytes_per_token", 4)
+
+    @property
+    def index_k_scale_offset_in_page(self) -> int:
+        """index_k_scale_offset_in_page"""
+        return getattr(
+            self.full_kv_pool,
+            "index_k_scale_offset_in_page",
+            self.page_size * (self.index_head_dim or 128),
+        )
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         """get_index_k_with_scale_buffer"""
@@ -4387,6 +4456,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
+    index_k_scale_bytes_per_token = 4
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
@@ -4404,6 +4474,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        use_fp4_indexer: Optional[bool] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -4440,6 +4511,22 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
+        self.use_fp4_indexer = (
+            use_dsa_fp4_indexer() if use_fp4_indexer is None else use_fp4_indexer
+        )
+        if self.use_fp4_indexer and _is_hip:
+            raise RuntimeError("DSA FP4 indexer is only supported on CUDA.")
+        # FP4 packs two E2M1 values per byte; the scale stays 4 bytes/token.
+        self.index_k_data_bytes_per_token = (
+            index_head_dim // 2 if self.use_fp4_indexer else index_head_dim
+        )
+        self.index_k_bytes_per_token = (
+            self.index_k_data_bytes_per_token + self.index_k_scale_bytes_per_token
+        )
+        self.index_k_scale_offset_in_page = (
+            self.page_size * self.index_k_data_bytes_per_token
+        )
+
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
                 assert (
@@ -4457,8 +4544,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _index_buffer_shape(self, num_pages: int) -> tuple[int, int]:
         return (
             num_pages,
-            self.page_size
-            * (self.index_head_dim + self.index_head_dim // self.quant_block_size * 4),
+            self.page_size * self.index_k_bytes_per_token,
         )
 
     def _create_index_buffers(self):

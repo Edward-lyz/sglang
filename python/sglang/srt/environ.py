@@ -975,6 +975,11 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Store the DSA indexer Q/K in FP4 (68B/token instead of 132B/token) and
+    # score them with DeepGEMM's fp8_fp4 MQA logits kernels. Blackwell only.
+    # DeepGEMM's fp8_fp4 kernels select FP4 for both Q and K via a single flag,
+    # so there is no FP8-Q/FP4-K mixed mode.
+    SGLANG_DSA_FP4_INDEXER = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
