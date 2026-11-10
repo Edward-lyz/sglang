@@ -1830,7 +1830,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
                     ]
-                logits_output.hidden_states = logits_output.hidden_states[:bs]
+                # [MEM-P3] hidden_states is None when the captured rows travel
+                # rank-major in hidden_states_rank_major (prefill-CP DSpark aux):
+                # that layout is not in global token order, so a prefix slice would
+                # drop live rows. The rank-major field is consumed before any
+                # unpadding consumer and needs no slicing.
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[:bs]
 
             if hasattr(self, "hidden_states_backup"):
                 self.spec_info.hidden_states = self.hidden_states_backup

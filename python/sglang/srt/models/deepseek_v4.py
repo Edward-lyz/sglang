@@ -3989,7 +3989,16 @@ class DeepseekV4Model(nn.Module):
                     hash_ids = tail.rows(hash_ids)
             engram = self.layers[i].engram
             if engram is not None:
-                before_engram = hidden_states
+                # [MEM-R6] `before_engram` is only read by the multimodal restore below.
+                # Binding it unconditionally pins a whole [T, hc_mult, hidden] activation
+                # (320 MiB at a 65532-token chunk / cp8) from the first engram layer to
+                # the end of the layer loop, where it stacks on the compressor and mhc
+                # working sets. Language-only runs never read it.
+                keep_before_engram = (
+                    self.config.model_type == "deepseek_v41"
+                    and self.config.vision_n_layers > 0
+                )
+                before_engram = hidden_states if keep_before_engram else None
                 if i == 14 and prefetched_engram_kv is not None:
                     main_stream = torch.cuda.current_stream()
                     main_stream.wait_stream(self.engram_prefetch_stream)
@@ -4005,15 +4014,13 @@ class DeepseekV4Model(nn.Module):
                         forward_batch,
                         cp_all_tokens=cp_extend,
                     )
-                if (
-                    self.config.model_type == "deepseek_v41"
-                    and self.config.vision_n_layers > 0
-                ):
+                if keep_before_engram:
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
                         before_engram,
                         hidden_states,
                     )
+                before_engram = None
             if capture_dspark and i in self.dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
                 aux = hidden_states

@@ -224,6 +224,74 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         ) * physical_rank_len + flat_indices // self.cp_size
         return gathered.index_select(0, gather_indices)
 
+    def gather_hidden_states_rank_major(self, x: Any, forward_batch):
+        """[MEM-P3] All-gather WITHOUT the global-token-order reorder.
+
+        ``_gather_interleaved_tensor`` keeps two full-size buffers alive at once:
+        the all-gather destination (rank-major ``[cp_size * physical_rank_len, *]``,
+        line 216) and the out-of-place ``index_select`` that flattens it into the
+        global token order (line 225). For a consumer that only scatters per row
+        (DSpark aux -> ``write_target_hidden_kv``), the second buffer is pure
+        waste: permuting the per-row int64 metadata (``cache_loc``/``positions``,
+        ~512 KB) is equivalent to permuting a ``[T, K*hidden]`` activation (GiB).
+
+        Returns ``(gathered, row_to_token)``: ``gathered`` is rank-major, and
+        ``row_to_token[m]`` is the global (logical) token index of row ``m``.
+        Row ``m`` holds rank ``r = m // P``, local row ``j = m % P``; the
+        interleave shard puts global token ``j * cp_size + r`` there, which is the
+        exact inverse of ``gather_indices`` above. Entries ``>= total_seq_lens``
+        are all-gather padding and MUST NOT be committed by the consumer.
+        """
+        metadata = getattr(forward_batch, "attn_cp_metadata", None)
+        if metadata is None:
+            raise RuntimeError("Interleave CP gather requires attn_cp_metadata.")
+
+        total_tokens = int(metadata.total_seq_lens)
+        physical_rank_len = max(metadata.per_rank_actual_token)
+        if physical_rank_len == 0:
+            return (
+                x.new_empty((0, *x.shape[1:])),
+                torch.empty(0, dtype=torch.int64, device=x.device),
+            )
+
+        logical_rank_lens = (
+            metadata.per_rank_logical_token or metadata.per_rank_actual_token
+        )
+        local_logical_len = logical_rank_lens[self.cp_rank]
+        if x.shape[0] < local_logical_len:
+            raise RuntimeError(
+                "Interleave CP gather received an unexpected local token count: "
+                f"rank={self.cp_rank}, got={x.shape[0]}, "
+                f"expected_at_least={local_logical_len}, "
+                f"total={total_tokens}, cp_size={self.cp_size}."
+            )
+
+        padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
+        padded_x[:local_logical_len] = x[:local_logical_len]
+
+        with use_symmetric_memory(
+            get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
+        ):
+            gathered = x.new_empty((self.cp_size * physical_rank_len, *x.shape[1:]))
+        attn_cp_all_gather_into_tensor(gathered, padded_x.contiguous())
+
+        num_rows = gathered.shape[0]
+        if metadata.gather_index is not None:
+            # Custom row->slot map (late-layer tail layout): invert it. Slots no
+            # logical token maps to stay at total_tokens, i.e. marked as padding.
+            row_to_token = torch.full(
+                (num_rows,), total_tokens, dtype=torch.int64, device=x.device
+            )
+            row_to_token[metadata.gather_index] = torch.arange(
+                metadata.gather_index.shape[0], device=x.device
+            )
+        else:
+            rows = torch.arange(num_rows, device=x.device)
+            row_to_token = (rows % physical_rank_len) * self.cp_size + (
+                rows // physical_rank_len
+            )
+        return gathered, row_to_token
+
     def get_supported_attention_backend(self):
         return [CPAttentionBackendKind.DSA]
 

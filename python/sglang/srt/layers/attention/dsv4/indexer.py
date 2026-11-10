@@ -1201,8 +1201,24 @@ def select_candidate_blocks(
     in logits, so an all -inf block means not reachable yet; the block holding the
     query's newest position is always kept."""
     width = logits.size(-1)
-    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
-    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    # [MEM-R2] Block-max without materializing a padded copy of `logits`.
+    # `F.pad(logits, (0, -width % block_size), value=-inf)` clones the whole fp32
+    # score block (1 GiB at a 65532-token chunk, it is the largest transient in the
+    # prefill indexer phase) just to make the last block full. amax is exact and
+    # order-independent and -inf padding cannot change a max, so reducing the full
+    # blocks through a view and the ragged tail separately is bit-identical.
+    num_full = width // block_size
+    tail = width - num_full * block_size
+    parts = []
+    if num_full:
+        parts.append(
+            logits[..., : num_full * block_size]
+            .unflatten(-1, (num_full, block_size))
+            .amax(dim=-1)
+        )
+    if tail:
+        parts.append(logits[..., num_full * block_size :].amax(dim=-1, keepdim=True))
+    scores = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
     num_blocks = scores.size(-1)
 
     last = (compress_lens - 1) // block_size

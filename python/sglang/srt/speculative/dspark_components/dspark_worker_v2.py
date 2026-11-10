@@ -560,7 +560,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
-        if logits_output.hidden_states is None:
+        # [MEM-P3] Prefill-CP may hand the aux over rank-major in a dedicated field
+        # (see LogitsProcessorOutput.hidden_states_rank_major); either field counts
+        # as a capture.
+        row_index = logits_output.hidden_states_row_token_index
+        target_hidden = (
+            logits_output.hidden_states_rank_major
+            if row_index is not None
+            else logits_output.hidden_states
+        )
+        if target_hidden is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
@@ -609,17 +618,38 @@ class DSparkWorkerV2(BaseSpecWorker):
             if state_slot is not None:
                 state_slot = state_slot[token_indices]
                 final_pos = final_pos[token_indices]
+        # [MEM-P3] Rank-major aux rows (row m belongs to global token row_index[m]):
+        # the CP gather skipped the full-size reorder copy, so permute the per-row
+        # metadata instead of the [T, K*hidden] activation, and mask the all-gather
+        # padding rows (row_index past the real token count) out of the commit.
+        row_valid = None
+        if row_index is not None:
+            if row_index.shape[0] != target_hidden.shape[0]:
+                raise RuntimeError(
+                    "Rank-major target hidden row count does not match its row map: "
+                    f"{target_hidden.shape[0]} vs {row_index.shape[0]}."
+                )
+            row_valid = row_index < positions.shape[0]
+            safe_index = torch.where(row_valid, row_index, row_index.new_zeros(()))
+            cache_loc = cache_loc[safe_index]
+            positions = positions[safe_index]
+            if state_slot is not None:
+                state_slot = state_slot[safe_index]
+                final_pos = final_pos[safe_index]
         self._kv_injector.inject_target_hidden(
-            target_hidden=logits_output.hidden_states,
+            target_hidden=target_hidden,
             cache_loc=cache_loc,
             positions=positions,
             state_slot=state_slot,
             final_pos=final_pos,
             target_hidden_is_projected=target_hidden_is_projected,
+            row_valid=row_valid,
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
         logits_output.hidden_states_token_indices = None
+        logits_output.hidden_states_rank_major = None
+        logits_output.hidden_states_row_token_index = None
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,

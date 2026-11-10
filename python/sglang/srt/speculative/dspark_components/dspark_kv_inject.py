@@ -43,6 +43,7 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        row_valid: Optional[torch.Tensor] = None,
     ) -> None:
         if target_hidden is None or target_hidden.numel() == 0:
             return
@@ -51,7 +52,12 @@ class TargetHiddenKvInjector:
         positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
         target_hidden = target_hidden.to(device=device, non_blocking=True)
         n_real = positions.shape[0]
-        if target_hidden.shape[0] > n_real:
+        # [MEM-P3] row_valid marks the live rows of a rank-major target_hidden
+        # (prefill-CP all-gather, no reorder copy). Its padding rows are
+        # interleaved, not trailing, so trailing truncation would cut real rows;
+        # the padding is dropped by masking swa_loc to -1 instead. cache_loc and
+        # positions were already permuted to match the rows by the caller.
+        if row_valid is None and target_hidden.shape[0] > n_real:
             target_hidden = target_hidden[:n_real]
         if cache_loc_2d is not None:
             cache_loc_2d = cache_loc_2d.to(
@@ -86,8 +92,15 @@ class TargetHiddenKvInjector:
                 commit_lens=commit_lens,
                 state_slot=state_slot,
                 final_pos=final_pos,
+                row_valid=row_valid,
             )
             return
+
+        if row_valid is not None:
+            raise RuntimeError(
+                "Rank-major target hidden (row_valid) is only supported by the "
+                "DSpark MLA KV injection path."
+            )
 
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
@@ -111,6 +124,7 @@ class TargetHiddenKvInjector:
         commit_lens: Optional[torch.Tensor],
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
+        row_valid: Optional[torch.Tensor] = None,
     ) -> None:
         if is_unified_kv_triton():
             swa_loc = self._unified_inject_loc(
@@ -132,6 +146,10 @@ class TargetHiddenKvInjector:
                 swa_loc = torch.where(
                     committed_mask, swa_loc, torch.full_like(swa_loc, -1)
                 )
+        if row_valid is not None:
+            # [MEM-P3] Rank-major all-gather padding rows: -1 means "do not commit",
+            # the same contract the commit gate above uses.
+            swa_loc = torch.where(row_valid, swa_loc, torch.full_like(swa_loc, -1))
 
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(

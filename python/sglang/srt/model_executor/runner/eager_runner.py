@@ -26,6 +26,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_gather_rank_major,
     cp_shard_model_inputs,
     get_cp_strategy,
     is_cp_active,
@@ -420,6 +421,13 @@ class EagerRunner(BaseRunner):
             forward_batch,
             complete_input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
+            # [MEM-R3] The full-order embedding is [T, hidden] (640 MiB at a 65532-token
+            # chunk) and exists only to produce the CP-local shard above; the body runs
+            # on `sharded_input_embeds`. Holding the reference here would pin it for the
+            # whole model body, where it stacks on the ratio-1/2 indexer transients.
+            # (If the caller passed input_embeds in `kwargs`, that reference still owns
+            # the tensor, so this only drops our own.)
+            input_embeds = None
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -442,18 +450,56 @@ class EagerRunner(BaseRunner):
             )
 
         stream = torch.cuda.current_stream()
+        # [MEM-P1] DSV4 returns (hidden_states, pre_hc_head). When DSpark aux
+        # capture is on, pre_hc_head is dropped at the logits boundary below
+        # (`if aux_hidden_states is None`), so CP-gathering it is pure waste:
+        # pre_hc_head is [T, hc_mult*H] and the interleave gather materializes it
+        # twice (all-gather dst + out-of-place index_select reorder).
+        # Dropping item 1 before the gather removes ~2x[T, hc_mult*H] from the
+        # prefill activation peak. Passing None keeps cp_gather_after_forward's
+        # existing `(x, None) -> x` contract, so nothing downstream changes.
+        if (
+            aux_hidden_states is not None
+            and isinstance(hidden_states, tuple)
+            and len(hidden_states) == 2
+        ):
+            hidden_states = (hidden_states[0], None)
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
+        aux_row_to_token = None
         if aux_hidden_states is not None:
             if isinstance(aux_hidden_states, torch.Tensor):
                 aux_hidden_states = cp_gather_after_forward(
                     aux_hidden_states, forward_batch, stream
                 )
             else:
-                aux_hidden_states = [
-                    cp_gather_after_forward(aux, forward_batch, stream)
-                    for aux in aux_hidden_states
-                ]
+                # [MEM-P3] Pack the K captures locally ([T_local, K*hidden], 240 MiB
+                # here) and CP-gather ONCE in rank-major order, instead of gathering
+                # K full [T, hidden] tensors and letting the logits processor cat
+                # them into a [T, K*hidden] copy. Dropping the local list before the
+                # gather keeps the K local captures out of the live set.
+                # The local pack ALONE was a regression (measured 5.70 -> 6.41 GiB):
+                # the ordinary gather keeps both the all-gather destination and the
+                # out-of-place index_select reorder alive, so packing only moved the
+                # cost. Rank-major drops the reorder, so the two only pay off
+                # together. The aux consumer (DSpark write_target_hidden_kv) scatters
+                # per row, so it does not need the global token order -- it needs
+                # cache_loc/positions permuted the same way, which
+                # hidden_states_row_token_index carries. See SOLUTION.md §4/§10.
+                local_packed = torch.cat(aux_hidden_states, dim=-1)
+                del aux_hidden_states[:]
+                if forward_batch.capture_hidden_mode.is_full():
+                    aux_hidden_states, aux_row_to_token = cp_gather_rank_major(
+                        local_packed, forward_batch, stream
+                    )
+                else:
+                    # LAST capture prunes the aux by global token index inside the
+                    # logits processor, so those rows must be in global order. The
+                    # pruned tensor is [bs, K*hidden] -- no memory concern.
+                    aux_hidden_states = cp_gather_after_forward(
+                        local_packed, forward_batch, stream
+                    )
+                del local_packed
         logits_kwargs = {}
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
         if isinstance(hidden_states, tuple):
@@ -462,7 +508,7 @@ class EagerRunner(BaseRunner):
             # DSpark aux capture is on, else it overrides the packed aux.
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        return model.logits_processor(
+        output = model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
             model.lm_head,
@@ -470,6 +516,16 @@ class EagerRunner(BaseRunner):
             aux_hidden_states,
             **logits_kwargs,
         )
+        if aux_row_to_token is not None:
+            # [MEM-P3] Captured aux rows are rank-major, not in global token order.
+            # Move them off `hidden_states` (post_forward_mlp_sync_batch prefix-
+            # slices that field, which would drop live rank-major rows) and publish
+            # the row -> global token map so the DSpark KV injector permutes
+            # cache_loc/positions instead of the activation itself.
+            output.hidden_states_rank_major = output.hidden_states
+            output.hidden_states_row_token_index = aux_row_to_token
+            output.hidden_states = None
+        return output
 
     def _execute_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None

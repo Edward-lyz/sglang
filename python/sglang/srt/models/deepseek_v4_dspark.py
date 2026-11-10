@@ -72,6 +72,12 @@ logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
 
+# [MEM-R5] Row chunk for committing the target hidden into the draft KV (see
+# write_target_hidden_kv). Bounds the projection/quantization transients during a long
+# prefill chunk; 0 disables chunking. Chunks stay large enough that the GEMMs remain
+# compute bound.
+_TARGET_HIDDEN_COMMIT_ROW_CHUNK = 16384
+
 # DSpark confidence is a per-token score that must stay in [0, 1].
 _CONFIDENCE = Invariant(
     "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
@@ -910,8 +916,42 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         positions: torch.Tensor,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
-        main_x = self.project_target_hidden(main_hidden)
         swa_loc = swa_loc.to(torch.int32)
+        rows = main_hidden.shape[0]
+        # [MEM-R5] Commit the target hidden in row chunks. Every step here is
+        # row-independent (main_proj / main_norm / wkv are per-row, the store scatters
+        # by swa_loc), but running the whole prefill chunk at once materializes the
+        # mxfp8 quantized copy of main_hidden plus the projection output for all rows
+        # at the same time as the gathered [rows, hc_mult*hidden] aux buffer is still
+        # live (960 + 640 MiB on top of 1920 MiB at a 65532-token chunk). Chunking
+        # bounds those transients without touching per-row math.
+        chunk = _TARGET_HIDDEN_COMMIT_ROW_CHUNK
+        if chunk <= 0 or rows <= chunk:
+            self._commit_target_hidden_rows(
+                main_hidden=main_hidden,
+                swa_loc=swa_loc,
+                positions=positions,
+                pool=pool,
+            )
+            return
+        for start in range(0, rows, chunk):
+            stop = min(start + chunk, rows)
+            self._commit_target_hidden_rows(
+                main_hidden=main_hidden[start:stop],
+                swa_loc=swa_loc[start:stop],
+                positions=positions[start:stop],
+                pool=pool,
+            )
+
+    def _commit_target_hidden_rows(
+        self,
+        *,
+        main_hidden: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
+        main_x = self.project_target_hidden(main_hidden)
         kvs = CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
