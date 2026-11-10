@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -280,6 +281,7 @@ def _try_mega_gate(
     hidden_states: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor],
     input_ids_global: Optional[torch.Tensor] = None,
+    raw_topk_ids: bool = False,
 ):
     """Router GEMM + biased top-k in one `deep_gemm.bf16_mega_gate` launch.
 
@@ -290,6 +292,9 @@ def _try_mega_gate(
     image-token rows use `e_score_correction_bias_vl` (`image_bias` +
     `image_token_mask`). Anything outside that routing shape returns `None`.
     Gated by SGLANG_OPT_DEEPGEMM_MEGA_GATE.
+
+    raw_topk_ids: return the kernel's ids as-is (no int32 cast, no padded-row
+    mask); the caller folds both into mega_moe_pre_dispatch (vllm#57604).
 
     Runs under CUDA-graph capture too: DeepGEMM only refuses a capturing stream
     on its lazy-init path, and sglang's graph runner warms up on the capture
@@ -428,6 +433,8 @@ def _try_mega_gate(
         )
         _MEGA_GATE_CAPTURED_LOGGED = True
 
+    if raw_topk_ids:
+        return topk_idx, topk_weights
     topk_ids = topk_idx.to(torch.int32)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids, topk_weights
@@ -441,22 +448,42 @@ def _run_mega_routed(
     num_tokens: int,
     apply_routed_scaling: bool = True,
     fuse_shared: bool = False,
+    zero_routed: bool = False,
+    routed_scale_in_weights: bool = False,
 ) -> torch.Tensor:
+    # zero_routed / routed_scale_in_weights only serve _selfcheck_fused_shared:
+    # zero every routed weight (ids stay valid, so the dispatch is unchanged and
+    # a fused call returns the in-kernel shared expert alone), and move the
+    # routed scaling onto the weights on the unfused path as the fused path does.
     import deep_gemm
 
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size
+    # vllm#57604: the sm100 fp8xfp4 staging kernel does the int32 cast, the
+    # padded-row mask and the routed-scaling multiply itself.
+    fold_staging = (
+        envs.SGLANG_OPT_MEGA_MOE_STAGING_FOLD.get()
+        and _device_sm != 90
+        and _mega_moe_mma_type() == "fp8xfp4"
+    )
+    staging_num_token_non_padded = None
 
     if num_tokens > 0:
         num_token_non_padded = (
             forward_batch.num_token_non_padded if forward_batch is not None else None
         )
         mega_gate_output = _try_mega_gate(
-            moe, hidden_states, num_token_non_padded, input_ids_global
+            moe,
+            hidden_states,
+            num_token_non_padded,
+            input_ids_global,
+            raw_topk_ids=fold_staging,
         )
         if mega_gate_output is not None:
             topk_ids, topk_weights = mega_gate_output
+            if fold_staging:
+                staging_num_token_non_padded = num_token_non_padded
         else:
             router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
             if isinstance(
@@ -515,11 +542,16 @@ def _run_mega_routed(
     )
 
     if num_tokens > 0:
-        topk_ids_in = topk_ids.to(torch.int32)
+        if fold_staging and topk_ids.dtype in (torch.int32, torch.int64):
+            topk_ids_in = topk_ids.contiguous()
+        else:
+            topk_ids_in = topk_ids.to(torch.int32)
         topk_weights_in = topk_weights.to(torch.float32)
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+    if zero_routed:
+        topk_weights_in = torch.zeros_like(topk_weights_in)
 
     if _device_sm == 90:
         return run_sm90_mega_routed(
@@ -552,13 +584,17 @@ def _run_mega_routed(
         # The in-kernel shared expert output is unscaled, so the routed scaling
         # moves onto the routed weights instead of y.
         scale_in_weights = (
-            fuse_shared
+            (fuse_shared or routed_scale_in_weights)
             and apply_routed_scaling
             and not moe.experts.should_fuse_routed_scaling_factor_in_topk
             and float(moe.routed_scaling_factor) != 1.0
         )
+        topk_weight_scale = 1.0
         if scale_in_weights:
-            topk_weights_in = topk_weights_in * float(moe.routed_scaling_factor)
+            if fold_staging:
+                topk_weight_scale = float(moe.routed_scaling_factor)
+            else:
+                topk_weights_in = topk_weights_in * float(moe.routed_scaling_factor)
         shared_block_m = 0
         if fuse_shared:
             shared_block_m = deep_gemm.get_block_m_for_mega_moe(
@@ -571,18 +607,48 @@ def _run_mega_routed(
                 num_topk=buf.num_topk,
                 mma_type=buf.mma_type,
             )
-        mega_moe_pre_dispatch(
-            hidden_states,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            quant_group_size=32,
-            shared_x_sf=buf.shared_l1_acts_sf if fuse_shared else None,
-            shared_block_m=shared_block_m,
-        )
+        if fold_staging:
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "vllm#57604 mega_moe_staging_fold",
+                "mega_moe_pre_dispatch takes topk_idx=%s as-is, masks padded rows "
+                "in-kernel (%s), scales weights by %s, writes only [:max(n,1)] "
+                "(tokens=%d)",
+                str(topk_ids_in.dtype).removeprefix("torch."),
+                "on" if staging_num_token_non_padded is not None else "off",
+                topk_weight_scale,
+                num_tokens,
+            )
+            mega_moe_pre_dispatch(
+                hidden_states,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                quant_group_size=32,
+                shared_x_sf=buf.shared_l1_acts_sf if fuse_shared else None,
+                shared_block_m=shared_block_m,
+                num_token_non_padded=staging_num_token_non_padded,
+                topk_weight_scale=topk_weight_scale,
+                # DeepGEMM reads topk rows [0, max(num_tokens, 1)) only.
+                fill_padded_tail=False,
+            )
+        else:
+            mega_moe_pre_dispatch(
+                hidden_states,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                quant_group_size=32,
+                shared_x_sf=buf.shared_l1_acts_sf if fuse_shared else None,
+                shared_block_m=shared_block_m,
+            )
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
@@ -607,7 +673,7 @@ def _run_mega_routed(
         )
     y = y[:num_tokens]
 
-    if fuse_shared:
+    if fuse_shared or (routed_scale_in_weights and mma_type == "fp8xfp4"):
         return y
     if apply_routed_scaling and not moe.experts.should_fuse_routed_scaling_factor_in_topk:
         y.mul_(moe.routed_scaling_factor)
@@ -620,7 +686,23 @@ def _selfcheck_fused_shared(
     """Verification aid (SGLANG_COMMUNITY_SELFCHECK_MEGA_SHARED): compare the fused
     output and the production path (routed + separate shared expert) against an
     fp32-weight shared-expert reference on the same input. Every EP rank reaches
-    this at the same layer, so the extra MegaMoE launches stay collective."""
+    this at the same layer, so the extra MegaMoE launches stay collective.
+
+    `fused` measures ||y_fused - (y_routed + shared_fp32)|| / ||shared_fp32||, so
+    it also carries the bf16 roundings of the routed sum, which scale with
+    ||routed||, not ||shared||. The extra terms separate them (report_D 2.3):
+      fused_shared_only  the fused kernel with every routed weight zeroed (ids
+                         kept valid) -- just the in-kernel shared expert, the
+                         same measure as `production`;
+      fused_vs_routed_w  `fused` against y_routed_w + shared_fp32, where
+                         y_routed_w folds the routed scaling into the weights
+                         like the fused kernel (one bf16 store of the routed sum);
+      routed_scale_noise ||y_routed_w - y_routed|| / ||shared_fp32||: the extra
+                         rounding of the y.mul_(scale) on the unfused path;
+      store_floor        ||bf16(y_routed + shared_fp32) - (y_routed + shared_fp32)||
+                         / ||shared_fp32||: what even an exact fused kernel shows
+                         here, from the single bf16 store of routed + shared;
+      routed/shared      ||y_routed|| / ||shared_fp32||."""
     from sglang.kernels.ops.attention.dsv4.moe import silu_and_mul_clamp
 
     y_fused = _run_mega_routed(
@@ -630,6 +712,14 @@ def _selfcheck_fused_shared(
     y_routed = _run_mega_routed(
         moe, hidden_states, forward_batch, input_ids_global, num_tokens,
         fuse_shared=False,
+    ).float()
+    y_shared_only = _run_mega_routed(
+        moe, hidden_states, forward_batch, input_ids_global, num_tokens,
+        fuse_shared=True, zero_routed=True,
+    ).float()
+    y_routed_w = _run_mega_routed(
+        moe, hidden_states, forward_batch, input_ids_global, num_tokens,
+        fuse_shared=False, routed_scale_in_weights=True,
     ).float()
     shared_prod = moe._forward_shared_experts(hidden_states).float()
 
@@ -651,16 +741,182 @@ def _selfcheck_fused_shared(
     denom = shared_fp32.norm().clamp_min(1e-12)
     err_prod = (shared_prod - shared_fp32).norm() / denom
     err_fused = (y_fused - target).norm() / denom
+    err_fused_shared = (y_shared_only - shared_fp32).norm() / denom
+    err_fused_routed_w = (y_fused - (y_routed_w + shared_fp32)).norm() / denom
+    routed_scale_noise = (y_routed_w - y_routed).norm() / denom
+    store_floor = (target.to(torch.bfloat16).float() - target).norm() / denom
+    routed_over_shared = y_routed.norm() / denom
     logger.info(
         "[community-opt] #39313 selfcheck: layer=%s tokens=%d "
         "rel_err_vs_fp32_shared: production=%.4e fused=%.4e "
-        "(fused vs production rel=%.4e)",
+        "(fused vs production rel=%.4e) "
+        "fused_shared_only=%.4e fused_vs_routed_w=%.4e routed_scale_noise=%.4e "
+        "store_floor=%.4e routed/shared=%.3f",
         getattr(moe, "layer_id", None),
         num_tokens,
         err_prod.item(),
         err_fused.item(),
         ((y_fused - (y_routed + shared_prod)).norm() / denom).item(),
+        err_fused_shared.item(),
+        err_fused_routed_w.item(),
+        routed_scale_noise.item(),
+        store_floor.item(),
+        routed_over_shared.item(),
     )
+
+
+def _deepgemm_cache_entries() -> Optional[int]:
+    """Kernels in DeepGEMM's on-disk JIT cache (None when the dir is unknown)."""
+    cache_dir = os.environ.get("DG_JIT_CACHE_DIR")
+    if not cache_dir:
+        return None
+    try:
+        return len(os.listdir(os.path.join(cache_dir, "cache")))
+    except OSError:
+        return 0
+
+
+def _mega_moe_warmup_plan(
+    moe: DeepseekV2MoE, buf: SymmBuffer, max_tokens: int, use_gate: bool
+) -> dict:
+    """vllm#60468: {(bf16_mega_gate config, fp8_fp4_mega_moe BLOCK_M): largest
+    token count in [1, max_tokens] selecting it}, from DeepGEMM's own config
+    getters. Both JIT caches are keyed by those configs, not by the token count
+    (fp8_fp4_mega_moe takes num_tokens at runtime), so running one count per
+    pair compiles every variant a request in that range can select."""
+    import deep_gemm
+
+    if use_gate:
+        num_routed, hidden = moe.gate.weight.shape
+        top_k = moe.topk.topk_config.top_k
+    plan = {}
+    for n in range(1, max_tokens + 1):
+        gate_cfg = (
+            tuple(
+                sorted(
+                    deep_gemm.get_bf16_mega_gate_config(
+                        n, hidden, num_routed, top_k
+                    ).items()
+                )
+            )
+            if use_gate
+            else None
+        )
+        block_m = deep_gemm.get_block_m_for_mega_moe(
+            buf.group.size(),
+            buf.num_experts,
+            buf.num_max_tokens_per_rank,
+            n,
+            buf.num_topk,
+            buf.mma_type,
+        )
+        plan[(gate_cfg, block_m)] = n
+    return plan
+
+
+def warmup_mega_moe_kernels(moes, max_tokens: int) -> dict:
+    """vllm#60468: run every bf16_mega_gate x fp8_fp4_mega_moe variant reachable
+    with up to `max_tokens` tokens per rank once, before serving.
+
+    One representative layer per kernel identity (experts, top-k, fused shared
+    expert, VL gate bias, hash routing): the JIT caches do not depend on the
+    layer. fp8_fp4_mega_moe is an EP collective, so every rank derives the same
+    token-count list from the same config and runs it in the same order; the
+    rank-local bf16_mega_gate variants are compiled first so the collective
+    phase only waits on the MegaMoE compiles themselves."""
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    stats = {"layers": 0, "token_counts": 0, "gate_cfgs": 0, "block_ms": 0}
+    if (
+        _device_sm != 100
+        or _mega_moe_mma_type() != "fp8xfp4"
+        or not get_moe_a2a_backend().is_megamoe()
+        or max_tokens <= 0
+    ):
+        return stats
+    ep = get_moe_ep_group()
+    num_max_tokens_per_rank = (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    )
+    max_tokens = min(max_tokens, num_max_tokens_per_rank)
+    seen = set()
+    # Gated layers first: a hash layer only adds a MegaMoE variant when no gated
+    # layer shares its kernel.
+    for moe in sorted(moes, key=lambda m: bool(getattr(m, "is_hash", False))):
+        if not getattr(moe.experts, "_mega_moe_weights_built", False):
+            continue
+        fuse_shared = moe.mega_shared_l1_weights is not None
+        is_hash = bool(getattr(moe, "is_hash", False))
+        is_vl = isinstance(
+            getattr(moe.gate, "e_score_correction_bias_vl", None), torch.Tensor
+        )
+        top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
+        moe_kernel = (
+            moe.experts.num_experts,
+            top_k,
+            fuse_shared,
+            moe.config.hidden_size,
+            moe.config.moe_intermediate_size,
+        )
+        layer_key = moe_kernel + (is_vl, is_hash)
+        if layer_key in seen or (is_hash and moe_kernel in seen):
+            continue
+        seen.update((layer_key, moe_kernel))
+
+        device = moe.gate.weight.device
+        gen = torch.Generator(device=device).manual_seed(0)
+        hidden_states = torch.randn(
+            (max_tokens, moe.config.hidden_size),
+            generator=gen,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        input_ids = (
+            torch.zeros((max_tokens,), dtype=torch.int64, device=device)
+            if (is_vl or is_hash)
+            else None
+        )
+
+        def ids(n):
+            return None if input_ids is None else input_ids[:n]
+
+        # Whether the gate serves decides the token-count list of the collective
+        # below, so the EP group agrees on it first.
+        use_gate = _try_mega_gate(moe, hidden_states[:1], None, ids(1)) is not None
+        flag = torch.tensor([int(use_gate)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MIN, group=ep.cpu_group
+        )
+        use_gate = bool(flag.item())
+
+        buf = _get_mega_moe_symm_buffer(
+            ep.device_group,
+            num_experts=moe.experts.num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_topk=top_k,
+            hidden=moe.config.hidden_size,
+            intermediate_hidden=moe.config.moe_intermediate_size,
+            num_shared_experts=moe.n_shared_experts if fuse_shared else 0,
+        )
+        plan = _mega_moe_warmup_plan(moe, buf, max_tokens, use_gate)
+        counts = sorted(plan.values())
+        if use_gate:
+            for n in counts:
+                _try_mega_gate(moe, hidden_states[:n], None, ids(n))
+            torch.cuda.synchronize()
+        ep.barrier()
+        for n in counts:
+            _run_mega_routed(
+                moe, hidden_states[:n], None, ids(n), n, fuse_shared=fuse_shared
+            )
+        torch.cuda.synchronize()
+
+        stats["layers"] += 1
+        stats["token_counts"] += len(counts)
+        stats["gate_cfgs"] += len({g for g, _ in plan} - {None})
+        stats["block_ms"] += len({b for _, b in plan})
+        del hidden_states, input_ids
+    return stats
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:

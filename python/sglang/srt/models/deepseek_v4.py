@@ -4786,6 +4786,124 @@ class DeepseekV4ForCausalLM(nn.Module):
                 type(self).__name__,
             )
 
+    def warmup_deepgemm_mega_kernels(
+        self, *, max_moe_tokens: int, max_mhc_tokens: int
+    ) -> None:
+        """vllm#60468 / #57843: JIT-compile the DeepGEMM mega kernels before serving.
+
+        bf16_mega_gate, fp8_fp4_mega_moe and mega_mhc compile one kernel per
+        config the first time a token count selects it (~3 s each); eager
+        prefill, whose per-rank row count follows the prompt, would otherwise
+        pay that on live requests. Runs after the KV pool and CUDA graphs exist,
+        on every rank in the same order (fp8_fp4_mega_moe is an EP collective).
+        """
+        if getattr(self, "_deepgemm_mega_warmed", False):
+            return
+        self._deepgemm_mega_warmed = True
+
+        from sglang.srt.layers.moe.mega_moe import (
+            _deepgemm_cache_entries,
+            warmup_mega_moe_kernels,
+        )
+
+        tic = time.perf_counter()
+        entries_before = _deepgemm_cache_entries()
+        with torch.inference_mode():
+            moe_stats = warmup_mega_moe_kernels(
+                [
+                    m
+                    for m in self.modules()
+                    if isinstance(m, deepseek_v2.DeepseekV2MoE)
+                ],
+                max_moe_tokens,
+            )
+            mhc_launches = self._warmup_mega_mhc(max_mhc_tokens)
+        torch.cuda.synchronize()
+        get_tp_group().barrier()
+        entries_after = _deepgemm_cache_entries()
+        new_entries = (
+            entries_after - entries_before
+            if entries_before is not None and entries_after is not None
+            else -1
+        )
+        elapsed = time.perf_counter() - tic
+        torch.cuda.empty_cache()
+        logger.info(
+            "DeepGEMM mega warmup (%s): %d MoE layer kinds, %d token counts "
+            "(%d bf16_mega_gate configs, %d fp8_fp4_mega_moe BLOCK_M) up to %d "
+            "tokens, %d mega_mhc M-blocks up to %d tokens, %.1fs, DeepGEMM cache "
+            "+%d entries",
+            type(self).__name__,
+            moe_stats["layers"],
+            moe_stats["token_counts"],
+            moe_stats["gate_cfgs"],
+            moe_stats["block_ms"],
+            max_moe_tokens,
+            mhc_launches,
+            max_mhc_tokens,
+            elapsed,
+            new_entries,
+        )
+        if moe_stats["token_counts"] or mhc_launches:
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "vllm#60468 deepgemm_mega_warmup",
+                "%s: warmed %d MegaMoE specs (%d bf16_mega_gate configs x %d "
+                "fp8_fp4_mega_moe BLOCK_M over %d layer kinds, <=%d tokens) + %d "
+                "mega_mhc M-blocks (<=%d tokens) in %.1fs; %d new DeepGEMM "
+                "compiles (cache entries %s -> %s)",
+                type(self).__name__,
+                moe_stats["token_counts"],
+                moe_stats["gate_cfgs"],
+                moe_stats["block_ms"],
+                moe_stats["layers"],
+                max_moe_tokens,
+                mhc_launches,
+                max_mhc_tokens,
+                elapsed,
+                new_entries,
+                entries_before,
+                entries_after,
+            )
+
+    def _warmup_mega_mhc(self, max_tokens: int) -> int:
+        """#57843 (adapted to mega_mhc): DeepGEMM compiles one mega_mhc kernel
+        per split count and derives the split count from the number of 64-row M
+        blocks only (deep_gemm 0.1.8 exports no getter; measured over T=1..12288
+        on B200: T<=192 -> 40, <=320 -> 27, <=448 -> 20, else 16). One launch
+        per M-block count is therefore exact. Rank-local."""
+        layer = next(
+            (
+                m
+                for m in self.modules()
+                if isinstance(m, DeepseekV4DecoderLayer)
+                and hasattr(m, "_mega_mhc_attn_boundary")
+            ),
+            None,
+        )
+        if layer is None or max_tokens <= 0:
+            return 0
+        device = layer.hc_ffn_fn.device
+        hc, hidden = layer.hc_mult, layer.hidden_size
+        x = torch.zeros((max_tokens, hidden), dtype=torch.bfloat16, device=device)
+        residual = torch.zeros(
+            (max_tokens, hc, hidden), dtype=torch.bfloat16, device=device
+        )
+        pre = torch.zeros((max_tokens, hc), dtype=torch.float32, device=device)
+        post = torch.zeros_like(pre)
+        comb = torch.zeros((max_tokens, hc, hc), dtype=torch.float32, device=device)
+        launches = 0
+        for t in range(64, max_tokens + 64, 64):
+            t = min(t, max_tokens)
+            out = layer._mega_mhc_attn_boundary(
+                x[:t], residual[:t], pre[:t], post[:t], comb[:t]
+            )
+            if out is None:
+                break
+            launches += 1
+        return launches
+
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.encoder_only:
             return

@@ -6,6 +6,8 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.environ import envs
+from sglang.srt.utils.community_opt import log_community_opt_once
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
@@ -74,6 +76,39 @@ def dequantize_k_cache_paged(
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
         assert out.dtype == torch.bfloat16
 
+    if num_tokens > 0 and envs.SGLANG_OPT_DSV41_DEQUANT_ROWS_PER_CTA.get():
+        # vllm#55061: the same gather over a few rows per program, so each SM
+        # has more independent loads in flight (the deployed V4 584-byte pages).
+        log_community_opt_once(
+            "vllm#55061 dequant_rows_per_cta",
+            "V4 fp8 dequant gather with %d rows per program (rows=%d)",
+            _V4_DEQUANT_BLOCK_ROWS,
+            num_tokens,
+        )
+        _dequantize_k_cache_paged_rows_kernel[
+            (triton.cdiv(num_tokens, _V4_DEQUANT_BLOCK_ROWS),)
+        ](
+            out,
+            buf_fp8,
+            buf_bf16,
+            buf_uint8,
+            page_table_1_flattened,
+            out.stride(0),
+            num_tokens,
+            BYTES_PER_PAGE=bytes_per_page,
+            PAGE_SIZE=page_size,
+            DIM_NOPE=DIM_NOPE,
+            DIM_ROPE=DIM_ROPE,
+            TILE_SIZE=TILE_SIZE,
+            NUM_SCALE_TILES=NUM_SCALE_TILES,
+            NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
+            PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
+            S_OFFSET_BYTES=s_offset_bytes,
+            BLOCK_ROWS=_V4_DEQUANT_BLOCK_ROWS,
+            num_warps=4,
+        )
+        return out
+
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
         buf_fp8,
@@ -132,6 +167,35 @@ def dequantize_k_cache_paged_v41(
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
         assert out.dtype == torch.bfloat16
     if num_tokens == 0:
+        return out
+
+    if layout is KVLayout.V41 and envs.SGLANG_OPT_DSV41_DEQUANT_ROWS_PER_CTA.get():
+        # vllm#55061: one row per program leaves the gather far from bandwidth
+        # bound; a few rows per program issue more independent loads per SM.
+        log_community_opt_once(
+            "vllm#55061 dequant_rows_per_cta",
+            "V4.1 fp8 dequant gather with %d rows per program (rows=%d)",
+            _V41_FP8_DEQUANT_BLOCK_ROWS,
+            num_tokens,
+        )
+        _dequantize_k_cache_paged_v41_fp8_rows_kernel[
+            (triton.cdiv(num_tokens, _V41_FP8_DEQUANT_BLOCK_ROWS),)
+        ](
+            out,
+            buf_fp8,
+            buf_uint8,
+            page_table_1_flattened,
+            out.stride(0),
+            num_tokens,
+            BYTES_PER_PAGE=bytes_per_page,
+            PAGE_SIZE=page_size,
+            DATA_BYTES=layout.data_bytes,
+            SCALE_BYTES=layout.scale_bytes,
+            TILE_SIZE=layout.tile_size,
+            S_OFFSET_BYTES=layout.scale_offset(page_size),
+            BLOCK_ROWS=_V41_FP8_DEQUANT_BLOCK_ROWS,
+            num_warps=4,
+        )
         return out
 
     kernel = (
@@ -340,6 +404,71 @@ def _dequantize_k_cache_paged_kernel(
     tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
 
 
+_V4_DEQUANT_BLOCK_ROWS = 4
+
+
+@triton.jit(do_not_specialize=["num_rows"])
+def _dequantize_k_cache_paged_rows_kernel(
+    output_ptr,
+    buf_fp8_ptr,
+    buf_bf16_ptr,
+    buf_uint8_ptr,
+    page_table_ptr,
+    output_stride_0,
+    num_rows,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    NUM_SCALE_TILES: tl.constexpr,
+    NOPE_ROPE_BYTES: tl.constexpr,
+    PADDED_SCALE_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    # _dequantize_k_cache_paged_kernel over BLOCK_ROWS rows at once; the
+    # per-element arithmetic is the same, so the output is bitwise identical.
+    rows = tl.program_id(0).to(tl.int64) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = rows < num_rows
+    loc = tl.load(page_table_ptr + rows, mask=row_mask, other=0).to(tl.int64)
+    page_idx = loc // PAGE_SIZE
+    in_page = loc % PAGE_SIZE
+    page_byte_base = page_idx * BYTES_PER_PAGE
+    token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
+    token_scale_base = (
+        page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
+    )
+    out_row_base = rows * output_stride_0
+    mask = row_mask[:, None]
+
+    nope_offs = tl.arange(0, TILE_SIZE)
+    for tile_id in tl.static_range(NUM_SCALE_TILES):
+        fp8_off = token_data_base[:, None] + tile_id * TILE_SIZE + nope_offs[None, :]
+        fp8_vals = tl.load(buf_fp8_ptr + fp8_off, mask=mask, other=0.0).to(tl.float32)
+
+        scale_u8 = tl.load(
+            buf_uint8_ptr + token_scale_base + tile_id, mask=row_mask, other=127
+        ).to(tl.int32)
+        scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
+
+        out_off = out_row_base[:, None] + tile_id * TILE_SIZE + nope_offs[None, :]
+        tl.store(
+            output_ptr + out_off,
+            (fp8_vals * scale_pow2[:, None]).to(output_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+    rope_offs = tl.arange(0, DIM_ROPE)
+    bf16_off = (token_data_base[:, None] + DIM_NOPE) // 2 + rope_offs[None, :]
+    rope_data = tl.load(buf_bf16_ptr + bf16_off, mask=mask, other=0.0)
+    tl.store(
+        output_ptr + out_row_base[:, None] + DIM_NOPE + rope_offs[None, :],
+        rope_data,
+        mask=mask,
+    )
+
+
 @triton.jit
 def _ue8m0_to_fp32(scale_u8):
     """The ue8m0 byte as fp32: ``2 ** (byte - 127)``, built from the exponent
@@ -397,6 +526,55 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     tl.store(
         output_ptr + token_id * output_stride_0 + offs,
         out.to(output_ptr.dtype.element_ty),
+    )
+
+
+_V41_FP8_DEQUANT_BLOCK_ROWS = 4
+
+
+@triton.jit(do_not_specialize=["num_rows"])
+def _dequantize_k_cache_paged_v41_fp8_rows_kernel(
+    output_ptr,
+    buf_fp8_ptr,
+    buf_uint8_ptr,
+    page_table_ptr,
+    output_stride_0,
+    num_rows,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DATA_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    # _dequantize_k_cache_paged_v41_fp8_kernel over BLOCK_ROWS rows at once; the
+    # per-element arithmetic is the same, so the output is bitwise identical.
+    tl.static_assert(DATA_BYTES == 512 and SCALE_BYTES == 16 and TILE_SIZE == 32)
+    rows = tl.program_id(0).to(tl.int64) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = rows < num_rows
+    loc = tl.load(page_table_ptr + rows, mask=row_mask, other=0).to(tl.int64)
+    page_idx = loc // PAGE_SIZE
+    in_page = loc % PAGE_SIZE
+    page_byte_base = page_idx * BYTES_PER_PAGE
+    token_data_base = page_byte_base + in_page * DATA_BYTES
+    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+
+    offs = tl.arange(0, DATA_BYTES)
+    mask = row_mask[:, None]
+    vals = tl.load(
+        buf_fp8_ptr + token_data_base[:, None] + offs[None, :], mask=mask, other=0.0
+    ).to(tl.float32)
+    scale_u8 = tl.load(
+        buf_uint8_ptr + token_scale_base[:, None] + (offs // TILE_SIZE)[None, :],
+        mask=mask,
+        other=127,
+    )
+    out = vals * _ue8m0_to_fp32(scale_u8)
+    tl.store(
+        output_ptr + rows[:, None] * output_stride_0 + offs[None, :],
+        out.to(output_ptr.dtype.element_ty),
+        mask=mask,
     )
 
 

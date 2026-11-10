@@ -7,6 +7,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+from sglang.srt.utils.community_opt import log_community_opt_once
+
 
 def _inputs_on_cuda(*args, **kwargs) -> bool:
     """Route kernel dispatch by input placement: the first tensor argument
@@ -153,8 +156,7 @@ def expand_prefill_causally(
     )
 
 
-@triton.jit
-def _expand_prefill_causally_kernel(
+def _expand_prefill_causally_kernel_fn(
     req_pool_ptr,
     seq_lens_ptr,
     extend_seq_lens_ptr,
@@ -191,6 +193,23 @@ def _expand_prefill_causally_kernel(
     tl.store(req_pool_repeated_ptr + offs, rp, mask=mask)
 
 
+# vllm#59119: the three ints change every prefill step and only feed masks and
+# the padding-row fallback, so specializing them (== 1, % 16) only multiplies the
+# variants compiled while serving. The specializing kernel stays behind
+# SGLANG_OPT_DSV4_EXPAND_PREFILL_NO_RESPECIALIZE=0.
+_expand_prefill_causally_kernel = triton.jit(
+    do_not_specialize=["bs", "num_tokens", "total_tokens"]
+)(_expand_prefill_causally_kernel_fn)
+_expand_prefill_causally_kernel_specialized = triton.jit(
+    _expand_prefill_causally_kernel_fn
+)
+# Smallest BS_P2, so prefill batches of up to 64 requests share one variant.
+_EXPAND_PREFILL_MIN_BS_P2 = 64
+# Tokens per program once BS_P2 >= 64: a 256 x BS_P2 tile spills at 4 warps
+# (B200: 42 us vs 3 us at 16K tokens); 32 rows keep it a few microseconds.
+_EXPAND_PREFILL_WIDE_BLOCK = 32
+
+
 def expand_prefill_causally_triton(
     *,
     req_pool_indices: torch.Tensor,
@@ -212,7 +231,22 @@ def expand_prefill_causally_triton(
         total_tokens, dtype=req_pool_indices.dtype, device=device
     )
     BLOCK = 256
-    _expand_prefill_causally_kernel[(triton.cdiv(total_tokens, BLOCK),)](
+    bs_p2 = triton.next_power_of_2(max(bs, 1))
+    if envs.SGLANG_OPT_DSV4_EXPAND_PREFILL_NO_RESPECIALIZE.get():
+        kernel = _expand_prefill_causally_kernel
+        bs_p2 = max(_EXPAND_PREFILL_MIN_BS_P2, bs_p2)
+        BLOCK = _EXPAND_PREFILL_WIDE_BLOCK
+        log_community_opt_once(
+            "vllm#59119 expand_prefill_no_respecialize",
+            "expand_prefill_causally without int specialization "
+            "(bs=%d, BS_P2=%d, num_tokens=%d)",
+            bs,
+            bs_p2,
+            num_tokens,
+        )
+    else:
+        kernel = _expand_prefill_causally_kernel_specialized
+    kernel[(triton.cdiv(total_tokens, BLOCK),)](
         req_pool_indices,
         seq_lens,
         extend_seq_lens,
@@ -222,7 +256,7 @@ def expand_prefill_causally_triton(
         num_tokens,
         total_tokens,
         BLOCK=BLOCK,
-        BS_P2=triton.next_power_of_2(max(bs, 1)),
+        BS_P2=bs_p2,
     )
     return ExpandPrefillCausallyResult(
         seq_lens_casual=seq_lens_casual,

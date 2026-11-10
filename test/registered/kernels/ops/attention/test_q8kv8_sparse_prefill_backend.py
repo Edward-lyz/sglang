@@ -306,8 +306,10 @@ def _patched_compressed_sparse_cache_paths(compress_ratio: int):
         self.compressed[compress_ratio] = gather
         return gather
 
-    def fake_combine_compressed(self, compress_ratio, sparse_raw_indices):
-        _ = sparse_raw_indices
+    def fake_combine_compressed(
+        self, compress_ratio, sparse_raw_indices, topk_version=None
+    ):
+        _ = sparse_raw_indices, topk_version
         n_compressed = self.compressed[compress_ratio].flat_token_ids.shape[0]
         return _with_compressed_prefix(self, n_compressed)
 
