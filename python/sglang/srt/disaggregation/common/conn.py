@@ -223,6 +223,7 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+            self._init_pp_sideband_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -359,6 +360,154 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    # ---------------------------------------------------------------- #
+    # PP + PD prefill: sideband bootstrap consensus
+    # ---------------------------------------------------------------- #
+    # Admission requires the AND over all PP ranks: a room may only leave the
+    # bootstrap queue once *every* prefill PP rank has received the
+    # transfer_infos of all its decode peers. Upstream evaluates that AND by
+    # relaying an intersection of bootstrapped ids around the PP ring, which
+    # costs one pipeline iteration per hop. Here the same AND is evaluated over
+    # the sideband ZMQ handshake socket instead: every rank reports PP_READY to
+    # PP0 the moment its own handshake completes, and PP0 promotes the room only
+    # after all pp_size reports landed. Same invariant, no pipeline hops.
+    #
+    # Everything below runs on the single bootstrap thread (the local-ready
+    # callback, the PP_READY receive and the ABORT cleanup all dispatch from
+    # `recv_multipart`), so the ledger needs no lock.
+
+    PP_READY_HEADER = b"PP_READY"
+
+    def _init_pp_sideband_bootstrap(self):
+        """Cache PP0's sideband endpoint and the per-room PP_READY ledger.
+
+        Must run before the bootstrap thread starts. PP0's address is
+        broadcast over the PP CPU group rather than fetched from the bootstrap
+        server, because `/route` only answers once *every* rank has registered
+        and we are still inside registration here.
+        """
+        # PP0's ledger: room -> set of PP ranks that reported a local handshake.
+        self._pp_ready_ranks: Dict[int, Set[int]] = {}
+        self._pp0_sideband_endpoint: Optional[str] = None
+        self._pp0_sideband_is_ipv6 = False
+        self._pp_pd_sideband_bootstrap = (
+            envs.SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS.get()
+            and self.pp_size > 1
+        )
+        if self.pp_size > 1:
+            # Before the early return below, so every rank reaches the collective.
+            self._check_uniform_sideband_flag()
+        if not self._pp_pd_sideband_bootstrap:
+            return
+
+        pp0_ip, pp0_port = self.pp_group.broadcast_object(
+            (self.local_ip, self.rank_port), src=0
+        )
+        if self.pp_rank != 0:
+            pp0_na = NetworkAddress(pp0_ip, pp0_port)
+            self._pp0_sideband_endpoint = pp0_na.to_tcp()
+            self._pp0_sideband_is_ipv6 = pp0_na.is_ipv6
+        logger.info(
+            f"PP+PD sideband bootstrap consensus enabled: pp_rank={self.pp_rank}, "
+            f"pp_size={self.pp_size}, pp0_sideband={pp0_ip}:{pp0_port}."
+        )
+
+    def _check_uniform_sideband_flag(self):
+        """Fail fast if the PP ranks disagree on whether the sideband path is on.
+
+        The flag gates a `point_to_point_pyobj` isend/irecv pair (the consensus
+        ring) that carries no tag, so channels on a link match purely by issue
+        order. A rank that keeps the ring while its neighbour drops it shifts
+        every later channel on that link by one message, and the ranks then
+        exchange each other's payloads silently -- an admission table read as a
+        release list, with no exception anywhere. A mixed rollout (env var set on
+        some hosts only, or a partially updated code tree) is the realistic way
+        to get there, so trade it for a startup error.
+
+        Cheap and bubble-free: one CPU-group broadcast during construction, not
+        on the event loop.
+        """
+        pp0_enabled = self.pp_group.broadcast_object(
+            self._pp_pd_sideband_bootstrap, src=0
+        )
+        if pp0_enabled != self._pp_pd_sideband_bootstrap:
+            raise RuntimeError(
+                "SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS must be set "
+                "identically on every PP rank: pp_rank="
+                f"{self.pp_rank} has {self._pp_pd_sideband_bootstrap}, pp_rank=0 "
+                f"has {pp0_enabled}. Mixed settings desynchronise the "
+                "point_to_point_pyobj channels on the PP ring."
+            )
+
+    def on_local_pp_bootstrap_ready(self, bootstrap_room: int):
+        """The local handshake for `bootstrap_room` just completed on this rank.
+
+        Replaces the plain `update_status(room, WaitingForInput)` when the
+        sideband path is on. Non-PP0 ranks keep their local status semantics
+        untouched and additionally report to PP0; PP0 records only itself and
+        defers its own promotion until every rank reported.
+        """
+        if self.pp_rank != 0:
+            # Read the abort state *before* the local update: `update_status`
+            # takes max() for non-Failed statuses, so WaitingForInput would mask
+            # an already-Failed room and we would report a dead room to PP0.
+            aborted = self.request_status.get(bootstrap_room) == KVPoll.Failed
+            self.update_status(bootstrap_room, KVPoll.WaitingForInput)
+            if not aborted:
+                self._report_pp_ready(bootstrap_room)
+            return
+
+        self._pp_ready_ranks.setdefault(bootstrap_room, set()).add(0)
+        self._try_promote_pp_ready(bootstrap_room)
+
+    def _report_pp_ready(self, bootstrap_room: int):
+        """Tell PP0 that this rank finished `bootstrap_room`'s handshake.
+
+        One message per room, sent the moment the handshake completes. A send
+        failure is logged and swallowed: PP0 then never reaches pp_size for this
+        room and the request degrades to the existing bootstrap timeout instead
+        of taking the bootstrap thread down.
+        """
+        try:
+            self._send_multipart_locked(
+                self._pp0_sideband_endpoint,
+                [
+                    self.PP_READY_HEADER,
+                    str(bootstrap_room).encode("ascii"),
+                    str(self.pp_rank).encode("ascii"),
+                ],
+                is_ipv6=self._pp0_sideband_is_ipv6,
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to report PP_READY for room {bootstrap_room} from "
+                f"pp_rank {self.pp_rank} to {self._pp0_sideband_endpoint}: {e}"
+            )
+
+    def handle_pp_ready(self, parts: List[bytes]):
+        """PP0: record a peer rank's PP_READY report. `parts` is the raw frame."""
+        bootstrap_room = int(parts[1].decode("ascii"))
+        reporter_pp_rank = int(parts[2].decode("ascii"))
+        self._pp_ready_ranks.setdefault(bootstrap_room, set()).add(reporter_pp_rank)
+        self._try_promote_pp_ready(bootstrap_room)
+
+    def _try_promote_pp_ready(self, bootstrap_room: int):
+        """PP0: promote the room once all pp_size ranks reported."""
+        ready_ranks = self._pp_ready_ranks.get(bootstrap_room)
+        if ready_ranks is None or len(ready_ranks) < self.pp_size:
+            return
+        self._pp_ready_ranks.pop(bootstrap_room, None)
+        if self.request_status.get(bootstrap_room) == KVPoll.Failed:
+            # Deferring the promotion opens a window an immediate one did not
+            # have: an abort can land while we wait for the remaining ranks.
+            # `update_status`'s max() would resurrect the room, so drop it.
+            return
+        self.update_status(bootstrap_room, KVPoll.WaitingForInput)
+
+    def clear_pp_ready(self, bootstrap_room: int):
+        """Drop the room's ledger entry; safe to call on any rank at any time."""
+        self._pp_ready_ranks.pop(bootstrap_room, None)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:

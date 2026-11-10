@@ -462,6 +462,20 @@ class PrefillBootstrapQueue:
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
                 elif not self.finalize_bootstrap(req):
+                    if self.scheduler._pp_pd_sideband_bootstrap:
+                        # The admission table comes from PP0, which already
+                        # reserved one metadata credit per admitted rid, and every
+                        # rank must admit exactly that set. Silently skipping this
+                        # req would diverge this rank's batch from the others', so
+                        # surface the broken quota lock-step instead.
+                        raise RuntimeError(
+                            f"No metadata buffer for req {req.rid} admitted by the "
+                            f"PP bootstrap consensus (pp_rank={self.pp_rank}, "
+                            "available_size="
+                            f"{self.req_to_metadata_buffer_idx_allocator.available_size()})"
+                            "; the metadata buffer quota is out of lock-step "
+                            "across PP ranks."
+                        )
                     continue
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)

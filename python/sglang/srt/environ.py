@@ -421,6 +421,16 @@ class Envs:
     # fixed decode fleet and collapses every room onto one queue. Kill-switch: set
     # to 0 to restore the byte-identical legacy whole-room path.
     SGLANG_PP_PD_KV_TRANSFER_TARGET_PARALLEL = EnvBool(False)
+    # PP + PD prefill (mooncake): evaluate the "all PP ranks acknowledged this
+    # room's bootstrap" AND over the sideband ZMQ handshake channel instead of
+    # over the pipeline relay chain. Every prefill PP rank reports PP_READY to
+    # PP0 the moment its own transfer_infos are complete; PP0 only promotes the
+    # room to KVPoll.WaitingForInput once all pp_size ranks reported, so PP0's
+    # poll() already means "globally ready" and the fixed pp_size-iteration wait
+    # on the admission path disappears. The invariant is unchanged: a room is
+    # admitted only when every PP rank acknowledged it. Kill-switch: set to 0 to
+    # restore the byte-identical two-pass (pre-consensus + consensus ring) path.
+    SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS = EnvBool(False)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)

@@ -1713,6 +1713,11 @@ class Scheduler(
         self._pp_pd_owns_aux = True
         # Whether this rank sends the final chunk from the loop's CPU phase.
         self._pp_pd_early_send_final_kv = False
+        # PP + PD prefill: the "all PP ranks acknowledged this room" AND is
+        # evaluated over the sideband ZMQ handshake channel (PP0 counts PP_READY
+        # reports) instead of over the pipeline consensus relay, so PP0's poll()
+        # already means "globally ready".
+        self._pp_pd_sideband_bootstrap = False
         self.disagg_prefill_pending_final_kv: List[PendingFinalKV] = []
 
         self.disaggregation_mode = DisaggregationMode(
@@ -1848,6 +1853,13 @@ class Scheduler(
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
+            self._pp_pd_sideband_bootstrap = (
+                envs.SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS.get()
+                and self.ps.pp_size > 1
+            )
+            if self._pp_pd_sideband_bootstrap:
+                self._validate_pp_pd_sideband_bootstrap()
+
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
@@ -1895,6 +1907,22 @@ class Scheduler(
                 "SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK supports only DSPARK "
                 "speculative decoding, got "
                 f"{self.server_args.speculative_algorithm}."
+            )
+
+    def _validate_pp_pd_sideband_bootstrap(self):
+        """Reject backends that never report PP_READY.
+
+        The sideband consensus defers PP0's promotion until every PP rank
+        reports, and only ``MooncakeKVManager``'s bootstrap thread emits that
+        report. On any other backend PP0's counter would never fill and every
+        request would stall until the bootstrap timeout, so refuse to boot
+        instead.
+        """
+        if self.transfer_backend != TransferBackend.MOONCAKE:
+            raise ValueError(
+                "SGLANG_PP_PD_PREFILL_SIDEBAND_BOOTSTRAP_CONSENSUS only supports "
+                "the mooncake transfer backend, got "
+                f"{self.transfer_backend.value}."
             )
 
     def init_overlap(self):

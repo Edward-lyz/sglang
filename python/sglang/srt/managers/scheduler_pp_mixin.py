@@ -1156,6 +1156,14 @@ class SchedulerPPMixin:
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
+                if self._pp_pd_sideband_bootstrap:
+                    # The all-PP-ranks AND is already settled (PP0's sideband
+                    # PP_READY counter), so admit here -- same loop slot on every
+                    # rank, before get_new_batch_prefill -- instead of waiting a
+                    # full trip around the consensus ring. The ring itself is
+                    # gone in this mode: both its isend and its irecv are skipped
+                    # under this same flag.
+                    self.process_bootstrapped_queue(bootstrapped_rids)
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
@@ -1312,7 +1320,11 @@ class SchedulerPPMixin:
                     )
                 )
 
-                if bmbs[next_mb_id] is not None:
+                if not self._pp_pd_sideband_bootstrap and bmbs[next_mb_id] is not None:
+                    # Legacy path only: under the sideband consensus the ring is
+                    # deleted on both ends (see
+                    # `_pp_pd_send_consensus_bootstrapped_ids`) and admission has
+                    # already happened in step 2.
                     next_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
                     )
@@ -1917,6 +1929,15 @@ class SchedulerPPMixin:
             good_bootstrapped_rids, bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
+        elif self._pp_pd_sideband_bootstrap:
+            # PP0's local ready set already carries the "every PP rank
+            # acknowledged this room" AND -- the sideband PP_READY counter gates
+            # its update_status -- so the table travelling down this chain is
+            # the admission table, not a candidate set. Adopt it verbatim: no
+            # intersection with the local poll, no local abort routing. That is
+            # what keeps every rank admitting the identical rid set in the
+            # identical loop slot (see the design doc, 6.1).
+            return self._pp_recv_pyobj_from_prev_stage()
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
@@ -1975,6 +1996,15 @@ class SchedulerPPMixin:
     ):
         # 3 (Release): send the release rids from last stage to the first stage
         send_consensus_bootstrapped_work = []
+        if self._pp_pd_sideband_bootstrap:
+            # Phase 2: the consensus ring has no reader left -- admission runs in
+            # step 2 off PP0's table -- so stop paying a pyobj round trip for it.
+            # The matching irecv in the event loop is skipped under the *same*
+            # process-level constant: `point_to_point_pyobj` carries no tag, so
+            # dropping the isend on one rank while another still posts the irecv
+            # would shift every later channel on that link by one message.
+            # `_init_pp_sideband_bootstrap` rejects a non-uniform flag at startup.
+            return send_consensus_bootstrapped_work, None
         if self.pp_group.is_last_rank:
             if bmbs[next_first_rank_mb_id] is not None:
                 consensus_bootstrapped_rids = bootstrapped_rids
