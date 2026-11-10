@@ -46,6 +46,8 @@ COPY aiak_sglang/dockerfile/gpu_requirements.env /tmp/gpu_requirements.env
 RUN pip install --no-cache-dir --force-reinstall -r /tmp/gpu_requirements.env && \
     rm -rf /tmp/gpu_requirements.env
 
+RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/mooncake_transfer_engine_cuda13-0.3.12.post1-cp312-cp312-manylinux_2_28_x86_64.whl
+
 # NOTE: Move these into the basic image to minimize difference with the community.
 RUN pip install jsonschema_rs
 RUN pip install distro
