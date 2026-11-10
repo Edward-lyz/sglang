@@ -2418,9 +2418,16 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
             self._precompute_output_gate(hidden_states)
-        return super().forward(
+        out = super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
+        # DSA (Kimi-K3.1) returns (hidden_states, topk_indices). Every DSA
+        # layer runs its own indexer (index_topk_freq=1), so the indices are
+        # not carried across layers and are dropped here.
+        if isinstance(out, tuple):
+            assert not self.use_dsa or not self.next_skip_topk
+            out = out[0]
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -4203,4 +4210,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
 
 
-EntryClass = [KimiK3ForConditionalGeneration]
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    """Kimi-K3.1: Kimi-K3 plus a DSA indexer on every MLA layer.
+
+    The indexer is built by DeepseekV2AttentionMLA (``use_dsa``) from the
+    flattened ``dsa_config`` on the text config (see configs/kimi_k3.py
+    KimiK31Config); its ``self_attn.indexer.*`` weights load by name.
+    """
+
+
+EntryClass = [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]

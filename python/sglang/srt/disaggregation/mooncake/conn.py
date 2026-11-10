@@ -2110,9 +2110,13 @@ class MooncakeKVManager(CommonKVManager):
                 StateType.SWA_RING,
                 StateType.C128_STATE,
             ):
+                # MLA latent KV and the DSA indexer cache are replicated across
+                # attn-TP ranks (not head-sharded), so a hybrid linear + MLA pool
+                # (Kimi-K3.1) can ship them to any decode TP size unchanged.
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
+                    and not (st == StateType.DSA and self.is_hybrid_mla_backend)
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
@@ -2154,6 +2158,18 @@ class MooncakeKVManager(CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        # Hybrid linear + DSA registers global layer ids so a
+                        # PP-local prefill stage maps onto the decode layers.
+                        **(
+                            dict(
+                                src_layer_ids=src_state_layer_ids,
+                                dst_layer_ids=dst_state_layer_ids,
+                            )
+                            if st == StateType.DSA
+                            and src_state_layer_ids
+                            and dst_state_layer_ids
+                            else {}
+                        ),
                     )
                     or rc
                 )

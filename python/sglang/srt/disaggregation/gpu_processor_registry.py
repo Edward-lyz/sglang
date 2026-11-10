@@ -10,6 +10,14 @@ _REGISTRY = {
         "sglang.srt.multimodal.processors.kimi_k25",
         "KimiK25VLImageProcessor",
     ),
+    "KimiK3ForConditionalGeneration": (
+        "sglang.srt.multimodal.processors.kimi_k3",
+        "KimiK3ImageProcessor",
+    ),
+    "KimiK31ForConditionalGeneration": (
+        "sglang.srt.multimodal.processors.kimi_k3",
+        "KimiK3ImageProcessor",
+    ),
 }
 
 

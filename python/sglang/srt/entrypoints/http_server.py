@@ -21,8 +21,8 @@ import asyncio
 import dataclasses
 import logging
 import os
-import ssl
 import re
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -112,6 +112,15 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
+from sglang.srt.entrypoints.warmup_sweep import (
+    claim_sweep_election,
+    mark_sweep_done,
+    reset_sweep_election,
+    resolve_sweep_lens,
+    run_prefill_sweep,
+    sweep_is_enabled,
+    wait_for_sweep_done,
+)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -177,6 +186,7 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.common import node_pp_rank_range
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -241,7 +251,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 
     # Configure logger to align with other sglang subprocess entry points;
     # uvicorn spawns this worker via multiprocessing.get_context("spawn"),
-    # so without this call the worker inherits whatever (mis)configuration
+    # so without this call the worker inherits whatever misconfiguration
     # the parent left on the root logger after re-import.
     configure_logger(server_args, f" Tokenizer {os.getpid()}")
 
@@ -777,13 +787,18 @@ async def get_instance_info():
     node_rank = _global_state.tokenizer_manager.server_args.node_rank
     dp_per_node = dp_size // nnodes
     start = node_rank * dp_per_node
+    pp_size = _global_state.tokenizer_manager.server_args.pp_size
+    pp_rank_range = node_pp_rank_range(pp_size, nnodes, node_rank)
 
     return {
         "kv_role": _global_state.tokenizer_manager.server_args.disaggregation_mode,
+        "node_rank": node_rank,
         "dp_ranks": list(range(start, start + dp_per_node)),
-        "dp_size": _global_state.tokenizer_manager.server_args.dp_size,
+        "pp_ranks": list(pp_rank_range),
+        "dp_size": dp_size,
         "tp_size": _global_state.tokenizer_manager.server_args.tp_size,
-        "nnodes": _global_state.tokenizer_manager.server_args.nnodes,
+        "pp_size": pp_size,
+        "nnodes": nnodes,
         "chunked_prefill_enabled": chunked_prefill_enabled,
         "chunked_prefill_size": _global_state.tokenizer_manager.server_args.chunked_prefill_size,
         "active_request_count": len(_global_state.tokenizer_manager.rid_to_state),
@@ -938,12 +953,34 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
+        generator = _global_state.tokenizer_manager.generate_request(obj, request)
+
+        # Kick-start the generator before the StreamingResponse is returned:
+        # afterwards HTTP 200 is committed and failures can only be reported
+        # in-band. Pre-generation failures (validation errors, scheduler
+        # aborts) must surface as a real HTTP status, same as the non-stream
+        # branch below.
+        first_out = None
+        try:
+            first_out = await generator.__anext__()
+            _raise_stream_abort(first_out)
+        except StopAsyncIteration:
+            pass
+        except ValueError as e:
+            # A client disconnect also surfaces here. It's a client-side
+            # cancellation, not a server error or bad input -- log it and
+            # return an empty stream instead of a 400.
+            if request is not None and await request.is_disconnected():
+                logger.info(f"[http_server] Client disconnected: {e}")
+            else:
+                logger.error(f"[http_server] Error: {e}")
+                return _create_error_response(e)
 
         async def stream_results() -> AsyncIterator[bytes]:
+            if first_out is not None:
+                yield b"data: " + dumps_json(first_out) + b"\n\n"
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+                async for out in generator:
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
@@ -2323,6 +2360,27 @@ def _create_error_response(e):
     )
 
 
+def _raise_stream_abort(out: dict) -> None:
+    """Raise if `out` is a scheduler abort carrying an explicit HTTP status code.
+
+    TokenizerManager._handle_abort_finish_reason only raises for non-stream
+    requests; streaming aborts are yielded as ordinary outputs. Callers that
+    have not committed HTTP 200 yet use this to get the same exception -- and
+    therefore the same HTTP status -- as the non-stream path.
+    """
+    finish_reason = out["meta_info"].get("finish_reason")
+    if not isinstance(finish_reason, dict) or finish_reason.get("type") != "abort":
+        return
+    status_code = finish_reason.get("status_code")
+    if not isinstance(status_code, HTTPStatus):
+        return
+
+    message = finish_reason.get("message", "Generation aborted.")
+    if status_code == HTTPStatus.BAD_REQUEST:
+        raise ValueError(message)
+    raise HTTPException(status_code=int(status_code), detail=message)
+
+
 # FIXME: In theory we should configure ADMIN_FORCE for some entrypoints, but doing so
 # would currently cause all endpoints to go through add_api_key_middleware
 # (even when neither api-key nor admin-api-key is configured).
@@ -2372,7 +2430,8 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     architectures = model_info.get("architectures") or []
     if (
         "KimiK3ForConditionalGeneration" in architectures
-        or model_info.get("model_type") == "kimi_k3"
+        or "KimiK31ForConditionalGeneration" in architectures
+        or model_info.get("model_type") in ("kimi_k3", "kimi_k31")
     ):
         logger.info(
             "Using a 448x448 image for Kimi K3 VLM startup warmup to exercise "
@@ -2545,6 +2604,16 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            # Sweep the real prefill shapes before announcing readiness, so a
+            # load balancer watching /health does not send the first client
+            # request into the JIT/autotune window.
+            _maybe_run_prefill_sweep(
+                server_args=server_args,
+                url=url,
+                headers=headers,
+                ssl_verify=ssl_verify,
+                model_info=model_info,
+            )
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
@@ -2565,6 +2634,13 @@ def _execute_server_warmup(server_args: ServerArgs):
                     server_args.dp_size,
                 )
                 logger.info("End of disaggregation warmup")
+                _maybe_run_prefill_sweep(
+                    server_args=server_args,
+                    url=url,
+                    headers=headers,
+                    ssl_verify=ssl_verify,
+                    model_info=model_info,
+                )
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
@@ -2583,11 +2659,73 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+def _maybe_run_prefill_sweep(
+    *,
+    server_args: ServerArgs,
+    url: str,
+    headers: Dict[str, str],
+    ssl_verify: Union[bool, str],
+    model_info: dict,
+) -> None:
+    """Extend the startup warmup with a sweep over realistic prefill lengths.
+
+    The minimal warmup above only proves liveness; the first real requests still
+    pay DeepGEMM JIT, attention-plan and MoE-buffer setup for their own shapes.
+    Opt in with SGLANG_WARMUP_PREFILL_LENS (see warmup_sweep.py).
+    """
+
+    if not model_info["is_generation"] or not sweep_is_enabled():
+        return
+
+    lens = resolve_sweep_lens(
+        chunked_prefill_size=server_args.chunked_prefill_size,
+        max_prefill_tokens=server_args.max_prefill_tokens,
+        page_size=server_args.page_size,
+        max_req_input_len=_global_state.tokenizer_manager.max_req_input_len,
+    )
+    if not lens:
+        return
+
+    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    timeout = warmup_timeout if warmup_timeout > 0 else 1800
+
+    # One sweep per server, even though every HTTP worker runs a warmup thread.
+    election_key = _sweep_election_key(server_args)
+    if election_key is not None and not claim_sweep_election(election_key):
+        wait_for_sweep_done(election_key, timeout=timeout)
+        return
+
+    try:
+        run_prefill_sweep(
+            url=url,
+            headers=headers,
+            ssl_verify=ssl_verify,
+            timeout=timeout,
+            dp_size=server_args.dp_size,
+            disaggregation_mode=server_args.disaggregation_mode,
+            lens=lens,
+            batch_size=max(envs.SGLANG_WARMUP_BATCH_SIZE.get(), 1),
+            vocab_size=_global_state.tokenizer_manager.model_config.vocab_size,
+        )
+    finally:
+        if election_key is not None:
+            mark_sweep_done(election_key)
+
+
+def _sweep_election_key(server_args: ServerArgs) -> Optional[str]:
+    """Key shared by every HTTP worker of this server, or None when alone."""
+
+    if server_args.tokenizer_worker_num == 1:
+        return None
+    return f"{get_main_process_id()}_{server_args.port}"
+
+
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
 ):
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_and_warmup start")
     if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
 
@@ -2607,6 +2745,7 @@ def _wait_and_warmup(
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     # The server is ready for requests
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] _wait_and_warmup done")
     logger.info("The server is fired up and ready to roll!")
 
     if server_args.delete_ckpt_after_loading:
@@ -2781,6 +2920,9 @@ def _setup_and_run_http_server(
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
             port_args, server_args, scheduler_infos[0]
         )
+        # The workers elect one sweeper among themselves via a marker file keyed
+        # by this pid; clear a stale marker in case the pid was recycled.
+        reset_sweep_election(f"{os.getpid()}_{server_args.port}")
 
     try:
         # Update logging configs
@@ -2986,6 +3128,8 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     # Launch subprocesses
+    configure_logger(server_args)
+    logger.info(f"[BOOTSTRAP_ANALYZING][{os.getpid()}] launch_server start")
     (
         tokenizer_manager,
         template_manager,

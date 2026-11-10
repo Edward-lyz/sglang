@@ -328,6 +328,9 @@ def _dspark_verify_on_decode_backend(
     """Whether the MLA decode backend can serve a q_len-wide target verify."""
     if backend == "trtllm_mla":
         return True
+    if backend == "dsa":
+        # Kimi-K3.1: DSA target verify always runs the DSA decode impl.
+        return True
     if backend == "tokenspeed_mla":
         return kv_cache_dtype == "fp8_e4m3" and q_len <= 8
     if backend == "cutedsl_mla":
@@ -336,7 +339,7 @@ def _dspark_verify_on_decode_backend(
     return False
 
 
-@_register_for("KimiK3ForConditionalGeneration")
+@_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     if server_args.dcp_size > 1:
         overrides = {}
@@ -476,7 +479,7 @@ def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
     )
 
 
-@_register_for("KimiK3ForConditionalGeneration")
+@_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
     # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
@@ -1296,6 +1299,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
@@ -1332,6 +1336,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
     }
 )
 

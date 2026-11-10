@@ -1067,6 +1067,24 @@ class HybridLinearAttnBackend(AttentionBackend):
             and self.linear_attn_backend.supports_ragged_verify_graph
         )
 
+    # DSA indexer entry points (hybrid linear + DSA full attention, Kimi-K3.1):
+    # the indexer reaches the backend through get_attn_backend(), i.e. this
+    # wrapper, while the metadata lives on the full-attention DSA backend.
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        """get_indexer_metadata"""
+        return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
+
+    @property
+    def kv_cache_dtype(self):
+        """kv_cache_dtype"""
+        return self.full_attn_backend.kv_cache_dtype
+
+    @property
+    def use_mha(self) -> bool:
+        """use_mha"""
+        # DSA picks MHA vs MLA per batch (handle_attention_dsa reads this).
+        return getattr(self.full_attn_backend, "use_mha", False)
+
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:

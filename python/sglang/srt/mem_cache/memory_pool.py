@@ -3580,6 +3580,10 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        # DSA indexer on the full-attention (MLA) layers (Kimi-K3.1): back
+        # them with a DSATokenToKVPool instead of a plain MLATokenToKVPool.
+        dsa_index_head_dim: Optional[int] = None,
+        dsa_kv_cache_dim: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -3656,16 +3660,30 @@ class HybridLinearKVPool(KVCache):
 
                 TokenToKVPoolClass = NPUMLATokenToKVPool
 
-            self.full_kv_pool = TokenToKVPoolClass(
-                size=size,
-                page_size=self.page_size,
-                dtype=dtype,
-                layer_num=self.full_layer_nums,
-                device=device,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                enable_memory_saver=enable_memory_saver,
-            )
+            if dsa_index_head_dim is not None:
+                self.full_kv_pool = DSATokenToKVPool(
+                    size=size,
+                    page_size=self.page_size,
+                    kv_lora_rank=kv_lora_rank,
+                    dtype=dtype,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    layer_num=self.full_layer_nums,
+                    device=device,
+                    index_head_dim=dsa_index_head_dim,
+                    enable_memory_saver=enable_memory_saver,
+                    kv_cache_dim=dsa_kv_cache_dim,
+                )
+            else:
+                self.full_kv_pool = TokenToKVPoolClass(
+                    size=size,
+                    page_size=self.page_size,
+                    dtype=dtype,
+                    layer_num=self.full_layer_nums,
+                    device=device,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    enable_memory_saver=enable_memory_saver,
+                )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
@@ -3901,6 +3919,59 @@ class HybridLinearKVPool(KVCache):
         loc = self._full_translate(loc)
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
+
+    # --- DSA indexer cache (full_kv_pool is a DSATokenToKVPool) ---------------
+    # The DSA pool is dense over the full-attention layers, so every entry point
+    # maps the global model layer id to its dense slot first.
+
+    @property
+    def kv_cache_dim(self) -> int:
+        """kv_cache_dim"""
+        return self.full_kv_pool.kv_cache_dim
+
+    @property
+    def dsa_kv_cache_store_fp8(self) -> bool:
+        """dsa_kv_cache_store_fp8"""
+        return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
+
+    @property
+    def index_head_dim(self) -> Optional[int]:
+        """index_head_dim"""
+        return getattr(self.full_kv_pool, "index_head_dim", None)
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        """get_index_k_with_scale_buffer"""
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_index_k_with_scale_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_index_k_continuous(self, layer_id: int, *args, **kwargs):
+        """get_index_k_continuous"""
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_index_k_continuous(
+            self._transfer_full_attention_id(layer_id), *args, **kwargs
+        )
+
+    def get_index_k_scale_continuous(self, layer_id: int, *args, **kwargs):
+        """get_index_k_scale_continuous"""
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_index_k_scale_continuous(
+            self._transfer_full_attention_id(layer_id), *args, **kwargs
+        )
+
+    def get_index_k_scale_buffer(self, layer_id: int, *args, **kwargs):
+        """get_index_k_scale_buffer"""
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_index_k_scale_buffer(
+            self._transfer_full_attention_id(layer_id), *args, **kwargs
+        )
+
+    def set_index_k_scale_buffer(self, layer_id: int, *args, **kwargs) -> None:
+        """set_index_k_scale_buffer"""
+        self.full_kv_pool.set_index_k_scale_buffer(
+            self._transfer_full_attention_id(layer_id), *args, **kwargs
+        )
 
 
 class MLATokenToKVPool(KVCache):

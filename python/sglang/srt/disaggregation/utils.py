@@ -1158,6 +1158,21 @@ def setup_state_kv_args(
                 slice_outer_counts,
                 layer_ids,
             )
+            # Hybrid linear + DSA (Kimi-K3.1): the full-attention layers also
+            # carry a paged DSA indexer K cache. Global layer ids pair the
+            # PP-local prefill buffers with the decode buffers.
+            if isinstance(token_to_kv_pool.full_kv_pool, DSATokenToKVPool):
+                dsa_ptrs, dsa_lens, dsa_item_lens = (
+                    token_to_kv_pool.full_kv_pool.get_state_buf_infos()
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.DSA,
+                    dsa_ptrs,
+                    dsa_lens,
+                    dsa_item_lens,
+                    layer_ids=list(token_to_kv_pool.full_attention_layer_id_mapping),
+                )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
@@ -1295,6 +1310,9 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
 
     # populate finish metadata and stream output
     req.finished_reason = FINISH_ABORT(error_message, status_code)
+
+    if getattr(req, "multimodal_inputs", None) is not None:
+        req.multimodal_inputs.release_pool_buffers()
 
     if req.return_logprob:
         req.logprob.input_token_logprobs_val = []

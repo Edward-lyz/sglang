@@ -1723,7 +1723,8 @@ class DeepseekV2AttentionMLA(
                 hidden_size=hidden_size,
                 index_n_heads=get_dsa_index_n_heads(config),
                 index_head_dim=get_dsa_index_head_dim(config),
-                rope_head_dim=qk_rope_head_dim,
+                # Kimi-K3.1's indexer carries no rope (index_rope_dim=0).
+                rope_head_dim=getattr(config, "index_rope_head_dim", qk_rope_head_dim),
                 index_topk=get_dsa_index_topk(config),
                 q_lora_rank=q_lora_rank,
                 max_position_embeddings=max_position_embeddings,

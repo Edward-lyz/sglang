@@ -115,13 +115,19 @@ def is_deepseek_dsa(config) -> bool:
             "GlmMoeDsaForCausalLMNextN",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
+            # Kimi-K3.1: top-level config, and the text config the MLA layers see.
+            "KimiK31ForConditionalGeneration",
+            "KimiLinearForCausalLM",
         )
         and _hf_attr(config, "index_topk") is not None
     )
 
 
 def is_kimi_k3(config) -> bool:
-    return _hf_arch(config) == "KimiK3ForConditionalGeneration"
+    return _hf_arch(config) in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+    )
 
 
 def is_deepseek_v4(config) -> bool:
@@ -898,6 +904,7 @@ class ModelConfig:
         elif (
             "KimiLinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+            or "KimiK31ForConditionalGeneration" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
             self.head_dim = 72
@@ -906,6 +913,9 @@ class ModelConfig:
             self.qk_rope_head_dim = tc.qk_rope_head_dim
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self.index_head_dim = (
+                get_dsa_index_head_dim(tc) if is_deepseek_dsa(tc) else None
+            )
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
             if getattr(tc, "rope_scaling", None):
                 self.scaling = compute_mla_mscale_scaling(tc.rope_scaling, self.scaling)
@@ -1814,6 +1824,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
 # do not apply (see PrefillCudaGraphRunner.mla_pinned_under_bcg).
 mla_breakable_cuda_graph_supported_model_archs = [
     "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():

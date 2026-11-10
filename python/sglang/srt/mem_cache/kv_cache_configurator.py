@@ -871,7 +871,7 @@ class KVCacheConfigurator:
                 token_to_kv_pool = self._build_ascend_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
-        elif self.use_mla_backend and is_dsa_model:
+        elif self.use_mla_backend and is_dsa_model and not self.mambaish_config:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
             )
@@ -1326,6 +1326,20 @@ class KVCacheConfigurator:
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
+            # Hybrid linear + DSA (Kimi-K3.1): the MLA layers carry a DSA
+            # indexer, so back them with a DSA pool. The draft worker's own
+            # config is not DSA.
+            if not self.is_draft_worker and is_deepseek_dsa(
+                self.model_config.hf_config
+            ):
+                extra_args["dsa_index_head_dim"] = get_dsa_index_head_dim(
+                    self.model_config.hf_config
+                )
+                extra_args["dsa_kv_cache_dim"] = calculate_mla_kv_cache_dim(
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    server_args=self.server_args,
+                )
         full_attention_layer_ids = (
             [0]
             if self.is_draft_worker

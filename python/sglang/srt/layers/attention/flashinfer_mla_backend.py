@@ -254,7 +254,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         server_args = get_server_args()
         model_arches = model_runner.model_config.hf_config.architectures or ()
         self.enable_kimi_k3_prefill_fp8_cache = (
-            "KimiK3ForConditionalGeneration" in model_arches
+            (
+                "KimiK3ForConditionalGeneration" in model_arches
+                or "KimiK31ForConditionalGeneration" in model_arches
+            )
             and server_args.disaggregation_mode == "prefill"
             and server_args.kv_cache_dtype == "fp8_e4m3"
         )

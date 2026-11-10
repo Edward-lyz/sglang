@@ -1150,10 +1150,16 @@ class DeepseekMLAForwardMixin:
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
         if self.current_attention_backend in ("dsa", "nsa"):
+            # Rope-less MLA (Kimi-K3.1) has no cos/sin cache to fuse; the DSA
+            # trtllm path quantizes without rope instead.
             return (
-                get_server_args().dsa_decode_backend == "trtllm"
-                or get_server_args().dsa_prefill_backend == "trtllm"
-            ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
+                self.rotary_emb is not None
+                and (
+                    get_server_args().dsa_decode_backend == "trtllm"
+                    or get_server_args().dsa_prefill_backend == "trtllm"
+                )
+                and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
+            )
 
         return (
             self.rotary_emb is not None

@@ -377,6 +377,14 @@ def _transfer_one_target(
         or mgr.is_hybrid_mla_backend
         or mgr.attn_tp_size == target_rank_registration_info.dst_attn_tp_size
     ):
+        # Same MLA/draft split as the legacy worker in conn.py: the whole-entry
+        # flat transfer cannot head-slice the draft (MHA) KV when attn_tp differs
+        # (e.g. prefill attn_tp=1 -> decode TP8), nor address a window-compact
+        # decode draft pool.
+        src_mla_entry_count, dst_mla_entry_count = mgr._mla_entry_counts(
+            target_rank_registration_info
+        )
+        has_draft_entries = src_mla_entry_count < len(mgr.kv_args.kv_item_lens)
         ret = mgr.send_kvcache(
             req.mooncake_session_id,
             kv_chunk.prefill_kv_indices,
@@ -384,7 +392,33 @@ def _transfer_one_target(
             chunked_dst_kv_indice,
             executor,
             target_rank_registration_info.dst_kv_layer_ids,
+            src_entry_count=src_mla_entry_count if has_draft_entries else None,
+            dst_entry_count=dst_mla_entry_count if has_draft_entries else None,
         )
+        if ret == 0 and has_draft_entries:
+            ret = mgr.send_kvcache_draft(
+                req.mooncake_session_id,
+                kv_chunk.prefill_kv_indices,
+                target_rank_registration_info.dst_kv_ptrs,
+                (
+                    req.draft_dst_kv_indices
+                    if req.draft_dst_kv_indices is not None
+                    else chunked_dst_kv_indice
+                ),
+                src_mla_entry_count=src_mla_entry_count,
+                dst_mla_entry_count=dst_mla_entry_count,
+                dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                dst_tp_rank=target_rank_registration_info.dst_tp_rank,
+                draft_total_kv_heads=mgr.kv_args.draft_kv_head_num * mgr.attn_tp_size,
+                # No DCP relayout on this branch, so the no-window fallback plan
+                # must not stride.
+                dst_dcp_size=1,
+                src_page_offset=kv_chunk.index_slice.start or 0,
+                decode_prefix_len=req.decode_prefix_len or 0,
+                num_kv_tokens=kv_chunk.num_kv_tokens,
+                draft_window_start=req.draft_window_start,
+                executor=executor,
+            )
     elif (
         mgr.enable_staging
         and staging_strategy is not None

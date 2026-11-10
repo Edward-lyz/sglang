@@ -16,7 +16,11 @@ import torch
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
-from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.models.kimi_k3 import (
+    KimiK3ForConditionalGeneration,
+    KimiK31ForConditionalGeneration,
+)
+from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -26,6 +30,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
+    KimiK25VideoPreprocessConfig,
+    KimiK25VLImageProcessor,
     _get_image_dimensions,
     _gpu_preprocess_images,
     navit_resize_config,
@@ -44,23 +50,21 @@ def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
         return list(tokenizer.encode(text))
 
 
-def _expand_k3_image_prompt_token_ids(
+def _expand_k3_media_prompt_token_ids(
     input_ids: Union[List[int], torch.Tensor],
     image_token_id: int,
     image_token_counts: List[int],
     image_sizes: List[tuple[int, int]],
     tokenizer,
 ) -> torch.Tensor:
-    """Expand K3 image placeholders into the checkpoint's media contract.
+    """Expand K3 media placeholders into the checkpoint's media contract.
 
-    K3 requires each image feature span to be enclosed by its original uploaded
-    dimensions.  The chat template deliberately emits one ``media_pad`` per
-    image; after decode, insert the surrounding control tokens and expand that
-    one placeholder to the NaViT feature count.
+    Every placeholder is expanded to its feature count. An image placeholder is
+    additionally enclosed in its original uploaded dimensions; a video
+    placeholder arrives already framed by the encode server and is recognised by
+    its preceding ``media_content`` token. ``image_token_counts`` covers every
+    placeholder in prompt order, ``image_sizes`` only the image ones.
     """
-    if len(image_token_counts) != len(image_sizes):
-        raise ValueError("Expected one original size for each K3 image.")
-
     if isinstance(input_ids, torch.Tensor):
         input_ids = input_ids.detach().flatten().cpu().numpy()
     input_ids = np.asarray(input_ids, dtype=np.int64)
@@ -68,27 +72,51 @@ def _expand_k3_image_prompt_token_ids(
     placeholder_count = np.count_nonzero(input_ids == image_token_id)
     if placeholder_count != len(image_token_counts):
         raise ValueError(
-            f"Expected {len(image_token_counts)} image placeholder token(s), "
+            f"Expected {len(image_token_counts)} media placeholder token(s), "
             f"found {placeholder_count}."
         )
 
+    media_content_ids = _encode_k3_special_tokens(tokenizer, "<|media_content|>")
+    media_content_token_id = media_content_ids[-1] if media_content_ids else None
+
     output = []
     image_index = 0
+    placeholder_index = 0
+    previous_token_id = None
     for token_id in input_ids:
+        token_id = int(token_id)
         if token_id != image_token_id:
-            output.append(int(token_id))
+            output.append(token_id)
+            previous_token_id = token_id
             continue
 
-        width, height = image_sizes[image_index]
-        output.extend(
-            _encode_k3_special_tokens(
-                tokenizer,
-                f"<|media_begin|>image {width}x{height}<|media_content|>",
+        num_tokens = image_token_counts[placeholder_index]
+        placeholder_index += 1
+        if previous_token_id == media_content_token_id:
+            output.extend([image_token_id] * num_tokens)
+        else:
+            if image_index >= len(image_sizes):
+                raise ValueError(
+                    "Expected one original size for each unframed K3 image "
+                    f"placeholder; ran out after {len(image_sizes)}."
+                )
+            width, height = image_sizes[image_index]
+            image_index += 1
+            output.extend(
+                _encode_k3_special_tokens(
+                    tokenizer,
+                    f"<|media_begin|>image {width}x{height}<|media_content|>",
+                )
             )
+            output.extend([image_token_id] * num_tokens)
+            output.extend(_encode_k3_special_tokens(tokenizer, "<|media_end|>"))
+        previous_token_id = token_id
+
+    if image_index != len(image_sizes):
+        raise ValueError(
+            f"Got {len(image_sizes)} original image size(s) but only "
+            f"{image_index} unframed K3 image placeholder(s)."
         )
-        output.extend([image_token_id] * image_token_counts[image_index])
-        output.extend(_encode_k3_special_tokens(tokenizer, "<|media_end|>"))
-        image_index += 1
 
     return torch.tensor(output, dtype=torch.long).unsqueeze(0)
 
@@ -200,7 +228,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             original_input_ids = _encode_k3_special_tokens(
                 self._hf_processor.tokenizer, input_text
             )
-        return _expand_k3_image_prompt_token_ids(
+        return _expand_k3_media_prompt_token_ids(
             original_input_ids,
             self._image_token_id,
             image_token_counts,
@@ -294,7 +322,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
 
 
 class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
-    models = [KimiK3ForConditionalGeneration]
+    models = [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
     gpu_image_decode = True
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
@@ -302,6 +330,11 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     auto_mm_io_worker_num = 16
     supports_mm_processor_concurrency = True
     preserve_processor_input_ids = True
+    # K3 composites RGBA onto the checkpoint-configured background instead of
+    # dropping alpha, so the encoder's decode stage must keep the 4th channel;
+    # the compositing itself runs in the GPU wrapper above, or inside the HF
+    # processor (``transparent_bg_fill_stage``) on the CPU preprocessing path.
+    keep_alpha_channel = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         mm_tokens = MultimodalSpecialTokens(
@@ -327,6 +360,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         )
         super().__init__(hf_config, server_args, processor, *args, **kwargs)
         self.mm_tokens = mm_tokens
+        self.IM_TOKEN_ID = mm_tokens.image_token_id
 
     async def process_mm_data_async(
         self,
@@ -336,8 +370,14 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        if getattr(request_obj, "video_data", None) or kwargs.get("audio_data"):
-            raise ValueError("Kimi-K3 supports image input only")
+        if kwargs.get("audio_data"):
+            raise ValueError("Kimi-K3 does not support audio input")
+        if has_valid_data(request_obj.video_data):
+            # This local path only ever sees images; reaching here means the
+            # request was never dispatched to an encoder.
+            raise ValueError(
+                "Kimi-K3 video input requires the disaggregated encode server"
+            )
 
         expected_image_count = len(image_data or [])
         if self.validate_tokenized_image_placeholders(
@@ -390,6 +430,113 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             im_token_id=self.mm_tokens.image_token_id,
         )
 
+    def expand_input_ids_from_image_sizes(
+        self, input_ids: List[int], image_sizes: List[tuple[int, int]]
+    ) -> List[int]:
+        """Rebuild the expanded prompt from the original image sizes alone.
+
+        The K3 media contract -- framing control tokens plus one placeholder per
+        NaViT feature -- is fully determined by each image's uploaded
+        ``(width, height)``.  A node that never runs the vision tower (the decode
+        node of a PD-disaggregated deployment) can therefore reproduce the
+        prefill node's ``origin_input_ids`` exactly, which is what its KV cache
+        allocation is sized from.
+        """
+        image_sizes = [tuple(size) for size in image_sizes]
+        return (
+            _expand_k3_media_prompt_token_ids(
+                input_ids,
+                self.mm_tokens.image_token_id,
+                self._processor.image_token_counts_from_sizes(image_sizes),
+                image_sizes,
+                self._tokenizer,
+            )
+            .flatten()
+            .tolist()
+        )
+
+    @staticmethod
+    def compute_num_tokens_per_item(model, mm_item) -> int:
+        """Number of LLM-visible tokens a single mm_item produces.
+
+        K3's projector merges each ``merge_kernel_size`` patch block into one
+        token, so grid ``[t, h, w]`` yields ``(h // merge_h) * (w // merge_w)``.
+        """
+        from sglang.srt.disaggregation.encode_utils import get_image_grid_dim
+
+        grid_dim = get_image_grid_dim(mm_item)
+        if not isinstance(grid_dim, torch.Tensor):
+            grid_dim = torch.tensor(grid_dim)
+        if grid_dim.dim() == 1:
+            grid_dim = grid_dim.unsqueeze(0)
+
+        merge_h, merge_w = model.config.vision_config.merge_kernel_size
+        return sum(
+            (int(g[1]) // merge_h) * (int(g[2]) // merge_w) for g in grid_dim
+        )
+
+    # Video hooks the encode server resolves through the architecture registry
+    # (disaggregation/gpu_processor_registry.py), so they must be statics. K3's
+    # released vision processor has no video branch, but the frame math is
+    # identical to K2.5's, so it is reused. Decoded frames are RGB, so K3's
+    # image-only transparent-background compositing has nothing to do here.
+
+    @staticmethod
+    def create_video_preprocess_config(
+        hf_processor, device: torch.device
+    ) -> KimiK25VideoPreprocessConfig:
+        """Read the checkpoint's video knobs into a GPU-ready config."""
+        return KimiK25VLImageProcessor.create_video_preprocess_config(
+            hf_processor, device
+        )
+
+    @staticmethod
+    def gpu_preprocess_video_chunk(
+        frames: torch.Tensor, config: KimiK25VideoPreprocessConfig
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resize, normalize and patchify one temporal chunk of frames."""
+        return KimiK25VLImageProcessor.gpu_preprocess_video_chunk(
+            frames=frames, config=config
+        )
+
+    @staticmethod
+    def get_video_compute_weight(config: KimiK25VideoPreprocessConfig) -> int:
+        """Per-chunk compute multiplier for the encoder's free_tokens scheduler."""
+        return KimiK25VLImageProcessor.get_video_compute_weight(config)
+
+    @staticmethod
+    def get_temporal_merge_kernel_size(
+        config: KimiK25VideoPreprocessConfig,
+    ) -> int:
+        """Number of frames the vision tower pools into one temporal chunk."""
+        return KimiK25VLImageProcessor.get_temporal_merge_kernel_size(config)
+
+    @staticmethod
+    def compute_frame_sampling(
+        num_frames: int, avg_fps: float, sample_fps: float
+    ) -> List[int]:
+        """Uniform frame indices to decode for the requested sample rate."""
+        return KimiK25VLImageProcessor.compute_frame_sampling(
+            num_frames, avg_fps, sample_fps
+        )
+
+    @staticmethod
+    def compute_chunk_timestamps(
+        frame_indices: List[int],
+        avg_fps: float,
+        tmks: int,
+        timestamp_mode: str = "mm:ss",
+    ) -> List[str]:
+        """Render one framed media prompt per temporal chunk.
+
+        The only place K3's video prompt contract is expressed. K3 publishes no
+        video framing of its own, so this provisionally follows K2.5's format;
+        change it here alone once the contract is confirmed.
+        """
+        return KimiK25VLImageProcessor.compute_chunk_timestamps(
+            frame_indices, avg_fps, tmks, timestamp_mode
+        )
+
     def get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
         output = self._build_kimi_mm_data_from_grids(
@@ -400,15 +547,12 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         )
         image_sizes = kwargs.get("original_image_sizes")
         if image_sizes is None:
+            # Video-only: the encode server already framed every chunk.
             return output
 
         counts = [self._num_image_tokens_from_grid(grid) for grid in img_grid_thw]
-        if len(image_sizes) != len(counts):
-            raise ValueError(
-                "Expected one original image size for each K3 encoder grid."
-            )
         output.input_ids = (
-            _expand_k3_image_prompt_token_ids(
+            _expand_k3_media_prompt_token_ids(
                 prompt,
                 self.mm_tokens.image_token_id,
                 counts,

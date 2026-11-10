@@ -167,3 +167,56 @@ class KimiK3Config(PretrainedConfig):
     @property
     def vocab_size(self) -> int:
         return self.text_config.vocab_size
+
+
+# dsa_config key -> flat DSA attribute name read by the DeepSeek DSA helpers
+# (configs/model_config.py get_dsa_* / dsa_layer_skips_topk, Indexer).
+_K31_DSA_ATTR_MAP = {
+    "index_topk": "index_topk",
+    "index_head_dim": "index_head_dim",
+    "index_num_heads": "index_n_heads",
+    "index_rope_dim": "index_rope_head_dim",
+    "index_k_norm_type": "index_k_norm_type",
+    "index_topk_freq": "index_topk_freq",
+    "index_skip_topk_offset": "index_skip_topk_offset",
+    "indexer_use_fp8": "indexer_use_fp8",
+}
+
+
+def _flatten_k31_dsa_config(text_config: KimiLinearConfig) -> None:
+    dsa_config = getattr(text_config, "dsa_config", None)
+    if not dsa_config:
+        return
+    for src, dst in _K31_DSA_ATTR_MAP.items():
+        if src in dsa_config:
+            setattr(text_config, dst, dsa_config[src])
+    full_attn_layers = (text_config.linear_attn_config or {}).get(
+        "full_attn_layers"
+    )
+    dsa_layers = dsa_config.get("dsa_layers")
+    if dsa_layers is not None and full_attn_layers is not None:
+        if sorted(dsa_layers) != sorted(full_attn_layers):
+            raise ValueError(
+                "Kimi-K3.1 expects a DSA indexer on every full-attention (MLA) "
+                f"layer; got dsa_layers={dsa_layers} "
+                f"full_attn_layers={full_attn_layers}."
+            )
+
+
+class KimiK31Config(KimiK3Config):
+    """Kimi-K3.1: Kimi-K3 + a DeepSeek-V3.2-style DSA indexer on every MLA layer.
+
+    The checkpoint nests the indexer params under ``text_config.dsa_config``;
+    they are flattened onto the text config (which the MLA layers consume) and
+    mirrored on this top-level config (which the KV-pool / attention-backend
+    DSA helpers read via ``model_config.hf_config``).
+    """
+
+    model_type = "kimi_k31"
+
+    def __init__(self, text_config=None, **kwargs):
+        super().__init__(text_config=text_config, **kwargs)
+        _flatten_k31_dsa_config(self.text_config)
+        for dst in _K31_DSA_ATTR_MAP.values():
+            if hasattr(self.text_config, dst):
+                setattr(self, dst, getattr(self.text_config, dst))
