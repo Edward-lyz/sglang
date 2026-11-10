@@ -25,10 +25,10 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
+    InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
     MatchResult,
-    InitLoadBackParams
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -256,7 +256,9 @@ class AsRadixCache(RadixCache):
     def cache_finished_req(self, req, is_insert: bool = True):
         """Cache finished request, then report to AS."""
         all_tokenids_len = len(req.origin_input_ids) + len(req.output_ids)
-        snapshot = self.req_to_token_pool.req_to_token[req.req_pool_idx, :all_tokenids_len].clone()
+        snapshot = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :all_tokenids_len
+        ].clone()
         # Standard radix tree insert
         super().cache_finished_req(req, is_insert)
 
@@ -474,15 +476,18 @@ class AsRadixCache(RadixCache):
 
         # Compute the final tree-key length the way RadixCache.insert will:
         # bigram view shrinks raw N to N-1, then page-align.
-        bigram_len = (
-            max(0, len(token_ids) - 1) if self.is_eagle else len(token_ids)
-        )
+        bigram_len = max(0, len(token_ids) - 1) if self.is_eagle else len(token_ids)
         final_key_len = bigram_len // self.page_size * self.page_size
 
         if final_key_len == 0:
             # No keys after page alignment — free all loaded indices
             self.token_to_kv_pool_allocator.free(loaded_indices)
-            return torch.empty((0,), dtype=loaded_indices.dtype, device=loaded_indices.device), last_host_node
+            return (
+                torch.empty(
+                    (0,), dtype=loaded_indices.dtype, device=loaded_indices.device
+                ),
+                last_host_node,
+            )
 
         # Build value: local prefix kv_indices + AS loaded kv_indices, sized
         # to the actual tree-key length so RadixCache.insert won't truncate.
@@ -538,9 +543,7 @@ class AsRadixCache(RadixCache):
             if tree_as_indices.numel() == loaded_indices.numel():
                 displaced_mask = tree_as_indices != loaded_indices
                 if bool(displaced_mask.any()):
-                    self.token_to_kv_pool_allocator.free(
-                        loaded_indices[displaced_mask]
-                    )
+                    self.token_to_kv_pool_allocator.free(loaded_indices[displaced_mask])
                     loaded_indices = tree_as_indices
 
         logger.debug(
@@ -692,14 +695,14 @@ class AsRadixCache(RadixCache):
         try:
             t0 = time.perf_counter()
             read_count = self.ascli.read(
-                self.layer_ids,
-                as_block_hashs,
-                start_block,
-                self.k_buffer_ptrs,
-                self.v_buffer_ptrs,
-                data_id_list,
-                1,  # read_flag
-                remote_addr,
+                layer_ids=self.layer_ids,
+                tokens=as_block_hashs,
+                start_transfer_block_index=start_block,
+                k_dest_ptrs=self.k_buffer_ptrs,
+                v_dest_ptrs=self.v_buffer_ptrs,
+                data_id_list=data_id_list,
+                timeout=1,
+                remote_addrs=remote_addr,
             )
             t1 = time.perf_counter()
             logger.info(f"AS read: count={read_count}, cost={(t1 - t0) * 1000:.2f}ms")
@@ -775,15 +778,15 @@ class AsRadixCache(RadixCache):
         try:
             t0 = time.perf_counter()
             w_res = self.ascli.write(
-                task.layer_ids,
-                task.as_block_hashs,
-                0,  # start_block_index
-                task.k_buffer_ptrs,
-                task.v_buffer_ptrs,
-                task.data_id_list,
-                1,  # timeout
-                False,  # h2h_copy
-                task.write_params,
+                layer_ids=task.layer_ids,
+                tokens=task.as_block_hashs,
+                start_transfer_block_index=0,
+                k_data_ptrs=task.k_buffer_ptrs,
+                v_data_ptrs=task.v_buffer_ptrs,
+                data_id_list=task.data_id_list,
+                timeout=1,
+                h2h_copy=False,
+                params=task.write_params,
             )
             t1 = time.perf_counter()
 
@@ -797,7 +800,7 @@ class AsRadixCache(RadixCache):
             logger.warning(f"AS write failed: {e}")
             return 0
 
-    def _write_kv_on_finish(self, req, snapshot : Optional[torch.Tensor] = None):
+    def _write_kv_on_finish(self, req, snapshot: Optional[torch.Tensor] = None):
         """Submit KV write task to async executor after request completion.
 
         Key points:
