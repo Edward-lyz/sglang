@@ -110,9 +110,13 @@ def _combine_topk_swa_indices_kernel(
     swa_start = swa_base + pos - swa_len + 1 - gather_start
     swa_vals = swa_start[:, None] + (offset - topk_len[:, None])
     in_swa = offset < (topk_len + swa_len)[:, None]
+    # A request's compressed region holds seq_len // COMPRESS_RATIO rows; an index
+    # past it (e.g. from NaN logits) stays -1 instead of reading the next
+    # request's rows or the SWA region.
+    topk_ok = (topk_vals >= 0) & (topk_vals < (seq_len // COMPRESS_RATIO)[:, None])
     vals = tl.where(
         in_topk,
-        tl.where(topk_vals >= 0, topk_vals + compressed_base[:, None], -1),
+        tl.where(topk_ok, topk_vals + compressed_base[:, None], -1),
         tl.where(in_swa, swa_vals, -1),
     )
     tl.store(

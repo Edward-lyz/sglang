@@ -759,6 +759,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     precompile_kernels_after_loading = (
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
     )
+    # vllm#60468: the draft's own MegaMoE / mega gate variants (its own experts
+    # and top-k) are compiled by the same warmup.
+    warmup_deepgemm_mega_kernels = DeepseekV4ForCausalLM.warmup_deepgemm_mega_kernels
+    _warmup_mega_mhc = DeepseekV4ForCausalLM._warmup_mega_mhc
 
     @classmethod
     def shared_experts_fusion_disable_reason(
@@ -989,6 +993,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "(call attach_shared_modules first)."
             )
         x = self.embed_tokens(input_ids)
+        if envs.SGLANG_OPT_DSPARK_EMBED_HC_BROADCAST.get():
+            # Same contiguous [T, hc_mult, H] copy as repeat(): the stages'
+            # fused mHC kernels flatten the hc dim, so an expand() view is not
+            # an option.
+            from sglang.kernels.ops.layernorm.mhc import hc_broadcast
+            from sglang.srt.utils.community_opt import log_community_opt_once
+
+            log_community_opt_once(
+                "vllm#53972 dspark_embed_hc_broadcast",
+                "DSpark draft initial mHC residual via Triton hc_broadcast "
+                "(tokens=%d, hc_mult=%d)",
+                x.shape[0],
+                self.hc_mult,
+            )
+            return hc_broadcast(x, self.hc_mult)
         x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
         return x
 

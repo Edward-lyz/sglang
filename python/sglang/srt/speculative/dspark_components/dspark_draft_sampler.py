@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
+    greedy_step_argmax,
     select_draft_hidden_without_anchor,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
@@ -32,7 +33,7 @@ def _base_logits_dtype(model) -> torch.dtype:
 
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
     del step_idx
-    return torch.argmax(step_logits, dim=-1)
+    return greedy_step_argmax(step_logits)
 
 
 class DsparkDraftSampler:

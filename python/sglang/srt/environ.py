@@ -563,6 +563,16 @@ class Envs:
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
+    # vLLM #53972 (light part): build the draft's initial mHC residual with the
+    # Triton hc_broadcast instead of unsqueeze().repeat(). Bit-identical.
+    SGLANG_OPT_DSPARK_EMBED_HC_BROADCAST = EnvBool(True)
+    # vLLM #58631: trim per-step host work when building the draft ForwardBatch
+    # (skip the overwritten num_token_non_padded H2D, one H2D for gnt and
+    # gnt_logprob, max-seq-len assert only under debug logging). Bit-identical.
+    SGLANG_OPT_DSPARK_DRAFT_HOST_TRIM = EnvBool(True)
+    # vLLM #57770: greedy draft step argmax via the split-vocab row_argmax under
+    # its exact (NaN / lowest-index tie) gate; torch.argmax otherwise.
+    SGLANG_OPT_DSPARK_GREEDY_ROW_ARGMAX = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     # With the TP-sharded markov_w2, gather each step's vocab-parallel logits over
@@ -1732,6 +1742,13 @@ class Envs:
     # loading: cached checkpoint pages fragment host memory and starve the 512 MiB
     # huge-page faults. Costs the next restart its warm page cache.
     SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
+    # vllm#59923 + #58766: shard the HBM engram tables on hash-column boundaries
+    # and move each looked-up row once, as packed fp8 bytes + e8m0 scales, to its
+    # token's rank with one all-to-all (dp-attention decode, interleave CP
+    # prefill); wkv then consumes the rows as MXFP8 with no dequant / requant.
+    # wkv outputs are bit-identical to the bf16 lookup path. Not used with the
+    # host table.
+    SGLANG_OPT_DSV41_ENGRAM_PACKED_A2A = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # Community #41660: fused c1/c2 compressor for eager extend (non-CP and, locally, the CP
@@ -1740,9 +1757,31 @@ class Envs:
     # vllm#59119: expand_prefill_causally kernel without bs/num_tokens/total_tokens
     # specialization and BS_P2 >= 64, so prefill steps stop compiling new variants.
     SGLANG_OPT_DSV4_EXPAND_PREFILL_NO_RESPECIALIZE = EnvBool(True)
+    # vllm#59131: the ratio-1/2 consumer layers of one kv_source reuse the
+    # compressed KV the source layer gathered into the sparse-prefill workspace,
+    # and reuse the combined indices until an index_source layer rewrites top-k.
+    SGLANG_OPT_DSV41_PREFILL_KV_REUSE = EnvBool(True)
+    # Debug: on every reuse, gather again into scratch and require bitwise equality.
+    SGLANG_COMMUNITY_SELFCHECK_KV_REUSE = EnvBool(False)
+    # vllm#59131: gather sum(seq_len // ratio) compressed rows (requests with rows
+    # on this rank only) instead of num_reqs * (max_seq_len // ratio).
+    SGLANG_OPT_DSV4_COMPACT_COMPRESSED_GATHER = EnvBool(True)
     # vllm#55061: the fp8 dequant gather (V4 584-byte and V4.1 fp8 pages) handles
     # 4 rows per program instead of one (bitwise identical).
     SGLANG_OPT_DSV41_DEQUANT_ROWS_PER_CTA = EnvBool(True)
+    # vLLM #59894: under decoder SWA bounded replay the last kv_source layer writes
+    # its KV (SWA, compressed, index K) for every row, then runs as the first tail
+    # layer. Off by default: its tail rows move from the sparse-prefill attention
+    # kernel to the dense one the later tail layers use, so outputs are not bitwise.
+    SGLANG_OPT_DSV41_DECODER_REPLAY_TRIM_CUT = EnvBool(False)
+    # vllm#60118 (bf16 baseline): generic bf16 wo_a bmm writes token-major [T, G, R]
+    # so wo_b's input flatten is a view, not a strided copy (bit-identical).
+    SGLANG_OPT_DSV41_WO_A_TOKEN_MAJOR = EnvBool(True)
+    # vllm#55575: DSPARK aux-capture layers (37-39) keep the fused mega_mhc FFN->attn
+    # boundary and take the aux hidden state from its residual output. Off: mega_mhc
+    # is not bit-identical to hc_post/_hc_combine/_hc_mix_stats (~1 bf16 ulp on
+    # ~1e-5 of the residual, fp32-level on the mixes).
+    SGLANG_OPT_DSV41_DSPARK_AUX_FROM_MEGA_MHC = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
