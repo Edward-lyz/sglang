@@ -3,7 +3,7 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -162,6 +162,44 @@ def contiguous_run_starts_and_counts(
     starts = np.concatenate((np.zeros(1, dtype=np.int64), brk))
     bounds = np.concatenate((starts, np.array([src.size], dtype=np.int64)))
     return src[starts], dst[starts], np.diff(bounds)
+
+
+def build_paged_transfer_descriptors(
+    *,
+    src_ptrs: Sequence[int],
+    dst_ptrs: Sequence[int],
+    item_lens: Sequence[int],
+    src_indices: npt.NDArray[np.int32],
+    dst_indices: npt.NDArray[np.int32],
+) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Entry-major, run-minor RDMA descriptors for a paged flat transfer.
+
+    One buffer entry (typically one layer) is described by ``(src_ptr, dst_ptr,
+    item_len)``; every entry ships the same page index pairs. Replaces the
+    per-(entry, run) Python tuple loop with a single ``(E, R)`` broadcast, so the
+    number of Python objects created while holding the GIL is O(1) rather than
+    O(E*R) -- the transfer call itself releases the GIL, the descriptor build did
+    not.
+
+    The output order is entry-major, run-minor -- the same order the tuple loop
+    appended in, and part of the contract: callers pass these straight to
+    ``batch_transfer_sync``.
+
+    Arithmetic is ``int64``, not Python's arbitrary precision. ``ptr + index *
+    item_len`` is a host virtual address plus a buffer offset, orders of
+    magnitude below 2**63, so this cannot overflow in practice.
+    """
+    src_starts, dst_starts, counts = contiguous_run_starts_and_counts(
+        src_indices, dst_indices
+    )
+    if counts.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return empty, empty.copy(), empty.copy()
+
+    item = np.asarray(item_lens, dtype=np.int64)[:, None]
+    src = np.asarray(src_ptrs, dtype=np.int64)[:, None] + src_starts[None, :] * item
+    dst = np.asarray(dst_ptrs, dtype=np.int64)[:, None] + dst_starts[None, :] * item
+    return src.ravel(), dst.ravel(), (counts[None, :] * item).ravel()
 
 
 @dataclasses.dataclass(frozen=True)

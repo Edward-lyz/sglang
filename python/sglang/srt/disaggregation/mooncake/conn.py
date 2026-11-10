@@ -36,14 +36,14 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     build_dcp_replicated_token_transfer_plan,
     build_dcp_token_transfer_plan,
+    build_paged_transfer_descriptors,
     contiguous_run_starts_and_counts,
-    group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mooncake.target_parallel_transfer import (
     PerTargetKVChunk,
-    enqueue_target_parallel_chunks,
+    maybe_enqueue_target_parallel_chunks,
     process_target_parallel_chunk,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
@@ -250,10 +250,19 @@ class MooncakeKVManager(CommonKVManager):
             self.session_cooldowns: dict[str, float] = {}  # 【新增】专门用于记录失败时间戳的字典
             self.session_cooldown_seconds = float(os.getenv("SGLANG_MOONCAKE_COOLDOWN", "120.0"))
             self.session_lock = threading.Lock()
-            # Opt-in per-destination fan-out; see mooncake/target_parallel_transfer.py.
-            # Off means the whole-room path below runs exactly as before.
+            # Two independent knobs, both off by default; see
+            # mooncake/target_parallel_transfer.py.
+            #   - room sharding picks a chunk's queue by room, so different rooms of
+            #     this rank run on different worker threads;
+            #   - target parallel additionally splits one room's multi-destination
+            #     fan-out into one work unit per destination.
+            # The fan-out shards by room too, so it implies room sharding.
             self.enable_target_parallel_transfer = (
                 envs.SGLANG_PP_PD_KV_TRANSFER_TARGET_PARALLEL.get()
+            )
+            self.enable_room_queue_sharding = (
+                envs.SGLANG_PP_PD_KV_TRANSFER_ROOM_SHARDING.get()
+                or self.enable_target_parallel_transfer
             )
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -263,6 +272,14 @@ class MooncakeKVManager(CommonKVManager):
             if transfer_thread_pool_size is None:
                 transfer_thread_pool_size = min(max(4, int(0.5 * cpu_count) // 8), 12)
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+            if self.enable_room_queue_sharding and transfer_queue_size <= 1:
+                # Both knobs only buy parallelism by spreading over queues, and each
+                # queue owns exactly one worker thread.
+                logger.warning(
+                    f"SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size} leaves "
+                    "nothing to spread over; room sharding / per-target fan-out are "
+                    "requested but every transfer still runs on one worker thread."
+                )
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
@@ -759,11 +776,6 @@ class MooncakeKVManager(CommonKVManager):
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V.
         """
-        # Group by indices for optimization
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_data_indices, dst_data_indices
-        )
-
         layers_params = None
 
         # Decode pp size should be equal to prefill pp size or 1
@@ -823,39 +835,34 @@ class MooncakeKVManager(CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
         assert layers_params is not None
+        if not layers_params:
+            return 0
 
-        def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, item_len: int
-        ) -> List[Tuple[int, int, int]]:
-            transfer_blocks = []
-            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
-            return transfer_blocks
-
-        # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
-
-        # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
-            transfer_blocks = []
-            for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+        src_ptrs, dst_ptrs, entry_item_lens = zip(*layers_params)
+        src_addrs, dst_addrs, lengths = build_paged_transfer_descriptors(
+            src_ptrs=src_ptrs,
+            dst_ptrs=dst_ptrs,
+            item_lens=entry_item_lens,
+            src_indices=prefill_data_indices,
+            dst_indices=dst_data_indices,
+        )
+        if lengths.size == 0:
+            return 0
 
         if self.enable_custom_mem_pool:
+            # One transfer per entry so the custom (NVLINK) memory pool can
+            # overlap them. The descriptors are entry-major, so entry i owns the
+            # i-th slice of runs -- a view, no copy.
+            runs_per_entry = lengths.size // len(layers_params)
             futures = [
                 executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
+                    self._transfer_data_arrays,
+                    mooncake_session_id,
+                    src_addrs[start : start + runs_per_entry],
+                    dst_addrs[start : start + runs_per_entry],
+                    lengths[start : start + runs_per_entry],
                 )
-                for (src_ptr, dst_ptr, item_len) in layers_params
+                for start in range(0, lengths.size, runs_per_entry)
             ]
             for future in concurrent.futures.as_completed(futures):
                 status = future.result()
@@ -864,10 +871,12 @@ class MooncakeKVManager(CommonKVManager):
                         f.cancel()
                     return status
             return 0
-        else:
-            # Combining all layers' params in one batch transfer is more efficient
-            # compared to using multiple threads
-            return process_layers(layers_params)
+
+        # Combining all layers' params in one batch transfer is more efficient
+        # compared to using multiple threads
+        return self._transfer_data_arrays(
+            mooncake_session_id, src_addrs, dst_addrs, lengths
+        )
 
     def send_kvcache(
         self,
@@ -2639,7 +2648,7 @@ class MooncakeKVManager(CommonKVManager):
             trace_ctx = TraceNullContext()
 
         if self.enable_target_parallel_transfer:
-            enqueue_target_parallel_chunks(
+            handled = maybe_enqueue_target_parallel_chunks(
                 self,
                 bootstrap_room=bootstrap_room,
                 kv_indices=kv_indices,
@@ -2650,16 +2659,12 @@ class MooncakeKVManager(CommonKVManager):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
             )
-            return
+            # Declined when the room has fewer than two real destinations: there is
+            # no fan-out to parallelize, so it takes the whole-room path below.
+            if handled:
+                return
 
-        # NOTE(shangming): sharding according to the dst_infos to make sure
-        # requests with the same dst_sessions will be added into the same
-        # queue, which enables early abort with failed sessions.
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
-
-        self.transfer_queues[shard_idx].put(
+        self.transfer_queues[self._transfer_queue_shard_idx(bootstrap_room)].put(
             TransferKVChunk(
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
@@ -2671,6 +2676,31 @@ class MooncakeKVManager(CommonKVManager):
                 trace_ctx=trace_ctx,
             )
         )
+
+    def _transfer_queue_shard_idx(self, bootstrap_room: int) -> int:
+        """Pick the transfer queue -- hence the worker thread -- for a whole-room chunk.
+
+        Both keys depend only on values that are constant across a room's chunks,
+        which the transfer path requires: only the last chunk concludes the room, so
+        the earlier chunks must stay ordered ahead of it on one queue.
+
+        Room sharding spreads this rank's concurrent rooms over the workers.
+        ``hash(int)`` is ``mod (2**61 - 1)`` and ignores PYTHONHASHSEED, so the
+        spread is uniform and reproducible across processes. The legacy key instead
+        sums the destination rpc ports, which is identical for every room whenever
+        the decode fleet is fixed, collapsing all rooms onto one worker. Its stated
+        purpose -- early abort on a failed session -- does not depend on co-location:
+        ``failed_sessions`` is shared under ``session_lock``, so any worker sees it.
+        """
+        if self.enable_room_queue_sharding:
+            return hash(bootstrap_room) % len(self.transfer_queues)
+
+        # NOTE(shangming): sharding according to the dst_infos to make sure
+        # requests with the same dst_sessions will be added into the same
+        # queue, which enables early abort with failed sessions.
+        dst_infos = self.transfer_infos[bootstrap_room].keys()
+        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
+        return session_port_sum % len(self.transfer_queues)
 
     def get_session_id(self):
         return self.engine.get_session_id()

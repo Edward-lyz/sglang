@@ -3,9 +3,17 @@
 Opt-in via ``SGLANG_PP_PD_KV_TRANSFER_TARGET_PARALLEL``. When enabled, a chunk's
 multi-destination fan-out is expanded at enqueue time into one work unit per
 decode destination, so the existing worker threads transfer to different decode
-ranks in parallel. This also replaces the legacy shard key (sum of the
-destination rpc ports), which is constant whenever the decode fleet is fixed --
-e.g. decode DCP -- and collapses every room onto a single queue/worker.
+ranks in parallel.
+
+This covers **only** the fan-out of one room. Spreading *different* rooms over the
+worker threads is a separate concern, owned by
+``SGLANG_PP_PD_KV_TRANSFER_ROOM_SHARDING`` and applied in
+``MooncakeKVManager._transfer_queue_shard_idx``; the fan-out shards by room as
+well, so enabling it forces that knob on. Keeping them apart matters because the
+deployments that need them are disjoint: a decode fleet with one destination per
+room (plain DP) needs only the room sharding, while the fan-out only pays off when
+a room really has several destinations (e.g. decode DCP). Accordingly a room with
+fewer than two real destinations is declined here and takes the whole-room path.
 
 **This module deliberately duplicates the per-destination body of
 ``MooncakeKVManager.transfer_worker``.** The legacy whole-room path in `conn.py`
@@ -103,7 +111,7 @@ class PerTargetKVChunk(TransferKVChunk):
     completion: Optional[_RoomCompletion] = None
 
 
-def enqueue_target_parallel_chunks(
+def maybe_enqueue_target_parallel_chunks(
     mgr: "MooncakeKVManager",
     *,
     bootstrap_room: int,
@@ -114,11 +122,25 @@ def enqueue_target_parallel_chunks(
     state_indices: Optional[List],
     num_kv_tokens: Optional[int],
     trace_ctx: TraceCtx,
-) -> None:
+) -> bool:
     """Expand a chunk into one work unit per real decode destination.
 
+    Returns True once the units are enqueued, False to decline -- the caller then
+    falls back to the whole-room path. **A room with fewer than two real
+    destinations is always declined**, even with the flag on: there is no fan-out
+    to parallelize, so the units would only add a ``_RoomCompletion`` and a second
+    code path over the well-trodden one. That covers both the single-destination
+    room (plain decode DP -- the common case, where the win comes from room
+    sharding instead) and the dummy-only room, whose Success the whole-room worker
+    already concludes.
+
+    A room cannot flip between the two paths mid-flight: ``transfer_infos[room]``
+    is complete and ``is_dummy`` resolved before the room reaches
+    ``WaitingForInput``, i.e. before its first chunk is enqueued.
+
     Sharding is ``(hash(room) + ordinal) % n_queues``: ``hash(room)`` spreads
-    different rooms over the queues, and the ordinal walks a room's own
+    different rooms over the queues -- the same key the whole-room path uses under
+    ``SGLANG_PP_PD_KV_TRANSFER_ROOM_SHARDING`` -- and the ordinal walks a room's own
     destinations onto consecutive queues. Two properties fall out of that:
 
     - as long as ``n_targets <= n_queues``, the fan-out occupies exactly
@@ -138,14 +160,8 @@ def enqueue_target_parallel_chunks(
     real_sessions = sorted(
         sid for sid, info in room_infos.items() if not info.is_dummy
     )
-
-    # Dummy destinations need no transfer at all: the decode side is not using
-    # this rank's KV, and no status sync is expected for them. A room made only of
-    # dummies concludes right here -- matching the legacy worker's dummy branch.
-    if not real_sessions:
-        if is_last_chunk and bootstrap_room in mgr.request_status:
-            mgr.update_status(bootstrap_room, KVPoll.Success)
-        return
+    if len(real_sessions) < 2:
+        return False
 
     # Shared by the sibling units of this chunk only; the middle chunks never
     # conclude a room and so need no tracker.
@@ -173,6 +189,7 @@ def enqueue_target_parallel_chunks(
                 completion=completion,
             )
         )
+    return True
 
 
 def process_target_parallel_chunk(

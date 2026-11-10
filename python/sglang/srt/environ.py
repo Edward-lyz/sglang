@@ -414,11 +414,20 @@ class Envs:
     # First phase supports mooncake only, without speculative decoding,
     # return_logprob, return_sampling_mask or grammar.
     SGLANG_PP_PD_PREFILL_EARLY_LAST_CHUNK = EnvBool(False)
+    # PP + PD prefill (mooncake): pick a chunk's transfer queue by
+    # ``hash(bootstrap_room)`` instead of by the legacy key (sum of the
+    # destination rpc ports). The legacy key is identical for every room whenever
+    # the decode fleet is fixed, so all of a prefill rank's rooms collapse onto one
+    # queue -- one worker thread -- and serialize behind each other. Independent of
+    # the fan-out below, but implied by it (the fan-out shards by room as well).
+    SGLANG_PP_PD_KV_TRANSFER_ROOM_SHARDING = EnvBool(False)
     # PP + PD prefill (mooncake): expand a chunk's multi-destination fan-out into
     # one transfer queue entry per decode destination, so the fan-out runs on
-    # several worker threads instead of serially inside one. Also replaces the
-    # legacy shard key (sum of destination rpc ports), which is constant for a
-    # fixed decode fleet and collapses every room onto one queue. Kill-switch: set
+    # several worker threads instead of serially inside one. Only rooms with two or
+    # more real destinations take this path; a single-destination room (e.g. decode
+    # DP without DCP) has nothing to parallelize and keeps the whole-room path, with
+    # SGLANG_PP_PD_KV_TRANSFER_ROOM_SHARDING above choosing its queue. Forces that
+    # knob on, since the fan-out's shard key is the room-based one. Kill-switch: set
     # to 0 to restore the byte-identical legacy whole-room path.
     SGLANG_PP_PD_KV_TRANSFER_TARGET_PARALLEL = EnvBool(False)
     # PP + PD prefill (mooncake): evaluate the "all PP ranks acknowledged this
