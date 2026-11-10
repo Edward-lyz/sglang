@@ -6,13 +6,11 @@ FROM iregistry.baidu-int.com/lyz/lmsysorg/sglang:dev-dsv41
 # 对应的 torch / sgl-kernel / flashinfer，所以这一层只做两件事：把 aiak_sglang 换进去，
 # 再补厂内环境需要的依赖。
 #
-# 和 kimi-k3 交付镜像相比，这里刻意少了两步：
-# 1. tokenspeed_mla 的精确除法 patch。那个包只在 aiak-inference-sglang 基础镜像里，
-#    社区镜像里没有，patch 会直接失败。
-# 2. kimi_k3 的 deep_gemm 预编译缓存。缓存是按 K3 编的，对 DSv4.1 无效。要给 DSv4.1
-#    做一份就用
-#      python3 -m sglang.compile_deep_gemm --model $path_to_dsv41 --tp 8 --trust-remote-code
-#    编出 ~/.cache/deep_gemm，打包上传后在这里加一段 wget + tar。
+# 和 kimi-k3 交付镜像相比，这里刻意少了一步：tokenspeed_mla 的精确除法 patch。
+# 那个包只在 aiak-inference-sglang 基础镜像里，社区镜像里没有，patch 会直接失败。
+#
+# deep_gemm 预编译缓存见文件末尾。kimi-k3 那份是按 K3 编的，对 DSv4.1 无效，
+# 这里换成 bzz2 prefill pod 上汇总出来的 DSv4.1-Flash 版本。
 ## ===========================================================================================
 
 
@@ -64,5 +62,18 @@ RUN set -eux; \
         pip install -e /sgl-workspace/sglang/python --no-deps --no-build-isolation
 
 RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/msit_llm-8.3.2-py3-none-any.whl onnx --no-deps
+
+# DSv4.1-Flash 的 JIT 预编译缓存：DeepGEMM cubin、Triton kernel、sgl-kernel JIT、tilelang。
+# 内容取自 bzz2 上跑过一轮 prefill 的 dsv41-flash pod 的 /root/.cache 与 /root/.tilelang，
+# 包内顶层就是 root/，所以解到 / 即落回原路径，省掉容器启动时的 kernel 编译。
+# 包里的 pip HTTP 缓存有 122MB 且运行时用不到，解包时排除，避免镜像白涨 120MB。
+#
+# 刷新方式：在 pod 上重新跑一轮 prefill，把 /root/.cache + /root/.tilelang 打包上传 BOS，
+# 再替换下面的 URL。包内路径约定不能变，第一步的测试会挡住路径不对的包。
+RUN wget -q -O /tmp/dsv41-flash-cache.tar.gz \
+        https://aihc-ai-datasets-bj.bj.bcebos.com/hac-aiacc/deepseek/deep_gemm_deepseekv41_flash_bzz2_cache_0918.tar.gz && \
+    tar -xzf /tmp/dsv41-flash-cache.tar.gz -C / --exclude='root/.cache/pip' && \
+    rm -f /tmp/dsv41-flash-cache.tar.gz && \
+    test -d /root/.cache/sglang/deep_gemm/cache && test -d /root/.tilelang/cache
 
 WORKDIR /sgl-workspace/sglang
