@@ -327,6 +327,7 @@ class DraftBlockProposer:
         dp_moe_sync: bool = False,
         dp_vocab_sync: bool = False,
         dp_graph_rows: Optional[int] = None,
+        dcp_enabled: bool = False,
         draft_window_size: Optional[int] = None,
         page_size: int = 1,
         resolve_target_req_to_token=None,
@@ -338,6 +339,12 @@ class DraftBlockProposer:
         self._mask_token_id = mask_token_id
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
+        # ROOT-FIX(luno-dcp-spec-rng): under DCP the shards of one request must
+        # draw identical draft coins. The in-graph sampler only has the default
+        # per-rank generator, so DCP sampling batches re-sample eagerly with the
+        # shared generator (get_spec_sample_generator). Without DCP there is no
+        # cross-rank RNG contract and the folded result is used as is.
+        self._eager_sampling_for_dcp = dcp_enabled
         self._dp_moe_sync = dp_moe_sync
         # The shared target lm_head shards its vocab over the global TP group
         # (dp attention without --enable-dp-lm-head): the base-logits path then
@@ -480,14 +487,17 @@ class DraftBlockProposer:
         folded_confidence = None
         confidence_tap = None
         folded = False
-        # ROOT-FIX(luno-dcp-spec-rng): only fold the draft sampler into the graph
-        # for all-greedy batches (deterministic argmax). Any sampling row must
-        # take the EAGER draft path below so its coins come from the shared
-        # cross-rank generator (get_spec_sample_generator); the in-graph sampler
-        # can only use the default per-rank generator, which desyncs DCP shards.
-        # all_greedy is a per-batch flag identical across shards, so every rank
-        # takes the same branch (no collective divergence).
-        if draft_sampler is not None and fwd.can_run_graph and all_greedy:
+        # The graph replay above already ran the folded sampler, including its
+        # base-logits collectives; the eager branch below issues another round.
+        # So the branch must be uniform across every lm-head collective group:
+        # - DCP: all members of a group serve the same batch, so the per-batch
+        #   all_greedy flag agrees and DCP sampling batches may go eager.
+        # - Pure DP (dcp=1): the DP-gathered vocab group spans different DP
+        #   batches (and idle ranks join with a dummy graph replay), so a
+        #   per-batch flag would desync the collectives and hang NCCL. Always
+        #   use the folded result here.
+        eager_resample = self._eager_sampling_for_dcp and not all_greedy
+        if draft_sampler is not None and fwd.can_run_graph and not eager_resample:
             folded = True
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),

@@ -258,6 +258,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
             dp_vocab_sync=self._dp_vocab_sync,
             dp_graph_rows=self._dp_graph_rows,
+            dcp_enabled=server_args.dcp_size > 1,
             draft_window_size=self.draft_window_size,
             page_size=self.page_size,
             resolve_target_req_to_token=lambda: (
