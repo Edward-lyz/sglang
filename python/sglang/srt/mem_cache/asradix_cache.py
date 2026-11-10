@@ -1193,6 +1193,11 @@ class AttentionStoreIntegrationMixin:
 
         start_block = local_hit_len // self.page_size
         hashes = req.as_block_hashs.hash_ids[start_block:]
+        # A checkpoint match is valid only for the hash at its returned endpoint.
+        # Apply the request's prefix limit before matching so a later checkpoint
+        # cannot be matched and then relabeled as an earlier prefix by truncation.
+        max_blocks = max((max_hit_len - local_hit_len) // self.page_size, 0)
+        hashes = hashes[:max_blocks]
         if not hashes:
             return None
 
@@ -1205,12 +1210,7 @@ class AttentionStoreIntegrationMixin:
             match_error = exc
             match_count = 0
 
-        match_count = self._tp_min(match_count)
-        max_blocks = max(
-            (len(req.full_untruncated_fill_ids) - local_hit_len - 1) // self.page_size,
-            0,
-        )
-        match_count = min(match_count, max_blocks)
+        match_count = min(self._tp_min(match_count), requested)
         if match_error is None:
             self._log_as_result(
                 "match",
