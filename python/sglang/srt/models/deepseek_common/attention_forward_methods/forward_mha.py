@@ -311,13 +311,14 @@ class DeepseekMHAForwardMixin:
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
+            # The pool layout, not the backend names, decides the format: the
+            # DSA-quantized 656 B/token layout (FP8 nope + scales + BF16 rope)
+            # needs dequantizing; the all-FP8 576 B/token layout (picked e.g.
+            # for trtllm prefill + flashmla_kv decode) is read and cast below.
             if (
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
-                and (
-                    not get_server_args().dsa_decode_backend == "trtllm"
-                    or not get_server_args().dsa_prefill_backend == "trtllm"
-                )
+                and getattr(get_token_to_kv_pool(), "dsa_kv_cache_store_fp8", False)
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
@@ -696,6 +697,9 @@ class DeepseekMHAForwardMixin:
         backend = get_attn_backend()
         if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
             backend = backend.primary
+        # Hybrid models (Kimi-K3.1: KDA + DSA) wrap the DSA backend, which owns
+        # the metadata; the wrapper only forwards use_mha.
+        backend = getattr(backend, "full_attn_backend", backend)
         kv_indices = backend.forward_metadata.page_table_1_flattened
         assert (
             kv_indices is not None
