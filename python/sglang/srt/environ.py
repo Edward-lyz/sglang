@@ -709,6 +709,23 @@ class Envs:
     # CP-group barriers around the read and cannot move off the scheduler
     # thread); each CP rank reads the full block set.
     SGLANG_ENABLE_AS_LOAD_BACK_ASYNC = EnvBool(False)
+    # Run the prefill forward on a dedicated worker thread so the scheduler
+    # thread can overlap the next batch's admission (get_next_batch + AS
+    # load-back submit + tree ops) with the in-flight forward. Only valid on a
+    # PREFILL disagg instance with pp=1 and enable_overlap: the forward's NCCL
+    # device_group is disjoint from the scheduler thread's gloo cpu_group
+    # collectives, and a prefill forward is read-only w.r.t. the KV allocator /
+    # radix tree / req_to_token. Off by default; gated in dispatch_event_loop so
+    # that with the flag unset the existing loop runs byte-identically (no thread
+    # spawned). See also SGLANG_PREFILL_FWD_THREAD_AHEAD.
+    SGLANG_ENABLE_PREFILL_FWD_THREAD = EnvBool(False)
+    # Step gate for SGLANG_ENABLE_PREFILL_FWD_THREAD. False: zero-overlap
+    # validation -- the scheduler blocks on each forward result immediately, so
+    # the forward merely runs on the worker thread with no concurrency (proves
+    # thread-safety, same perf). True: admit the next batch AHEAD while the
+    # current forward is in flight (the actual overlap win). Only read when
+    # SGLANG_ENABLE_PREFILL_FWD_THREAD is set.
+    SGLANG_PREFILL_FWD_THREAD_AHEAD = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime

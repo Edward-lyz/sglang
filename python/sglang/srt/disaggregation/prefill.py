@@ -19,6 +19,7 @@ Life cycle of a request in the prefill server
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 from array import array
@@ -696,6 +697,207 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
+    def _ensure_prefill_fwd_thread(self: Scheduler) -> None:
+        """Lazily start the forward worker thread (never created when the
+        SGLANG_ENABLE_PREFILL_FWD_THREAD gate is off, so the base loop is
+        untouched)."""
+        if getattr(self, "_fwd_thread", None) is not None:
+            return
+        import queue as _queue
+        import threading as _threading
+
+        self._fwd_in_q: _queue.Queue = _queue.Queue(maxsize=1)
+        self._fwd_out_q: _queue.Queue = _queue.Queue(maxsize=1)
+        self._fwd_thread = _threading.Thread(
+            target=self._prefill_fwd_thread_main, name="prefill_fwd", daemon=True
+        )
+        self._fwd_thread.start()
+
+    def _prefill_fwd_thread_main(self: Scheduler) -> None:
+        """Worker thread: bind the CUDA device, then run each submitted forward.
+
+        Safe to run off the scheduler thread because a prefill forward is
+        read-only w.r.t. the KV allocator / radix tree / req_to_token (those
+        mutate only on the scheduler thread), and the forward's NCCL
+        device_group is a distinct communicator from the gloo cpu_group every
+        scheduler-thread collective uses -- so the two threads never share a
+        communicator. The WAR barrier is recorded here, right after the
+        forward's shared reads, so it captures them before any slot reuse.
+        """
+        self.device_module.set_device(self.ps.gpu_id)
+        while True:
+            item = self._fwd_in_q.get()
+            if item is None:  # shutdown sentinel
+                return
+            batch, early_send_prefix = item
+            try:
+                result = self.run_batch(batch, early_send_prefix=early_send_prefix)
+                self._apply_war_barrier()
+                # Snapshot on the worker, after the forward's in-place SB edits
+                # and while only this thread owns the batch (the scheduler has
+                # moved on to the next admission), so the copy is race-free.
+                batch_copy = batch.copy()
+                self._fwd_out_q.put((result, batch_copy, None))
+            except BaseException as exc:  # relay to the scheduler thread
+                self._fwd_out_q.put((None, None, exc))
+
+    def _fwd_submit(self: Scheduler, batch, *, early_send_prefix: bool = True) -> None:
+        """Hand a batch to the forward thread (non-blocking)."""
+        self._ensure_prefill_fwd_thread()
+        self._fwd_in_q.put((batch, early_send_prefix))
+
+    def _fwd_collect(self: Scheduler):
+        """Block for the oldest submitted forward; return (result, batch_copy)
+        or re-raise its error."""
+        result, batch_copy, exc = self._fwd_out_q.get()
+        if exc is not None:
+            raise exc
+        return result, batch_copy
+
+    def _run_batch_on_fwd_thread(self: Scheduler, batch):
+        """Zero-overlap (Step 1): submit then block immediately, so the worker
+        and scheduler never run concurrently -- proves the forward is correct
+        off-thread with no perf change. Returns (result, batch_copy)."""
+        self._fwd_submit(batch)
+        return self._fwd_collect()
+
+    def _snapshot_batch_for_forward(self: Scheduler, batch):
+        """Independent-enough snapshot so the forward thread can read it while
+        the scheduler admits the next batch (Step 2).
+
+        A shallow ScheduleBatch copy already isolates every field admission
+        rebinds out of place: get_next / filter_batch rebind the LIVE batch's
+        attrs (reqs, seq_lens, req_pool_indices, sampling_info, ...), and this
+        copy is a distinct object that keeps the old refs. Only the in-place
+        mutations the forward actually reads need explicit isolation:
+
+        - sampling_info: filter_batch mutates it in place. The forward-only copy
+          drops the penalizer orchestrator (overlap-mode sampling reads the acc_*
+          buffers), leaving the live sampling_info's orchestrator intact for
+          admission's filter.
+        - spec_info: filter_batch mutates it in place when present.
+
+        The reqs list itself is NOT copied per-element: the forward reads only
+        batch-level tensors (input_ids / seq_lens / out_cache_loc / ...), never a
+        req's fill_ids, so admission's in-place edits to a chunked req don't race
+        it. Crucially, process_batch_result must see the LIVE req objects here so
+        its inflight_middle_chunks decrement lands on the same req the admission
+        increment did -- isolating the chunked req into a throwaway copy leaked
+        that decrement and left the live req wedged as a middle chunk forever
+        (orphaned req_to_token slot + KV, and 1-token admission thereafter).
+        """
+        snap = copy.copy(batch)
+        if batch.sampling_info is not None:
+            snap.sampling_info = batch.sampling_info.copy_for_forward()
+        if batch.spec_info is not None:
+            snap.spec_info = copy.copy(batch.spec_info)
+        return snap
+
+    def event_loop_overlap_disagg_prefill_threaded(self: Scheduler) -> None:
+        """SGLANG_ENABLE_PREFILL_FWD_THREAD: run the forward on a worker thread.
+
+        AHEAD off (Step 1): zero-overlap validation -- submit and block.
+        AHEAD on (Step 2): admit the NEXT batch while the current forward is in
+        flight, so the loop-top retire/ingest/admission overlap the previous
+        forward. Safe on a prefill P instance (forward read-only w.r.t.
+        allocator/tree/req_to_token; NCCL group disjoint from the scheduler
+        thread's gloo collectives; read slots stay tree-locked until their
+        pipelined process_batch_result).
+        """
+        ahead = envs.SGLANG_PREFILL_FWD_THREAD_AHEAD.get()
+        self.result_queue = deque()
+        inflight = None  # live prev batch whose forward is on the worker (ahead)
+
+        while True:
+            self.retire_ascache_writes()
+            self.ingest_requests()
+            if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
+                continue
+            self.waiting_queue.extend(
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            )
+
+            plan = self.get_next_disagg_prefill_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
+            self.cur_batch_for_debug = batch
+
+            if not ahead:
+                if batch:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(batch)
+                    batch_result, batch_copy = self._run_batch_on_fwd_thread(batch)
+                    self.result_queue.append((batch_copy, batch_result))
+                else:
+                    batch_result = None
+                if self.last_batch:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
+                elif batch is None:
+                    self.on_idle()
+                self.process_disagg_prefill_inflight_queue()
+                self.launch_batch_sample_if_needed(batch_result, batch)
+                self.last_batch = batch
+                continue
+
+            # Step 2: admit-ahead. This iteration's retire / ingest / get_next
+            # above already ran WHILE the previous batch's forward was in flight.
+            # Only sampling must run with the worker idle: it uses forward_stream
+            # and future_map, which run_batch (worker) uses too. So: collect the
+            # previous forward, sample it, launch this batch's forward, and only
+            # THEN process the previous result, which overlaps the new forward
+            # (the base loop orders run_batch(N) before process(N-1) the same
+            # way). process touches neither forward_stream nor future_map; its
+            # radix inserts, SWA staging (side stream) and KV sends hit the
+            # previous batch's reqs, never what the new forward reads. Admission
+            # touches neither structure either (the future_map.stash paths are
+            # gated to non-overlap / mixed-decode, which never fire here).
+            prev_result = None
+            if inflight is not None:
+                prev_snap = inflight
+                prev_result, prev_result_copy = self._fwd_collect()
+                # prev_snap carries an independent sampling_info, so sampling the
+                # previous batch is correct even though get_next above already
+                # filtered its live batch.
+                self.launch_batch_sample_if_needed(prev_result, prev_snap)
+
+            if batch:
+                if self.enable_staging:
+                    self.maybe_prefetch_staging_for_batch(batch)
+                snap = self._snapshot_batch_for_forward(batch)
+                # Early-send the cached prefix here rather than inside run_batch,
+                # so the forward thread never races the send_kv_chunk that
+                # process_batch_result below issues for a continuing chunked req.
+                for req in snap.reqs:
+                    self.maybe_send_cached_prefix_chunk(req)
+                self._fwd_submit(snap, early_send_prefix=False)
+                new_inflight = snap
+            else:
+                new_inflight = None
+
+            if prev_result is not None:
+                # Worker's post-forward copy of the snapshot; finished reqs are
+                # the same objects, so KV-send / cache writes land on the real reqs.
+                self.process_batch_result(prev_result_copy, prev_result)
+            elif new_inflight is None:
+                self.on_idle()
+
+            # Drain KV transfers every iter (as the base loop does); pending
+            # sends must complete even when the pipeline momentarily has nothing
+            # in flight, or their requests never finish.
+            self.process_disagg_prefill_inflight_queue()
+
+            inflight = new_inflight
+            # Admission state only (no forward result); the next iter's
+            # get_next_batch must see this batch as last_batch.
+            self.last_batch = batch
+
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -767,14 +969,18 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
+        # Rescue every finished req's tail SWA window in ONE batched staging
+        # pass, before the per-req loop below submits any AttentionStore write
+        # (the write consumes the staged slots). The window is only HBM-resident
+        # this forward, so this must run before any early-continue below.
+        self.detect_and_may_copy_as_swa_batch(
+            [req for req in batch.reqs if req.inflight_middle_chunks <= 0]
+        )
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
-                # Before any early-continue below: the final chunk's SWA window is
-                # only resident right now, so rescue its checkpoints first.
-                self.detect_and_may_copy_as_swa(req)
 
                 if is_aborted(req):
                     if self._retire_aborted_prefill_result(req):
@@ -1557,7 +1763,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
             )
             if gather_stream is not None:
-                num_pages = kv_indices.numel() // page_size
+                num_pages = kv_to_page_num(kv_indices.numel(), page_size)
                 host_buf = self._sendkv_pinned_pages(num_pages, kv_indices)
                 with self.device_module.stream(gather_stream):
                     page_indices = kv_to_page_indices_pinned(

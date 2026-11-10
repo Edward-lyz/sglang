@@ -2154,7 +2154,6 @@ class Scheduler(
                 f"target={target_tail.num_pages}, draft={draft_tail.num_pages}"
             )
 
-    @profile_method("radix.as.swa_stage", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def detect_and_may_copy_as_swa(self, req: Req) -> None:
         """Rescue the tail SWA window at every swa_step checkpoint this request
         has now committed.
@@ -2165,12 +2164,23 @@ class Scheduler(
         it. A loop (not an ``if``) because one forward can cross several
         checkpoints.
         """
-        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        pool = getattr(kvcache, "chunk_tail_swa_pool", None)
-        if pool is None:
-            return
-        policy = kvcache.swa_policy
-        swa_win = pool.swa_win
+        self._stage_as_swa_copies([req])
+
+    def detect_and_may_copy_as_swa_batch(self, reqs: List[Req]) -> None:
+        """Batched ``detect_and_may_copy_as_swa`` for a whole finished batch.
+
+        Same per-req semantics, but resolves every req's checkpoints with ONE
+        gather + ONE host sync + ONE copy launch per pool instead of one set per
+        req. Must run before any AttentionStore write submits this round: the
+        write consumes the slots this stages.
+        """
+        self._stage_as_swa_copies(reqs)
+
+    def _plan_swa_copies(self, req: Req, policy, swa_win: int):
+        """Advance one req's checkpoint cursor; return its committed, live
+        checkpoints as ``(req, live_nos, tail_starts)`` or ``None``. Pure CPU:
+        no device work, so it carries no cross-req ordering constraint.
+        """
         # This branch has no ``Req.fill_ids`` attribute (that is master-v4's name):
         # the token array lives in ``full_untruncated_fill_ids`` and
         # ``get_fill_ids()`` slices it at ``extend_range.end``, i.e. exactly the
@@ -2178,72 +2188,102 @@ class Scheduler(
         # here would count tokens of later chunks as committed and stage a window
         # whose KV has not been written yet.
         committed_len = len(req.get_fill_ids())
+        first = req.as_swa_copy_count
+        while req.as_swa_copy_count < len(req.as_swa_kv_slots):
+            if policy.checkpoint_pos(req.as_swa_copy_count) > committed_len:
+                # Not committed yet; a later chunk will pick it up.
+                break
+            req.as_swa_copy_count += 1
+        live_nos = [
+            no
+            for no in range(first, req.as_swa_copy_count)
+            if req.as_swa_kv_slots[no] != -1
+        ]
+        if not live_nos:
+            return None
+        tail_starts = [policy.checkpoint_pos(no) - swa_win for no in live_nos]
+        return (req, live_nos, tail_starts)
+
+    @profile_method("radix.as.swa_stage", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
+    def _stage_as_swa_copies(self, reqs: List[Req]) -> None:
+        """Stage every committed SWA window in ``reqs`` into the chunk-tail
+        backup pool with one batched probe + copy (see
+        ``detect_and_may_copy_as_swa``)."""
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        pool = getattr(kvcache, "chunk_tail_swa_pool", None)
+        if pool is None:
+            return
+        policy = kvcache.swa_policy
+        swa_win = pool.swa_win
         draft_pool = (
             self.draft_worker.primary_draft_kv_pool if self.draft_worker else None
         )
         draft_tail = getattr(draft_pool, "chunk_tail_swa_pool", None)
 
-        first = req.as_swa_copy_count
-        while req.as_swa_copy_count < len(req.as_swa_kv_slots):
-            checkpoint_no = req.as_swa_copy_count
-            checkpoint_pos = policy.checkpoint_pos(checkpoint_no)
-            if checkpoint_pos > committed_len:
-                # Not committed yet; a later chunk will pick it up.
-                break
-            req.as_swa_copy_count += 1
-
-        # Batched staging: resolve every committed checkpoint's physical page
-        # with ONE gather + ONE host sync, then one kernel launch per pool.
-        # Per-checkpoint .item() syncs were the dominant swa_stage cost.
-        last = req.as_swa_copy_count
-        live_nos = [
-            no
-            for no in range(first, last)
-            if req.as_swa_kv_slots[no] != -1
+        plans = [
+            plan
+            for req in reqs
+            if (plan := self._plan_swa_copies(req, policy, swa_win)) is not None
         ]
-        if not live_nos:
+        if not plans:
             return
-        tail_starts = [policy.checkpoint_pos(no) - swa_win for no in live_nos]
-        # The gather + D2H runs on a side stream, NOT the schedule stream:
+
+        # ONE element-wise gather over every req's checkpoints (req_pool_idx
+        # varies per row, so rows and cols are paired vectors), then ONE host
+        # sync. The gather + D2H runs on a side stream, NOT the schedule stream:
         # _apply_war_barrier chained schedule_stream behind the in-flight
         # forward, so a host sync there drains the forward (measured 55ms per
         # call). The probe fences on prep_done_event (recorded on
         # schedule_stream at run_batch entry, i.e. after this batch's prep
         # writes but with no forward dependency), so the sync ends in
         # microseconds. Values are stable: the probed req_to_token rows and
-        # full_to_swa entries cover this req's committed prefix, which stays
-        # tree-locked (and its SWA pages un-evicted) until the AS write
-        # releases it -- no later clear can race this probe.
+        # full_to_swa entries cover committed prefixes, which stay tree-locked
+        # (SWA pages un-evicted) until the AS write releases them -- and this
+        # runs before any write submits, so no later clear can race the probe.
+        rows: List[int] = []
+        cols: List[int] = []
+        for req, _live_nos, tail_starts in plans:
+            rows.extend([req.kv.req_pool_idx] * len(tail_starts))
+            cols.extend(tail_starts)
+        device = self.req_to_token_pool.req_to_token.device
         self.swa_copy_stream.wait_event(self.prep_done_event)
         with self.device_module.stream(self.swa_copy_stream):
             full_slots = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, torch.tensor(tail_starts, dtype=torch.int64)
+                torch.tensor(rows, dtype=torch.int64, device=device),
+                torch.tensor(cols, dtype=torch.int64, device=device),
             ]
             swa_slots = kvcache.full_to_swa_index_mapping[full_slots]
             swa_slots_host = swa_slots.cpu().tolist()
-
-        slot_ids = []
-        swa_page_idxs = []
-        for no, swa_slot in zip(live_nos, swa_slots_host):
-            slot_id = req.as_swa_kv_slots[no]
-            if swa_slot == 0:
-                # Slot 0 is the reserved SWA padding sink and is never handed out
-                # (see allocator/swa.py:25-27), so reading it back means
-                # clear_full_to_swa_mapping already dropped this token's mapping:
-                # the window has been evicted. Copying anyway would silently stage
-                # the padding page's garbage and AS would serve it as valid KV.
-                # Degrade to the -1 sentinel and recycle the staging slot.
-                logger.warning(
-                    "chunk_tail_swa: rid=%s checkpoint#%d has no live full->swa "
-                    "mapping (window already evicted); skipping this checkpoint",
-                    req.rid,
-                    no,
-                )
-                req.as_swa_kv_slots[no] = -1
-                free_chunk_tail_swa_slots(kvcache, [slot_id])
-                continue
-            slot_ids.append(slot_id)
-            swa_page_idxs.append(swa_slot // kvcache.swa_page_size)
+        slot_ids: List[int] = []
+        swa_page_idxs: List[int] = []
+        cursor = 0
+        for req, live_nos, tail_starts in plans:
+            for no in live_nos:
+                swa_slot = swa_slots_host[cursor]
+                cursor += 1
+                slot_id = req.as_swa_kv_slots[no]
+                if swa_slot == 0:
+                    # Slot 0 is the reserved SWA padding sink and is never handed
+                    # out (see allocator/swa.py:25-27), so reading it back means
+                    # clear_full_to_swa_mapping already dropped this token's
+                    # mapping: the window has been evicted. Copying anyway would
+                    # silently stage the padding page's garbage and AS would serve
+                    # it as valid KV. Degrade to the -1 sentinel and recycle the
+                    # staging slot.
+                    logger.warning(
+                        "chunk_tail_swa: rid=%s checkpoint#%d has no live "
+                        "full->swa mapping (window already evicted); skipping "
+                        "this checkpoint",
+                        req.rid,
+                        no,
+                    )
+                    req.as_swa_kv_slots[no] = -1
+                    free_chunk_tail_swa_slots(kvcache, [slot_id])
+                    continue
+                slot_ids.append(slot_id)
+                swa_page_idxs.append(swa_slot // kvcache.swa_page_size)
+        if not slot_ids:
+            return
         # The triton copy launches on the scheduler thread's current stream (the
         # schedule stream): it reads SWA pages this forward wrote, and the next
         # run_batch's forward_stream.wait_stream(schedule_stream) orders the next
@@ -2251,7 +2291,7 @@ class Scheduler(
         pool.copy_swa_page_half_batch(
             slot_ids, swa_page_idxs, kvcache.swa_kv_pool, half=1
         )
-        if draft_tail is not None and slot_ids:
+        if draft_tail is not None:
             # Same slot_ids and swa_page_idxs: the draft shares the target's
             # slot-id space and the very same full_to_swa_index_mapping object
             # (asserted in _assert_draft_swa_geometry).
@@ -4724,6 +4764,8 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        *,
+        early_send_prefix: bool = True,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.metrics_reporter.record_scheduler_active()
@@ -4756,7 +4798,10 @@ class Scheduler(
             return self._run_batch_prebuilt(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        # The threaded prefill loop sends on the scheduler thread instead
+        # (early_send_prefix=False) so the forward thread never touches a req's
+        # KV sender while process_batch_result sends the previous chunk.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL and early_send_prefix:
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
 
@@ -6260,7 +6305,10 @@ def dispatch_event_loop(scheduler: Scheduler):
         if get_parallel().pp_size > 1:
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:
-            scheduler.event_loop_overlap_disagg_prefill()
+            if envs.SGLANG_ENABLE_PREFILL_FWD_THREAD.get():
+                scheduler.event_loop_overlap_disagg_prefill_threaded()
+            else:
+                scheduler.event_loop_overlap_disagg_prefill()
         else:
             scheduler.event_loop_normal_disagg_prefill()
     elif disaggregation_mode == DisaggregationMode.DECODE:
