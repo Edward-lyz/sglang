@@ -918,6 +918,15 @@ class Envs:
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
 
+    # FlashKDA
+    # Extend-length window in which the fused FlashKDA prefill kernel is used.
+    # Batches whose shortest extend length is below MIN (fewer than one kernel
+    # chunk) or whose longest exceeds MAX (past the measured crossover where
+    # Triton's chunked prefill wins) fall back to Triton chunk_kda for the whole
+    # batch. Raise MAX to keep large chunked-prefill batches on FlashKDA.
+    SGLANG_FLASHKDA_MIN_SEQ_LEN = EnvInt(64)
+    SGLANG_FLASHKDA_MAX_SEQ_LEN = EnvInt(2048)
+
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
 

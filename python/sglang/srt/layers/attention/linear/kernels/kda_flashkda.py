@@ -2,16 +2,10 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-
-# FlashKDA chunk size. Sequences shorter than this fall back to Triton.
-_FLASHKDA_CHUNK_SIZE = 64
-
-# FlashKDA's max sequence length, Batches whose longest sequence exceeds this
-# fall back to Triton for the whole batch.
-_FLASHKDA_MAX_SEQ_LEN = 2048
 
 
 def _load_flash_kda():
@@ -81,6 +75,11 @@ class FlashKDAKernel(LinearAttnKernelBase):
     Requires an SM90+ GPU with the ``flash_kda`` package.
     """
 
+    def __init__(self):
+        # Extend-length window for the fused path, read once (not per forward).
+        self.min_seq_len = envs.SGLANG_FLASHKDA_MIN_SEQ_LEN.get()
+        self.max_seq_len = envs.SGLANG_FLASHKDA_MAX_SEQ_LEN.get()
+
     def decode(
         self,
         q: torch.Tensor,
@@ -117,11 +116,18 @@ class FlashKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # The fused kernel cannot expose per-chunk states (h), which the mamba
-        # radix extra_buffer track path needs; route tracked batches through
-        # the Triton chunk_kda fallback instead of silently skipping the
-        # snapshot (that would corrupt prefix-cache restores).
-        if return_intermediate_states or self._should_fall_back(
+        # The fused kernel cannot expose per-chunk states (h), so a batch whose
+        # mamba track snapshot reads *interior* chunk rows must use Triton.
+        # Boundary-aligned tracks read the committed final state out of the pool
+        # instead (track_ssm_final_src), never index h, and stay on the fused
+        # path with a zero-row h stand-in -- same escape hatch as NvidiaKDAKernel.
+        track_h_src = kwargs.get("track_ssm_h_src")
+        needs_interior_snapshot = (
+            return_intermediate_states
+            and track_h_src is not None
+            and track_h_src.numel() > 0
+        )
+        if needs_interior_snapshot or self._should_fall_back(
             lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
         ):
             return _triton_fallback(
@@ -139,7 +145,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 return_intermediate_states=return_intermediate_states,
             )
 
-        return self._flashkda_extend(
+        out = self._flashkda_extend(
             q,
             k,
             v,
@@ -152,9 +158,16 @@ class FlashKDAKernel(LinearAttnKernelBase):
             dt_bias=dt_bias,
             lower_bound=lower_bound,
         )
+        if return_intermediate_states:
+            # Keep the (out, h) contract; h is never indexed in this branch.
+            h_empty = q.new_empty(
+                (1, 0) + tuple(ssm_states.shape[1:]), dtype=torch.float32
+            )
+            return out, h_empty
+        return out
 
-    @staticmethod
     def _should_fall_back(
+        self,
         lower_bound: Optional[float],
         is_spec_decode: bool,
         query_start_loc: torch.Tensor,
@@ -187,7 +200,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
             seq_lens = query_start_loc[1:] - query_start_loc[:-1]
             lo_t, hi_t = torch.aminmax(seq_lens)
             lo, hi = int(lo_t), int(hi_t)
-        return lo < _FLASHKDA_CHUNK_SIZE or hi > _FLASHKDA_MAX_SEQ_LEN
+        return lo < self.min_seq_len or hi > self.max_seq_len
 
     def _flashkda_extend(
         self,
