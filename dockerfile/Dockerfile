@@ -1,4 +1,4 @@
-FROM iregistry.baidu-int.com/hac-aiacc/sglang:v0.5.12-cu130-runtime
+FROM iregistry.baidu-int.com/zhangyanzhe/sglang-test:v0.5.15.post1-cu130
 
 ## ===========================================================================================
 # 这个是base是在社区这个commit v0.5.8 基础上打的镜像，作了如下修改：
@@ -33,8 +33,7 @@ RUN cd /tmp/aiak_sglang && find . -name "*.py" -exec cp --parents {} /sgl-worksp
     git log -1 --format="%H %s %an %ad" > /sgl-workspace/sglang/aiak-last-commit && \
     rm -rf /tmp/aiak_sglang
 
-
-RUN pip install --upgrade tokenspeed-mla --break-system-packages --proxy http://agent.baidu.com:8891
+# RUN pip install --upgrade tokenspeed-mla --break-system-packages --proxy http://agent.baidu.com:8891
 
 RUN pip config set global.index-url http://mirrors.baidubce.com/pypi/simple/ && \
     pip config set global.trusted-host mirrors.baidubce.com
@@ -52,7 +51,11 @@ RUN pip install --no-cache-dir --force-reinstall -r /tmp/gpu_requirements.env &&
 # NOTE: Move these into the basic image to minimize difference with the community.
 RUN pip install jsonschema_rs
 RUN pip install distro
-RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/msit_llm-8.3.2-py3-none-any.whl
+RUN pip install decord
+RUN pip install PyNvVideoCodec
+
+# Disable msit: numpy collision
+# RUN pip install https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/msit_llm-8.3.2-py3-none-any.whl
 
 # Warmup flashinfer trtllm-gen fused MoE module to pre-create cubin symlinks.
 # Avoids a FileExistsError race in ensure_symlink() when multiple TP workers
