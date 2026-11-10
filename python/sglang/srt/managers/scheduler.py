@@ -286,7 +286,11 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
-from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+from sglang.srt.utils.numa_utils import (
+    bind_current_process_to_gpu_numa,
+    get_numa_node_if_available,
+    numa_bind_to_node,
+)
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -5992,7 +5996,14 @@ def run_scheduler_process(
     display_tp_rank: Optional[int] = None,
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
+    bind_numa_in_child: bool = False,
 ):
+    # The parent decides NUMA binding and passes it explicitly, so parent and
+    # child never diverge on whether the numactl wrapper was skipped. Bind before
+    # any large host allocation to keep it node-local.
+    if bind_numa_in_child:
+        bind_current_process_to_gpu_numa(server_args, gpu_id)
+
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = configure_scheduler_process(

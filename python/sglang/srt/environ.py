@@ -1240,6 +1240,9 @@ class Envs:
     SGLANG_AUTO_NUMA_BIND = EnvBool(False)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
 
+    # Scheduler launch
+    SGLANG_PARALLEL_SCHEDULER_LAUNCH = EnvBool(False)
+
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
