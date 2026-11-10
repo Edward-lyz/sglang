@@ -283,6 +283,8 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    # Time when lazy decode entered the post-compute allocation wait.
+    lazy_alloc_wait_start: Optional[float] = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -381,6 +383,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        # Decode-side lazy KV allocation; only the mooncake manager implements it.
+        self.lazy_alloc = (
+            transfer_backend == TransferBackend.MOONCAKE and self.kv_manager.lazy_alloc
+        )
+        self.lazy_indices_timeout = (
+            envs.SGLANG_DISAGGREGATION_LAZY_INDICES_TIMEOUT.get()
+        )
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -795,6 +804,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.kv_receiver.conclude_state == KVPoll.Failed
                 for decode_req in self.queue
             )
+            and not self.lazy_alloc
         ):
             return
 
@@ -819,7 +829,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if poll == KVPoll.Bootstrapping:
                 pass
             elif poll == KVPoll.WaitingForInput:
-                decode_req.waiting_for_input = True
+                if not decode_req.waiting_for_input:
+                    decode_req.waiting_for_input = True
+                    if self.lazy_alloc:
+                        decode_req.lazy_alloc_wait_start = time.time()
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -984,6 +997,31 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
 
+    def _abort_timed_out_lazy_reqs(self) -> None:
+        """Abort lazy requests that waited too long for decode KV allocation.
+
+        The allocation loop in ``pop_preallocated`` stops at the first request
+        that does not fit (strict FIFO), so requests queued behind a blocked head
+        never reach any per-request check inside it. Scanning here, before that
+        loop, keeps the FIFO order while still giving every request its own
+        deadline. Fake transfers never joined the lazy protocol (no CLAIM was
+        sent and their receiver has no ``lazy_abort``), so they are skipped.
+        """
+        if not self.lazy_alloc:
+            return
+        now = time.time()
+        for decode_req in self.queue:
+            wait_start = decode_req.lazy_alloc_wait_start
+            if wait_start is None or now - wait_start < self.lazy_indices_timeout:
+                continue
+            if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
+                continue
+            decode_req.kv_receiver.lazy_abort(
+                f"Decode lazy KV allocation timed out after {now - wait_start:.1f}s "
+                f"waiting for free KV for request rank={self.tp_rank} "
+                f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+            )
+
     def pop_preallocated(
         self,
         rids_to_check: Optional[List[str]] = None,
@@ -998,6 +1036,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             raise ValueError("rids_to_check cannot be used in PP mode")
 
         self._resolve_pending_reqs()
+        self._abort_timed_out_lazy_reqs()
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
@@ -1088,6 +1127,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if not decode_req.waiting_for_input:
+                continue
+
+            # A lazy request aborted by _abort_timed_out_lazy_reqs is dequeued by
+            # the next handshake poll; it must not be allocated in the meantime.
+            if (
+                self.lazy_alloc
+                and decode_req.kv_receiver.conclude_state == KVPoll.Failed
+            ):
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
