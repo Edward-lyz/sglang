@@ -3283,7 +3283,7 @@ class Scheduler(
                 req for req in self.waiting_queue if req not in deleted_reqs
             ]
 
-    def _abort_failed_cache_read(self, req: Req) -> None:
+    def _abort_failed_cache_read(self, req: Req) -> Dict[str, Any]:
         """Remove a waiting request whose AttentionStore read was incomplete."""
         message = getattr(req, "_as_cache_read_abort_reason", None) or (
             "AttentionStore cache read failed"
@@ -3316,6 +3316,12 @@ class Scheduler(
             req,
         )
         logger.error("Aborted request after incomplete AS read: rid=%s", req.rid)
+        return {
+            "rid": req.rid,
+            "origin_pp_rank": int(self.ps.pp_rank),
+            "reason_code": "AS_CACHE_READ_FAILED",
+            "reason": message,
+        }
 
     def handle_embedding_request(
         self,
@@ -3652,7 +3658,7 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
-        ret, running_batch = self._get_new_batch_prefill_raw(
+        ret, running_batch, pp_local_aborts = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             running_batch=running_batch,
             authoritative_plan=authoritative_plan,
@@ -3661,14 +3667,18 @@ class Scheduler(
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
 
-        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+        return NextBatchPlan(
+            batch_to_run=ret,
+            running_batch=running_batch,
+            pp_local_aborts=pp_local_aborts,
+        )
 
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
         authoritative_plan: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch, Tuple[Dict[str, Any], ...]]:
         authoritative_admissions = (
             tuple(authoritative_plan.get("admissions", ()))
             if authoritative_plan is not None
@@ -3690,7 +3700,7 @@ class Scheduler(
         # A downstream PP stage may have queued requests beyond PP0's committed
         # microbatch. An empty authoritative plan means it must stay idle.
         if authoritative_admissions == ():
-            return None, running_batch
+            return None, running_batch, ()
 
         if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
@@ -3704,7 +3714,7 @@ class Scheduler(
             and (running_batch.batch_is_full or len(self.waiting_queue) == 0)
             and self.chunked_req is None
         ):
-            return None, running_batch
+            return None, running_batch, ()
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
@@ -3716,7 +3726,7 @@ class Scheduler(
                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
             )
         ):
-            return None, running_batch
+            return None, running_batch, ()
 
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
@@ -3729,7 +3739,7 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
-            return None, running_batch
+            return None, running_batch, ()
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
@@ -3748,7 +3758,7 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
-            return None, running_batch
+            return None, running_batch, ()
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
@@ -3834,6 +3844,7 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(candidate_reqs))
         cache_read_aborted_reqs = set()
+        pp_local_aborts = []
         # Get requests from the waiting queue to a new prefill batch
         for req in candidate_reqs:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -3878,13 +3889,10 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.ABORT:
-                    self._abort_failed_cache_read(req)
+                    pp_local_aborts.append(self._abort_failed_cache_read(req))
                     cache_read_aborted_reqs.add(req)
-                    # All PP stages receive the same ABORT from the cache
-                    # collective. Stop at this request so the next scheduler
-                    # round cannot consume a different request sequence on
-                    # one stage and leave a later collective unmatched.
-                    break
+                    # Preserve the fixed PP candidate sequence after a local abort.
+                    continue
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
@@ -3927,13 +3935,21 @@ class Scheduler(
             resumed_chunked_req,
         )
         if authoritative_admissions is not None:
-            if local_admissions != authoritative_admissions:
+            aborted_rids = {record["rid"] for record in pp_local_aborts}
+            expected_local_admissions = tuple(
+                admission
+                for admission in authoritative_admissions
+                if admission.get("rid") not in aborted_rids
+            )
+            if local_admissions != expected_local_admissions:
                 raise RuntimeError(
                     "PP0 batch admission could not be reproduced locally: "
-                    f"planned={authoritative_admissions} local={local_admissions}"
+                    f"planned={authoritative_admissions} "
+                    f"aborted={tuple(sorted(aborted_rids))} "
+                    f"local={local_admissions}"
                 )
         if len(can_run_list) == 0:
-            return None, running_batch
+            return None, running_batch, tuple(pp_local_aborts)
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
@@ -4028,7 +4044,7 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
-        return new_batch, running_batch
+        return new_batch, running_batch, tuple(pp_local_aborts)
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]

@@ -3424,5 +3424,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
 
 class NextBatchPlan(msgspec.Struct):
+    """Describe the next runnable batch and request-local PP aborts."""
+
     batch_to_run: Optional[ScheduleBatch]
     running_batch: ScheduleBatch
+    pp_local_aborts: Tuple[Dict[str, Any], ...] = ()

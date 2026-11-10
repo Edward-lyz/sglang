@@ -1607,15 +1607,59 @@ def build_inner_fb_view(
 
 
 class PPProxyTensors:
+    """Carry token-row-aligned model intermediates across PP stages."""
+
     # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
     tensors: Dict[str, torch.Tensor]
 
     def __init__(self, tensors):
+        """Initialize a PP proxy from token-row-aligned tensor fields."""
+
         # manually define this function, so that
         # Dynamo knows `IntermediateTensors()` comes from this file.
         # Otherwise, dataclass will generate this function by evaluating
         # a string, and we will lose the information about the source file.
         self.tensors = tensors
+        self._pp_projected_token_rows: Optional[int] = None
+
+    def _mark_pp_projected_token_rows(self, num_rows: int) -> None:
+        """Mark this proxy as compact real-token rows awaiting local padding."""
+        if num_rows < 0:
+            raise RuntimeError(f"invalid projected PP token rows: {num_rows}")
+        for key, value in self.tensors.items():
+            if not isinstance(value, torch.Tensor) or value.ndim == 0:
+                continue
+            if value.shape[0] != num_rows:
+                raise RuntimeError(
+                    "projected PP proxy tensor is not compact: "
+                    f"key={key} rows={value.shape[0]} expected={num_rows}"
+                )
+        self._pp_projected_token_rows = num_rows
+
+    def _pad_pp_projected_token_rows(self, target_rows: int) -> None:
+        """Append zero tail rows to match the prepared local ForwardBatch."""
+        current_rows = self._pp_projected_token_rows
+        if current_rows is None:
+            return
+        if target_rows < current_rows:
+            raise RuntimeError(
+                "local PP padded token rows are shorter than the survivor proxy: "
+                f"target={target_rows} survivor={current_rows}"
+            )
+        for key, value in tuple(self.tensors.items()):
+            if not isinstance(value, torch.Tensor) or value.ndim == 0:
+                continue
+            if value.shape[0] != current_rows:
+                raise RuntimeError(
+                    "projected PP proxy tensor row count changed before padding: "
+                    f"key={key} rows={value.shape[0]} expected={current_rows}"
+                )
+            if target_rows != current_rows:
+                padding = value.new_zeros(
+                    (target_rows - current_rows, *value.shape[1:])
+                )
+                self.tensors[key] = torch.cat((value, padding), dim=0)
+        self._pp_projected_token_rows = target_rows
 
     def __getitem__(self, key: Union[str, slice]):
         if isinstance(key, str):

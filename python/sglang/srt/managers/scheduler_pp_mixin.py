@@ -1,3 +1,5 @@
+"""Coordinate pipeline-parallel scheduling, transport, and output handling."""
+
 from __future__ import annotations
 
 import logging
@@ -54,6 +56,7 @@ if TYPE_CHECKING:
 
 PPTransferStatus = Tuple[List[str], List[str]]
 PPReleasePayload = Union[List[str], PPTransferStatus]
+_PP_BATCH_CONTROL_KEY = "__pp_batch_control__"
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -118,6 +121,137 @@ def _pp_merge_transfer_status(
     return success, failed
 
 
+def _pp_merge_abort_records(
+    *record_groups: Tuple[Dict[str, Any], ...],
+) -> Tuple[Dict[str, Any], ...]:
+    """Merge request aborts deterministically, with the lowest PP rank winning."""
+    by_request: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    for records in record_groups:
+        for record in records:
+            rid = str(record["rid"])
+            candidate = dict(record)
+            key = (int(candidate.get("plan_seq", -1)), rid)
+            previous = by_request.get(key)
+            if previous is None or (
+                int(candidate.get("origin_pp_rank", -1)),
+                str(candidate.get("reason_code", "")),
+                str(candidate.get("reason", "")),
+            ) < (
+                int(previous.get("origin_pp_rank", -1)),
+                str(previous.get("reason_code", "")),
+                str(previous.get("reason", "")),
+            ):
+                by_request[key] = candidate
+    return tuple(by_request[key] for key in sorted(by_request))
+
+
+def _pp_control_has_current_aborts(control: Optional[Dict[str, Any]]) -> bool:
+    """Return whether control carries aborts for its current batch plan."""
+
+    if control is None:
+        return False
+    plan_seq = int(control.get("plan_seq", -1))
+    return any(
+        int(record.get("plan_seq", -1)) == plan_seq
+        for record in control.get("aborts", ())
+    )
+
+
+def _pp_project_contract(
+    contract: Dict[str, Any], active_rids: Tuple[str, ...]
+) -> Dict[str, Any]:
+    """Project a PP batch contract onto an ordered subset of requests."""
+    remote_rids = tuple(contract.get("rids", ()))
+    active_set = set(active_rids)
+    projected_order = tuple(rid for rid in remote_rids if rid in active_set)
+    if projected_order != active_rids or len(active_set) != len(active_rids):
+        raise RuntimeError(
+            "PP active requests are not an ordered subset of the upstream contract: "
+            f"upstream={remote_rids} active={active_rids}"
+        )
+
+    prefix_lens = tuple(contract.get("prefix_lens", ()))
+    extend_ranges = tuple(contract.get("extend_ranges", ()))
+    if len(prefix_lens) != len(remote_rids) or len(extend_ranges) != len(remote_rids):
+        raise RuntimeError(f"invalid PP batch contract request vectors: {contract}")
+
+    keep_indices = [i for i, rid in enumerate(remote_rids) if rid in active_set]
+    projected_ranges = tuple(extend_ranges[i] for i in keep_indices)
+    decisions = tuple(
+        decision
+        for decision in contract.get("as_decisions", ())
+        if decision and decision[0] in active_set
+    )
+    return {
+        "version": contract.get("version"),
+        "mb_id": contract.get("mb_id"),
+        "rids": active_rids,
+        "prefix_lens": tuple(prefix_lens[i] for i in keep_indices),
+        "extend_ranges": projected_ranges,
+        "extend_num_tokens": sum(end - start for start, end in projected_ranges),
+        "chunked_rid": (
+            contract.get("chunked_rid")
+            if contract.get("chunked_rid") in active_set
+            else None
+        ),
+        "as_decisions": decisions,
+    }
+
+
+def _pp_filter_proxy_rows(
+    pp_proxy_tensors: PPProxyTensors,
+    upstream_contract: Dict[str, Any],
+    active_rids: Tuple[str, ...],
+) -> Dict[str, Any]:
+    """Drop aborted request rows from token-row-aligned proxy tensors."""
+    tensors = pp_proxy_tensors.tensors
+    upstream_rids = tuple(upstream_contract.get("rids", ()))
+    if active_rids == upstream_rids:
+        return dict(tensors)
+    _pp_project_contract(upstream_contract, active_rids)
+
+    ranges = tuple(upstream_contract.get("extend_ranges", ()))
+    if len(ranges) != len(upstream_rids):
+        raise RuntimeError(f"invalid PP proxy row contract: {upstream_contract}")
+    row_lengths = [end - start for start, end in ranges]
+    total_rows = sum(row_lengths)
+    active_set = set(active_rids)
+    spans = []
+    offset = 0
+    for rid, row_count in zip(upstream_rids, row_lengths):
+        if rid in active_set:
+            spans.append((offset, offset + row_count))
+        offset += row_count
+
+    for key, value in tensors.items():
+        if key.startswith("__") or not isinstance(value, torch.Tensor):
+            continue
+        if value.ndim == 0:
+            continue
+        if value.shape[0] < total_rows:
+            raise RuntimeError(
+                "PP proxy tensor cannot be projected after request abort: "
+                f"key={key} rows={value.shape[0]} expected_at_least={total_rows}"
+            )
+
+    filtered: Dict[str, Any] = {}
+    for key, value in tensors.items():
+        if key.startswith("__") or not isinstance(value, torch.Tensor):
+            filtered[key] = value
+            continue
+        if value.ndim == 0:
+            filtered[key] = value
+            continue
+        if not spans:
+            filtered[key] = value[:0]
+        elif len(spans) == 1:
+            start, end = spans[0]
+            filtered[key] = value[start:end]
+        else:
+            filtered[key] = torch.cat([value[start:end] for start, end in spans], dim=0)
+    return filtered
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -125,6 +259,8 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    """Provide pipeline-parallel scheduling and communication operations."""
+
     def _pp_extract_authoritative_batch_plan(
         self, mb_id: int, recv_reqs: List[Any]
     ) -> Tuple[List[Any], Optional[Dict[str, Any]]]:
@@ -204,6 +340,8 @@ class SchedulerPPMixin:
         batch: Optional[ScheduleBatch],
         prior_chunked_req: Optional[Req] = None,
         next_chunked_req: Optional[Req] = None,
+        local_aborts: Tuple[Dict[str, Any], ...] = (),
+        transport: Optional[bool] = None,
     ) -> Dict[str, Any]:
         requests = []
         admissions = tuple(
@@ -211,6 +349,7 @@ class SchedulerPPMixin:
         )
         if batch is not None:
             for req in batch.reqs:
+                req._pp_plan_seq = int(self._pp_next_plan_seq)
                 decision = getattr(req, "_as_pp_match_decision", None)
                 requests.append(
                     {
@@ -260,25 +399,286 @@ class SchedulerPPMixin:
                 "action": "yield",
             }
 
+        plan_seq = self._pp_next_plan_seq
+        self._pp_next_plan_seq += 1
+        tombstones = self._pp_abort_tombstones_for_plan()
+        local_aborts = tuple(
+            {**record, "plan_seq": int(plan_seq)} for record in local_aborts
+        )
+        for record in local_aborts:
+            logger.error(
+                "PP request cancellation originated: plan_seq=%s mb_id=%s "
+                "rid=%s origin_pp_rank=%s reason_code=%s reason=%s",
+                plan_seq,
+                mb_id,
+                record["rid"],
+                record["origin_pp_rank"],
+                record["reason_code"],
+                record["reason"],
+            )
         return {
-            "version": 2,
+            "version": 3,
             "mb_id": int(mb_id),
+            "plan_seq": int(plan_seq),
+            "transport": batch is not None if transport is None else bool(transport),
             "chunked_transition": chunked_transition,
             "admissions": admissions,
             "requests": tuple(requests),
             "contract": self._pp_batch_contract(batch, mb_id),
+            "aborts": _pp_merge_abort_records(tombstones, local_aborts),
         }
+
+    def _pp_abort_tombstones_for_plan(self) -> Tuple[Dict[str, Any], ...]:
+        """Collect active abort tombstones and age them by one batch plan."""
+
+        records = []
+        expired = []
+        for key, entry in self._pp_abort_tombstones.items():
+            records.append(entry["record"])
+            entry["remaining"] -= 1
+            if entry["remaining"] <= 0:
+                expired.append(key)
+        for key in expired:
+            del self._pp_abort_tombstones[key]
+        return _pp_merge_abort_records(tuple(records))
+
+    def _pp_register_abort_tombstones(
+        self, records: Tuple[Dict[str, Any], ...]
+    ) -> None:
+        """Retain finalized abort records for propagation across the PP ring."""
+
+        ttl = self.ps.pp_size + self.pp_loop_size
+        for record in records:
+            rid = str(record["rid"])
+            key = (int(record.get("plan_seq", -1)), rid)
+            previous = self._pp_abort_tombstones.get(key)
+            merged = _pp_merge_abort_records(
+                (() if previous is None else (previous["record"],)),
+                (record,),
+            )[0]
+            self._pp_abort_tombstones[key] = {
+                "record": merged,
+                "remaining": ttl,
+            }
+
+    def _pp_apply_abort_records_to_local_queue(
+        self, records: Tuple[Dict[str, Any], ...], current_plan_seq: int
+    ) -> None:
+        """Remove locally queued requests identified by propagated abort records."""
+
+        if not records:
+            return
+        by_request = {
+            (int(record.get("plan_seq", -1)), record["rid"]): record
+            for record in records
+        }
+        kept_waiting = []
+        for req in self.waiting_queue:
+            req_plan_seq = int(getattr(req, "_pp_plan_seq", -1))
+            record = by_request.get((req_plan_seq, req.rid))
+            if record is None and req_plan_seq == -1:
+                record = by_request.get((current_plan_seq, req.rid))
+            if record is None:
+                kept_waiting.append(req)
+                continue
+            if not req.finished():
+                req._as_cache_read_abort_reason = record.get("reason")
+                self._abort_failed_cache_read(req)
+        self.waiting_queue = kept_waiting
+
+        if self.chunked_req is not None:
+            chunked_plan_seq = int(getattr(self.chunked_req, "_pp_plan_seq", -1))
+            record = by_request.get((chunked_plan_seq, self.chunked_req.rid))
+            if record is None and chunked_plan_seq == -1:
+                record = by_request.get((current_plan_seq, self.chunked_req.rid))
+            if record is not None:
+                if not self.chunked_req.finished():
+                    self.chunked_req._as_cache_read_abort_reason = record.get("reason")
+                    self._abort_failed_cache_read(self.chunked_req)
+                self.chunked_req = None
+
+    def _pp_apply_local_aborts_to_plan(
+        self,
+        mb_id: int,
+        batch: Optional[ScheduleBatch],
+        plan: Dict[str, Any],
+        local_aborts: Tuple[Dict[str, Any], ...],
+    ) -> Dict[str, Any]:
+        """Project an upstream batch plan after request-local stage aborts."""
+
+        upstream_contract = plan["contract"]
+        local_contract = self._pp_batch_contract(batch, mb_id)
+        upstream_rids = tuple(upstream_contract.get("rids", ()))
+        local_rids = tuple(local_contract.get("rids", ()))
+        local_aborts = tuple(
+            {**record, "plan_seq": int(plan["plan_seq"])} for record in local_aborts
+        )
+        chunked_rid = upstream_contract.get("chunked_rid")
+        for record in local_aborts:
+            if record["rid"] == chunked_rid:
+                # Retain the abort until already-relayed chunk plans drain.
+                self._pp_local_chunk_abort_records.setdefault(
+                    str(record["rid"]), dict(record)
+                )
+        local_abort_rids = {record["rid"] for record in local_aborts}
+        for record in local_aborts:
+            logger.error(
+                "PP request cancellation originated: plan_seq=%s mb_id=%s "
+                "rid=%s origin_pp_rank=%s reason_code=%s reason=%s",
+                plan["plan_seq"],
+                mb_id,
+                record["rid"],
+                record["origin_pp_rank"],
+                record["reason_code"],
+                record["reason"],
+            )
+        removed_rids = {rid for rid in upstream_rids if rid not in set(local_rids)}
+        if removed_rids != local_abort_rids:
+            raise RuntimeError(
+                "PP batch admission diverged without matching request aborts: "
+                f"planned={upstream_rids} local={local_rids} "
+                f"aborted={tuple(sorted(local_abort_rids))}"
+            )
+        projected_contract = _pp_project_contract(upstream_contract, local_rids)
+        if projected_contract != local_contract:
+            raise RuntimeError(
+                "PP authoritative batch plan mismatch after applying request aborts: "
+                f"local={local_contract} projected={projected_contract}"
+            )
+
+        active_set = set(local_rids)
+        outgoing = dict(plan)
+        outgoing["admissions"] = tuple(
+            admission
+            for admission in plan.get("admissions", ())
+            if admission.get("rid") in active_set
+        )
+        outgoing["requests"] = tuple(
+            request
+            for request in plan.get("requests", ())
+            if request.get("rid") in active_set
+        )
+        outgoing["contract"] = local_contract
+        outgoing["aborts"] = _pp_merge_abort_records(
+            tuple(plan.get("aborts", ())), local_aborts
+        )
+        return outgoing
+
+    def _pp_project_locally_aborted_chunked_requests(
+        self, plan: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Project in-flight plans that still reference a locally aborted chunk."""
+        if not self._pp_local_chunk_abort_records:
+            return plan
+
+        known_abort_keys = {
+            (int(record.get("plan_seq", -1)), str(record.get("rid", "")))
+            for record in plan.get("aborts", ())
+        }
+        acknowledged_rids = [
+            rid
+            for rid, record in self._pp_local_chunk_abort_records.items()
+            if (int(record["plan_seq"]), rid) in known_abort_keys
+        ]
+        for rid in acknowledged_rids:
+            del self._pp_local_chunk_abort_records[rid]
+
+        if not self._pp_local_chunk_abort_records:
+            return plan
+
+        transition = plan.get("chunked_transition", {})
+        referenced_rids = {
+            str(entry.get("rid"))
+            for key in ("admissions", "requests")
+            for entry in plan.get(key, ())
+            if entry.get("rid") is not None
+        }
+        referenced_rids.update(str(rid) for rid in plan["contract"].get("rids", ()))
+        if transition.get("rid") is not None:
+            referenced_rids.add(str(transition["rid"]))
+
+        aborted_rids = set(self._pp_local_chunk_abort_records).intersection(
+            referenced_rids
+        )
+        if not aborted_rids:
+            return plan
+
+        active_rids = tuple(
+            rid for rid in plan["contract"].get("rids", ()) if rid not in aborted_rids
+        )
+        current_plan_seq = int(plan["plan_seq"])
+        current_aborts = tuple(
+            {
+                **self._pp_local_chunk_abort_records[rid],
+                "plan_seq": current_plan_seq,
+            }
+            for rid in sorted(aborted_rids)
+        )
+        outgoing = dict(plan)
+        outgoing["admissions"] = tuple(
+            entry
+            for entry in plan.get("admissions", ())
+            if entry.get("rid") not in aborted_rids
+        )
+        outgoing["requests"] = tuple(
+            entry
+            for entry in plan.get("requests", ())
+            if entry.get("rid") not in aborted_rids
+        )
+        outgoing["contract"] = _pp_project_contract(plan["contract"], active_rids)
+        if transition.get("rid") in aborted_rids:
+            outgoing["chunked_transition"] = {"rid": None, "action": "none"}
+        outgoing["aborts"] = _pp_merge_abort_records(
+            tuple(plan.get("aborts", ())), current_aborts
+        )
+        logger.error(
+            "PP projected in-flight plans for locally aborted chunk: "
+            "plan_seq=%s rids=%s",
+            current_plan_seq,
+            tuple(sorted(aborted_rids)),
+        )
+        self._pp_validate_authoritative_plan_schema(int(plan["mb_id"]), outgoing)
+        return outgoing
+
+    def _pp_defer_chunked_cache_read_abort(
+        self, req: Req, record: Dict[str, Any]
+    ) -> None:
+        """Stop future chunks now and release KV at the next safe loop point."""
+        req._as_cache_read_abort_reason = record.get("reason")
+        if self.chunked_req is req:
+            self.chunked_req = None
+        self._pp_pending_cache_read_aborts[id(req)] = (req, dict(record))
+
+    def _pp_drain_pending_cache_read_aborts(self) -> None:
+        """Release deferred chunk resources after the prior forward was drained."""
+        pending = tuple(self._pp_pending_cache_read_aborts.values())
+        self._pp_pending_cache_read_aborts.clear()
+        for req, record in pending:
+            if req.finished():
+                continue
+            req._as_cache_read_abort_reason = record.get("reason")
+            self._abort_failed_cache_read(req)
 
     def _pp_install_authoritative_batch_plan(
         self, mb_id: int, plan: Dict[str, Any]
     ) -> None:
-        if not isinstance(plan, dict) or plan.get("version") != 2:
+        if not isinstance(plan, dict) or plan.get("version") != 3:
             raise RuntimeError(f"invalid PP batch plan at mb_id={mb_id}: {plan}")
         if int(plan.get("mb_id", -1)) != mb_id:
             raise RuntimeError(
                 f"PP batch plan mb_id mismatch: local={mb_id} remote={plan.get('mb_id')}"
             )
         self._pp_validate_authoritative_plan_schema(mb_id, plan)
+        plan_seq = int(plan["plan_seq"])
+        if plan_seq <= self._pp_last_received_plan_seq:
+            raise RuntimeError(
+                "stale or reordered PP batch plan: "
+                f"last={self._pp_last_received_plan_seq} received={plan_seq}"
+            )
+        self._pp_last_received_plan_seq = plan_seq
+        self._pp_apply_abort_records_to_local_queue(
+            tuple(plan.get("aborts", ())), plan_seq
+        )
 
         local_reqs = list(self.waiting_queue) + list(self.running_batch.reqs)
         if self.chunked_req is not None:
@@ -292,6 +692,7 @@ class SchedulerPPMixin:
                     f"PP batch plan references unavailable rid={rid} mb_id={mb_id}"
                 )
             req._as_pp_match_decision_required = True
+            req._pp_plan_seq = int(plan["plan_seq"])
             decision = entry.get("as_match")
             if decision is None:
                 if hasattr(req, "_as_pp_match_decision"):
@@ -304,6 +705,8 @@ class SchedulerPPMixin:
         mb_id: int, plan: Dict[str, Any]
     ) -> None:
         try:
+            plan_seq = int(plan["plan_seq"])
+            transport = plan["transport"]
             transition = plan["chunked_transition"]
             action = transition["action"]
             transition_rid = transition["rid"]
@@ -312,7 +715,12 @@ class SchedulerPPMixin:
                 (entry["rid"], entry["source"]) for entry in admissions
             )
             request_rids = {entry["rid"] for entry in plan["requests"]}
-        except (KeyError, TypeError) as exc:
+            contract_rids = tuple(plan["contract"]["rids"])
+            aborts = tuple(plan.get("aborts", ()))
+            abort_keys = tuple(
+                (int(record["plan_seq"]), record["rid"]) for record in aborts
+            )
+        except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(
                 f"invalid PP batch plan shape at mb_id={mb_id}: {plan}"
             ) from exc
@@ -324,7 +732,9 @@ class SchedulerPPMixin:
             if source == "chunked"
         ]
         if (
-            action not in ("none", "resume", "hold", "yield", "abort")
+            plan_seq < 0
+            or not isinstance(transport, bool)
+            or action not in ("none", "resume", "hold", "yield", "abort")
             or (action == "none") != (transition_rid is None)
             or any(
                 not isinstance(rid, str)
@@ -333,9 +743,15 @@ class SchedulerPPMixin:
                 for rid, source in admission_pairs
             )
             or len(set(admission_rids)) != len(admission_rids)
+            or len(set(abort_keys)) != len(abort_keys)
+            or any(not isinstance(rid, str) or not rid for _, rid in abort_keys)
+            or not {
+                rid for abort_seq, rid in abort_keys if abort_seq == plan_seq
+            }.isdisjoint(contract_rids)
             or chunked_admissions not in ([], [(0, transition_rid)])
             or ((action == "resume") != bool(chunked_admissions))
             or not set(admission_rids).issubset(request_rids)
+            or (not transport and bool(contract_rids))
         ):
             raise RuntimeError(
                 f"invalid PP transition/admissions at mb_id={mb_id}: "
@@ -415,28 +831,52 @@ class SchedulerPPMixin:
                 f"local={local_contract} remote={remote_contract}"
             )
 
-    def _pp_validate_proxy_batch_contract(
+    @staticmethod
+    def _pp_control_from_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+        """Build transport control metadata from an authoritative batch plan."""
+
+        return {
+            "version": 1,
+            "plan_seq": int(plan["plan_seq"]),
+            "mb_id": int(plan["mb_id"]),
+            "transport": bool(plan["transport"]),
+            "contract": plan["contract"],
+            "aborts": tuple(plan.get("aborts", ())),
+        }
+
+    def _pp_prepare_received_proxy(
         self,
         mb_id: int,
-        batch: ScheduleBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-    ) -> None:
-        if (
-            not getattr(self, "_pp_batch_contract_guard_enabled", False)
-            or self.pp_group.is_first_rank
-        ):
-            return
-        if pp_proxy_tensors is None:
-            raise RuntimeError(f"missing PP proxy tensors for mb_id={mb_id}")
-        remote_contract = pp_proxy_tensors.tensors.get("__pp_batch_contract__")
-        local_contract = self._pp_batch_contract(batch, mb_id)
-        if remote_contract != local_contract:
+        batch: Optional[ScheduleBatch],
+        pp_proxy_tensors: PPProxyTensors,
+        upstream_plan: Dict[str, Any],
+    ) -> PPProxyTensors:
+        """Validate and project a received proxy for the local survivor batch."""
+
+        tensors = pp_proxy_tensors.tensors
+        remote_control = tensors.get(_PP_BATCH_CONTROL_KEY)
+        expected_control = self._pp_control_from_plan(upstream_plan)
+        if remote_control != expected_control:
             raise RuntimeError(
-                "PP hidden batch contract mismatch before forward: "
-                f"local={local_contract} remote={remote_contract}"
+                "PP proxy control does not match the relayed plan: "
+                f"mb_id={mb_id} proxy={remote_control} plan={expected_control}"
             )
-        # The manifest is scheduler metadata, not a model input tensor.
-        pp_proxy_tensors.tensors.pop("__pp_batch_contract__", None)
+
+        expected_contract = expected_control["contract"]
+        local_contract = self._pp_batch_contract(batch, mb_id)
+        active_rids = tuple(local_contract.get("rids", ()))
+        filtered = _pp_filter_proxy_rows(
+            pp_proxy_tensors,
+            expected_contract,
+            active_rids,
+        )
+        filtered.pop(_PP_BATCH_CONTROL_KEY, None)
+        prepared = PPProxyTensors(filtered)
+        if active_rids != tuple(expected_contract.get("rids", ())):
+            prepared._mark_pp_projected_token_rows(
+                int(local_contract.get("extend_num_tokens", 0))
+            )
+        return prepared
 
     def _pp_validate_authoritative_plan_configuration(self) -> None:
         unsupported = []
@@ -633,15 +1073,22 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 authoritative_plan = None
+                upstream_plan = None
                 if self._pp_batch_contract_guard_enabled:
                     recv_reqs, authoritative_plan = (
                         self._pp_extract_authoritative_batch_plan(mb_id, recv_reqs)
                     )
+                    upstream_plan = authoritative_plan
                 self.process_input_requests(recv_reqs)
                 recv_reqs = self._pp_pd_get_mm_ready_reqs(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
+
+                # Finish any in-flight proxy send before releasing aborted KV.
+                if self._pp_pending_cache_read_aborts:
+                    self._pp_commit_comm_work(self.send_proxy_work)
+                    self._pp_drain_pending_cache_read_aborts()
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
@@ -655,6 +1102,11 @@ class SchedulerPPMixin:
                     self._pp_batch_contract_guard_enabled
                     and not self.pp_group.is_first_rank
                 ):
+                    authoritative_plan = (
+                        self._pp_project_locally_aborted_chunked_requests(
+                            authoritative_plan
+                        )
+                    )
                     self._pp_install_authoritative_batch_plan(mb_id, authoritative_plan)
 
                 prior_chunked_req = self.chunked_req
@@ -673,29 +1125,62 @@ class SchedulerPPMixin:
                 )
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
+                scheduled_batch = batch
+                if (
+                    self._pp_batch_contract_guard_enabled
+                    and not self.pp_group.is_first_rank
+                ):
+                    authoritative_plan = self._pp_apply_local_aborts_to_plan(
+                        mb_id,
+                        batch,
+                        authoritative_plan,
+                        tuple(prefill_plan.pp_local_aborts),
+                    )
+                    self._pp_validate_authoritative_batch_plan(
+                        mb_id, batch, authoritative_plan
+                    )
+                batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 if (
                     self._pp_batch_contract_guard_enabled
                     and self.pp_group.is_first_rank
                 ):
                     authoritative_plan = self._pp_make_authoritative_batch_plan(
                         mb_id,
-                        batch,
+                        scheduled_batch,
                         prior_chunked_req=prior_chunked_req,
                         next_chunked_req=self.chunked_req,
+                        local_aborts=tuple(prefill_plan.pp_local_aborts),
+                        transport=batch is not None,
                     )
-                elif self._pp_batch_contract_guard_enabled:
-                    self._pp_validate_authoritative_batch_plan(
-                        mb_id, batch, authoritative_plan
+                if self._pp_batch_contract_guard_enabled:
+                    self._pp_mb_controls[mb_id] = self._pp_control_from_plan(
+                        authoritative_plan
                     )
-                batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
-                if cur_batch:
+                transport_expected = bool(
+                    self._pp_batch_contract_guard_enabled
+                    and self._pp_mb_controls[mb_id]["transport"]
+                )
+                if cur_batch or transport_expected:
                     server_is_idle = False
+                if cur_batch or (
+                    transport_expected and not self.pp_group.is_first_rank
+                ):
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    if (
+                        self._pp_batch_contract_guard_enabled
+                        and not self.pp_group.is_first_rank
+                    ):
+                        pp_proxy_tensors = self._pp_prepare_received_proxy(
+                            mb_id,
+                            cur_batch,
+                            pp_proxy_tensors,
+                            upstream_plan,
+                        )
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -713,6 +1198,24 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                if transport_expected and self.pp_group.is_last_rank:
+                    control = self._pp_mb_controls[mb_id]
+                    if cur_batch:
+                        output_tensors = self.last_rank_comm_queue[-1][1].tensors
+                        output_tensors[_PP_BATCH_CONTROL_KEY] = control
+                    else:
+                        event = self.device_module.Event()
+                        event.record(self.device_module.current_stream())
+                        self.mb_metadata[mb_id] = PPBatchMetadata(
+                            can_run_cuda_graph=False,
+                            forward_done=event,
+                        )
+                        self.last_rank_comm_queue.append(
+                            (
+                                event,
+                                PPProxyTensors({_PP_BATCH_CONTROL_KEY: control}),
+                            )
+                        )
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -756,6 +1259,13 @@ class SchedulerPPMixin:
                         next_batch_result,
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                elif (
+                    self._pp_batch_contract_guard_enabled
+                    and self._pp_mb_controls[next_mb_id] is not None
+                    and self._pp_mb_controls[next_mb_id]["transport"]
+                ):
+                    # Clear stale state after a cancellation-only output.
+                    self.last_mbs[next_mb_id] = None
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
@@ -778,19 +1288,22 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        proxy_tensors = (
-                            dict(result.pp_hidden_states_proxy_tensors.tensors)
-                            if self._pp_batch_contract_guard_enabled
-                            else result.pp_hidden_states_proxy_tensors.tensors
-                        )
-                        if self._pp_batch_contract_guard_enabled:
-                            proxy_tensors["__pp_batch_contract__"] = (
-                                self._pp_batch_contract(cur_batch, mb_id)
+                    if cur_batch or transport_expected:
+                        if cur_batch:
+                            self.device_module.current_stream().wait_event(
+                                self.launch_event
                             )
+                            proxy_tensors = (
+                                dict(result.pp_hidden_states_proxy_tensors.tensors)
+                                if self._pp_batch_contract_guard_enabled
+                                else result.pp_hidden_states_proxy_tensors.tensors
+                            )
+                        else:
+                            proxy_tensors = {}
+                        if self._pp_batch_contract_guard_enabled:
+                            proxy_tensors[_PP_BATCH_CONTROL_KEY] = self._pp_mb_controls[
+                                mb_id
+                            ]
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             proxy_tensors,
                             async_send=True,
@@ -1007,6 +1520,7 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
+        self._pp_batch_contract_guard_enabled = False
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not self.server_args.enable_dsa_prefill_context_parallel
@@ -1018,6 +1532,14 @@ class SchedulerPPMixin:
             for _ in range(self.pp_loop_size)
         ]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
+        self._pp_mb_controls: List[Optional[Dict[str, Any]]] = [
+            None
+        ] * self.pp_loop_size
+        self._pp_next_plan_seq = 0
+        self._pp_last_received_plan_seq = -1
+        self._pp_abort_tombstones: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        self._pp_local_chunk_abort_records: Dict[str, Dict[str, Any]] = {}
+        self._pp_pending_cache_read_aborts: Dict[int, Tuple[Req, Dict[str, Any]]] = {}
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
 
@@ -1501,7 +2023,7 @@ class SchedulerPPMixin:
 
     def _pp_send_dict_to_next_stage(
         self: Scheduler,
-        tensor_dict: Dict[str, torch.Tensor],
+        tensor_dict: Dict[str, Any],
         async_send: bool = True,
         msg_type: str = "default",
     ):
@@ -1528,7 +2050,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_kind: str = "default",
         all_gather_group: Optional = None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
         If a message of the wrong kind is received, it's stashed in the queue
@@ -1572,7 +2094,7 @@ class SchedulerPPMixin:
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
             all_gather_group=(
@@ -1633,11 +2155,12 @@ class SchedulerPPMixin:
         # below would either raise an opaque broadcast error or, when the two
         # sizes happen to match with different members, silently write tokens
         # into the wrong slots.
-        assert next_token_ids.shape[0] == batch.req_pool_indices.shape[0], (
-            "PP batch size mismatch between stages: "
-            f"next_token_ids={next_token_ids.shape[0]} "
-            f"req_pool_indices={batch.req_pool_indices.shape[0]}"
-        )
+        if next_token_ids.shape[0] != batch.req_pool_indices.shape[0]:
+            raise RuntimeError(
+                "PP batch size mismatch between stages: "
+                f"next_token_ids={next_token_ids.shape[0]} "
+                f"req_pool_indices={batch.req_pool_indices.shape[0]}"
+            )
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
@@ -1683,11 +2206,20 @@ class SchedulerPPMixin:
         if self.pp_group.is_last_rank:
             # send ready PP output to rank 0
             target = mbs[next_first_rank_mb_id]
-            if target is not None:
+            target_control = self._pp_mb_controls[next_first_rank_mb_id]
+            control_transport = bool(
+                self._pp_batch_contract_guard_enabled
+                and target_control is not None
+                and target_control["transport"]
+            )
+            if target is not None or control_transport:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
+                if target is None or (
                     not target.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(target)
+                    and (
+                        not _pp_can_skip_output_comm(target)
+                        or _pp_control_has_current_aborts(target_control)
+                    )
                 ):
                     self.device_module.current_stream().wait_event(q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
@@ -1706,6 +2238,124 @@ class SchedulerPPMixin:
                         msg_type="output",
                     )
         return send_output_work
+
+    def _pp_reconcile_output_aborts(
+        self,
+        mb_id: int,
+        batch: Optional[ScheduleBatch],
+        pp_outputs: PPProxyTensors,
+    ) -> Optional[ScheduleBatch]:
+        """Apply finalized PP aborts and return the surviving output batch."""
+
+        expected_control = self._pp_mb_controls[mb_id]
+        remote_control = pp_outputs.tensors.get(_PP_BATCH_CONTROL_KEY)
+        if expected_control is None or remote_control is None:
+            raise RuntimeError(f"missing PP cancellation control for mb_id={mb_id}")
+        if (
+            remote_control.get("version") != expected_control.get("version")
+            or remote_control.get("plan_seq") != expected_control.get("plan_seq")
+            or remote_control.get("mb_id") != mb_id
+            or not remote_control.get("transport")
+        ):
+            raise RuntimeError(
+                "PP output cancellation control mismatch: "
+                f"local={expected_control} remote={remote_control}"
+            )
+
+        final_contract = remote_control.get("contract")
+        local_contract = expected_control.get("contract")
+        final_rids = tuple(final_contract.get("rids", ()))
+        projected = _pp_project_contract(local_contract, final_rids)
+        if projected != final_contract:
+            raise RuntimeError(
+                "PP output contract is not a valid survivor projection: "
+                f"local={local_contract} remote={final_contract}"
+            )
+
+        abort_records = tuple(remote_control.get("aborts", ()))
+        remote_abort_by_key = {
+            (int(record.get("plan_seq", -1)), record.get("rid")): record
+            for record in abort_records
+        }
+        missing_known_aborts = tuple(
+            record
+            for record in expected_control.get("aborts", ())
+            if remote_abort_by_key.get(
+                (int(record.get("plan_seq", -1)), record.get("rid"))
+            )
+            != record
+        )
+        if missing_known_aborts:
+            raise RuntimeError(
+                "PP output lost previously known abort records: "
+                f"missing={missing_known_aborts} remote={abort_records}"
+            )
+        current_abort_records = tuple(
+            record
+            for record in abort_records
+            if int(record.get("plan_seq", -1)) == int(expected_control["plan_seq"])
+        )
+        abort_by_rid = {record["rid"]: record for record in current_abort_records}
+        surviving_aborts = set(final_rids).intersection(abort_by_rid)
+        if surviving_aborts:
+            raise RuntimeError(
+                "PP output kept requests marked aborted: "
+                f"rids={tuple(sorted(surviving_aborts))}"
+            )
+        removed_rids = set(local_contract.get("rids", ())) - set(final_rids)
+        if not removed_rids.issubset(abort_by_rid):
+            raise RuntimeError(
+                "PP output removed requests without abort evidence: "
+                f"removed={tuple(sorted(removed_rids))} aborts={abort_records}"
+            )
+        if self.pp_group.is_first_rank and current_abort_records:
+            self._pp_register_abort_tombstones(current_abort_records)
+            logger.error(
+                "PP request cancellation finalized: plan_seq=%s mb_id=%s "
+                "aborted_rids=%s surviving_rids=%s",
+                expected_control["plan_seq"],
+                mb_id,
+                tuple(record["rid"] for record in current_abort_records),
+                final_rids,
+            )
+
+        if batch is None:
+            if final_rids:
+                raise RuntimeError(
+                    "PP output revived requests after the local batch was cancelled: "
+                    f"mb_id={mb_id} final={final_rids}"
+                )
+            return None
+
+        had_requests = bool(batch.reqs)
+        keep_indices = []
+        for index, req in enumerate(batch.reqs):
+            record = abort_by_rid.get(req.rid)
+            if record is None:
+                keep_indices.append(index)
+                continue
+            is_chunked = self.chunked_req is req or batch.chunked_req is req
+            if is_chunked:
+                # Defer KV release until its in-flight proxy send completes.
+                self._pp_defer_chunked_cache_read_abort(req, record)
+                if batch.chunked_req is req:
+                    batch.chunked_req = None
+            elif not req.finished():
+                req._as_cache_read_abort_reason = record.get("reason")
+                self._abort_failed_cache_read(req)
+
+        if len(keep_indices) != len(batch.reqs):
+            # filter_batch expects request rows, not prefill token rows.
+            batch.input_ids = None
+            batch.filter_batch(keep_indices=keep_indices)
+            batch.prefix_lens = list(final_contract.get("prefix_lens", ()))
+            batch.extend_lens = [
+                end - start for start, end in final_contract.get("extend_ranges", ())
+            ]
+            batch.extend_num_tokens = int(final_contract.get("extend_num_tokens", 0))
+        if had_requests and not batch.reqs:
+            return None
+        return batch
 
     def _pp_send_recv_and_preprocess_output_tensors(
         self: Scheduler,
@@ -1756,15 +2406,34 @@ class SchedulerPPMixin:
         def _do_recv():
             nonlocal next_pp_outputs, batch_result, d2h_event
             target = mbs[next_mb_id]
-            if target is None or target.forward_mode.is_prebuilt():
+            target_control = self._pp_mb_controls[next_mb_id]
+            control_transport = bool(
+                self._pp_batch_contract_guard_enabled
+                and target_control is not None
+                and target_control["transport"]
+            )
+            if (target is None and not control_transport) or (
+                target is not None and target.forward_mode.is_prebuilt()
+            ):
                 return
-            if _pp_can_skip_output_comm(target):
+            if (
+                target is not None
+                and _pp_can_skip_output_comm(target)
+                and not _pp_control_has_current_aborts(target_control)
+            ):
                 next_pp_outputs, batch_result, d2h_event = (
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
                 )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+            if self._pp_batch_contract_guard_enabled:
+                target = self._pp_reconcile_output_aborts(
+                    next_mb_id, target, next_pp_outputs
+                )
+                mbs[next_mb_id] = target
+                if target is None:
+                    return
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
                 batch_result = self._pp_prep_batch_result(
@@ -1790,7 +2459,6 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
-        self._pp_validate_proxy_batch_contract(mb_id, cur_batch, pp_proxy_tensors)
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
