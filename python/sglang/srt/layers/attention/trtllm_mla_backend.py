@@ -44,6 +44,11 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_page_per_block_flashmla,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.kernels.ops.quantization.mla_qkv_fp8_cast import (
+    quantize_mla_qkv_fp8_profitable,
+    quantize_mla_qkv_fp8_supported,
+    quantize_mla_qkv_fp8_triton,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
@@ -107,11 +112,30 @@ def grow_multi_ctas_kv_counter_buffer_if_needed(
 
 
 def _quantize_fp8_qkv(q, k, v, layer):
-    q = q.to(torch.float8_e4m3fn)
-
     k_scale = getattr(layer, "k_scale_float", None)
     if k_scale is None:
         k_scale = 1.0
+    v_scale = getattr(layer, "v_scale_float", None)
+    if v_scale is None:
+        v_scale = 1.0
+
+    # The unscaled triple is one bit-exact Triton path; anything else keeps the
+    # original per-tensor casts below. Order matters: the profitability test is
+    # three numel() calls, while the support guard is a dozen attribute checks,
+    # and on the small prefill shapes this whole function costs ~44 us, so the
+    # cheap test goes first and short-circuits straight to the original path.
+    if (
+        envs.SGLANG_OPT_USE_TRITON_MLA_QKV_FP8_CAST.get()
+        and k_scale == 1.0
+        and v_scale == 1.0
+        and quantize_mla_qkv_fp8_profitable(q, k, v)
+        and quantize_mla_qkv_fp8_supported(q, k, v)
+    ):
+        q, k, v = quantize_mla_qkv_fp8_triton(q, k, v)
+        return q, k, v, k_scale, v_scale
+
+    q = q.to(torch.float8_e4m3fn)
+
     if k_scale != 1.0:
         assert hasattr(layer, "k_scale"), "k_scale is not set"
         k_2d, _ = scaled_fp8_quant(
@@ -121,9 +145,6 @@ def _quantize_fp8_qkv(q, k, v, layer):
     else:
         k = k.to(torch.float8_e4m3fn)
 
-    v_scale = getattr(layer, "v_scale_float", None)
-    if v_scale is None:
-        v_scale = 1.0
     if v_scale != 1.0:
         assert hasattr(layer, "v_scale"), "v_scale is not set"
         v_2d, _ = scaled_fp8_quant(

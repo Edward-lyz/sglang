@@ -80,6 +80,135 @@ def concat_and_cast_mha_k_triton(
     )
 
 
+BLOCK_R_FLATROW = 16
+NUM_WARPS_FLATROW = 8
+_FLATROW_DTYPES = (torch.bfloat16, torch.float16)
+
+
+@triton.jit
+def concat_mla_k_flatrow_kernel(
+    k_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    n_rows,
+    head_cnt,
+    nope_stride0,
+    nope_stride1,
+    rope_stride0,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    """Flatten (token, head) into one row axis so every store stream is long and
+    contiguous.
+
+    ``concat_and_cast_mha_k_kernel`` gives one program the whole head axis of a
+    single token, which requires ``head_cnt`` to be a power of two for
+    ``tl.arange``. Here a program owns ``BLOCK_R`` consecutive **output rows**
+    instead, so the head count never enters a ``tl.arange`` bound and any
+    ``head_cnt`` works, including Kimi-K3's 96.
+    """
+    pid = tl.program_id(0)
+    D_K: tl.constexpr = NOPE_DIM + ROPE_DIM
+
+    rows = pid * BLOCK_R + tl.arange(0, BLOCK_R)
+    mask = rows < n_rows
+    t = rows // head_cnt
+    h = rows % head_cnt
+
+    nope_offs = tl.arange(0, NOPE_DIM)
+    rope_offs = tl.arange(0, ROPE_DIM)
+
+    # k is contiguous (guaranteed by concat_mla_k_flatrow_supported), so the
+    # destination of one row block is one unbroken span of D_K * BLOCK_R values.
+    dst = k_ptr + rows[:, None].to(tl.int64) * D_K
+
+    src_nope = (
+        k_nope_ptr
+        + t[:, None].to(tl.int64) * nope_stride0
+        + h[:, None].to(tl.int64) * nope_stride1
+        + nope_offs[None, :]
+    )
+    tl.store(
+        dst + nope_offs[None, :],
+        tl.load(src_nope, mask=mask[:, None], other=0),
+        mask=mask[:, None],
+    )
+
+    src_rope = k_rope_ptr + t[:, None].to(tl.int64) * rope_stride0 + rope_offs[None, :]
+    tl.store(
+        dst + NOPE_DIM + rope_offs[None, :],
+        tl.load(src_rope, mask=mask[:, None], other=0),
+        mask=mask[:, None],
+    )
+
+
+def concat_mla_k_flatrow_supported(
+    k: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+) -> bool:
+    """Cheap host-side guard; return False to keep the caller's original path.
+
+    Unsupported (falls back): non-CUDA, non-bf16/fp16, mixed dtype (the fp8
+    kv-cache cast path), a non-contiguous ``k``, a non-unit stride on the last
+    dimension of an input, or head dims that are not multiples of 8 elements.
+    """
+    return (
+        k.is_cuda
+        and k_nope.is_cuda
+        and k_rope.is_cuda
+        and k.dtype in _FLATROW_DTYPES
+        and k_nope.dtype == k.dtype
+        and k_rope.dtype == k.dtype
+        and k.dim() == 3
+        and k_nope.dim() == 3
+        and k_rope.dim() == 3
+        and k.is_contiguous()
+        and k_nope.stride(2) == 1
+        and k_rope.stride(2) == 1
+        and k_rope.shape[1] == 1
+        and k.shape[0] == k_nope.shape[0] == k_rope.shape[0]
+        and k.shape[1] == k_nope.shape[1]
+        and k.shape[2] == k_nope.shape[2] + k_rope.shape[2]
+        and k_nope.shape[2] % 8 == 0
+        and k_rope.shape[2] % 8 == 0
+    )
+
+
+def concat_mla_k_flatrow_triton(
+    k: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+):
+    """Write ``k = cat(k_nope, broadcast(k_rope))`` for any head count.
+
+    Caller must have checked :func:`concat_mla_k_flatrow_supported`.
+
+    The head-count-agnostic sibling of :func:`concat_and_cast_mha_k_triton`: it
+    replaces the two unvectorized ``direct_copy`` kernels PyTorch emits for
+    ``k[..., :nope] = k_nope`` / ``k[..., nope:] = k_rope`` when the head count
+    is not a power of two, because a strided destination slice blocks
+    TensorIterator's vectorization and it degenerates to 2 bytes per thread.
+    """
+    n_rows = k.shape[0] * k.shape[1]
+    grid = (triton.cdiv(n_rows, BLOCK_R_FLATROW),)
+    concat_mla_k_flatrow_kernel[grid](
+        k,
+        k_nope,
+        k_rope,
+        n_rows,
+        k.shape[1],
+        k_nope.stride(0),
+        k_nope.stride(1),
+        k_rope.stride(0),
+        NOPE_DIM=k_nope.shape[2],
+        ROPE_DIM=k_rope.shape[2],
+        BLOCK_R=BLOCK_R_FLATROW,
+        num_warps=NUM_WARPS_FLATROW,
+    )
+
+
 @triton.jit
 def reshape_and_cache_flash(
     key_ptr,

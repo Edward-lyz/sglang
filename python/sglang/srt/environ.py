@@ -868,11 +868,64 @@ class Envs:
     SGLANG_ENABLE_K3_MOE_WEIGHT_SHARD = EnvBool(False)
     # Layer selection: "all", comma-separated ids, or inclusive ranges.
     SGLANG_K3_MOE_WEIGHT_SHARD_LAYERS = EnvStr("all")
+    # Fuse the K3 KDA short_conv q/k/v width-4 depthwise causal conv1d + SiLU,
+    # plus the in-place conv-state update, into one CUDA launch, replacing the
+    # three serial Triton causal_conv1d_fn calls in KDAAttnBackend.forward_extend.
+    # Bit-exact (torch.equal) against that Triton path and 1.787x aggregate over
+    # 5 prefill shapes on sm_100. Covers width 4, bf16 x, fp32 weight, bias None,
+    # equal q/k/v splits whose per-projection dim is a multiple of 128 (every
+    # attn_tp size), a row-major mixed_qkv whose stride(0) may exceed 3 * dim (the
+    # production torch.split view of the fused q/k/v/g projection is NOT
+    # contiguous), and SM100+; every other case stays on the Triton branch and
+    # logs the failing predicate once. See kernels/ops/kimi_k3/kda_short_conv.py
+    # and srt/layers/attention/linear/kda_backend.py. Default off.
+    SGLANG_K3_KDA_SHORT_CONV = EnvBool(False)
+    # KDA extend preprocessing (bit-exact fused CUDA JIT kernels; both fall back
+    # to the original torch path when the tensor layout is not covered).
+    # 1) beta.float().sigmoid() on the strided [f_a|b] slice -> one kernel that
+    #    reads BF16 strided and writes contiguous FP32 sigmoid.
+    #    See kernels/ops/kimi_k3/kda_preprocess.py::fused_beta_sigmoid.
+    SGLANG_OPT_USE_K3_KDA_FUSED_BETA_SIGMOID = EnvBool(False)
+    # 2) has_initial_state compare + tracked conv-window gather + index_put ->
+    #    one kernel writing the conv pool in place.
+    #    See kda_preprocess.py::fused_track_conv_state_flag.
+    SGLANG_OPT_USE_K3_KDA_FUSED_TRACK_CONV_STATE = EnvBool(False)
     # Debug-only: instantiate only the first N Kimi-K3 routed experts per MoE
     # layer and load the matching expert prefix. 0/unset keeps the full
     # checkpoint. This preserves all transformer layers, so DSpark layer capture
     # still observes the configured target layer ids.
     SGLANG_KIMI_K3_KEEP_NUM_EXPERTS = EnvInt(0)
+    # MHA-prefill K concat: use the flat-(token,head)-row Triton kernel instead of
+    # the PyTorch slice assignment on the branch where the head count is not a
+    # power of two, so neither concat_mla_k (128 heads only) nor
+    # concat_and_cast_mha_k_triton (power-of-two heads only) applies -- Kimi-K3's
+    # num_local_heads=96. The torch path emits two unvectorized direct_copy
+    # kernels there because a strided destination slice blocks TensorIterator
+    # vectorization, moving 2 bytes per thread. Bit-exact; unsupported inputs
+    # (mixed dtype, non-contiguous k, head dim not a multiple of 8) fall back to
+    # the original assignment. Gates both K concats of chunked prefill: the
+    # extend-token one in _concat_and_cast_mha_k and the per-prefix-chunk one in
+    # _chunked_prefix_attn_mha. See
+    # kernels/ops/kvcache/cache_ops.py:concat_mla_k_flatrow_triton.
+    SGLANG_OPT_USE_FLATROW_CONCAT_MHA_K = EnvBool(False)
+
+    # MHA-prefill Q/K/V FP8 cast: replace the three bf16 -> fp8_e4m3fn
+    # Tensor.to calls in trtllm_mla_backend._quantize_fp8_qkv with one Triton
+    # path that splits by layout -- a flat 1D kernel for the contiguous q/k and a
+    # row-per-program kernel for v, which is kv[..., qk_nope_head_dim:] and
+    # therefore has head stride 256 with only the inner 128 elements contiguous.
+    # That strided source blocks TensorIterator vectorization, so the torch cast
+    # degenerates to gpu_kernel_impl_nocast at 0.667 TB/s: 188.9 us of the
+    # group's 397.6 us on Kimi-K3 prefill (B200, T=32768, H=12). Bit-exact,
+    # including PyTorch's non-saturating overflow encoding (|x| > 464 and every
+    # inf/nan become 0x7f with the sign kept, not the hardware clamp to 448).
+    # Applies only to the k_scale == v_scale == 1.0 branches; the
+    # scaled_fp8_quant branches and unsupported inputs (non-bf16, non-contiguous
+    # q/k, non-unit inner stride on v) fall back to the original casts. A
+    # measured size gate keeps small shapes on torch, where the operator is
+    # host-launch bound rather than bandwidth bound. See
+    # kernels/ops/quantization/mla_qkv_fp8_cast.py:quantize_mla_qkv_fp8_triton.
+    SGLANG_OPT_USE_TRITON_MLA_QKV_FP8_CAST = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -1012,6 +1065,13 @@ class Envs:
     # batch. Raise MAX to keep large chunked-prefill batches on FlashKDA.
     SGLANG_FLASHKDA_MIN_SEQ_LEN = EnvInt(64)
     SGLANG_FLASHKDA_MAX_SEQ_LEN = EnvInt(2048)
+
+    # KDA extend/prefill output tail: fuse the non-contiguous layout copy
+    # (forced by FusedRMSNormGated's x.reshape(-1, D) on core_attn_out, which
+    # aliases the transposed conv-output buffer) together with the gated
+    # RMSNorm into one JIT kernel. Off by default; falls back to the
+    # existing self.o_norm(...) + squeeze/flatten path when not covered.
+    SGLANG_OPT_USE_KDA_STRIDED_ONORM = EnvBool(False)
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)

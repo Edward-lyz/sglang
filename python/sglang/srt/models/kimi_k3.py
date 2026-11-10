@@ -1213,6 +1213,26 @@ class KimiK3MoE(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def kda_activate_beta(beta: torch.Tensor) -> torch.Tensor:
+    """FP32 sigmoid of the delta-rule write strength (chunk_kda wants it pre-activated).
+
+    ``beta`` is the tail slice of the fused ``[f_a|b]`` GEMM output, so the torch
+    path pays a strided BF16->FP32 copy plus a separate sigmoid. The fused kernel
+    does both in one launch; layouts it does not cover fall back to torch.
+    """
+    if envs.SGLANG_OPT_USE_K3_KDA_FUSED_BETA_SIGMOID.get():
+        from sglang.kernels.ops.kimi_k3.kda_preprocess import (
+            can_fuse_beta_sigmoid,
+            fused_beta_sigmoid,
+        )
+
+        if can_fuse_beta_sigmoid(beta):
+            out = torch.empty(beta.shape, dtype=torch.float32, device=beta.device)
+            fused_beta_sigmoid(beta, out)
+            return out
+    return beta.float().sigmoid()
+
+
 class KimiK3DeltaAttention(nn.Module):
     def __init__(
         self,
@@ -1665,7 +1685,7 @@ class KimiK3DeltaAttention(nn.Module):
             if not forward_batch.forward_mode.is_target_verify():
                 # Only chunk_kda (extend) wants pre-activated beta; the verify
                 # kernel sigmoids it in-kernel like decode.
-                beta = beta.float().sigmoid()
+                beta = kda_activate_beta(beta)
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
@@ -1693,9 +1713,44 @@ class KimiK3DeltaAttention(nn.Module):
             self.attn._k3_onorm_gate = None
             fused_onorm = self.attn._k3_onorm_consumed
         if not fused_onorm:
-            norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
-            core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        core_attn_out = core_attn_out.squeeze(0).flatten(-2)
+            # unsqueeze(0) to match core_attn_out's leading batch dim of 1
+            # (added by the attn kernel dispatcher); covered() requires
+            # x.shape == g.shape, so without this norm_gate stays 3-D and
+            # covered() always returns False.
+            norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim)).unsqueeze(0)
+            # Strided-onorm fast path (extend/prefill only): fuse the ATen
+            # layout copy that FusedRMSNormGated's x.reshape(-1, D) would
+            # otherwise force on non-contiguous core_attn_out, together with
+            # the gated RMSNorm, into one kernel that already returns
+            # contiguous [T, H*D] -- skip the flatten below on this path.
+            if envs.SGLANG_OPT_USE_KDA_STRIDED_ONORM.get():
+                from sglang.kernels.ops.kimi_k3.kda_strided_onorm import (
+                    covered as _kda_strided_onorm_covered,
+                    kda_strided_onorm,
+                )
+
+                if _kda_strided_onorm_covered(
+                    core_attn_out,
+                    norm_gate,
+                    self.o_norm.weight,
+                    self.o_norm.activation,
+                    self.o_norm.eps,
+                ):
+                    core_attn_out = kda_strided_onorm(
+                        core_attn_out,
+                        norm_gate,
+                        self.o_norm.weight,
+                        self.o_norm.activation,
+                        self.o_norm.eps,
+                    )
+                else:
+                    core_attn_out = self.o_norm(core_attn_out, norm_gate)
+                    core_attn_out = core_attn_out.squeeze(0).flatten(-2)
+            else:
+                core_attn_out = self.o_norm(core_attn_out, norm_gate)
+                core_attn_out = core_attn_out.squeeze(0).flatten(-2)
+        else:
+            core_attn_out = core_attn_out.squeeze(0).flatten(-2)
         if self.all_reduce_fusion:
             with k3_ar_fusion.symm_alloc():
                 partial, _ = self.o_proj(core_attn_out)

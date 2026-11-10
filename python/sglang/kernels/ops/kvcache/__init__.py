@@ -60,6 +60,7 @@ __all__ = ["reshape_and_cache_flash"]
 # triton_ops); registered for inventory. Import them from their modules.
 _TRITON_KERNELS = [
     ("cache_ops", "concat_and_cast_mha_k_triton"),
+    ("cache_ops", "concat_mla_k_flatrow_triton"),
     ("cache_ops", "launch_reshape_and_cache_flash"),
     ("kv_indices", "create_flashinfer_kv_indices_triton"),
     ("kv_indices", "create_flashmla_kv_indices_triton"),

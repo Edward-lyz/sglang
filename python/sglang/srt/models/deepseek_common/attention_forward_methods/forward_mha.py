@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
-from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
+from sglang.kernels.ops.attention.utils import (
+    concat_and_cast_mha_k_triton,
+    concat_mla_k_flatrow_supported,
+    concat_mla_k_flatrow_triton,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -515,8 +519,13 @@ class DeepseekMHAForwardMixin:
                     dtype=v.dtype,
                     device=v.device,
                 )
-                k[..., : self.qk_nope_head_dim] = k_nope
-                k[..., self.qk_nope_head_dim :] = k_pe
+                if envs.SGLANG_OPT_USE_FLATROW_CONCAT_MHA_K.get() and (
+                    concat_mla_k_flatrow_supported(k, k_nope, k_pe)
+                ):
+                    concat_mla_k_flatrow_triton(k, k_nope, k_pe)
+                else:
+                    k[..., : self.qk_nope_head_dim] = k_nope
+                    k[..., self.qk_nope_head_dim :] = k_pe
 
             output, lse = self.attn_mha(
                 q,
@@ -655,6 +664,11 @@ class DeepseekMHAForwardMixin:
             concat_and_cast_mha_k_triton(k, k_nope, k_pe)
         else:
             k = k_nope.new_empty(*k_shape)
-            k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
+            if envs.SGLANG_OPT_USE_FLATROW_CONCAT_MHA_K.get() and (
+                concat_mla_k_flatrow_supported(k, k_nope, k_pe)
+            ):
+                concat_mla_k_flatrow_triton(k, k_nope, k_pe)
+            else:
+                k[..., : self.qk_nope_head_dim] = k_nope
+                k[..., self.qk_nope_head_dim :] = k_pe
         return k

@@ -4,10 +4,14 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.kimi_k3.kda_short_conv import (
+    covered as kda_short_conv_covered,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -18,6 +22,7 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_verify_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -296,6 +301,56 @@ class KDAKernelDispatcher:
             query_start_loc=query_start_loc,
             **kwargs,
         )
+
+
+def kda_extend_initial_state_and_track(
+    *,
+    prefix_lens: torch.Tensor,
+    mixed_qkv: torch.Tensor,
+    conv_pool: Optional[torch.Tensor] = None,
+    track_indices: Optional[torch.Tensor] = None,
+    destination_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """``has_initial_state`` plus the tracked conv-window snapshot.
+
+    The torch path is three tiny kernels (`prefix_lens > 0`, the
+    ``mixed_qkv[track_indices]`` gather and the ``conv_pool[dst] = ...``
+    index_put) moving ~200KB, so it is launch-bound. The fused kernel does the
+    gather-scatter in place and writes the flag from an otherwise idle block.
+    Uncovered layouts and the no-tracking case fall back to torch.
+    """
+    do_track = track_indices is not None
+    if do_track and envs.SGLANG_OPT_USE_K3_KDA_FUSED_TRACK_CONV_STATE.get():
+        from sglang.kernels.ops.kimi_k3.kda_preprocess import (
+            can_fuse_track_conv_state_flag,
+            fused_track_conv_state_flag,
+        )
+
+        has_initial_state = torch.empty(
+            prefix_lens.shape, dtype=torch.bool, device=prefix_lens.device
+        )
+        if can_fuse_track_conv_state_flag(
+            mixed_qkv,
+            conv_pool,
+            track_indices,
+            destination_indices,
+            prefix_lens,
+            has_initial_state,
+        ):
+            fused_track_conv_state_flag(
+                mixed_qkv,
+                conv_pool,
+                track_indices,
+                destination_indices,
+                prefix_lens,
+                has_initial_state,
+            )
+            return has_initial_state
+
+    has_initial_state = prefix_lens > 0
+    if do_track:
+        conv_pool[destination_indices] = mixed_qkv[track_indices]
+    return has_initial_state
 
 
 def ragged_verify_dense_scatter_indices(
@@ -579,62 +634,105 @@ class KDAAttnBackend(MambaAttnBackendBase):
             raise RuntimeError(
                 "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
             )
-        has_initial_state = forward_batch.extend_prefix_lens > 0
-
-        if self.forward_metadata.has_mamba_track_mask:
-            # Snapshot the conv sliding window at the last track-aligned chunk
-            # boundary into the ping-pong track slots (the prefix-cache restore
-            # source). The KDA pool stores conv states as [kernel-1, dim], so
-            # rows of the raw [tokens, dim] pre-conv input index in directly
-            # (GDN needs a transpose here; KDA does not).
-            mamba_cache_params.conv[0][
-                self.forward_metadata.conv_states_mask_indices
-            ] = mixed_qkv[self.forward_metadata.track_conv_indices]
+        # Snapshot the conv sliding window at the last track-aligned chunk
+        # boundary into the ping-pong track slots (the prefix-cache restore
+        # source). The KDA pool stores conv states as [kernel-1, dim], so
+        # rows of the raw [tokens, dim] pre-conv input index in directly
+        # (GDN needs a transpose here; KDA does not).
+        track = self.forward_metadata.has_mamba_track_mask
+        has_initial_state = kda_extend_initial_state_and_track(
+            prefix_lens=forward_batch.extend_prefix_lens,
+            mixed_qkv=mixed_qkv,
+            conv_pool=mamba_cache_params.conv[0] if track else None,
+            track_indices=(
+                self.forward_metadata.track_conv_indices if track else None
+            ),
+            destination_indices=(
+                self.forward_metadata.conv_states_mask_indices if track else None
+            ),
+        )
 
         splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
-        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
-            splits, dim=0
-        )
-        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
-        if layer.bias is not None:
-            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
-        else:
-            q_bias, k_bias, v_bias = None, None, None
+        if envs.SGLANG_K3_KDA_SHORT_CONV.get() and kda_short_conv_covered(
+            mixed_qkv,
+            layer.conv_weights,
+            mamba_cache_params.conv[0],
+            layer.bias,
+            splits,
+            # The flag is already known to be on here (Python short-circuits the
+            # `and`), so a rejection means the user asked for the fused kernel
+            # and did not get it: log the failing predicate once instead of
+            # falling back silently forever.
+            warn_if_rejected=True,
+        ):
+            # One fused launch for q/k/v (plus a small conv-state update launch)
+            # instead of three serial causal_conv1d_fn calls. It returns the same
+            # (dim, tokens) layout, so the same .transpose(0, 1) applies. Every
+            # unsupported shape/dtype is rejected by kda_short_conv_covered above
+            # and falls through to the original branch below.
+            from sglang.kernels.ops.kimi_k3.kda_short_conv import (
+                kimi_k3_kda_short_conv,
+            )
 
-        q = causal_conv1d_fn(
-            q,
-            q_conv_weight,
-            q_bias,
-            activation="silu",
-            conv_states=q_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        k = causal_conv1d_fn(
-            k,
-            k_conv_weight,
-            k_bias,
-            activation="silu",
-            conv_states=k_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        v = causal_conv1d_fn(
-            v,
-            v_conv_weight,
-            v_bias,
-            activation="silu",
-            conv_states=v_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+            q, k, v = kimi_k3_kda_short_conv(
+                mixed_qkv,
+                layer.conv_weights,
+                # The raw pool, not the transposed `conv_states` view: the kernel
+                # reproduces that view's addressing internally and updates the
+                # pool in place, exactly as causal_conv1d_fn does.
+                mamba_cache_params.conv[0],
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
+                has_initial_state=has_initial_state,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            )
+            q = q.transpose(0, 1)
+            k = k.transpose(0, 1)
+            v = v.transpose(0, 1)
+        else:
+            q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+            q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+                splits, dim=0
+            )
+            q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+            if layer.bias is not None:
+                q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+            else:
+                q_bias, k_bias, v_bias = None, None, None
+
+            q = causal_conv1d_fn(
+                q,
+                q_conv_weight,
+                q_bias,
+                activation="silu",
+                conv_states=q_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            k = causal_conv1d_fn(
+                k,
+                k_conv_weight,
+                k_bias,
+                activation="silu",
+                conv_states=k_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            v = causal_conv1d_fn(
+                v,
+                v_conv_weight,
+                v_bias,
+                activation="silu",
+                conv_states=v_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
