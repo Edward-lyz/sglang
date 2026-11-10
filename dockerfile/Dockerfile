@@ -33,6 +33,12 @@ RUN rm -rf /sgl-workspace/sglang/python && cp -r /tmp/aiak_sglang/python /sgl-wo
 
 # RUN pip install --upgrade tokenspeed-mla --break-system-packages --proxy http://agent.baidu.com:8891
 
+# 改精确除法
+RUN set -eux; \
+    target=/usr/local/lib/python3.12/dist-packages/tokenspeed_mla/mla_decode_fp8.py; \
+    python3 -c 'import sys; from pathlib import Path; p = Path("/usr/local/lib/python3.12/dist-packages/tokenspeed_mla/mla_decode_fp8.py"); old = "epi_scale = epilogue_params.output_scale * cute.arch.rcp_approx(row_sum)"; new = "epi_scale = epilogue_params.output_scale / row_sum"; text = p.read_text(); sys.exit("target line not found") if old not in text else p.write_text(text.replace(old, new, 1))'; \
+    python3 -m py_compile "$target"
+
 RUN pip config set global.index-url http://mirrors.baidubce.com/pypi/simple/ && \
     pip config set global.trusted-host mirrors.baidubce.com
 
