@@ -1629,8 +1629,17 @@ class DeepseekV4AttnBackend(
             tail_len=SWA_WINDOW,
             device=device,
         )
+        # The contiguous fast path takes rows [start:] to the end of the batch, so it
+        # only holds when the tail ends the batch; MLP-sync padding (tp without
+        # prefill CP) appends rows past the extend -> gather token_indices instead.
         contiguous_start = (
-            extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
+            extend_lens_cpu[0] - tail_lens_cpu[0]
+            if len(extend_lens_cpu) == 1
+            and (
+                is_cp_active(forward_batch)
+                or forward_batch.out_cache_loc.shape[0] == extend_lens_cpu[0]
+            )
+            else None
         )
         out_cache_loc = _tail_rows(
             forward_batch.out_cache_loc,
@@ -3564,11 +3573,16 @@ class DeepseekV4AttnBackend(
         q_fp4 = q_fp4.view(num_tokens, num_heads, 64)
         q_sf = q_sf.view(num_tokens, num_heads)
         compress_lens = ((pos + 1) // ratio).to(torch.int32)
+        # Rows past sum(q_lens) are MLP-sync padding (tp without prefill CP); no
+        # request owns them, they keep the -1 selection below.
+        live_rows = sum(q_lens_cpu)
         ks = torch.repeat_interleave(
             starts_dev.to(torch.int32),
             q_lens.to(torch.int64),
-            output_size=num_tokens,
+            output_size=min(live_rows, num_tokens),
         )
+        if live_rows < num_tokens:
+            ks = torch.nn.functional.pad(ks, (0, num_tokens - live_rows), value=0)
         topk = indexer.index_topk
         # -1 is the "nothing selected" value the tail below turns into a -1 page:
         # a request with no visible compressed position never enters the loop.
