@@ -426,6 +426,12 @@ class Envs:
     # accounting (CompiledGrammar.memory_size_bytes, which overestimates real
     # RSS by ~15x on DSV4.1). Negative = unbounded.
     SGLANG_XGRAMMAR_CACHE_LIMIT_GB = EnvFloat(200.0)
+    # Chain-verify spec decode (DSPARK/DFLASH): build the grammar bitmask level
+    # by level with xgrammar's batched native calls instead of a per-request
+    # Python DFS. Output is identical; off restores the reference traversal.
+    SGLANG_SPEC_GRAMMAR_CHAIN_FAST_PATH = EnvBool(True)
+    # Threads of the batched xgrammar mask fill (per scheduler process).
+    SGLANG_SPEC_GRAMMAR_FILL_THREADS = EnvInt(4)
 
     # ===================================================================
     # Fault injection and regression tests
