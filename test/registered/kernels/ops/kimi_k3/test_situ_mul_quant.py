@@ -142,6 +142,9 @@ class TestSituMulQuantVarlen(CustomTestCase):
             (8, 64, 1024, 16, 64),
             (112, 64, 6144, 16, 6),
             (48, 960, 1024, 8, 160),
+            # K3.1 under PP without EP: all 896 routed experts on one rank and
+            # D = 3072 -> 384 threads per CTA, so masked_m is scanned in chunks.
+            (896, 64, 3072, 16, 1),
         ]
         for E, N, D, topk, mm_max in cases:
             gate_up = (

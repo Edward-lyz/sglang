@@ -34,7 +34,8 @@ struct SituMulQuantVarlenParams {
   uint32_t max_rows;  // num_tokens * topk: rows beyond this are dropped
 };
 
-constexpr uint32_t kMaxExperts = 256;
+// 1024 covers K3.1 under PP without EP (896 routed experts per rank).
+constexpr uint32_t kMaxExperts = 1024;
 
 SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
   static_assert(device::kWarpThreads == 32);
@@ -72,7 +73,10 @@ situ_and_mul(DType2 gate, DType2 up, float beta, float inv_beta, float linear_be
 }
 
 // Inclusive prefix sum of masked_m into s_end[0, num_experts); returns the total.
-// Preconditions: blockDim.x >= params.num_experts, params.num_experts <= kMaxExperts.
+// Preconditions: blockDim.x % 32 == 0, 0 < params.num_experts <= kMaxExperts.
+// Experts are scanned in chunks of blockDim.x with a running carry, so the expert
+// count may exceed the CTA size (hidden_dim / 8 threads). That happens with PP and
+// no EP, where every rank holds all routed experts (896 on K3.1).
 SGL_DEVICE uint32_t scan_masked_m(const SituMulQuantVarlenParams& params, uint32_t* s_end) {
   using namespace device;
   static_assert(kWarpThreads == 32);
@@ -83,18 +87,25 @@ SGL_DEVICE uint32_t scan_masked_m(const SituMulQuantVarlenParams& params, uint32
   const uint32_t lane_id = tx % kWarpThreads;
   const uint32_t warp_id = tx / kWarpThreads;
 
-  const uint32_t val = tx < params.num_experts ? params.masked_m[tx] : 0u;
+  uint32_t carry = 0u;
+  for (uint32_t base = 0; base < params.num_experts; base += blockDim.x) {
+    const uint32_t e = base + tx;
+    const uint32_t val = e < params.num_experts ? params.masked_m[e] : 0u;
 
-  // Per-warp inclusive scan of masked_m.
-  const uint32_t warp_inclusive = warp_inclusive_sum(lane_id, val);
+    // Per-warp inclusive scan of masked_m.
+    const uint32_t warp_inclusive = warp_inclusive_sum(lane_id, val);
 
-  // Write each warp total.
-  if (lane_id == kWarpThreads - 1) s_warp_sum[warp_id] = warp_inclusive;
-  __syncthreads();
-  const auto tmp_val = lane_id < warp_id ? s_warp_sum[lane_id] : 0u;
-  const auto prefix_inclusive = warp::reduce_sum(tmp_val) + warp_inclusive;
-  if (tx < params.num_experts) s_end[tx] = prefix_inclusive;
-  __syncthreads();
+    // Write each warp total.
+    if (lane_id == kWarpThreads - 1) s_warp_sum[warp_id] = warp_inclusive;
+    __syncthreads();
+    const auto tmp_val = lane_id < warp_id ? s_warp_sum[lane_id] : 0u;
+    const auto prefix_inclusive = warp::reduce_sum(tmp_val) + warp_inclusive + carry;
+    if (e < params.num_experts) s_end[e] = prefix_inclusive;
+    // Every thread has read s_warp_sum (safe to overwrite in the next chunk) and
+    // this chunk of s_end is complete after this barrier.
+    __syncthreads();
+    carry = s_end[min(base + blockDim.x, params.num_experts) - 1];
+  }
   return s_end[params.num_experts - 1];
 }
 
@@ -283,7 +294,7 @@ struct SituAndMulMaskedPostQuantKernel {
 
     RuntimeCheck(D.unwrap() == 2 * hidden_dim, "invalid dimension");
     RuntimeCheck(hidden_dim % kGroupSize == 0);
-    RuntimeCheck(num_experts <= kMaxExperts, "num_experts exceeds maximum (256)");
+    RuntimeCheck(num_experts > 0 && num_experts <= kMaxExperts, "num_experts exceeds maximum (1024)");
     RuntimeCheck(num_groups * kGroupSize == hidden_dim, "invalid num_groups");
 
     const auto params = SituMulQuantVarlenParams{
@@ -301,7 +312,6 @@ struct SituAndMulMaskedPostQuantKernel {
 
     const auto num_threads = hidden_dim / 8;
     RuntimeCheck(num_threads % device::kWarpThreads == 0);
-    RuntimeCheck(num_threads >= num_experts);
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
     // persistent=false: one CTA per (padded) row, each CTA handles at most one row.
     uint32_t num_ctas = params.max_rows;
