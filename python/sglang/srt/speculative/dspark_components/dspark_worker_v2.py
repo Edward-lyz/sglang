@@ -1090,7 +1090,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             span = int(max(e - s for s, e in zip(starts, ends)))
             pos = torch.arange(span, dtype=torch.int64, device=device_)
-            idx = starts_t.unsqueeze(1) + pos.unsqueeze(0)
+            # 【修复】列索引夹在 req_to_token 宽度内（同 draft_swa_pool.advance_window）。
+            # idx 用的是「本批最大的 span」，不是每个请求自己的 span：span 较小的
+            # 请求会被带着读到自己的 end 之外，当它 start 靠后（请求接近满上下文）
+            # 时就越过 req_to_token 的 max_context_len → 越界读 → device-side
+            # assert。越界列 keep 已标掉、最终被 where 换成 -1，夹紧不改语义。
+            idx = (starts_t.unsqueeze(1) + pos.unsqueeze(0)).clamp_(
+                max=target_req_to_token.shape[1] - 1
+            )
             keep = pos.unsqueeze(0) < lens_t.unsqueeze(1)
             reqs_t = upload_host_ints(active_reqs, device=device_)
             gathered = target_req_to_token[reqs_t.unsqueeze(1), idx]

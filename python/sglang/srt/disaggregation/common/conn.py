@@ -945,7 +945,19 @@ class CommonKVManager(BaseKVManager):
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:
                 sock.setsockopt(zmq.IPV6, 1)
-            sock.setsockopt(zmq.RECONNECT_IVL, -1)
+            # Do NOT disable reconnection (-1). The monitor below only reports
+            # EVENT_DISCONNECTED for a connection that was established first, so
+            # if the peer is unreachable when we connect -- or if this socket is
+            # rebuilt while the peer is still restarting -- no event is ever
+            # raised and a -1 interval leaves the socket permanently dead: the
+            # first SNDHWM (1000) messages are silently queued and every send
+            # after that blocks for SNDTIMEO and raises zmq.error.Again.
+            sock.setsockopt(zmq.RECONNECT_IVL, 100)
+            # Never queue into a pipe that is not connected. Without this the
+            # messages above are dropped into the void instead of failing
+            # loudly, and the caller cannot tell the transfer apart from a
+            # successful one.
+            sock.setsockopt(zmq.IMMEDIATE, 1)
             sock.setsockopt(zmq.SNDTIMEO, 30000)
             sock.setsockopt(zmq.LINGER, 0)
             sock.setsockopt(zmq.TCP_KEEPALIVE, 1)

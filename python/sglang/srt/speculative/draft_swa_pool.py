@@ -433,6 +433,40 @@ class DraftWindowSlotMap:
         full_indices = full_indices.to(
             dtype=torch.int64, device=self.full_to_swa.device
         )
+        # 【修复】分片处理，避免一次性 materialize 整个索引网格。
+        # 下面是 (n, page_size) 的 int64 网格，n 由调用方决定：请求的第一个
+        # decode step 会把整段 prefill 前缀交给 sweep（根因见 advance_window），
+        # n 到 10 万级时 n × page_size 64 ≈ 1.6 GiB 瞬时显存，在 KV cache 已吃满
+        # 的卡上直接 CUDA OOM。这里按「网格元素数」分片，把峰值显存压到
+        # grid_budget × 8 字节；span 小的常态路径只跑一个分片，没有额外开销。
+        # 语义完全不变：每个分片仍按原顺序做 unmap / dedup / 推栈，而一个 full
+        # page 只有在「最后一个仍 mapped 的槽位被解映射的那个分片」里才会满足
+        # released（要求整页已 unmapped），所以不会重复入栈、也不会漏释放；
+        # 映射表、页表、空闲栈 top、释放计数都与单次调用一致。
+        # 唯一差异：跨分片的页会在「补完它的那个分片」里入栈，因此空闲栈里页的
+        # 排列顺序可能与单次调用不同（仅在 n 超过分片阈值时才会发生）。栈里的
+        # 空闲页彼此等价，只是下次分配谁先被取出的区别，不影响正确性。
+        #
+        # 计数单独在 unmap 之前整体算一次：原语义是「重复 id 各算一次」，而分片
+        # 后后面的分片看到的是前面已清零过的表，会把跨分片的重复 id 少算一次。
+        # return_count=True 不是热路径（decode / prefill 都传 False）。
+        num_mapped = (
+            int((self.full_to_swa[full_indices] > 0).sum()) if return_count else 0
+        )
+        grid_budget = 1 << 22  # 每个分片最多 4M 个网格元素 ≈ 32 MiB
+        chunk = max(1, grid_budget // self.page_size)
+        for lo in range(0, full_indices.numel(), chunk):
+            self._free_slots_chunk(full_indices[lo : lo + chunk])
+        return num_mapped
+
+    def _free_slots_chunk(self, full_indices: torch.Tensor) -> None:
+        """One slice of ``free_slots``: unmap, then recycle completed pages.
+
+        Split out only so the caller can bound the transient ``(n, page_size)``
+        index grid; the body is the single-call version verbatim minus the
+        freed-slot count, which ``free_slots`` computes over the whole input.
+        Called with the instance lock already held.
+        """
         swa = self.full_to_swa[full_indices]
         # Unmapped ids read 0 and the -1 sentinel reads -1, so both drop out.
         mapped = swa > 0
@@ -470,9 +504,6 @@ class DraftWindowSlotMap:
             torch.where(valid, self._c_zero, self._c_minus_one)
         )
 
-        # Counts each occurrence of a duplicated id; the pool state does not.
-        return int(mapped.sum()) if return_count else 0
-
     # ---- window eviction ------------------------------------------------
 
     def evict_threshold(self, committed_len: int) -> int:
@@ -509,6 +540,29 @@ class DraftWindowSlotMap:
         returned count is 0.
         """
         # Host-side frontier advance; collect the ranges that actually moved.
+        #
+        # 【根因】请求的第一个 decode step 上 old_frontier 必然是 0（release_request
+        # 会把它重置为 0），而 committed_len 此时已经是整段 prefill 前缀，于是
+        # new_frontier = committed_len - max(window, page)（10 万前缀 → 97920），
+        # 下面就把 [0, 97920) 整段交给 sweep。正常稳态这里只有 gamma 量级。
+        #
+        # 这一段绝大多数位置 draft 从没映射过：forward 侧的映射是从
+        # max(frontier, end - window_tail) 起步的，PD transfer 侧（decode.py 的
+        # send_metadata 预分配）也只映射 [origin_input_len - window, origin_input_len)，
+        # 两者都贴着 new_frontier 附近。所以这个 sweep 真正要释放的只有顶部
+        # 一页左右，其余全是空转。
+        #
+        # 空转本身不算错（未映射的位置会被 free_slots 判为 no-op），但代价是：
+        # 下面把整批的 [start, end) 拼成 (R, span) 的 gather，span 被撑到整个
+        # 前缀长度，free_slots 再据此造一个 (R*span, page_size) 的 int64 索引网格
+        # —— 35 个 10 万前缀的请求 × page_size 64 ≈ 1.6 GiB 瞬时显存，在 KV cache
+        # 已吃满的卡上直接 CUDA OOM。
+        #
+        # 这里刻意不「跳过」这段 sweep：能安全跳过的前提是知道本请求最低被映射过
+        # 的位置，而 mapped_high_water 只由 forward 侧（note_mapped_extents）维护，
+        # PD transfer 侧和 prefill 侧的 map_slots 都不更新它 —— 用它当判据会漏掉
+        # transfer 已映射、且落在 frontier 下方的那一页，从而泄漏 draft page。
+        # 所以改为在 free_slots 里分片处理（语义完全不变），把峰值显存压住。
         starts: list[int] = []
         ends: list[int] = []
         advancing_reqs: list[int] = []
@@ -535,7 +589,17 @@ class DraftWindowSlotMap:
         reqs_t = upload_host_ints(advancing_reqs, device=device)
         span = int(max(e - s for s, e in zip(starts, ends)))
         pos = torch.arange(span, dtype=torch.int64, device=device)
-        idx = starts_t.unsqueeze(1) + pos.unsqueeze(0)
+        # 【修复】列索引必须夹在 req_to_token 的宽度内。
+        # idx 用的是「本批最大的 span」，不是每个请求自己的 span，所以 span 较小的
+        # 请求会一路读到自己的 end 之外：例如本批有个 span=97920 的请求，另一个
+        # 请求 start=97900，则它的 idx 会走到 97900+97920-1=195819，超过
+        # req_to_token 的 max_context_len（131072）→ 越界读 → CUDA device-side
+        # assert（而且是异步上报，行号往往指向后面某个无辜的 kernel）。
+        # 越界的那些列 keep 已经标掉了（keep = pos < lens），最终会被 torch.where
+        # 换成 -1 丢弃，所以夹紧只影响注定被丢弃的位置，语义不变。
+        idx = (starts_t.unsqueeze(1) + pos.unsqueeze(0)).clamp_(
+            max=target_req_to_token.shape[1] - 1
+        )
         keep = pos.unsqueeze(0) < lens_t.unsqueeze(1)
         gathered = target_req_to_token[reqs_t.unsqueeze(1), idx]
         # Scalar -1 (not ``_c_minus_one``): this row is built on the TARGET
@@ -560,9 +624,12 @@ class DraftWindowSlotMap:
     ) -> int:
         """Free everything still mapped for a finished request and reset it.
 
-        Sweeps ``[0, high_water)`` -- the furthest position ever mapped -- not the
-        committed length: the draft forward maps the whole verify block, so a
-        rejected tail sits above the committed length and would otherwise leak.
+        Sweeps ``[evict_frontier, high_water)`` -- from the eviction frontier up to
+        the furthest position ever mapped, and not the committed length: the draft
+        forward maps the whole verify block, so a rejected tail sits above the
+        committed length and would otherwise leak. Starting at the frontier rather
+        than at 0 is equivalent (everything below it is already freed or was never
+        mapped) and avoids handing the whole prefill prefix to ``free_slots``.
 
         Draft KV is never shared across requests (it is a function of this
         request's target hidden states), so a finished request keeps nothing.
@@ -571,11 +638,22 @@ class DraftWindowSlotMap:
         returned count is 0.
         """
         idx = int(req_pool_idx)
+        # 【优化】起点从 0 改成 evict_frontier。
+        # 所有映射路径（forward 的 _maintain_draft_swa_window、PD transfer 的
+        # send_metadata 预分配、prefill 的 _map_prefill_draft_slots）都只映射
+        # frontier 及其之上的位置，而 advance_window 每次推进 frontier 时已经把
+        # 下面那一段 sweep 干净了。所以剩下的活槽位只可能在
+        # [frontier, high_water) 里，从 0 开始扫纯属白干：长上下文下会白造一个
+        # (high_water, page_size) 的 int64 索引网格（128k × page_size 64 ≈ 64 MiB
+        # 瞬时显存/次释放）。high_water 仍是「映射过的最远位置」，语义不变，
+        # 所以 rejected tail 依旧不会漏。
+        low_water = int(self.evict_frontier[idx])
         high_water = int(self.mapped_high_water[idx])
         num_freed = 0
-        if high_water > 0:
+        if high_water > low_water:
             num_freed = self.free_slots(
-                target_req_to_token[idx, :high_water], return_count=return_count
+                target_req_to_token[idx, low_water:high_water],
+                return_count=return_count,
             )
         self.evict_frontier[idx] = 0
         self.mapped_high_water[idx] = 0
