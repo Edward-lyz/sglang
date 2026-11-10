@@ -1011,6 +1011,12 @@ class Envs:
     # overlap combine send + recv instead of the GEMMs. DeepEP a2a only (not
     # MegaMoE). Default off.
     SGLANG_K3_SHARED_IN_COMBINE_HOOK = EnvBool(False)
+    # K3 SP-MoE GEMM-RS: when the o_proj reduction is the push reduce-scatter,
+    # the o_proj DeepGEMM epilogue writes its rows straight into the owner
+    # ranks' RS slots (needs the DeepGEMM fp8_gemm_nt_push_rs fork API) and the
+    # RS only polls + reduces. Bit-identical to GEMM + push RS. Inert when the
+    # installed DeepGEMM lacks the API. Default off.
+    SGLANG_K3_GEMM_RS = EnvBool(False)
     # With SGLANG_K3_SHARED_IN_COMBINE_HOOK: enqueue the combine send on a
     # high-priority stream. The send and the shared experts become ready
     # together when the routed GEMMs drain; at equal priority the shared GEMM

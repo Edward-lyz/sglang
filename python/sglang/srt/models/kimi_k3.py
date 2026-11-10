@@ -2601,6 +2601,9 @@ class KimiK3DecoderLayer(nn.Module):
                 _sp_inner_o_proj_forward = o_proj.forward
 
                 def _sp_o_proj_forward(x, *args, **kwargs):
+                    pushed = k3_sp_collective.maybe_o_proj_push_rs(o_proj, x)
+                    if pushed is not None:
+                        return pushed, None
                     output_rows = k3_sp_collective.get_o_proj_output_rows(x.shape[0])
                     if k3_sp_collective.requires_symmetric_rs(output_rows, x.device):
                         output = k3_sp_collective.get_o_proj_output_buffer(
@@ -2874,9 +2877,21 @@ class KimiK3DecoderLayer(nn.Module):
             prefix_sum = None
 
         # ---- Attention ----
-        hidden_states = self._run_self_attn(
-            hidden_states, positions, forward_batch, zero_allocator
-        )
+        # SGLANG_K3_GEMM_RS: o_proj pushes its rows straight into the RS slots
+        # when the reduction below is the standalone push reduce-scatter.
+        push_rs_rows = None
+        if (
+            self._sp_moe
+            and k3_sp_collective.push_rs_supported(
+                hidden_states.shape[0], prefix_sum, hidden_states.device
+            )
+            and not forward_batch.forward_mode.is_idle()
+        ):
+            push_rs_rows = hidden_states.shape[0]
+        with k3_sp_collective.o_proj_push_rs(push_rs_rows):
+            hidden_states = self._run_self_attn(
+                hidden_states, positions, forward_batch, zero_allocator
+            )
 
         # ---- Complete o_proj's deferred reduction ----
         # SP-MoE takes precedence (reduce-scatter to this rank's token shard);

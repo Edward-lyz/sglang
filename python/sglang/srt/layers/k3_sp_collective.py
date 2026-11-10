@@ -289,10 +289,130 @@ def _eligible(
     return local_bytes <= state.comm.max_push_size
 
 
+# ---- GEMM-RS (SGLANG_K3_GEMM_RS) ---------------------------------------------
+# The o_proj GEMM epilogue writes the push half of reduce_scatter_res itself
+# (DeepGEMM fp8_gemm_nt_push_rs: every output row goes straight into its owner
+# rank's producer slot), and the RS only runs the poll + reduce half. The pushed
+# values and the reduction are those of the unfused GEMM + push RS, so the
+# result is bit-identical.
+_PUSH_RS_ROWS: ContextVar[Optional[int]] = ContextVar("k3_sp_push_rs_rows", default=None)
+# o_proj outputs whose rows were pushed instead of stored: data_ptr -> tensor.
+# Each one MUST be consumed by reduce_scatter_res, or the slots stay filled.
+_PUSHED_O_PROJ: dict[int, torch.Tensor] = {}
+_PUSH_LAYOUT = None
+_PUSH_RS_LOGGED = False
+
+
+def push_rs_supported(num_tokens: int, residual: Optional[torch.Tensor], device) -> bool:
+    """Whether this layer's o_proj may push its rows into the RS slots: the
+    RS that follows must be the standalone push reduce_scatter_res."""
+    if not envs.SGLANG_K3_GEMM_RS.get():
+        return False
+    state = _init_state()
+    if state is None or num_tokens <= 0 or num_tokens % state.group.world_size != 0:
+        return False
+    import deep_gemm
+
+    if not hasattr(deep_gemm, "fp8_gemm_nt_push_rs"):
+        return False
+    if requires_symmetric_rs(num_tokens, device):
+        return False
+    from sglang.kernels.ops.kimi_k3 import sp_collective
+
+    dispatch = sp_collective.get_dispatch(
+        "reduce_scatter", state.group.world_size, _HIDDEN_SIZE, num_tokens, device
+    )
+    if dispatch is None or dispatch.strategy != "push":
+        return False
+    world = state.group.world_size
+    if residual is not None and (
+        residual.shape not in ((num_tokens, _HIDDEN_SIZE), (num_tokens // world, _HIDDEN_SIZE))
+        or residual.dtype != torch.bfloat16
+        or not residual.is_contiguous()
+    ):
+        return False
+    return num_tokens * _HIDDEN_SIZE * 2 // world <= state.comm.max_push_size
+
+
+@contextmanager
+def o_proj_push_rs(num_tokens: Optional[int]):
+    """Arm the next o_proj with exactly ``num_tokens`` rows for GEMM-RS."""
+    token = _PUSH_RS_ROWS.set(num_tokens)
+    try:
+        yield
+    finally:
+        _PUSH_RS_ROWS.reset(token)
+
+
+def maybe_o_proj_push_rs(o_proj, x) -> Optional[torch.Tensor]:
+    """Run o_proj as a push-RS GEMM when armed; returns its (unwritten) output,
+    which only reduce_scatter_res may consume."""
+    rows = _PUSH_RS_ROWS.get()
+    if rows is None or isinstance(x, tuple) or x.ndim != 2 or x.shape[0] != rows:
+        return None
+    from sglang.srt.layers.quantization import fp8_utils
+
+    if not fp8_utils.consumes_prequantized_input(o_proj) or o_proj.weight.shape[0] != _HIDDEN_SIZE:
+        return None
+    check_push_rs_consumed()
+    state = _init_state()
+    global _PUSH_LAYOUT, _PUSH_RS_LOGGED
+    from sglang.kernels.ops.kimi_k3 import sp_collective
+
+    if _PUSH_LAYOUT is None:
+        _PUSH_LAYOUT = sp_collective.push_layout(state.group.world_size)
+    q_input, x_scale = fp8_utils.deepgemm_block_fp8_quantize_input(x, block_k=128)
+    out = torch.empty((rows, _HIDDEN_SIZE), dtype=torch.bfloat16, device=x.device)
+    import deep_gemm
+
+    deep_gemm.fp8_gemm_nt_push_rs(
+        (q_input, x_scale),
+        (o_proj.weight, o_proj.weight_scale_inv),
+        out,
+        _PUSH_LAYOUT.push_workspaces,
+        _PUSH_LAYOUT.counter_ptr,
+        _PUSH_LAYOUT.stride_bytes,
+        _PUSH_LAYOUT.rank,
+    )
+    _PUSHED_O_PROJ[out.data_ptr()] = out
+    if not _PUSH_RS_LOGGED:
+        _PUSH_RS_LOGGED = True
+        logger.info("K3 GEMM-RS active (o_proj epilogue pushes RS slots, %d rows)", rows)
+    return out
+
+
+def _reduce_scatter_poll(
+    pushed: torch.Tensor, residual: Optional[torch.Tensor]
+) -> torch.Tensor:
+    state = _init_state()
+    from sglang.kernels.ops.kimi_k3 import sp_collective
+
+    world = state.group.world_size
+    dispatch = sp_collective.get_dispatch(
+        "reduce_scatter", world, _HIDDEN_SIZE, pushed.shape[0], pushed.device
+    )
+    assert dispatch is not None and dispatch.strategy == "push"
+    output = torch.empty(
+        (pushed.shape[0] // world, _HIDDEN_SIZE), dtype=pushed.dtype, device=pushed.device
+    )
+    return sp_collective.reduce_scatter_poll(
+        world, pushed, output, residual, tuning=dispatch.tuning
+    )
+
+
+def check_push_rs_consumed() -> None:
+    """A pushed o_proj output left unconsumed would leave the RS slots filled."""
+    if _PUSHED_O_PROJ:
+        raise RuntimeError("K3 GEMM-RS o_proj output was not consumed by reduce_scatter_res")
+
+
 def reduce_scatter_res(
     tensor: torch.Tensor, residual: Optional[torch.Tensor]
 ) -> Optional[torch.Tensor]:
     """Return a fused local shard, or None when the NCCL fallback should run."""
+    pushed = _PUSHED_O_PROJ.pop(tensor.data_ptr(), None)
+    if pushed is not None:
+        return _reduce_scatter_poll(pushed, residual)
     state = _init_state()
     if state is None or not _eligible(state, tensor, residual):
         return None
@@ -346,6 +466,9 @@ def reduce_scatter_attn_res(
     eps: float,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     """Fused NVLS pull RS + local residual + attention-residual aggregation."""
+    if tensor.data_ptr() in _PUSHED_O_PROJ:
+        # Already pushed by GEMM-RS: only reduce_scatter_res may consume it
+        return None
     state = _init_state()
     if (
         state is None

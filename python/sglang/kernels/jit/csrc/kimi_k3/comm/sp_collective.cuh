@@ -104,7 +104,10 @@ SGL_DEVICE bool bumper_block(const Params& params) {
   return true;
 }
 
-template <uint32_t kWorldSize, bool kHasResidual, bool kUsePDL>
+// kProduce=false is the consumer half only: the producer slots were already
+// filled by the o_proj GEMM epilogue (DeepGEMM fp8_gemm_nt_push_rs), in the same
+// slot layout and data-as-flag encoding as the loop below.
+template <uint32_t kWorldSize, bool kHasResidual, bool kUsePDL, bool kProduce = true>
 __global__ void reduce_scatter_res_kernel(const __grid_constant__ Params params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;  // 16 B
 
@@ -122,7 +125,7 @@ __global__ void reduce_scatter_res_kernel(const __grid_constant__ Params params)
   const auto producer_offset = phase_offset + params.rank * params.stride_bytes;
 
   // Each vector goes only to the rank that owns its row shard.
-  for (uint32_t vid = tid; vid < kWorldSize * params.local_vecs; vid += num_threads) {
+  for (uint32_t vid = tid; kProduce && vid < kWorldSize * params.local_vecs; vid += num_threads) {
     const uint32_t dst_rank = vid / params.local_vecs;
     const uint32_t local_vid = vid - dst_rank * params.local_vecs;
     vec_t vec;
@@ -387,6 +390,41 @@ struct SPCollectiveKernel {
     const auto kernel = residual.has_value() ? sp_collective::reduce_scatter_res_kernel<kWorldSize, true, kUsePDL>
                                              : sp_collective::reduce_scatter_res_kernel<kWorldSize, false, kUsePDL>;
     host::LaunchKernel(num_blocks + 1, block_size, input.device()).enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  // Consumer half of reduce_scatter_res after a push-RS GEMM. `input` is the
+  // GEMM's (unwritten) [world * rows, hidden] output: only its shape is used.
+  static void reduce_scatter_poll(
+      CommunicatorRef ref,
+      TensorView input,
+      TensorView output,
+      std::optional<TensorView> residual,
+      bool residual_is_local,
+      int64_t num_blocks,
+      int64_t block_size) {
+    const auto& data = *ref.get();
+    check_launch(data, num_blocks, block_size);
+    auto params = make_params(data, input, output, residual, residual_is_local, 0);
+    const auto kernel = residual.has_value()
+                            ? sp_collective::reduce_scatter_res_kernel<kWorldSize, true, kUsePDL, false>
+                            : sp_collective::reduce_scatter_res_kernel<kWorldSize, false, kUsePDL, false>;
+    host::LaunchKernel(num_blocks + 1, block_size, input.device()).enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  // Push-slot layout for an external producer, written into a CPU int64
+  // tensor: [push_workspaces..., counter, push_bytes, rank].
+  static void push_layout(CommunicatorRef ref, TensorView out) {
+    using namespace host;
+    const auto& data = *ref.get();
+    CHECK_HOST(data.world_size == kWorldSize);
+    TensorMatcher({kWorldSize + 3}).with_dtype<int64_t>().with_device<kDLCPU>().verify(out);
+    auto* dst = static_cast<int64_t*>(out.data_ptr());
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      dst[i] = reinterpret_cast<int64_t>(data.push_workspaces[i]);
+    }
+    dst[kWorldSize] = reinterpret_cast<int64_t>(data.push_counter);
+    dst[kWorldSize + 1] = data.push_bytes;
+    dst[kWorldSize + 2] = data.rank;
   }
 
   static void all_gather(
