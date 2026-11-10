@@ -1429,15 +1429,25 @@ class KimiK3DeltaAttention(nn.Module):
         )
 
         # Decide fusion strategy
-        # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
+        # The low-rank fused path hardcodes tp_size sharding, so require attn_tp == tp.
         # For the full-rank gate (K3) the checkpoint quantizes only the MoE
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
         # non-None quant_config is fine for the merged projection.
         self.do_fuse_qkvbfg = self.attn_tp_size == self.tp_size and (
             quant_config is None or self.use_full_rank_gate
         )
+        # The full-rank [q, k, v, g] projection is sharded over the
+        # attention-TP group, so it fuses under DP attention too (attn_tp <
+        # tp), where the unfused path runs five serial GEMMs. Keep the unfused
+        # layout only when runtime weight sharding shards the attention
+        # weights (attn_tp == 1): weight_shard_targets() names the unfused
+        # modules.
+        self._fuse_full_rank_qkvg = self.use_full_rank_gate and (
+            self.do_fuse_qkvbfg
+            or not (self.attn_tp_size == 1 and get_weight_sharding_config().enabled)
+        )
 
-        if self.do_fuse_qkvbfg and self.use_full_rank_gate:
+        if self._fuse_full_rank_qkvg:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
             # (6144/rank at TP8). Folding b (12/rank) and f_a (128, replicated)
             # in as well skews the output dim to 6284 and measurably degrades
@@ -1457,8 +1467,8 @@ class KimiK3DeltaAttention(nn.Module):
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
-                3 * projection_size // self.tp_size,
-                projection_size // self.tp_size,
+                3 * projection_size // self.attn_tp_size,
+                projection_size // self.attn_tp_size,
             ]
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1688,7 +1698,7 @@ class KimiK3DeltaAttention(nn.Module):
         ``RadixLinearAttention`` captured a squeezed view by reference), and
         the ``do_fuse_qkvbfg`` batched-linear variants (3-D weights).
         """
-        if self.do_fuse_qkvbfg:
+        if self.do_fuse_qkvbfg or self._fuse_full_rank_qkvg:
             return []
         targets = ["qkv_proj", "f_b_proj", "o_proj"]
         if self.use_full_rank_gate:
@@ -1831,7 +1841,7 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        if self.do_fuse_qkvbfg:
+        if self.do_fuse_qkvbfg or self._fuse_full_rank_qkvg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states
             )
@@ -3252,7 +3262,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if not self.config.is_kda_layer(layer_id):
                         continue
                     layer = self.model.layers[layer_id].self_attn
-                    if not getattr(layer, "do_fuse_qkvbfg", False):
+                    # fused_qkvg_proj follows the layer's full-rank fusion
+                    # decision; the low-rank fused modules still need
+                    # do_fuse_qkvbfg.
+                    if param_name == ".fused_qkvg_proj":
+                        if not getattr(layer, "_fuse_full_rank_qkvg", False):
+                            continue
+                    elif not getattr(layer, "do_fuse_qkvbfg", False):
                         continue
                 if weight_name in {".q_proj", ".k_proj", ".v_proj"}:
                     layer_id = int(name.split(".")[2])
