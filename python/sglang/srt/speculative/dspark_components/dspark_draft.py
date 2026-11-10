@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import vocab_dp_static_rows
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -585,8 +586,18 @@ class DraftBlockProposer:
         bakes, so eager and idle joins have to match it. Above that capacity no
         rank can be on the graph path, and the raw DP max is agreed on by
         everyone.
+
+        A static capacity short-circuits all of that: it is a constant, so it
+        needs no DP-synced values at all, which is what makes this path work
+        under SGLANG_SCHEDULER_SKIP_ALL_GATHER (where ``global_num_tokens`` holds
+        the LOCAL count and ``max(gnt)`` would differ per rank).
         """
-        if not self._dp_vocab_sync or batch.global_num_tokens is None:
+        if not self._dp_vocab_sync:
+            return None
+        static_rows = vocab_dp_static_rows()
+        if static_rows:
+            return static_rows
+        if batch.global_num_tokens is None:
             return None
         gnt, _ = spec_scale_global_num_tokens(
             self._draft_block_spec_info,

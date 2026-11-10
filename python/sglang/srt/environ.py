@@ -522,6 +522,23 @@ class Envs:
     # loaded weights plus the model config, so no configuration is needed.
     SGLANG_DYNAMIC_CHUNKING_COST_MODEL = EnvBool(False)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
+    # Per-rank constant that stands in for the all-gathered sync value when
+    # SGLANG_SCHEDULER_SKIP_ALL_GATHER is on but the MLP path still needs a
+    # DP-uniform row layout (require_mlp_tp_gather -- i.e. anything under
+    # --enable-dp-attention that gathers rows across DP ranks: the
+    # LayerCommunicator, the dense MLP, a TP-sharded embedding / lm_head).
+    # Every rank reports the SAME constant, so the layout becomes MAX_LEN with
+    # offsets rank * bound and no collective is needed to learn it.
+    # Units match the gathered value: request counts on decode-family rounds
+    # (spec_scale_global_num_tokens turns them into tokens later), tokens on
+    # extend rounds -- so the bound must cover the largest of the two across
+    # every mode the ranks can be in. Start from max_running_requests // dp_size;
+    # if it is too small the scheduler raises and names the value it saw.
+    # 0 = off, keeping today's behaviour (a this-rank-only list), which is what
+    # DWDP relies on. Must be set identically on every rank, and every rank must
+    # be in the same forward mode on every step: the skipped all-gather no longer
+    # reconciles global_forward_mode / can_run_dp_cuda_graph.
+    SGLANG_DP_STATIC_SYNC_BOUND = EnvInt(0)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
@@ -1468,6 +1485,19 @@ class Envs:
     # all-gather / embed all-reduce never crosses the NIC, at the cost of one
     # replica per node instead of one per job. Must divide tp_size.
     SGLANG_VOCAB_TP_SIZE = EnvInt(0)
+    # Per-rank row capacity of the vocab DP gather/scatter that the sharded
+    # embedding and lm_head run (see vocab_dp_block_layout). 0 = derive the
+    # layout from the DP-synced per-rank token counts (default). Set it to a
+    # constant >= the largest row count any rank can bring, and every rank then
+    # claims an equally sized slot, so the offsets are rank * rows and the buffer
+    # is dp_per_block * rows -- derivable locally. That is what makes this path
+    # usable together with SGLANG_SCHEDULER_SKIP_ALL_GATHER, where the per-rank
+    # counts are no longer gathered and describe only the local rank. Same
+    # contract as DSpark's rows_capacity: must be identical on every rank, and
+    # every rank must be in the same forward mode on every step (the skipped
+    # all-gather no longer reconciles global_forward_mode). Rows are the
+    # post-spec-scaling token count, i.e. batch_size * num_tokens_per_req.
+    SGLANG_VOCAB_DP_STATIC_ROWS = EnvInt(0)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)

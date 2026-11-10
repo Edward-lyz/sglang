@@ -7,6 +7,8 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
+from sglang.srt.layers.dp_attention import vocab_dp_static_rows
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -148,6 +150,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
         self._pp_context_feature_indices: Optional[list[int]] = None
+        self._linear_accept_index_cache: Optional[torch.Tensor] = None
 
         if self.ps.tp_rank == 0:
             logger.info(
@@ -196,11 +199,20 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Largest captured draft row count: the capacity every DP-gathered vocab
         # collective pads to when the batch fits, so graph replays (which bake
         # it) and eager / idle joins always agree on the shape.
-        self._dp_graph_rows = (
-            max(server_args.cuda_graph_config.decode.bs) * int(self.gamma)
-            if self._dp_vocab_sync and self._decode_graph_allowed
-            else None
-        )
+        # A static capacity (SGLANG_VOCAB_DP_STATIC_ROWS) wins: it is the one
+        # value that also holds when the per-rank counts are no longer DP-synced,
+        # and captures must bake the same number the eager path will use.
+        static_vocab_rows = vocab_dp_static_rows()
+        if not self._dp_vocab_sync:
+            self._dp_graph_rows = None
+        elif static_vocab_rows:
+            self._dp_graph_rows = static_vocab_rows
+        elif self._decode_graph_allowed:
+            self._dp_graph_rows = max(server_args.cuda_graph_config.decode.bs) * int(
+                self.gamma
+            )
+        else:
+            self._dp_graph_rows = None
         self.draft_model.dp_embed_rows_capacity = self._dp_graph_rows
 
         self._verify_planner = DSparkVerifyPlanner(
@@ -691,6 +703,19 @@ class DSparkWorkerV2(BaseSpecWorker):
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
+    def _linear_accept_indices(self, bs: int) -> torch.Tensor:
+        num_indices = bs * self.verify_num_draft_tokens
+        if (
+            self._linear_accept_index_cache is None
+            or self._linear_accept_index_cache.numel() < num_indices
+        ):
+            self._linear_accept_index_cache = torch.arange(
+                num_indices, dtype=torch.int64, device=self.device
+            )
+        return self._linear_accept_index_cache[:num_indices].view(
+            bs, self.verify_num_draft_tokens
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -698,11 +723,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DSpark speculative decoding does not support return_logprob yet."
-            )
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
@@ -1302,6 +1322,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        if batch.return_logprob:
+            compute_spec_v2_logprobs(
+                batch,
+                logits_output,
+                accept.out_tokens.reshape(-1),
+                self._linear_accept_indices(bs),
+                self.verify_num_draft_tokens - 1,
+            )
+
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)

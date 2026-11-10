@@ -25,6 +25,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import get_narrowed_vocab_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_bool_env_var, is_hip
 
@@ -690,13 +691,68 @@ def vocab_dp_block_group() -> Optional[GroupCoordinator]:
     return group
 
 
+def vocab_dp_static_rows() -> int:
+    """Per-rank row capacity of the vocab DP gather, or 0 to derive the layout
+    from the DP-synced per-rank counts.
+
+    Same contract as DSpark's ``rows_capacity`` (see ``shared_lm_head_logits`` /
+    ``shared_embed_lookup``): a constant every attention-DP rank agrees on
+    without talking to anyone, which is what lets the layout be built when the
+    per-rank counts are NOT DP-synced (SGLANG_SCHEDULER_SKIP_ALL_GATHER). Must
+    be >= the largest row count any rank can bring in any forward mode, and set
+    identically on every rank.
+    """
+    return max(0, envs.SGLANG_VOCAB_DP_STATIC_ROWS.get())
+
+
+def _static_vocab_dp_block_layout(
+    *,
+    group: GroupCoordinator,
+    dp_per_block: int,
+    dp_rank: int,
+    rows: int,
+    global_num_tokens_cpu: Optional[List[int]],
+    global_num_tokens_gpu: torch.Tensor,
+) -> VocabBlockDpLayout:
+    """Block layout from a static per-rank row capacity.
+
+    Every rank claims an equally sized ``rows`` slot, so the offset is
+    ``idx * rows`` and the buffer is ``dp_per_block * rows`` -- both derivable
+    locally, with no cumsum over other ranks' counts. Only this rank's REAL rows
+    are copied in and back out; the rest of its slot stays zero, exactly like
+    the ``rows_capacity`` padding on the DSpark side.
+    """
+    dp_size = get_attention_dp_size()
+    counts = global_num_tokens_cpu
+    # Without the scheduler all-gather the counts were never widened to the DP
+    # dimension and describe this rank only, so index 0 IS the local entry.
+    local_idx = (
+        dp_rank if counts is not None and len(counts) == dp_size else 0
+    )
+    if counts is not None and int(counts[local_idx]) > rows:
+        raise RuntimeError(
+            f"Vocab DP gather got {int(counts[local_idx])} local rows > "
+            f"SGLANG_VOCAB_DP_STATIC_ROWS ({rows}); the padded slot would drop "
+            f"rows. Raise the capacity above the per-rank maximum."
+        )
+    idx = dp_rank % dp_per_block
+    return VocabBlockDpLayout(
+        group=group,
+        buffer_len=dp_per_block * rows,
+        local_start_pos=torch.full(
+            (), idx * rows, dtype=torch.int64, device=global_num_tokens_gpu.device
+        ),
+        local_num_tokens=global_num_tokens_gpu[local_idx],
+    )
+
+
 def vocab_dp_block_layout(
     global_num_tokens_cpu: Optional[List[int]],
     global_num_tokens_gpu: Optional[torch.Tensor],
 ) -> Optional[VocabBlockDpLayout]:
     """Row layout of this rank's vocab block, or None to keep the global path."""
     group = vocab_dp_block_group()
-    if group is None or global_num_tokens_cpu is None or global_num_tokens_gpu is None:
+    if group is None or global_num_tokens_gpu is None:
         return None
     dp_per_block = group.world_size // get_attn_tensor_model_parallel_world_size()
     dp_size = get_attention_dp_size()
@@ -704,9 +760,21 @@ def vocab_dp_block_layout(
     # would make the row set inconsistent across the group.
     if dp_per_block < 1 or dp_per_block >= dp_size or dp_size % dp_per_block != 0:
         return None
+    dp_rank = get_attention_dp_rank()
+    static_rows = vocab_dp_static_rows()
+    if static_rows:
+        return _static_vocab_dp_block_layout(
+            group=group,
+            dp_per_block=dp_per_block,
+            dp_rank=dp_rank,
+            rows=static_rows,
+            global_num_tokens_cpu=global_num_tokens_cpu,
+            global_num_tokens_gpu=global_num_tokens_gpu,
+        )
+    if global_num_tokens_cpu is None:
+        return None
     if len(global_num_tokens_cpu) != dp_size:
         return None
-    dp_rank = get_attention_dp_rank()
     start_rank = (dp_rank // dp_per_block) * dp_per_block
     counts = global_num_tokens_cpu[start_rank : start_rank + dp_per_block]
     block_gpu = global_num_tokens_gpu[start_rank : start_rank + dp_per_block]

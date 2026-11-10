@@ -239,6 +239,7 @@ def dp_sharded_embed(
         vocab_block_dp_gather_replicate,
         vocab_block_dp_scatter,
         vocab_dp_block_layout,
+        vocab_dp_static_rows,
     )
 
     block = vocab_dp_block_layout(
@@ -259,6 +260,18 @@ def dp_sharded_embed(
         raise RuntimeError(
             "dp_sharded_embed needs the DP buffer length for this forward; "
             "the caller must run inside the mlp-sync (DP gather) path."
+        )
+    if vocab_dp_static_rows() or forward_batch.global_num_tokens_cpu is None:
+        # The global path derives both its buffer length and its offsets from
+        # DP-synced per-rank counts. A static row capacity is only wired into the
+        # block layout, and without the counts `get_global_dp_buffer_len()` is a
+        # leftover from an earlier forward: gathering into it would silently
+        # mis-place rows rather than fail.
+        raise RuntimeError(
+            "dp_sharded_embed fell back to the global DP gather, which needs "
+            "DP-synced per-rank token counts. Narrow the vocab scope with "
+            "SGLANG_VOCAB_TP_SIZE so the block layout applies, or drop "
+            "SGLANG_VOCAB_DP_STATIC_ROWS / SGLANG_SCHEDULER_SKIP_ALL_GATHER."
         )
     global_ids = input_ids.new_zeros((global_len,))
     dp_gather_replicate(global_ids, input_ids, forward_batch)
