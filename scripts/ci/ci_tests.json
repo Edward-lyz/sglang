@@ -1,6 +1,6 @@
 {
   "//schema": [
-    "SGLang CI 动态测试配置（仅保留 2026-05-28 A100×8 实测通过的 case）",
+    "SGLang CI 动态测试配置",
     "",
     "所有 target 字段都支持动态语法：",
     "  file_patterns:  glob 模式，运行时展开    test/registered/quant/test_*.py",
@@ -13,182 +13,251 @@
     "  $VAR 变量：在 vars 或 CLI --var KEY=VAL 中定义，所有字符串字段自动替换",
     "",
     "用法：",
-    "  ./run_ci.sh run -c ci_tests.json -p cpu-passing",
-    "  ./run_ci.sh run -c ci_tests.json -p stage-b-small-1gpu-passing",
+    "  ./run_ci.sh run -c ci_tests.json -p quick-unit",
+    "  ./run_ci.sh run -c ci_tests.json -p quick-unit --var HW=amd",
+    "  ./run_ci.sh run -c ci_tests.json -p quick-unit -f extra_file.py",
     "  ./run_ci.sh list -c ci_tests.json"
   ],
+
   "vars": {
     "HW": "cuda",
-    "TIMEOUT": "1800"
+    "TIMEOUT": "600",
+    "MAX_EST": "120"
   },
-  "all-passing": {
-    "description": "一次性跑全部实测通过的 56（61-5） 个 case（CPU + 全部 CUDA suite 合并）",
+
+  "quick-unit": {
+    "description": "快速单元测试：glob 自动匹配所有 unit 文件，过滤 est_time < $MAX_EST",
     "hw": "$HW",
-    "nightly": false,
     "timeout": "$TIMEOUT",
     "continue_on_error": true,
     "file_patterns": [
-      "test/registered/utils/test_log_utils.py",
-      "test/registered/unit/function_call/test_json_schema_constraint.py",
-      "test/registered/unit/function_call/test_unknown_tool_name.py",
-      "test/registered/unit/function_call/test_parallel_tool_calls.py",
-      "test/registered/unit/function_call/test_function_call_parser.py",
-      "test/registered/unit/parser/test_jinja_template_utils.py",
-      "test/registered/vlm/test_video_utils.py",
-      "test/registered/unit/observability/test_metrics_utils.py",
-      "test/registered/unit/parser/test_harmony_parser.py",
-      "test/registered/unit/parser/test_reasoning_parser.py",
-      "test/registered/unit/managers/test_prefill_adder.py",
-      "test/registered/spec/utils/test_build_eagle_tree.py",
-      "test/registered/unit/mem_cache/test_radix_cache_unit.py",
-      "test/registered/unit/mem_cache/test_mamba_unittest.py",
-      "test/registered/unit/model_loader/test_modelopt_loader.py",
-      "test/registered/unit/mem_cache/test_dsa_pool_host_unit.py",
-      "test/registered/vlm/test_evs.py",
-      "test/registered/quant/test_block_int8.py",
-      "test/registered/quant/test_int8_kernel.py",
-      "test/registered/quant/test_marlin_moe.py",
-      "test/registered/layers/mamba/test_mamba_ssm_ssd.py",
-      "test/registered/layers/mamba/test_mamba_ssm.py",
-      "test/registered/layers/mamba/test_causal_conv1d.py",
-      "test/registered/unit/entrypoints/openai/test_serving_chat.py",
-      "test/registered/unit/entrypoints/openai/test_protocol.py",
-      "test/registered/unit/entrypoints/openai/test_serving_completions.py",
-      "test/registered/kernels/test_dsa_indexer.py",
-      "test/registered/attention/test_create_kvindices.py",
-      "test/registered/unit/utils/test_profile_merger.py",
-      "test/registered/unit/managers/test_profile_merger_http_api.py",
-      "test/registered/rl/test_fp32_lm_head.py",
+      "test/registered/unit/mem_cache/test_*_unit.py",
       "test/registered/unit/mem_cache/test_swa_unittest.py",
-      "test/registered/unit/model_loader/test_modelopt_export.py",
-      "test/registered/moe/test_triton_fused_moe.py",
-      "test/registered/moe/test_fused_moe.py",
-      "test/registered/quant/test_fp8_kernel.py",
-      "test/registered/prefill_only/test_serving_rerank.py",
+      "test/registered/unit/mem_cache/test_mamba_unittest.py",
+      "test/registered/unit/entrypoints/openai/test_protocol*.py",
+      "test/registered/unit/entrypoints/openai/test_serving_chat.py",
+      "test/registered/unit/entrypoints/openai/test_serving_completions.py",
       "test/registered/unit/entrypoints/openai/test_serving_embedding.py",
+      "test/registered/prefill_only/test_serving_rerank.py",
+      "test/registered/unit/server_args/test_server_args.py",
       "test/registered/unit/managers/test_io_struct.py",
-      "test/registered/attention/unittests/dense/test_fa3.py",
-      "test/registered/attention/test_hybrid_attn_backend.py",
+      "test/registered/core/test_request_queue_validation.py"
+    ],
+    "test_patterns": [
+      "test/registered/observability/test_metrics.py::TestComputeRoutingKeyStats::test_*"
+    ],
+    "exclude": ["*benchmark*", "*perf*"],
+    "filters": {
+      "max_est_time": "$MAX_EST"
+    }
+  },
+
+  "kernel-sanity": {
+    "description": "Kernel 算子验证：kernels/quant/ops/moe/mla/attention 算子层测试",
+    "hw": "$HW",
+    "timeout": "300",
+    "continue_on_error": true,
+    "file_patterns": [
+      "test/registered/kernels/test_*.py",
+      "test/registered/quant/test_*kernel*.py",
+      "test/registered/quant/test_*scaled*.py",
+      "test/registered/quant/test_int8*.py",
+      "test/registered/quant/test_fp8_utils.py",
+      "test/registered/quant/test_triton_scaled_mm.py",
+      "test/registered/ops/test_*.py",
+      "test/registered/moe/test_fused_moe.py",
+      "test/registered/moe/test_triton_fused_moe.py",
+      "test/registered/moe/test_triton_moe_channel_fp8_kernel.py",
+      "test/registered/mla/test_flashmla.py",
+      "test/registered/mla/test_mla_fp8.py",
+      "test/registered/attention/test_create_kvindices.py",
+      "test/registered/attention/test_triton_attention_kernels.py",
       "test/registered/attention/test_kda_kernels.py",
-      "test/registered/layers/mamba/test_mamba2_mixer.py",
-      "test/registered/perf/test_bench_one_batch_2gpu.py",
-      "test/registered/rl/test_patch_torch.py",
-      "test/registered/backends/test_qwen3_fp4_trtllm_gen_moe.py",
-      "test/registered/lora/test_lora_openai_api.py",
-      "test/registered/unit/batch_invariant_ops/test_batch_invariant_ops.py",
-      "test/registered/debug_utils/test_dumper.py",
-      "test/registered/8-gpu-models/test_llama4.py",
-      "test/registered/8-gpu-models/test_mistral_large3.py"
-    ]
-  },
-  "cpu-passing": {
-    "description": "CPU 实测通过（10 个）：function_call / parser / metrics / vlm utils",
-    "hw": "cpu",
-    "timeout": "$TIMEOUT",
-    "continue_on_error": true,
-    "file_patterns": [
-      "test/registered/utils/test_log_utils.py",
-      "test/registered/unit/function_call/test_json_schema_constraint.py",
-      "test/registered/unit/function_call/test_unknown_tool_name.py",
-      "test/registered/unit/function_call/test_parallel_tool_calls.py",
-      "test/registered/unit/function_call/test_function_call_parser.py",
-      "test/registered/unit/parser/test_jinja_template_utils.py",
-      "test/registered/vlm/test_video_utils.py",
-      "test/registered/unit/observability/test_metrics_utils.py",
-      "test/registered/unit/parser/test_harmony_parser.py",
-      "test/registered/unit/parser/test_reasoning_parser.py"
-    ]
-  },
-  "stage-b-small-1gpu-passing": {
-    "description": "CUDA stage-b-small-1-gpu 实测通过24（25-1） 个",
-    "hw": "$HW",
-    "timeout": "$TIMEOUT",
-    "continue_on_error": true,
-    "file_patterns": [
-      "test/registered/unit/managers/test_prefill_adder.py",
-      "test/registered/spec/utils/test_build_eagle_tree.py",
-      "test/registered/unit/mem_cache/test_radix_cache_unit.py",
-      "test/registered/unit/mem_cache/test_mamba_unittest.py",
-      "test/registered/unit/model_loader/test_modelopt_loader.py",
-      "test/registered/unit/mem_cache/test_dsa_pool_host_unit.py",
-      "test/registered/vlm/test_evs.py",
-      "test/registered/quant/test_block_int8.py",
-      "test/registered/quant/test_int8_kernel.py",
-      "test/registered/quant/test_marlin_moe.py",
-      "test/registered/layers/mamba/test_mamba_ssm_ssd.py",
       "test/registered/layers/mamba/test_mamba_ssm.py",
-      "test/registered/layers/mamba/test_causal_conv1d.py",
-      "test/registered/unit/entrypoints/openai/test_serving_chat.py",
-      "test/registered/unit/entrypoints/openai/test_protocol.py",
-      "test/registered/unit/entrypoints/openai/test_serving_completions.py",
-      "test/registered/kernels/test_dsa_indexer.py",
-      "test/registered/attention/test_create_kvindices.py",
-      "test/registered/unit/utils/test_profile_merger.py",
-      "test/registered/unit/managers/test_profile_merger_http_api.py",
-      "test/registered/rl/test_fp32_lm_head.py"
-    ]
+      "test/registered/layers/mamba/test_mamba_ssm_ssd.py",
+      "test/registered/layers/mamba/test_causal_conv1d.py"
+    ],
+    "exclude": ["*benchmark*"]
   },
-  "stage-b-large-1gpu-passing": {
-    "description": "CUDA stage-b-large-1-gpu 实测通过（12 个）",
+
+  "pre-commit": {
+    "description": "提交前检查：stage-a 全量 + unit + server_args + metrics method",
     "hw": "$HW",
-    "timeout": "$TIMEOUT",
     "continue_on_error": true,
+    "retry": true,
+    "suite_patterns": ["stage-a-*"],
     "file_patterns": [
+      "test/registered/unit/mem_cache/test_*_unit.py",
       "test/registered/unit/mem_cache/test_swa_unittest.py",
-      "test/registered/unit/model_loader/test_modelopt_export.py",
-      "test/registered/moe/test_triton_fused_moe.py",
-      "test/registered/moe/test_fused_moe.py",
-      "test/registered/quant/test_fp8_kernel.py",
-      "test/registered/prefill_only/test_serving_rerank.py",
-      "test/registered/unit/entrypoints/openai/test_serving_embedding.py",
-      "test/registered/unit/managers/test_io_struct.py",
-      "test/registered/attention/unittests/dense/test_fa3.py",
-      "test/registered/attention/test_hybrid_attn_backend.py",
-      "test/registered/attention/test_kda_kernels.py"
+      "test/registered/unit/mem_cache/test_mamba_unittest.py",
+      "test/registered/unit/entrypoints/openai/test_protocol*.py",
+      "test/registered/unit/server_args/test_server_args.py",
+      "test/registered/unit/managers/test_io_struct.py"
+    ],
+    "test_patterns": [
+      "test/registered/observability/test_metrics.py::TestComputeRoutingKeyStats::*"
     ]
   },
-  "stage-b-large-2gpu-passing": {
-    "description": "CUDA stage-b-large-2-gpu 实测通过（3 个）",
+
+  "sampling-focus": {
+    "description": "采样专项：penalty / logprobs / pytorch_sampling / original_logprobs",
     "hw": "$HW",
     "timeout": "$TIMEOUT",
     "continue_on_error": true,
     "file_patterns": [
-      "test/registered/layers/mamba/test_mamba2_mixer.py",
-      "test/registered/perf/test_bench_one_batch_2gpu.py",
-      "test/registered/rl/test_patch_torch.py"
+      "test/registered/sampling/test_*.py"
+    ],
+    "test_patterns": [
+      "test/registered/sampling/test_penalty.py::TestPenalty::test_*"
     ]
   },
-  "nightly-1gpu-passing": {
-    "description": "CUDA nightly-1-gpu 实测通过4（8-4） 个，test_bench_serving_functionality 仅部分子测试通过",
+
+  "all-small-1gpu": {
+    "description": "所有 small-1-gpu suite（通配匹配）",
+    "hw": "$HW",
+    "suite_patterns": ["stage-*-small-1-gpu"],
+    "continue_on_error": true,
+    "retry": true,
+    "max_attempts": 3,
+    "filters": {
+      "max_est_time": 300
+    }
+  },
+
+  "full-1gpu": {
+    "description": "1-GPU 全量：通配所有 stage-a + stage-b 的 1-gpu suite",
+    "hw": "$HW",
+    "suite_patterns": [
+      "stage-a-*",
+      "stage-b-*-1-gpu"
+    ],
+    "exclude": ["*amd*", "*mi35x*", "*ascend*", "*npu*"],
+    "continue_on_error": true,
+    "retry": true,
+    "max_attempts": 3
+  },
+
+  "all-nightly": {
+    "description": "运行所有 nightly 测试（通配匹配所有 nightly-* suite）",
     "hw": "$HW",
     "nightly": true,
-    "timeout": "$TIMEOUT",
     "continue_on_error": true,
-    "file_patterns": [
-      "test/registered/backends/test_qwen3_fp4_trtllm_gen_moe.py",
-      "test/registered/lora/test_lora_openai_api.py",
-      "test/registered/unit/batch_invariant_ops/test_batch_invariant_ops.py"
+    "retry": true,
+    "suite_patterns": ["nightly-*"]
+  },
+
+  "b200-percommit": {
+    "description": "B200 per-commit 全量：stage-a/b 全部 + b200/gb200/deepep 专属 stage-c，排除 h100/h200/h20/amd/npu",
+    "hw": "cuda",
+    "nightly": false,
+    "continue_on_error": true,
+    "retry": true,
+    "max_attempts": 2,
+    "timeout": "3600",
+    "suite_patterns": [
+      "stage-a-*",
+      "stage-b-*",
+      "stage-c-test-4-gpu-b200",
+      "stage-c-test-4-gpu-gb200",
+      "stage-c-test-deepep-4-gpu",
+      "stage-c-test-8-gpu-b200"
+    ],
+    "exclude": [
+      "*h100*", "*h200*", "*h20*",
+      "*amd*", "*mi30x*", "*mi35x*",
+      "*npu*", "*ascend*",
+      "*benchmark*"
     ]
   },
-  "nightly-2gpu-passing": {
-    "description": "CUDA nightly-2-gpu 实测通过（1 个，7 个子测试全通过）",
-    "hw": "$HW",
+
+  "b200-nightly": {
+    "description": "B200 nightly 全量：所有 nightly suite，排除 h100/h200/h20/amd/npu",
+    "hw": "cuda",
     "nightly": true,
-    "timeout": "$TIMEOUT",
     "continue_on_error": true,
-    "file_patterns": [
-      "test/registered/debug_utils/test_dumper.py"
+    "retry": true,
+    "max_attempts": 2,
+    "timeout": "3600",
+    "suite_patterns": [
+      "nightly-1-gpu",
+      "nightly-2-gpu",
+      "nightly-4-gpu",
+      "nightly-4-gpu-b200",
+      "nightly-8-gpu-b200",
+      "nightly-8-gpu-common",
+      "nightly-eval-text-2-gpu",
+      "nightly-eval-vlm-2-gpu",
+      "nightly-perf-text-2-gpu",
+      "nightly-perf-vlm-2-gpu"
+    ],
+    "exclude": [
+      "*h100*", "*h200*", "*h20*",
+      "*amd*", "*mi30x*", "*mi35x*",
+      "*npu*", "*ascend*",
+      "*benchmark*"
     ]
   },
-  "nightly-8gpu-common-passing": {
-    "description": "CUDA nightly-8-gpu-common 实测通过（2 个，依赖本地缓存模型）",
+
+  "by-category": {
+    "description": "按目录类别选择：attention/scheduler/radix_cache/moe/mla/quant/spec/distributed",
     "hw": "$HW",
-    "nightly": true,
-    "timeout": "$TIMEOUT",
     "continue_on_error": true,
     "file_patterns": [
-      "test/registered/8-gpu-models/test_llama4.py",
-      "test/registered/8-gpu-models/test_mistral_large3.py"
-    ]
+      "test/registered/attention/test_*.py",
+      "test/registered/scheduler/test_*.py",
+      "test/registered/radix_cache/test_*.py",
+      "test/registered/moe/test_*.py",
+      "test/registered/mla/test_*.py",
+      "test/registered/quant/test_*.py",
+      "test/registered/spec/eagle/test_eagle*.py",
+      "test/registered/spec/test_spec_ngram*.py",
+      "test/registered/spec/test_spec_standalone*.py",
+      "test/registered/dp_attn/test_dp_attention.py",
+      "test/registered/dp_engine/test_data_parallelism.py",
+      "test/registered/constrained_decoding/test_*.py",
+      "test/registered/disaggregation/test_*.py",
+      "test/registered/hicache/test_*.py",
+      "test/registered/lora/test_*.py",
+      "test/registered/rl/test_*.py",
+      "test/registered/vlm/test_*.py",
+      "test/registered/models/test_*.py",
+      "test/registered/core/test_*.py",
+      "test/registered/openai_server/basic/test_*.py",
+      "test/registered/openai_server/features/test_*.py",
+      "test/registered/openai_server/validation/test_*.py",
+      "test/registered/openai_server/function_call/test_*.py",
+      "test/registered/function_call/test_*.py",
+      "test/registered/tokenizer/test_*.py",
+      "test/registered/dllm/test_*.py",
+      "test/registered/ep/test_*.py",
+      "test/registered/backends/test_*.py",
+      "test/registered/debug_utils/test_*.py",
+      "test/registered/model_loading/test_*.py",
+      "test/registered/cuda_graph/**/*.py",
+      "test/registered/layers/mamba/test_*.py",
+      "test/registered/rotary/test_*.py",
+      "test/registered/bench_fn/test_*.py",
+      "test/registered/ops/test_*.py",
+      "test/registered/kernels/test_*.py",
+      "test/registered/observability/test_*.py",
+      "test/registered/profiling/test_*.py",
+      "test/registered/sampling/test_*.py",
+      "test/registered/utils/test_*.py",
+      "test/registered/eval/test_*.py",
+      "test/registered/stress/test_*.py",
+      "test/registered/perf/test_*.py",
+      "test/registered/4-gpu-models/test_*.py",
+      "test/registered/8-gpu-models/test_*.py",
+      "test/registered/test_*.py"
+    ],
+    "exclude": [
+      "*amd*", "*mi30x*", "*mi35x*",
+      "*ascend*", "*npu*",
+      "*h100*", "*h200*", "*h20*",
+      "*benchmark*", "*wave*"
+    ],
+    "filters": {
+      "max_est_time": 200
+    }
   }
 }
