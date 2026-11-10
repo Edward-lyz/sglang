@@ -417,24 +417,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 
-        # Allocate buffers
-        # different from flashinfer zero_init_global_workspace_buffer
-        global_workspace_buffer = get_buffer(
-            "flashinfer_workspace",
-            lambda: torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            ),
-        )
-        if init_new_workspace:
-            self.workspace_buffer = torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
-        else:
-            self.workspace_buffer = global_workspace_buffer
+        # Workspace allocation is deferred to first use (see
+        # _flashinfer_workspace below); the wrappers capture it, so they are
+        # constructed lazily as well. Backends that fully override the forward
+        # paths (e.g. trtllm_mha) never commit this buffer.
+        self._workspace_buffer: Optional[torch.Tensor] = None
+        self._init_new_workspace = init_new_workspace
+        self._workspace_device = model_runner.device
         max_bs = get_cuda_graph_max_batch_size(
             model_runner.server_args, model_runner.req_to_token_pool.size
         )
@@ -471,39 +460,29 @@ class FlashInferAttnBackend(AttentionBackend):
             # due to TMA descriptor initialization issues on SM100 GPUs.
             if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
                 fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
-        )
+        self._fmha_backend = fmha_backend
 
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
-        self.prefill_wrappers_paged = []
-        self.prefill_wrappers_verify = []
-        self.decode_wrappers = []
-        for _ in range(self.num_wrappers):
-            if not skip_prefill:
-                self.prefill_wrappers_paged.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.prefill_backend,
-                    )
-                )
-                self.prefill_wrappers_verify.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.prefill_backend,
-                    )
-                )
-            self.decode_wrappers.append(
-                BatchDecodeWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    backend=self.decode_backend,
-                    use_tensor_cores=self.decode_use_tensor_cores,
-                )
-            )
+        self._prefill_wrapper_ragged: Optional[
+            BatchPrefillWithRaggedKVCacheWrapper
+        ] = None
+        self._prefill_wrappers_paged: Optional[
+            List[BatchPrefillWithPagedKVCacheWrapper]
+        ] = None
+        self._prefill_wrappers_verify: Optional[
+            List[BatchPrefillWithPagedKVCacheWrapper]
+        ] = None
+        self._decode_wrappers: Optional[
+            List[BatchDecodeWithPagedKVCacheWrapper]
+        ] = None
+        if not envs.SGLANG_LAZY_ATTN_WORKSPACE.get():
+            # Eagerly materialize the workspace and wrappers (pre-lazy behavior).
+            self._flashinfer_workspace()
+            _ = self.prefill_wrapper_ragged
+            _ = self.prefill_wrappers_paged
+            _ = self.prefill_wrappers_verify
+            _ = self.decode_wrappers
 
         # Create indices updater
         if not skip_prefill:
@@ -524,6 +503,97 @@ class FlashInferAttnBackend(AttentionBackend):
         self.full_cg_prefill_wrappers: Optional[
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
+
+    def _flashinfer_workspace(self) -> torch.Tensor:
+        """FlashInfer float workspace, allocated on first use.
+
+        Named accessor (instead of the workspace_buffer property) so that
+        subclasses overriding workspace_buffer (e.g. trtllm_mha's zero-init
+        workspace) never leak their buffer into the FlashInfer wrappers.
+        """
+        if self._workspace_buffer is None:
+            if self._init_new_workspace:
+                self._workspace_buffer = torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=self._workspace_device,
+                )
+            else:
+                # different from flashinfer zero_init_global_workspace_buffer
+                self._workspace_buffer = get_buffer(
+                    "flashinfer_workspace",
+                    lambda: torch.empty(
+                        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                        dtype=torch.uint8,
+                        device=self._workspace_device,
+                    ),
+                )
+        return self._workspace_buffer
+
+    @property
+    def workspace_buffer(self) -> torch.Tensor:
+        """workspace_buffer"""
+        return self._flashinfer_workspace()
+
+    @property
+    def prefill_wrapper_ragged(self) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """prefill_wrapper_ragged"""
+        if self._prefill_wrapper_ragged is None:
+            self._prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+                self._flashinfer_workspace(), "NHD", backend=self._fmha_backend
+            )
+        return self._prefill_wrapper_ragged
+
+    @property
+    def prefill_wrappers_paged(self) -> List[BatchPrefillWithPagedKVCacheWrapper]:
+        """prefill_wrappers_paged"""
+        if self._prefill_wrappers_paged is None:
+            self._prefill_wrappers_paged = (
+                []
+                if self.skip_prefill
+                else [
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self._flashinfer_workspace(),
+                        "NHD",
+                        backend=self.prefill_backend,
+                    )
+                    for _ in range(self.num_wrappers)
+                ]
+            )
+        return self._prefill_wrappers_paged
+
+    @property
+    def prefill_wrappers_verify(self) -> List[BatchPrefillWithPagedKVCacheWrapper]:
+        """prefill_wrappers_verify"""
+        if self._prefill_wrappers_verify is None:
+            self._prefill_wrappers_verify = (
+                []
+                if self.skip_prefill
+                else [
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self._flashinfer_workspace(),
+                        "NHD",
+                        backend=self.prefill_backend,
+                    )
+                    for _ in range(self.num_wrappers)
+                ]
+            )
+        return self._prefill_wrappers_verify
+
+    @property
+    def decode_wrappers(self) -> List[BatchDecodeWithPagedKVCacheWrapper]:
+        """decode_wrappers"""
+        if self._decode_wrappers is None:
+            self._decode_wrappers = [
+                BatchDecodeWithPagedKVCacheWrapper(
+                    self._flashinfer_workspace(),
+                    "NHD",
+                    backend=self.decode_backend,
+                    use_tensor_cores=self.decode_use_tensor_cores,
+                )
+                for _ in range(self.num_wrappers)
+            ]
+        return self._decode_wrappers
 
     def _check_kv_attention_access(self, phase: str, access) -> None:
         if access is not None:
@@ -1142,7 +1212,7 @@ class FlashInferAttnBackend(AttentionBackend):
         requests); kv indices cover up to num_slots sequences of
         max_context_len.
         """
-        device = self.workspace_buffer.device
+        device = self.kv_last_page_len.device
         self.full_cg_prefill_req_slots = num_slots
         upd = self.indices_updater_prefill
         workspace_bytes = self._full_cg_prefill_workspace_bytes(
@@ -1734,6 +1804,13 @@ class FlashInferIndicesUpdaterDecode:
 
 
 class FlashInferIndicesUpdaterPrefill:
+    @property
+    def prefill_wrapper_ragged(self) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """prefill_wrapper_ragged"""
+        # Resolved lazily so that constructing the updater does not force the
+        # backend to build its (workspace-backed) ragged wrapper.
+        return self.attn_backend.prefill_wrapper_ragged
+
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
         self.num_qo_heads = (
@@ -1753,7 +1830,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
-        self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
