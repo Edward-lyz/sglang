@@ -28,7 +28,9 @@ EOF
 
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
+# 新增copy单测用例：scripts/ci/ci_tests.json
 RUN cd /tmp/aiak_sglang && find . -name "*.py" -exec cp --parents {} /sgl-workspace/sglang \; && \
+    cp scripts/ci/ci_tests.json scripts/ci/run_ci.py /sgl-workspace/sglang/scripts/ci/ && \
     cp -R python/sglang/jit_kernel /sgl-workspace/sglang/python/sglang && \
     git log -1 --format="%H %s %an %ad" > /sgl-workspace/sglang/aiak-last-commit && \
     rm -rf /tmp/aiak_sglang
