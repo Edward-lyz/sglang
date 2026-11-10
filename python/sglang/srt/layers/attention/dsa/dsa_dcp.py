@@ -21,6 +21,7 @@ _SCRATCH_RESERVE_BYTES = 128 << 20
 
 
 def trtllm_rows_per_call(*, workspace_bytes: int, heads: int) -> int:
+    """trtllm_rows_per_call"""
     rows = (workspace_bytes - _SCRATCH_RESERVE_BYTES) // (
         heads * _SOFTMAX_BYTES_PER_ROW_HEAD
     )

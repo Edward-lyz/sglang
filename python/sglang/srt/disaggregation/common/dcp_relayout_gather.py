@@ -106,6 +106,7 @@ def gather_rows(
 
 
 def entry_ptr_tensor(tensors: Sequence[torch.Tensor], gpu_id: int) -> torch.Tensor:
+    """entry_ptr_tensor"""
     return torch.tensor(
         [t.data_ptr() for t in tensors], dtype=torch.int64, device=f"cuda:{gpu_id}"
     )

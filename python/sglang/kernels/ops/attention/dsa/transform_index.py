@@ -25,6 +25,7 @@ def transform_index_page_table_dcp_kernel(
     TOPK: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
 ):
+    """transform_index_page_table_dcp_kernel"""
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_TOPK)
     slots = tl.load(
