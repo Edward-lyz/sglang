@@ -573,6 +573,8 @@ class ModelRunner:
         self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
+        if hasattr(self.model, "force_weight_shard_finalize"):
+            self.model.force_weight_shard_finalize()
         prepare_moe_topk(
             model=self.model,
             model_config=self.model_config,

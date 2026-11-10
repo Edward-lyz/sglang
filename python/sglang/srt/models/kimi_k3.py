@@ -97,6 +97,14 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
+from sglang.srt.moe_sharding import (
+    MoeShardingForwardPlanner,
+    finalize_model_weight_shard,
+    get_moe_sharding_config,
+    get_moe_sharding_side_stream,
+    prepare_layer_weight_shard_forward,
+    setup_layer_weight_shard_flat,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
@@ -563,6 +571,30 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
 
+        if get_moe_sharding_config().enabled and self.use_latent_moe:
+            shard_targets = [
+                ("routed_expert_down_proj", "routed_expert_down_proj"),
+                ("routed_expert_up_proj", "routed_expert_up_proj"),
+            ]
+            if self._shared_experts_tp1 and self.shared_experts is not None:
+                shard_targets.extend(
+                    [
+                        (
+                            "shared_experts.gate_up_proj",
+                            "shared_experts.gate_up_proj",
+                        ),
+                        (
+                            "shared_experts.down_proj",
+                            "shared_experts.down_proj",
+                        ),
+                    ]
+                )
+            setup_layer_weight_shard_flat(
+                self,
+                targets=shard_targets,
+                side_stream=get_moe_sharding_side_stream(),
+            )
+
         # Static eligibility for fusing the fused-front latent all-reduce with
         # the RMSNorm epilogue (SGLANG_K3_AR_FUSION). The kernel views the flat
         # [latent | shared] buffer as [3N, NORM_DIM] rows and norms the first N,
@@ -602,7 +634,10 @@ class KimiK3MoE(nn.Module):
         cuda graph capture); only plain bf16/fp16 dense weights are merged —
         quantized or mixed-dtype checkpoints keep the unfused path.
         """
-        if not self.use_latent_moe:
+        if (
+            not self.use_latent_moe
+            or getattr(self, "_moe_shard_sched", None) is not None
+        ):
             return
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
             mods = [
@@ -1151,6 +1186,7 @@ class KimiK3MoE(nn.Module):
         once, and prefix_sum is consumed in the tail add like the non-DP
         path — gathering first would just replicate the whole batch onto
         every rank (tp-fold redundant compute + a2a traffic)."""
+        prepare_layer_weight_shard_forward(self)
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         use_dp = self._dp_attention and forward_batch is not None and not self._ep_a2a
@@ -2357,6 +2393,18 @@ class KimiK3LinearModel(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
+        self._moe_shard_layers = [
+            (i, self.layers[i].mlp)
+            for i in range(self.start_layer, self.end_layer)
+            if isinstance(self.layers[i], KimiK3DecoderLayer)
+            and isinstance(self.layers[i].mlp, KimiK3MoE)
+            and getattr(self.layers[i].mlp, "_moe_shard_sched", None) is not None
+        ]
+        self._moe_shard_planner = MoeShardingForwardPlanner(
+            self._moe_shard_layers
+        )
+        self._moe_shard_pool = None
+        self._moe_shard_finalized = False
 
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -2442,7 +2490,10 @@ class KimiK3LinearModel(nn.Module):
         )
         sp_sharded = False
         aux_hidden_states = []
+        self._moe_shard_planner.reset()
+        self._moe_shard_planner.pre_dispatch(self.start_layer)
         for i in range(self.start_layer, self.end_layer):
+            self._moe_shard_planner.maybe_dispatch(i + 1)
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
                 sp_sharded = False
@@ -2457,6 +2508,7 @@ class KimiK3LinearModel(nn.Module):
                     input_sharded=sp_sharded,
                     keep_sharded=sp_attn_res,
                 )
+            self._moe_shard_planner.update_done_event(i, self.layers[i])
             if (
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
@@ -2519,6 +2571,18 @@ class KimiK3LinearModel(nn.Module):
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def force_weight_shard_finalize(self) -> None:
+        """Finalize Kimi K3 MoE weight shards before CUDA graph capture."""
+        if self._moe_shard_finalized:
+            return
+        modules = [module for _, module in self._moe_shard_layers]
+        self._moe_shard_pool = finalize_model_weight_shard(
+            modules, mode="force"
+        )
+        self._moe_shard_finalized = True
+        if modules:
+            torch.cuda.empty_cache()
 
     def _dspark_capture_stream(
         self,
@@ -2585,6 +2649,10 @@ class KimiK3LinearForCausalLM(nn.Module):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def force_weight_shard_finalize(self) -> None:
+        """Finalize MoE weight sharding on the underlying model."""
+        self.model.force_weight_shard_finalize()
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.pp_group.world_size > 1:
@@ -2965,6 +3033,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
         if self.language_model is not None:
             self.language_model.post_load_weights()
+
+    def force_weight_shard_finalize(self) -> None:
+        """Finalize MoE weight sharding on the language model, if present."""
+        if self.language_model is not None:
+            self.language_model.force_weight_shard_finalize()
 
     def precompile_kernels_after_loading(self) -> None:
         if self.config.language_only:

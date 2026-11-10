@@ -777,6 +777,11 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Keep only one TP rank's slice of Kimi K3's replicated latent-MoE and TP1
+    # shared-expert weights, reconstructing them with a lookahead AllGather.
+    SGLANG_ENABLE_K3_MOE_WEIGHT_SHARD = EnvBool(False)
+    # Layer selection: "all", comma-separated ids, or inclusive ranges.
+    SGLANG_K3_MOE_WEIGHT_SHARD_LAYERS = EnvStr("all")
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
