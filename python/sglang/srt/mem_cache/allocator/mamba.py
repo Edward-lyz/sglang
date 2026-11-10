@@ -38,6 +38,7 @@ class MambaSlotAllocator:
         self.device = device
         self._alloc_iter: Optional[Iterator] = None
         self._alloc_host_iter: Optional[Iterator[int]] = None
+        self._preallocated_size = 0
         self._last_alloc_host_ids: Optional[tuple[int, ...]] = None
         self._free_slots_cpu: list[int] = []
         # Pending slots are published to both free lists together.
@@ -96,16 +97,23 @@ class MambaSlotAllocator:
         self._reap_pending_host_frees()
         return len(self.free_slots)
 
+    @property
+    def preallocated_size(self) -> int:
+        """Unused group slots that will return to the free list after matching."""
+        return self._preallocated_size
+
     def alloc_group_begin(self, num_reqs: int):
         """Pre-allocate a batch of slots for match_prefix to amortize overhead."""
         self._prepare_alloc(num_reqs)
         self._alloc_iter = None
         self._alloc_host_iter = None
+        self._preallocated_size = 0
         if num_reqs > 0:
             result = self._do_alloc(num_reqs)
             if result is not None:
                 self._alloc_iter = iter(result.split(1))
                 self._alloc_host_iter = iter(self._last_alloc_host_ids or ())
+                self._preallocated_size = num_reqs
                 self._last_alloc_host_ids = None
 
     def alloc_group_end(self):
@@ -121,12 +129,14 @@ class MambaSlotAllocator:
                 self.free(torch.cat(remaining), host_ids=remaining_host)
         self._alloc_iter = None
         self._alloc_host_iter = None
+        self._preallocated_size = 0
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         self._prepare_alloc(need_size)
         if self._alloc_iter is not None and need_size == 1:
             slot = next(self._alloc_iter, None)
             if slot is not None:
+                self._preallocated_size -= 1
                 if self._alloc_host_iter is not None:
                     next(self._alloc_host_iter, None)
                 return slot
@@ -142,6 +152,7 @@ class MambaSlotAllocator:
         if self._alloc_iter is not None and need_size == 1:
             slot = next(self._alloc_iter, None)
             if slot is not None:
+                self._preallocated_size -= 1
                 host_iter = self._alloc_host_iter
                 host_id = None if host_iter is None else next(host_iter, None)
                 return slot, None if host_id is None else (int(host_id),)
@@ -214,6 +225,7 @@ class MambaSlotAllocator:
         self._last_alloc_host_ids = None
         self._alloc_iter = None
         self._alloc_host_iter = None
+        self._preallocated_size = 0
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )

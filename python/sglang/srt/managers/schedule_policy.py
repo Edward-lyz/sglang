@@ -387,7 +387,9 @@ class SchedulePolicy:
         enable_priority_scheduling: bool,
         priority_sign: int,
     ) -> None:
-        """Sorts the waiting queue based on the longest output (max_new_tokens). If using priority scheduling, sort by priority first."""
+        """Sort by longest output (max_new_tokens), considering priority first
+        when priority scheduling is enabled.
+        """
         if enable_priority_scheduling:
             waiting_queue.sort(
                 key=lambda x: (
@@ -654,17 +656,30 @@ class PrefillAdder:
         # MAMBA-recoverable bytes for a mamba slot (shared gap + peer holes +
         # mamba-evictable radix), NOT full-evictable. Gate new mamba slots on
         # that mamba-recoverable budget separately or an over-admit hits the
-        # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
-        self.rem_mamba_slots = None
+        # fail-loud `RuntimeError`. `None` when there is no mamba pool.
+        #
+        # Plain pools also need a slot budget for state + ping-pong buffers.
+        # Prefix matching/load-back may allocate a state before admission, so
+        # use live capacity there and reserve only slots not yet allocated.
+        req_pool = getattr(self.tree_cache, "req_to_token_pool", None)
+
+        self._rem_mamba_slots = None
+        self._plain_mamba_pool = None
+        self._reserved_mamba_slots = 0
         if self._mamba_slot_cost:
-            self.rem_mamba_slots = (
+            self._rem_mamba_slots = (
                 self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             )
             if self.is_hybrid_ssm_cache:
-                self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
+                self._rem_mamba_slots += self.tree_cache.mamba_evictable_size()
+        elif (
+            isinstance(req_pool, HybridReqToTokenPool)
+            and req_pool.enable_mamba_extra_buffer
+            and getattr(req_pool, "mamba_allocator", None) is not None
+        ):
+            self._plain_mamba_pool = req_pool
 
         self._mamba_slot_alloc_factor = 1
-        req_pool = getattr(self.tree_cache, "req_to_token_pool", None)
         if isinstance(req_pool, HybridReqToTokenPool):
             if self.tree_cache.supports_mamba():
                 self._mamba_slot_alloc_factor = (
@@ -864,6 +879,53 @@ class PrefillAdder:
             return self._mamba_slot_cost
         return 0
 
+    @property
+    def rem_mamba_slots(self) -> Optional[int]:
+        """Return recoverable Mamba slots after pending admission reservations."""
+        pool = self._plain_mamba_pool
+        if pool is None:
+            return self._rem_mamba_slots
+        allocator = pool.mamba_allocator
+        # alloc_group_begin temporarily removes unused COW slots from the free
+        # list; alloc_group_end returns them before alloc_req_slots runs.
+        available = allocator.schedulable_available_size() + allocator.preallocated_size
+        if self.is_hybrid_ssm_cache and getattr(pool, "mamba_ckpt_pool", None) is None:
+            # Int8 checkpoints have a separate allocator: evicting them cannot
+            # supply active state or ping-pong slots.
+            available += self.tree_cache.mamba_evictable_size()
+        return available - self._reserved_mamba_slots
+
+    def _mamba_slots_for_req(self, req: Req) -> int:
+        """Slots still needed by alloc_req_slots, excluding existing state/buffers."""
+        pool = self._plain_mamba_pool
+        if pool is None:
+            return 0
+        owner = req
+        if req.mamba_pool_idx is None and getattr(req, "session", None) is not None:
+            # PP replay may reach the pre-match gate before a streaming
+            # session has restored its already-owned state and buffers.
+            session_cache = self.tree_cache
+            find_slot = getattr(type(session_cache), "find_active_slot", None)
+            if not callable(find_slot):
+                session_cache = getattr(self.tree_cache, "session", None)
+                find_slot = getattr(type(session_cache), "find_active_slot", None)
+            if callable(find_slot):
+                owner = find_slot(session_cache, req) or req
+        needed = int(owner.mamba_pool_idx is None)
+        if owner.mamba_ping_pong_track_buffer is None:
+            needed += (
+                1
+                if pool.enable_mamba_extra_buffer_lazy
+                else pool.mamba_ping_pong_track_buffer_size
+            )
+        return needed
+
+    def _has_mamba_slots_for_req(self, req: Req) -> bool:
+        """Return whether the request's missing Mamba state and buffers fit."""
+        remaining = self.rem_mamba_slots
+        needed = self._mamba_slots_for_req(req)
+        return needed == 0 or remaining is None or needed <= remaining
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
@@ -925,7 +987,13 @@ class PrefillAdder:
             no_token = self.rem_swa_tokens <= 0
         # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
         # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
-        if not no_token and self.rem_mamba_slots is not None:
+        # Plain pools check each candidate before admission, allowing requests
+        # that already own all their slots to proceed even at zero free slots.
+        if (
+            not no_token
+            and self._plain_mamba_pool is None
+            and self.rem_mamba_slots is not None
+        ):
             no_token = self.rem_mamba_slots <= 0
         if no_token:
             return AddReqResult.NO_TOKEN
@@ -953,8 +1021,10 @@ class PrefillAdder:
         host_hit_len: int,
         mamba_gap_reserve: int = 0,
         cost=None,
+        mamba_slots_needed: int = 0,
     ):
-        # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
+        # TODO(lsyin): check this workaround logic, which only ensures the
+        # prefill will not run out of memory and may be too conservative.
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
@@ -969,13 +1039,10 @@ class PrefillAdder:
         self.cur_rem_token_offset += (
             extend_input_len + page_overhead + mamba_gap_reserve
         )
-        # The new mamba slot also consumes one mamba-recoverable slot (gated
-        # separately so full_evictable can't cover it — see __init__).
-        if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            # `alloc_req_slots` needs MAMBA_STATE_PER_REQ_* mamba slots per
-            # request, not one. Charge the same factor here or admission can
-            # over-commit and hit the fail-loud RuntimeError.
-            self.rem_mamba_slots -= self._mamba_slot_alloc_factor
+        if self._plain_mamba_pool is not None:
+            self._reserved_mamba_slots += mamba_slots_needed
+        elif mamba_gap_reserve and self._rem_mamba_slots is not None:
+            self._rem_mamba_slots -= self._mamba_slot_alloc_factor
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
@@ -1031,6 +1098,7 @@ class PrefillAdder:
             req.retracted_stain,
             host_hit_len=req.host_hit_length,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slots_needed=self._mamba_slots_for_req(req),
         )
 
     def _req_inc_lock_ref(self, req: Req):
@@ -1050,6 +1118,8 @@ class PrefillAdder:
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
+        if not self._has_mamba_slots_for_req(req):
+            return AddReqResult.NO_TOKEN
         _rem_tokens = self._get_dllm_remain_tokens()
 
         if _rem_tokens <= 0:
@@ -1079,6 +1149,7 @@ class PrefillAdder:
             req.retracted_stain,
             host_hit_len=req.host_hit_length,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slots_needed=self._mamba_slots_for_req(req),
         )
 
         # Return based on remaining token availability
@@ -1141,6 +1212,17 @@ class PrefillAdder:
                 waiting_queue_len=self.waiting_queue_len,
             )
 
+        if not self._has_mamba_slots_for_req(req):
+            if planned_admission is None:
+                return req
+            # Join the existing replay abort sync after every shard has
+            # participated in the delayer negotiation above.
+            req._pp_replay_local_abort = True
+            req._as_cache_read_abort_reason = (
+                "PP replay resumed chunk exceeds the local Mamba slot budget: "
+                f"rid={req.rid}"
+            )
+
         prefix_len = len(req.prefix_indices)
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - prefix_len
         if planned_admission is None:
@@ -1198,6 +1280,7 @@ class PrefillAdder:
             req.retracted_stain,
             host_hit_len=0,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slots_needed=self._mamba_slots_for_req(req),
             # Decision-side only: charging the replay ranks would let their
             # rem_cost hit zero and abort an admission PP0 already promised.
             cost=(
@@ -1298,6 +1381,8 @@ class PrefillAdder:
         return result
 
     def add_one_req_ignore_eos(self, req: Req):
+        if not self._has_mamba_slots_for_req(req):
+            return self._sync_attention_store_read_abort(req, AddReqResult.NO_TOKEN)
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1418,6 +1503,7 @@ class PrefillAdder:
                 req.retracted_stain,
                 host_hit_len=0,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                mamba_slots_needed=self._mamba_slots_for_req(req),
                 cost=self._req_cost(len(req.prefix_indices), req.extend_range.length),
             )
         else:
@@ -1447,6 +1533,7 @@ class PrefillAdder:
                 req.retracted_stain,
                 host_hit_len=0,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                mamba_slots_needed=self._mamba_slots_for_req(req),
                 cost=self._req_cost(len(req.prefix_indices), trunc_len),
             )
 
@@ -1626,6 +1713,9 @@ class PrefillAdder:
             if total_tokens >= self.rem_total_tokens:
                 return sync_admission(AddReqResult.NO_TOKEN)
 
+            if not self._has_mamba_slots_for_req(req):
+                return sync_admission(AddReqResult.NO_TOKEN)
+
             if self.is_hybrid_swa:
                 # self.rem_swa_tokens may decrease after the lock acquisition
                 swa_needed = self._swa_budget_for_req(
@@ -1793,6 +1883,11 @@ class PrefillAdder:
                     )
                     return sync_admission(AddReqResult.ABORT)
 
+            # Load-back may allocate the state itself or lock more cached
+            # states. Recheck the remaining buffer demand before committing.
+            if not self._has_mamba_slots_for_req(req):
+                return sync_admission(AddReqResult.NO_TOKEN)
+
             # Validate both the restored prefix and the local chunk budget
             # before the final sync. No request has been admitted yet, and an
             # abort on any attention shard must cancel it on all of them.
@@ -1821,6 +1916,7 @@ class PrefillAdder:
                     req.retracted_stain,
                     req.host_hit_length,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_slots_needed=self._mamba_slots_for_req(req),
                 )
             elif self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
@@ -1856,6 +1952,7 @@ class PrefillAdder:
                     req.retracted_stain,
                     req.host_hit_length,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_slots_needed=self._mamba_slots_for_req(req),
                     cost=self._req_cost(prefix_len, input_tokens),
                 )
             else:
@@ -1873,7 +1970,8 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
+                # When truncation alignment is set, the prefill prefix length
+                # must be a multiple of the truncation alignment size.
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                 # we need the prefill prefix length to be multiple of attention split size
                 if truncation_align_size is not None:
@@ -1916,6 +2014,7 @@ class PrefillAdder:
                     req.retracted_stain,
                     host_hit_len=req.host_hit_length,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_slots_needed=self._mamba_slots_for_req(req),
                     cost=self._req_cost(prefix_len, trunc_len),
                 )
 
@@ -1923,7 +2022,8 @@ class PrefillAdder:
 
     def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
         """
-        Preempt running requests to serve the new request if the priority threshold is met and token count sum is verified.
+        Preempt running requests to serve the new request if the priority
+        threshold is met and the token count sum is verified.
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests

@@ -4281,6 +4281,20 @@ class Scheduler(
                     if loaded_tokens > 0:
                         req.storage_hit_length = loaded_tokens
 
+            # Prefix matching can allocate a Mamba COW state before add_one_req
+            # checks admission. Leave enough room for the state and buffers
+            # before entering that allocation path.
+            if not adder._has_mamba_slots_for_req(req):
+                if authoritative_plan is not None:
+                    replay_rejection = "PP replay Mamba slots exhausted locally"
+                else:
+                    running_batch.batch_is_full = (
+                        len(adder.can_run_list) > 0 or not running_batch.is_empty()
+                        if self.enable_hierarchical_cache
+                        else True
+                    )
+                    break
+
             if authoritative_plan is not None:
                 # Prefix matching contains TP/CP collectives. Every shard must
                 # agree to enter it, even when only one ran out of request slots.
