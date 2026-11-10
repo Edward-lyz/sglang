@@ -99,7 +99,8 @@ def resolve_sweep_lens(
     for length in candidates:
         if length <= 0:
             continue
-        lens.add(_align_len(min(length, limit), page_size))
+        length = min(length, limit)
+        lens.add(_align_len(length, page_size) if raw == "auto" else length)
     return sorted(lens)
 
 

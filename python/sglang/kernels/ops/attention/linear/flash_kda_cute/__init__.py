@@ -25,11 +25,13 @@ batched mode (``cu_seqlens is None`` with ``B > 1``), which is folded into a
 packed single row with synthetic ``cu_seqlens`` because the CuTe kernel is
 packed/B=1.
 """
+
 from __future__ import annotations
 
 import torch
 
 from .impl.forward import fwd as _cute_fwd
+from .impl.forward import precompile
 
 D = 128
 
@@ -59,7 +61,9 @@ def fwd(
     if q.dtype != torch.bfloat16:
         raise TypeError(f"FlashKDA requires bf16 q/k/v/g, got {q.dtype}")
     if q.shape[-1] != D or v.shape[-1] != D:
-        raise ValueError(f"FlashKDA/CuTe require K=V={D}, got K={q.shape[-1]} V={v.shape[-1]}")
+        raise ValueError(
+            f"FlashKDA/CuTe require K=V={D}, got K={q.shape[-1]} V={v.shape[-1]}"
+        )
 
     B, T, H = q.shape[0], q.shape[1], q.shape[2]
     dt_bias = dt_bias.reshape(H, D)
@@ -112,4 +116,4 @@ def fwd(
     return None
 
 
-__all__ = ["fwd", "get_workspace_size", "D"]
+__all__ = ["fwd", "get_workspace_size", "precompile", "D"]

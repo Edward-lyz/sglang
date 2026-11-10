@@ -40,7 +40,10 @@ Routing per call:
 """
 
 import heapq
+import logging
 import math
+import os
+import time
 
 import cuda.bindings.driver as cuda_driver
 import cutlass
@@ -50,6 +53,8 @@ from cutlass.cute.runtime import from_dlpack
 
 from . import pkdw as _k
 from .planner import _one_chunk_warm_tables, pack_bins, plan_pieces
+
+logger = logging.getLogger(__name__)
 
 # Retained workload-specific schedules. Keep their predicates here rather than
 # using sequence count as an implicit workload label in kernel routing.
@@ -81,6 +86,84 @@ LAST_TPROBE: list = [None]
 _PLAN_CACHE: dict = {}
 _STATE_SAFE: dict = {}
 _SMS: dict = {}
+
+
+def get_forward_config(
+    *,
+    num_heads: int,
+    num_sequences: int,
+    full_chunks: bool,
+    has_split: bool,
+    store_final_state: bool,
+    lower_bound: float,
+    allow_approximate_split: bool = False,
+) -> dict:
+    """Shape-dependent options shared by serving and startup compilation."""
+    fixed = num_sequences == 1
+    generic = not fixed and not full_chunks
+    return {
+        # Single-sequence fused gate and four-row Q/K pairing.
+        "gate2": 1 if fixed else 0,
+        "qk_rowpair": 4 if fixed else 8,
+        "has_split": has_split,
+        "beta_tma": True,
+        # Generic tails use preaddressed Gram issue and rolling gate batches.
+        "gram_w9": 2 if generic else 0,
+        "restore_tail": False,
+        "reg_mode": (
+            1 if fixed or full_chunks or (num_heads == 96 and store_final_state) else 2
+        ),
+        "full_chunks": full_chunks,
+        # H96 must retain identical FP32 lower-bound arithmetic when an
+        # aligned sequence is packed with an odd-tail sequence.
+        "lower_bound_m5": (
+            num_heads != 96 and (full_chunks or num_heads == 64) and lower_bound == -5.0
+        ),
+        "approximate_split": allow_approximate_split and has_split,
+        "prep_peel": num_heads == 96 and generic,
+        "cluster_size": 4 if fixed else (2 if num_sequences in (6, 8) else 1),
+        "gate_roll": generic,
+    }
+
+
+def get_precompile_configs(
+    *, num_heads: int, num_sms: int, lower_bound: float
+) -> list[dict]:
+    """Enumerate serving keys, independent of exact token or batch counts.
+
+    The FlashKDA wrapper supplies FP32 initial/final state, and serving uses
+    exact FP32 handoffs without exports. Batch sizes 2 and 6 represent the
+    cluster-1 and cluster-2 varlen routes; size 8 shares size 6's options.
+    A single sequence cannot split when its heads fit on the available SMs.
+    """
+    configs = []
+    for num_sequences in (1, 2, 6):
+        splits = (
+            (False, True) if num_sequences != 1 or num_heads > num_sms else (False,)
+        )
+        for full_chunks in (True, False):
+            for has_split in splits:
+                configs.append(
+                    {
+                        **get_forward_config(
+                            num_heads=num_heads,
+                            num_sequences=num_sequences,
+                            full_chunks=full_chunks,
+                            has_split=has_split,
+                            store_final_state=True,
+                            lower_bound=lower_bound,
+                        ),
+                        "mid_bf16": False,
+                        "store_final_state": True,
+                        "do_export": False,
+                        "have_state": True,
+                        "bf16_dv": True,
+                        "beta_bf16": True,
+                        "rcp_decor": True,
+                        "rf_hoist": True,
+                    }
+                )
+    return configs
 
 
 def _sm_count(dev: torch.device) -> int:
@@ -286,6 +369,34 @@ def _get_compiled(
         _COMPILED[key] = tfn
         entry = tfn
     return entry
+
+
+@torch.no_grad()
+def precompile(*, num_heads: int, device: torch.device, lower_bound: float) -> int:
+    """Compile serving variants on this PP worker before accepting requests."""
+    device = torch.device(device)
+    started = time.perf_counter()
+    with torch.cuda.device(device):
+        configs = get_precompile_configs(
+            num_heads=num_heads, num_sms=_sm_count(device), lower_bound=lower_bound
+        )
+        logger.info(
+            "Precompiling %d CuTe KDA serving variants: pid=%d device=%s heads=%d",
+            len(configs),
+            os.getpid(),
+            device,
+            num_heads,
+        )
+        for config in configs:
+            _get_compiled(num_heads, device, **config)
+    logger.info(
+        "Precompiled %d CuTe KDA serving variants in %.2f s: pid=%d device=%s",
+        len(configs),
+        time.perf_counter() - started,
+        os.getpid(),
+        device,
+    )
+    return len(configs)
 
 
 def _dummy_exp(dev: torch.device):
@@ -1073,7 +1184,6 @@ def fwd(
     H = q.shape[2]
     T = q.shape[0] * q.shape[1]
     nseq = 1 if cu_seqlens is None else int(cu_seqlens.numel()) - 1
-    fixed = nseq == 1
     store_final_state = final_state is not None
     allow_approximate_split = allow_approximate_split and _stream_state_is_safe(
         initial_state
@@ -1103,36 +1213,15 @@ def fwd(
     if has_split and not allow_approximate_split:
         mfl.zero_()
         fepoch = 1
-    # v98 fused-gate kernel variant: routed to single-sequence (fixed)
-    # shapes only — it wins ~1-3% there (long chains, steady-state L1
-    # relief) but costs ~2% on short varlen chains (prep-latency exposure
-    # at chain starts; profiles/NOTES.md session 2).
-    common = {
-        "initial_state": initial_state,
-        "final_state": final_state,
-        "cu_seqlens": cu32,
-        "sched": (soff, schain, spt0, sptn, ssrc, sdst, G, mid, mfl, fepoch),
-        "gate2": 1 if fixed else 0,
-    }
-    # NCU v119 source counters identify the prep warpgroup's raw-Q/K indexing
-    # as a compiler-spill trigger.  Mode 4 is algebraically just a four-row
-    # half-warp pairing through the combined prep-thread coordinate.  Mode 8
-    # keeps that row map and enables the fused per-channel gate scan while
-    # retaining varlen's measured-faster raw V/residual layout.
-    qk_rowpair = 4 if fixed else 8
-    # Central, preaddressed Gram issue relieves generic-tail prep scheduling.
-    # Full-chunk varlen routes retain per-instance self-issue.
-    generic = not fixed and not full_chunks
-    gram_w9 = 2 if generic else 0
-    # Full-chunk varlen favors 160/88/24/48. Packed normalization lets generic
-    # mixed use 152/96/24/48 without H96's old 56-reg prep. Both fixed shapes
-    # use 160/88/24/48 after the strict final-state retune.
-    reg_mode = 1 if fixed else 0
-    if not fixed:
-        reg_mode = 1 if full_chunks or (H == 96 and store_final_state) else 2
-    # Cluster-2 also wins on uniform H64 after the dedicated MMA issuer;
-    # matched 15x100 bookends improve by 0.208% over cluster-1.
-    cluster_size = 4 if fixed else (2 if nseq in (6, 8) else 1)
+    config = get_forward_config(
+        num_heads=H,
+        num_sequences=nseq,
+        full_chunks=full_chunks,
+        has_split=has_split,
+        store_final_state=store_final_state,
+        lower_bound=lower_bound,
+        allow_approximate_split=allow_approximate_split,
+    )
     result = _launch_forward(
         q,
         k,
@@ -1144,25 +1233,11 @@ def fwd(
         A_log,
         dt_bias,
         lower_bound,
-        has_split=has_split,
-        beta_tma=True,
-        qk_rowpair=qk_rowpair,
-        gram_w9=gram_w9,
-        restore_tail=False,
-        reg_mode=reg_mode,
-        full_chunks=full_chunks,
-        # H96 must use the same FP32 lower-bound arithmetic for full chunks
-        # and odd tails. The constant-M5 variant changes aligned rows when
-        # they are packed with an odd-tail sequence.
-        lower_bound_m5=H != 96 and (full_chunks or H == 64) and lower_bound == -5.0,
-        approximate_split=allow_approximate_split and has_split,
-        prep_peel=H == 96 and generic,
-        cluster_size=cluster_size,
-        # Rolling eight-row gate batches also shorten generic H64 by about
-        # 0.17% in matched 5x100 bookends; full-chunk H64 still prefers the
-        # scalar schedule.
-        gate_roll=generic,
-        **common,
+        initial_state=initial_state,
+        final_state=final_state,
+        cu_seqlens=cu32,
+        sched=(soff, schain, spt0, sptn, ssrc, sdst, G, mid, mfl, fepoch),
+        **config,
     )
     if allow_approximate_split and has_split:
         done = _DONE_EVENT[dev.index]

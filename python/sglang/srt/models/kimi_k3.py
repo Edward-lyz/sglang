@@ -3576,6 +3576,44 @@ class KimiK3LinearForCausalLM(nn.Module):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
 
+    def precompile_kernels_after_loading(self) -> None:
+        """Precompile the Kimi-K3 KDA CuTe prefill kernels after weight loading."""
+        if not envs.SGLANG_OPT_FLASH_KDA_CUTE.get():
+            return
+        # This hook precedes attention-backend initialization, so resolve the
+        # configured backend directly instead of consulting its global cache.
+        server_args = get_server_args()
+        if server_args.disaggregation_mode == "decode":
+            return
+        backend = (
+            server_args.linear_attn_prefill_backend or server_args.linear_attn_backend
+        )
+        if backend != "flashkda":
+            return
+
+        compiled = set()
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer) or not isinstance(
+                layer.self_attn, KimiK3DeltaAttention
+            ):
+                continue
+            attn = layer.self_attn
+            device = attn.dt_bias.device
+            lower_bound = attn.attn.lower_bound
+            if device.type != "cuda" or lower_bound is None:
+                continue
+            key = (attn.local_num_heads, device, lower_bound)
+            if key in compiled:
+                continue
+            from sglang.kernels.ops.attention.linear.flash_kda_cute import precompile
+
+            # Each PP worker has its own CuTe cache. Compile locally instead
+            # of letting the first request compile serially through all stages.
+            precompile(
+                num_heads=attn.local_num_heads, device=device, lower_bound=lower_bound
+            )
+            compiled.add(key)
+
 
 # ---------------------------------------------------------------------------
 # KimiK3ForConditionalGeneration — multimodal wrapper
@@ -3656,6 +3694,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
             self.language_model.force_weight_shard_finalize()
 
     def precompile_kernels_after_loading(self) -> None:
+        if self.language_model is not None:
+            self.language_model.precompile_kernels_after_loading()
         if self.config.language_only:
             return
         if self.vision_tower.precompile_fused_rope():

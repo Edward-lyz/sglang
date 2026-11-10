@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
+import msgspec
 import numpy as np
 import torch
 import torch.distributed
@@ -63,6 +64,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
+PPBootstrapStatus = List[List[str]]
 PPTransferStatus = Tuple[List[str], List[str]]
 PPReleasePayload = Union[List[str], PPTransferStatus]
 _PP_BATCH_CONTROL_KEY = "__pp_batch_control__"
@@ -273,6 +275,13 @@ def _pp_filter_proxy_rows(
 class PPBatchMetadata:
     can_run_cuda_graph: bool
     forward_done: torch.Event
+
+
+class PPPrefillStatus(msgspec.Struct, frozen=True, kw_only=True):
+    """Bootstrap and transfer decisions relayed together between PP stages."""
+
+    bootstrap: PPBootstrapStatus
+    transfer: PPTransferStatus
 
 
 class SchedulerPPMixin:
@@ -1203,8 +1212,7 @@ class SchedulerPPMixin:
         ====================================================================
         Stage P
         recv ith req from previous stage
-        recv ith bootstrap req from previous stage
-        recv ith transferred req from previous stage
+        recv ith bootstrap/transfer statuses from previous stage
         recv ith proxy from previous stage
         run ith batch
         recv prev (i+1) % mb_size th consensus bootstrapped req from previous stage
@@ -1214,8 +1222,7 @@ class SchedulerPPMixin:
         recv prev (i+1) % mb_size th outputs
         process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
         send ith req to next stage
-        send ith bootstrap req to next stage
-        send ith transferred req to next stage
+        send ith bootstrap/transfer statuses to next stage
         send ith proxy to next stage
         send current stage's outputs to next stage (can be stashed and delayed to send later)
 
@@ -1230,7 +1237,8 @@ class SchedulerPPMixin:
         """
         self.init_pp_loop_state()
         # PPBatchPlan is currently an AttentionStore correctness protocol. Keep
-        # the ordinary PP and non-AS disaggregated paths byte-for-byte compatible.
+        # batch-plan handling outside AS unchanged. The combined statuses apply
+        # to all disaggregated prefill ranks independently of the cache mode.
         self._pp_batch_contract_guard_enabled = bool(self.enable_asradix_cache)
         if self._pp_batch_contract_guard_enabled:
             self._pp_validate_authoritative_plan_configuration()
@@ -1241,8 +1249,7 @@ class SchedulerPPMixin:
         consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: PPTransferStatus = ([], [])
         release_rids: Optional[PPTransferStatus] = None
-        send_bootstrapped_work = []
-        send_transfer_work = []
+        send_status_work: List[P2PWork] = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
 
@@ -1288,9 +1295,21 @@ class SchedulerPPMixin:
                     self._pp_commit_comm_work(self.send_proxy_work)
                     self._pp_drain_pending_cache_read_aborts()
 
-                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+                previous_bootstrapped: Optional[PPBootstrapStatus] = None
+                previous_transferred: Optional[PPTransferStatus] = None
+                if not self.pp_group.is_first_rank:
+                    (previous_status,) = self._pp_recv_pyobj_from_prev_stage()
+                    if not isinstance(previous_status, PPPrefillStatus):
+                        raise TypeError(
+                            "Expected PPPrefillStatus from the previous stage"
+                        )
+                    previous_bootstrapped = previous_status.bootstrap
+                    previous_transferred = previous_status.transfer
+                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids(
+                    previous_status=previous_bootstrapped
+                )
                 bmbs[mb_id] = bootstrapped_rids
-                self._pp_commit_comm_work(send_bootstrapped_work)
+                self._pp_commit_comm_work(send_status_work)
                 if self._pp_pd_sideband_bootstrap:
                     # The all-PP-ranks AND is already settled (PP0's sideband
                     # PP_READY counter), so admit here -- same loop slot on every
@@ -1300,8 +1319,9 @@ class SchedulerPPMixin:
                     # under this same flag.
                     self.process_bootstrapped_queue(bootstrapped_rids)
 
-                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
-                self._pp_commit_comm_work(send_transfer_work)
+                transferred_rids = self._pp_pd_get_prefill_transferred_ids(
+                    previous_status=previous_transferred
+                )
                 tmbs[mb_id] = transferred_rids
 
                 if (
@@ -1524,11 +1544,14 @@ class SchedulerPPMixin:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         relay_reqs, async_send=True
                     )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
+                    send_status_work = self._pp_send_pyobj_to_next_stage(
+                        [
+                            PPPrefillStatus(
+                                bootstrap=bootstrapped_rids,
+                                transfer=transferred_rids,
+                            )
+                        ],
+                        async_send=True,
                     )
                     if cur_batch or transport_expected:
                         if cur_batch:
@@ -2267,37 +2290,34 @@ class SchedulerPPMixin:
         prepare_abort(req, error_msg, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
 
-    def _pp_pd_get_bootstrapped_ids(self: Scheduler):
-        # communicate pre-consensus bootstrapp reqs
+    def _pp_pd_get_bootstrapped_ids(
+        self: Scheduler,
+        *,
+        previous_status: Optional[PPBootstrapStatus] = None,
+    ) -> PPBootstrapStatus:
+        """Combine the upstream bootstrap decision with this stage's readiness."""
         if self.pp_group.is_first_rank:
             good_bootstrapped_rids, bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
-        elif self._pp_pd_sideband_bootstrap:
-            # PP0's local ready set already carries the "every PP rank
-            # acknowledged this room" AND -- the sideband PP_READY counter gates
-            # its update_status -- so the table travelling down this chain is
-            # the admission table, not a candidate set. Adopt it verbatim: no
-            # intersection with the local poll, no local abort routing. That is
-            # what keeps every rank admitting the identical rid set in the
-            # identical loop slot (see the design doc, 6.1).
-            return self._pp_recv_pyobj_from_prev_stage()
         else:
-            # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-            prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
-            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
-                prev_bootstrapped_rids
-            )
+            if previous_status is None:
+                raise ValueError("Missing upstream PP bootstrap status")
+            if self._pp_pd_sideband_bootstrap:
+                # PP0's sideband decision already represents all PP ranks.
+                # Adopt it without polling locally or changing admission order.
+                return previous_status
+            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = previous_status
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
             good_bootstrapped_rids = _pp_ordered_intersection(
-                prev_good_bootstrapped_rids,
-                curr_good_bootstrapped_rids,
+                left=prev_good_bootstrapped_rids,
+                right=curr_good_bootstrapped_rids,
             )
             bad_bootstrapped_rids = _pp_ordered_union(
-                prev_bad_bootstrapped_rids,
-                curr_bad_bootstrapped_rids,
+                left=prev_bad_bootstrapped_rids,
+                right=curr_bad_bootstrapped_rids,
             )
         # Route locally-aborted reqs through the bad-union consensus so every PP
         # rank flushes them in the same consensus round, regardless of when the
@@ -2315,21 +2335,19 @@ class SchedulerPPMixin:
 
     def _pp_pd_get_prefill_transferred_ids(
         self: Scheduler,
+        *,
+        previous_status: Optional[PPTransferStatus] = None,
     ) -> PPTransferStatus:
-        # get the current stage transfer success
+        """Combine the upstream transfer decision with this stage's local poll."""
         current_status = self.get_transferred_rids()
         if self.pp_group.is_first_rank:
-            transferred_rids = current_status
-        # if other ranks, do intersection with the previous rank's transferred rids
-        else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
-            previous_status = self._pp_recv_pyobj_from_prev_stage()
-            transferred_rids = _pp_merge_transfer_status(
-                previous=previous_status,
-                current=current_status,
-            )
-        return transferred_rids
+            return current_status
+        if previous_status is None:
+            raise ValueError("Missing upstream PP transfer status")
+        return _pp_merge_transfer_status(
+            previous=previous_status,
+            current=current_status,
+        )
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
