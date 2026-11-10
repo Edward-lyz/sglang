@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
+    ComponentDeviceValueAllocator,
     ComponentType,
     EvictLayer,
     TreeComponent,
@@ -34,6 +35,17 @@ if TYPE_CHECKING:
 
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
+
+    def device_value_allocator(self) -> ComponentDeviceValueAllocator:
+        """Describe allocation of the cache's complete token-slot bundle."""
+        allocator = self.cache.token_to_kv_pool_allocator
+        return ComponentDeviceValueAllocator(
+            alloc=allocator.alloc,
+            free=allocator.free,
+            evict=lambda count: self.cache.evict(EvictParams(num_tokens=count)),
+            available=allocator.available_size,
+            eviction_margin=self.cache.page_size,
+        )
 
     def __init__(self, cache, params):
         super().__init__(cache, params)

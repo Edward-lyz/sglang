@@ -14,9 +14,10 @@ from array import array
 from dataclasses import dataclass
 from enum import Enum
 from numbers import Integral
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import torch
+
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InitLoadBackParams,
@@ -25,14 +26,18 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache_components import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import (
+    UnifiedRadixCache,
+    UnifiedTreeNode,
+)
 
 logger = logging.getLogger(__name__)
 
 AS_MIN_MATCH_BLOCKS = 5
-AS_KDA_CHECKPOINT_GPU_COUNT_ENV = "AS_KDA_CHECKPOINT_GPU_COUNT"
+_KDA_PENDING_HASH = "as_kda_pending_hash"
+_KDA_PUBLISHED_HASH = "as_kda_published_hash"
 
 
 class AttentionStoreEndpointRole(str, Enum):
@@ -40,14 +45,6 @@ class AttentionStoreEndpointRole(str, Enum):
 
     PAGE = "PAGE"
     CHECKPOINT = "CHECKPOINT"
-
-
-class AttentionStoreCacheTopology(str, Enum):
-    """Identify the radix-cache topology used by an AttentionStore plan."""
-
-    RADIX = "RADIX"
-    SWA = "SWA"
-    MAMBA = "MAMBA"
 
 
 @dataclass(frozen=True)
@@ -218,19 +215,29 @@ def _acquire_node_release(cache, node) -> Callable[[], None]:
 
 def _contiguous_page_ids(slot_ids: torch.Tensor, page_size: int) -> tuple[int, ...]:
     """Validate page-aligned contiguous slots with one device-to-host sync."""
+    return _materialize_page_ids(_page_id_metadata(slot_ids, page_size), page_size)
+
+
+def _page_id_metadata(slot_ids: torch.Tensor, page_size: int) -> torch.Tensor:
+    """Build page bases and validity flags on the source device."""
     if page_size <= 0 or slot_ids.numel() % page_size:
         raise ValueError(
             f"slot count {slot_ids.numel()} is not aligned to page_size={page_size}"
         )
     if not slot_ids.numel():
-        return ()
+        return torch.empty((0, 2), dtype=torch.int64, device=slot_ids.device)
 
     pages = slot_ids.reshape(-1, page_size)
     page_bases = pages[:, 0]
     offsets = torch.arange(page_size, dtype=pages.dtype, device=pages.device)
     valid = torch.all(pages == page_bases[:, None] + offsets, dim=1)
     valid &= page_bases.remainder(page_size) == 0
-    page_meta = torch.stack((page_bases, valid.to(page_bases.dtype)), dim=1).tolist()
+    return torch.stack((page_bases, valid.to(page_bases.dtype)), dim=1)
+
+
+def _materialize_page_ids(page_meta: torch.Tensor, page_size: int) -> tuple[int, ...]:
+    """Validate host page metadata and return physical page identifiers."""
+    page_meta = page_meta.tolist()
     for page_index, (_, is_valid) in enumerate(page_meta):
         if not is_valid:
             raise ValueError(
@@ -240,11 +247,51 @@ def _contiguous_page_ids(slot_ids: torch.Tensor, page_size: int) -> tuple[int, .
 
 
 @dataclass
+class _PreparedPageIds:
+    page_size: int
+    metadata: torch.Tensor
+    ready_event: Any = None
+    source_ready_event: Any = None
+    source_metadata: Optional[torch.Tensor] = None
+
+    def materialize(self) -> tuple[int, ...]:
+        """Wait for an asynchronous copy and return validated page IDs."""
+        if self.ready_event is not None:
+            self.ready_event.synchronize()
+        return _materialize_page_ids(self.metadata, self.page_size)
+
+    def release(self) -> None:
+        """Wait until asynchronous metadata users are quiescent."""
+        if self.ready_event is not None:
+            self.ready_event.synchronize()
+
+
+def _request_block_hash_ids(
+    req, token_ids: Sequence[int], page_size: int, page_count: int
+) -> tuple[int, ...]:
+    """Reuse request block hashes when they cover the written prefix."""
+    # Padding preserves length, so a length check alone would let the scheduler's
+    # multimodal substitution (which rebinds origin_input_ids) hash away the image.
+    if (
+        req.as_block_hashs is not None
+        and req.origin_input_ids is req.origin_input_ids_unpadded
+    ):
+        request_hashes = req.as_block_hashs.hash_ids
+        if len(request_hashes) >= page_count:
+            return tuple(map(int, request_hashes[:page_count]))
+
+    from attentionstore_sdk.sdk import Tokens
+
+    aligned_tokens = page_count * page_size
+    return tuple(map(int, Tokens(token_ids[:aligned_tokens], page_size).hash_ids))
+
+
+@dataclass
 class _PageWriteTask:
     rid: str
     endpoint: Optional[AttentionStoreEndpointBinding]
     block_hash_ids: Sequence[int]
-    data_id_list: List[int]
+    data_id_list: Any
     write_params: Any
     release_after_write: Callable[[], None] = _noop_release
     release: Callable[[], None] = _noop_release
@@ -258,9 +305,9 @@ class _PageWriteTask:
 @dataclass
 class _KDAWriteTask:
     rid: str
-    node: TreeNode
+    node: UnifiedTreeNode
     block_hash_ids: Sequence[int]
-    page_ids: Sequence[int]
+    page_ids: Any
     checkpoint_slot: int
     params: dict
     request: Any = None
@@ -291,7 +338,7 @@ class _SPAWriteTask:
     page_endpoint: Optional[AttentionStoreEndpointBinding]
     checkpoint_store: Any
     block_hash_ids: Sequence[int]
-    page_ids: Sequence[int]
+    page_ids: Any
     checkpoint_snapshot: Optional[_SPACheckpointSnapshot]
     params: dict
     release_after_write: Callable[[], None] = _noop_release
@@ -324,7 +371,43 @@ class AttentionStoreCoordinator:
         """Initialize an idle asynchronous write coordinator."""
         self._write_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._pending_writes: list[_PendingWrite] = []
+        self._page_id_copy_stream = None
         self._closed = False
+
+    def prepare_page_ids(self, cache, slot_ids: torch.Tensor) -> _PreparedPageIds:
+        """Stage validated page metadata without blocking the scheduler."""
+        metadata = _page_id_metadata(slot_ids, cache.page_size)
+        if metadata.device.type != "cuda" or not metadata.numel():
+            return _PreparedPageIds(cache.page_size, metadata.cpu())
+
+        if self._page_id_copy_stream is None:
+            self._page_id_copy_stream = torch.cuda.Stream(device=metadata.device)
+        source_ready = torch.cuda.Event()
+        source_ready.record(torch.cuda.current_stream(metadata.device))
+        host_metadata = torch.empty(
+            metadata.shape,
+            dtype=metadata.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        with torch.cuda.stream(self._page_id_copy_stream):
+            self._page_id_copy_stream.wait_event(source_ready)
+            host_metadata.copy_(metadata, non_blocking=True)
+            copy_ready = torch.cuda.Event()
+            copy_ready.record(self._page_id_copy_stream)
+        return _PreparedPageIds(
+            cache.page_size,
+            host_metadata,
+            ready_event=copy_ready,
+            source_ready_event=source_ready,
+            source_metadata=metadata,
+        )
+
+    def create_binding(
+        self, _context: AttentionStoreInitContext
+    ) -> AttentionStoreBinding:
+        """Create this coordinator's storage binding."""
+        raise NotImplementedError
 
     def capture_finished(
         self, _cache, _req, _is_insert: bool
@@ -351,12 +434,29 @@ class AttentionStoreCoordinator:
         if task is not None:
             self._discard_unsubmitted(cache, task)
 
+    def extend_match(
+        self,
+        cache,
+        params: MatchPrefixParams,
+        local_result: MatchResult,
+    ) -> Optional[MatchResult]:
+        """Extend a local component-consistent match with an L2 hit."""
+        raise NotImplementedError
+
+    def init_load_back(
+        self,
+        cache,
+        params: InitLoadBackParams,
+    ) -> Tuple[torch.Tensor, Any]:
+        """Restore an L2 hit into the components declared by the cache plan."""
+        raise NotImplementedError
+
     def do_write(self, cache, task) -> int:
-        """Execute one topology-specific AttentionStore write."""
+        """Execute one payload-specific AttentionStore write."""
         raise NotImplementedError
 
     def finish(self, _cache, _task, _result: int) -> None:
-        """Apply topology-specific state after a write retires."""
+        """Apply payload-specific state after a write retires."""
         return
 
     def _ensure_executor(self) -> concurrent.futures.ThreadPoolExecutor:
@@ -505,8 +605,29 @@ class AttentionStoreCoordinator:
                 self._write_executor = None
 
 
-class PageWriteCoordinator(AttentionStoreCoordinator):
-    """Apply the shared post-commit policy to a typed page endpoint."""
+class CheckpointedPageCacheCoordinator(AttentionStoreCoordinator):
+    """Provide the shared remote-match contract for hybrid component plans."""
+
+    def extend_match(
+        self,
+        cache,
+        params: MatchPrefixParams,
+        local_result: MatchResult,
+    ) -> Optional[MatchResult]:
+        """Extend a local component-consistent match with remote pages/state."""
+        return cache._match_checkpointed_page_prefix(params, local_result)
+
+    def init_load_back(
+        self,
+        cache,
+        params: InitLoadBackParams,
+    ) -> Tuple[torch.Tensor, Any]:
+        """Restore one hybrid checkpointed-page prefix into UnifiedRadixCache."""
+        raise NotImplementedError
+
+
+class FullPageCacheCoordinator(AttentionStoreCoordinator):
+    """Coordinate remote match, load-back, and writes for typed page endpoints."""
 
     def capture_finished(
         self, cache, req, is_insert: bool
@@ -523,6 +644,283 @@ class PageWriteCoordinator(AttentionStoreCoordinator):
             snapshot=snapshot,
             is_insert=is_insert,
         )
+
+    def extend_match(
+        self,
+        cache,
+        params: MatchPrefixParams,
+        local_result: MatchResult,
+    ) -> Optional[MatchResult]:
+        """Extend a local FULL-component match with remote page hits."""
+        req = params.req
+        if (
+            req is None
+            or req.ever_read_as
+            or not req.as_block_hashs
+            or cache.ascli is None
+        ):
+            return None
+        max_hit_length = len(params.key) // cache.page_size * cache.page_size
+        if local_result.device_indices.numel() == max_hit_length:
+            return None
+        return self._match_remote(cache, req, local_result)
+
+    def init_load_back(
+        self,
+        cache,
+        params: InitLoadBackParams,
+    ) -> Tuple[torch.Tensor, Any]:
+        """Load remote FULL-component pages into UnifiedRadixCache."""
+        anchor = params.best_match_node
+        empty = torch.empty((0,), dtype=torch.int64, device=cache.device)
+        if params.host_hit_length <= 0:
+            return empty, anchor
+
+        anchor, load_info, req = cache._take_attention_store_load_context(params)
+        if cache.ascli is None or load_info is None or req is None:
+            return empty, anchor
+
+        loaded_indices = self._load_pages(cache, load_info, params.host_hit_length)
+        if loaded_indices is None or len(loaded_indices) == 0:
+            return empty, anchor
+
+        req.ever_read_as = True
+        return self._insert_loaded(cache, req, anchor, load_info, loaded_indices)
+
+    def _match_remote(
+        self,
+        cache,
+        req,
+        local_result: MatchResult,
+    ) -> Optional[MatchResult]:
+        local_hit_len = len(local_result.device_indices)
+        start_block = local_hit_len // cache.page_size
+        remote_addrs = req.as_max_hit_host_ip
+        remote_len = req.as_max_hit_token_len
+
+        if remote_len and len(remote_len) == 1 and remote_len[0] > 0:
+            as_hit_tokens = (
+                (remote_len[0] - local_hit_len) // cache.page_size
+            ) * cache.page_size
+            if as_hit_tokens <= 0:
+                return None
+        else:
+            requested_hashes = req.as_block_hashs.hash_ids[start_block:]
+            requested = len(requested_hashes)
+            started = time.perf_counter()
+            match_error = None
+            try:
+                match_count = cache.ascli.match(requested_hashes, timeout=1.0)
+            except Exception as exc:
+                match_error = exc
+                match_count = 0
+
+            match_count = cache._tp_min(match_count)
+            max_blocks = max(
+                (len(req.full_untruncated_fill_ids) - local_hit_len - 1)
+                // cache.page_size,
+                0,
+            )
+            match_count = min(match_count, max_blocks)
+            if match_count < AS_MIN_MATCH_BLOCKS:
+                match_count = 0
+            if match_error is None:
+                cache._log_as_result(
+                    "match",
+                    rid=req.rid,
+                    requested=requested,
+                    result=match_count,
+                    started=started,
+                )
+            else:
+                cache._log_as_failure(
+                    "match",
+                    rid=req.rid,
+                    requested=requested,
+                    error=match_error,
+                    started=started,
+                )
+            if match_count == 0:
+                return None
+            as_hit_tokens = match_count * cache.page_size
+
+        max_as_tokens = (
+            (len(req.full_untruncated_fill_ids) - local_hit_len - 1)
+            // cache.page_size
+            * cache.page_size
+        )
+        if max_as_tokens <= 0:
+            return None
+        as_hit_tokens = min(as_hit_tokens, max_as_tokens)
+
+        anchor = local_result.last_device_node
+        req._as_load_info = {
+            "rid": req.rid,
+            "start_block": start_block,
+            "as_hit_tokens": as_hit_tokens,
+            "as_block_hashs": req.as_block_hashs,
+            "remote_addrs": remote_addrs,
+            "remote_len": remote_len,
+        }
+        return MatchResult(
+            device_indices=local_result.device_indices,
+            last_device_node=anchor,
+            last_host_node=anchor,
+            best_match_node=anchor,
+            host_hit_length=as_hit_tokens,
+        )
+
+    def _load_pages(
+        self,
+        cache,
+        load_info: dict,
+        host_hit_length: int,
+    ) -> Optional[torch.Tensor]:
+        rid = load_info.get("rid", "-")
+        requested = host_hit_length // cache.page_size
+        started = time.perf_counter()
+        as_hit_tokens = load_info["as_hit_tokens"]
+        available = cache.token_to_kv_pool_allocator.available_size()
+        if available < as_hit_tokens and cache.evictable_size() > 0:
+            evict_tokens = max(as_hit_tokens - available, 0) + cache.page_size
+            cache.evict(EvictParams(num_tokens=evict_tokens))
+
+        try:
+            alloc_indices = cache.token_to_kv_pool_allocator.alloc(as_hit_tokens)
+        except Exception as exc:
+            cache._log_as_failure(
+                "load_back",
+                rid=rid,
+                requested=requested,
+                error=exc,
+                started=started,
+            )
+            return None
+        if alloc_indices is None or len(alloc_indices) == 0:
+            cache._log_as_failure(
+                "load_back",
+                rid=rid,
+                requested=requested,
+                error=RuntimeError(
+                    "allocation failed: "
+                    f"need={as_hit_tokens}, "
+                    f"available={cache.token_to_kv_pool_allocator.available_size()}, "
+                    f"evictable={cache.evictable_size()}"
+                ),
+                started=started,
+            )
+            return None
+        try:
+            data_ids = list(_contiguous_page_ids(alloc_indices, cache.page_size))
+        except ValueError as exc:
+            cache.token_to_kv_pool_allocator.free(alloc_indices)
+            cache._log_as_failure(
+                "load_back",
+                rid=rid,
+                requested=requested,
+                error=exc,
+                started=started,
+            )
+            return None
+
+        start_block = load_info["start_block"]
+        block_hash_ids = load_info["as_block_hashs"].hash_ids[
+            start_block : start_block + len(data_ids)
+        ]
+        requested = len(block_hash_ids)
+        remote_addrs = load_info.get("remote_addrs", [])
+        remote_addr = remote_addrs[0] if remote_addrs else ""
+        read_error = None
+        try:
+            read_count = cache.ascli.read(
+                block_hash_ids,
+                data_ids,
+                timeout=1.0,
+                remote_addrs=(remote_addr,) if remote_addr else (),
+                logical_start=start_block,
+            )
+        except Exception as exc:
+            read_error = exc
+            read_count = 0
+        read_count = cache._tp_min(read_count)
+        if read_error is None:
+            cache._log_as_result(
+                "load_back",
+                rid=rid,
+                requested=requested,
+                result=read_count,
+                started=started,
+            )
+        else:
+            cache._log_as_failure(
+                "load_back",
+                rid=rid,
+                requested=requested,
+                error=read_error,
+                started=started,
+            )
+        if read_count <= 0:
+            cache.token_to_kv_pool_allocator.free(alloc_indices)
+            return None
+
+        loaded_tokens = read_count * cache.page_size
+        loaded_indices = alloc_indices[:loaded_tokens]
+        if loaded_tokens < len(alloc_indices):
+            cache.token_to_kv_pool_allocator.free(alloc_indices[loaded_tokens:])
+        return loaded_indices
+
+    def _insert_loaded(
+        self,
+        cache,
+        req,
+        anchor,
+        load_info,
+        loaded_indices: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Any]:
+        local_hit_len = load_info["start_block"] * cache.page_size
+        total_prefix_len = local_hit_len + len(loaded_indices)
+        assert len(req.prefix_indices) == local_hit_len, (
+            f"prefix_indices length {len(req.prefix_indices)} != "
+            f"local_hit_len {local_hit_len} (start_block={load_info['start_block']}, "
+            f"page_size={cache.page_size})"
+        )
+        token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
+        bigram_len = max(0, len(token_ids) - 1) if cache.is_eagle else len(token_ids)
+        final_key_len = bigram_len // cache.page_size * cache.page_size
+        if final_key_len == 0:
+            cache.token_to_kv_pool_allocator.free(loaded_indices)
+            return loaded_indices[:0], anchor
+
+        full_values = torch.cat([req.prefix_indices, loaded_indices])
+        values = full_values[:final_key_len].to(dtype=torch.int64, copy=True)
+        tail_start = max(final_key_len - local_hit_len, 0)
+        if tail_start < len(loaded_indices):
+            cache.token_to_kv_pool_allocator.free(loaded_indices[tail_start:])
+            loaded_indices = loaded_indices[:tail_start]
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(token_ids, req.extra_key, is_bigram=cache.is_eagle),
+                value=values,
+                prev_prefix_len=local_hit_len,
+            )
+        )
+        match = UnifiedRadixCache.match_prefix(
+            cache,
+            MatchPrefixParams(
+                key=RadixKey(token_ids, req.extra_key, is_bigram=cache.is_eagle),
+            ),
+        )
+        if match.last_device_node is None:
+            return loaded_indices, anchor
+
+        tree_full_indices = match.device_indices
+        if len(tree_full_indices) >= final_key_len:
+            # _insert_helper already freed the slots the tree displaced.
+            loaded_indices = tree_full_indices[
+                local_hit_len : local_hit_len + len(loaded_indices)
+            ].to(dtype=loaded_indices.dtype)
+        return loaded_indices, match.last_device_node
 
     def after_local_commit(self, cache, context: AttentionStoreWriteContext) -> None:
         """Enqueue eligible page data after the local commit."""
@@ -552,9 +950,10 @@ class PageWriteCoordinator(AttentionStoreCoordinator):
             endpoint = task.endpoint
             if endpoint is None:
                 return 0
+            data_ids = task.data_id_list.materialize()
             written = endpoint.store.write(
                 task.block_hash_ids,
-                task.data_id_list,
+                data_ids,
                 timeout=1.0,
                 params=task.write_params,
             )
@@ -591,23 +990,20 @@ class PageWriteCoordinator(AttentionStoreCoordinator):
         task = None
         num_pages = 0
         try:
-            from attentionstore_sdk.sdk import Tokens
-
             num_pages = len(token_ids) // cache.page_size
             if num_pages <= 0:
                 if cache.tp_world_size > 1:
                     self.enqueue_dummy()
                 return
             aligned_tokens = num_pages * cache.page_size
-            hashes = tuple(
-                map(
-                    int,
-                    Tokens(token_ids[:aligned_tokens], cache.page_size).hash_ids,
-                )
+            hashes = _request_block_hash_ids(
+                req,
+                token_ids,
+                cache.page_size,
+                num_pages,
             )
             kv_indices = snapshot[:aligned_tokens]
-            data_ids = list(_contiguous_page_ids(kv_indices, cache.page_size))
-            match = RadixCache.match_prefix(
+            match = UnifiedRadixCache.match_prefix(
                 cache,
                 MatchPrefixParams(
                     key=RadixKey(token_ids, req.extra_key, is_bigram=cache.is_eagle)
@@ -624,6 +1020,7 @@ class PageWriteCoordinator(AttentionStoreCoordinator):
                 if cache.tp_world_size > 1:
                     self.enqueue_dummy()
                 return
+            data_ids = self.prepare_page_ids(cache, kv_indices)
 
             task = _PageWriteTask(
                 rid=req.rid,
@@ -631,6 +1028,7 @@ class PageWriteCoordinator(AttentionStoreCoordinator):
                 block_hash_ids=hashes,
                 data_id_list=data_ids,
                 write_params=getattr(req, "as_kv_cache_params", None) or {},
+                release_after_write=data_ids.release,
             )
             task.release = _acquire_node_release(cache, node)
             self.submit_write(cache, task)
@@ -647,8 +1045,40 @@ class PageWriteCoordinator(AttentionStoreCoordinator):
                 self.enqueue_dummy()
 
 
-class SPACacheCoordinator(AttentionStoreCoordinator):
+class MHACacheCoordinator(FullPageCacheCoordinator):
+    """Coordinate MHA page cache I/O."""
+
+    def create_binding(
+        self, context: AttentionStoreInitContext
+    ) -> AttentionStoreBinding:
+        return create_mha_binding(context)
+
+
+class MLACacheCoordinator(FullPageCacheCoordinator):
+    """Coordinate MLA page cache I/O."""
+
+    def create_binding(
+        self, context: AttentionStoreInitContext
+    ) -> AttentionStoreBinding:
+        return create_mla_binding(context)
+
+
+class DSACacheCoordinator(FullPageCacheCoordinator):
+    """Coordinate DSA page cache I/O."""
+
+    def create_binding(
+        self, context: AttentionStoreInitContext
+    ) -> AttentionStoreBinding:
+        return create_dsa_binding(context)
+
+
+class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
     """Coordinate SPA page writes with a stable endpoint checkpoint snapshot."""
+
+    def create_binding(
+        self, context: AttentionStoreInitContext
+    ) -> AttentionStoreBinding:
+        return create_spa_binding(context)
 
     write_thread_name = "as_spa_writer"
 
@@ -701,14 +1131,12 @@ class SPACacheCoordinator(AttentionStoreCoordinator):
             return
 
         try:
-            from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-
             key = RadixKey(
                 context.token_ids,
                 context.req.extra_key,
                 is_bigram=cache.is_eagle,
             ).page_aligned(cache.page_size)
-            match = SWARadixCache.match_prefix(
+            match = UnifiedRadixCache.match_prefix(
                 cache,
                 MatchPrefixParams(key=key),
             )
@@ -757,16 +1185,19 @@ class SPACacheCoordinator(AttentionStoreCoordinator):
         requested = 0
         checkpoint_snapshot = None
         try:
-            from attentionstore_sdk.sdk import Tokens
-
-            page_ids = _contiguous_page_ids(snapshot[:cache_len], cache.page_size)
+            page_count = cache_len // cache.page_size
             swa_indices = (
                 cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                     snapshot[cache_len - cache.page_size : cache_len]
                 )
             )
             swa_page_id = int(swa_indices[0].item()) // cache.page_size
-            hashes = tuple(map(int, Tokens(token_ids, cache.page_size).hash_ids))
+            hashes = _request_block_hash_ids(
+                req,
+                token_ids,
+                cache.page_size,
+                page_count,
+            )
             requested = len(hashes)
             checkpoint_endpoint = cache.binding.checkpoint_endpoint
             if checkpoint_endpoint is None:
@@ -777,6 +1208,14 @@ class SPACacheCoordinator(AttentionStoreCoordinator):
             checkpoint_snapshot = checkpoint_store.snapshot(
                 self.state_slots(cache, req.req_pool_idx, swa_page_id)
             )
+            page_ids = self.prepare_page_ids(cache, snapshot[:cache_len])
+
+            def release_staging() -> None:
+                try:
+                    page_ids.release()
+                finally:
+                    checkpoint_snapshot.release()
+
             return _SPAWriteTask(
                 rid=req.rid,
                 page_endpoint=cache.binding.page_endpoint,
@@ -785,7 +1224,7 @@ class SPACacheCoordinator(AttentionStoreCoordinator):
                 page_ids=page_ids,
                 checkpoint_snapshot=checkpoint_snapshot,
                 params=getattr(req, "as_kv_cache_params", None) or {},
-                release_after_write=checkpoint_snapshot.release,
+                release_after_write=release_staging,
             )
         except Exception as exc:
             if checkpoint_snapshot is not None:
@@ -798,31 +1237,179 @@ class SPACacheCoordinator(AttentionStoreCoordinator):
             )
             return None
 
+    def init_load_back(
+        self,
+        cache,
+        params: InitLoadBackParams,
+    ) -> Tuple[torch.Tensor, Any]:
+        """Load matched SPA pages and checkpoint state into unified storage."""
+        anchor = params.best_match_node
+        empty = torch.empty((0,), dtype=torch.int64, device=cache.device)
+        if params.host_hit_length <= 0:
+            return empty, anchor
+
+        anchor, load_info, req = cache._take_attention_store_load_context(params)
+        if cache.ascli is None or load_info is None or req is None:
+            return empty, anchor
+
+        requested = int(load_info["block_count"])
+        started = time.perf_counter()
+        token_count = requested * cache.page_size
+        available = cache.token_to_kv_pool_allocator.available_size()
+        if available < token_count and cache.full_evictable_size() > 0:
+            cache.evict(
+                EvictParams(
+                    num_tokens=token_count - available + cache.page_size,
+                    swa_num_tokens=cache.page_size,
+                )
+            )
+        local_hit_len = int(load_info["start_block"]) * cache.page_size
+        device = cache.token_to_kv_pool_allocator.device
+        prefix_cpu = torch.tensor([local_hit_len], dtype=torch.int64)
+        seq_cpu = torch.tensor([local_hit_len + token_count], dtype=torch.int64)
+        last_loc_value = int(req.prefix_indices[-1].item()) if local_hit_len else -1
+        loaded = cache.token_to_kv_pool_allocator.alloc_extend_swa_tail(
+            prefix_cpu.to(device),
+            prefix_cpu,
+            seq_cpu.to(device),
+            seq_cpu,
+            torch.tensor([last_loc_value], dtype=torch.int64, device=device),
+            token_count,
+            min(token_count, cache.page_size),
+        )
+        if loaded is None:
+            cache._log_as_failure(
+                "load_back",
+                rid=req.rid,
+                requested=requested,
+                error=RuntimeError(f"cannot allocate {token_count} tokens"),
+                started=started,
+            )
+            return empty, anchor
+        try:
+            page_ids = _contiguous_page_ids(loaded, cache.page_size)
+        except ValueError as exc:
+            cache.token_to_kv_pool_allocator.free(loaded)
+            cache._log_as_failure(
+                "load_back",
+                rid=req.rid,
+                requested=requested,
+                error=exc,
+                started=started,
+            )
+            return empty, anchor
+        swa_indices = cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+            loaded[-cache.page_size :]
+        )
+        swa_page_id = int(swa_indices[0].item()) // cache.page_size
+        state_slots = self.state_slots(cache, req.req_pool_idx, swa_page_id)
+        read_error = None
+        try:
+            read_count = cache.ascli.read(
+                load_info["hashes"],
+                page_ids,
+                state_slots,
+                timeout=1.0,
+                remote_addrs=load_info.get("remote_addrs") or None,
+            )
+        except Exception as exc:
+            read_error = exc
+            read_count = 0
+        read_count = cache._tp_min(read_count)
+        if read_error is None:
+            cache._log_as_result(
+                "load_back",
+                rid=req.rid,
+                requested=requested,
+                result=read_count,
+                started=started,
+            )
+        else:
+            cache._log_as_failure(
+                "load_back",
+                rid=req.rid,
+                requested=requested,
+                error=read_error,
+                started=started,
+            )
+        if read_count != requested:
+            cache.token_to_kv_pool_allocator.free(loaded)
+            return empty, anchor
+
+        total_prefix_len = local_hit_len + token_count
+        token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
+        values = torch.cat([req.prefix_indices, loaded]).to(
+            dtype=torch.int64, copy=True
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey(token_ids, req.extra_key, is_bigram=cache.is_eagle),
+                value=values,
+                prev_prefix_len=local_hit_len,
+                swa_evicted_seqlen=local_hit_len
+                + max(0, token_count - cache.page_size),
+            )
+        )
+        match = UnifiedRadixCache.match_prefix(
+            cache,
+            MatchPrefixParams(
+                key=RadixKey(token_ids, req.extra_key, is_bigram=cache.is_eagle),
+                req=req,
+            ),
+        )
+        tree_indices = match.device_indices[local_hit_len:total_prefix_len].to(
+            dtype=loaded.dtype
+        )
+        if len(tree_indices) != token_count:
+            logger.warning(
+                "AS cache insert: cache_plan=%s rid=%s status=error "
+                "reason=shortened_prefix expected_tokens=%s actual_tokens=%s",
+                cache.attention_store_plan.name,
+                req.rid,
+                token_count,
+                len(tree_indices),
+            )
+        req.ever_read_as = True
+        return tree_indices, match.last_device_node
+
     def do_write(self, cache, task: _SPAWriteTask) -> int:
         """Write SPA pages followed by their terminal checkpoint."""
         if not task.block_hash_ids:
             return 0
         started = time.perf_counter()
         try:
-            task.page_endpoint.store.write(
-                task.block_hash_ids,
-                task.page_ids,
-                timeout=1.0,
-                params=task.params,
-            )
+            page_ids = task.page_ids.materialize()
             confirmed_pages = task.page_endpoint.store.match(
                 task.block_hash_ids,
                 timeout=1.0,
             )
-            if confirmed_pages != task.requested_blocks:
-                result = confirmed_pages
-            else:
-                checkpoint_result = task.checkpoint_store.write_snapshot(
-                    int(task.block_hash_ids[-1]),
-                    task.checkpoint_snapshot,
+            confirmed_pages = max(0, min(confirmed_pages, task.requested_blocks))
+            if confirmed_pages < task.requested_blocks:
+                task.page_endpoint.store.write(
+                    task.block_hash_ids[confirmed_pages:],
+                    page_ids[confirmed_pages:],
                     timeout=1.0,
                     params=task.params,
                 )
+                confirmed_pages = task.page_endpoint.store.match(
+                    task.block_hash_ids,
+                    timeout=1.0,
+                )
+                confirmed_pages = max(0, min(confirmed_pages, task.requested_blocks))
+            if confirmed_pages != task.requested_blocks:
+                result = confirmed_pages
+            else:
+                checkpoint_hash = int(task.block_hash_ids[-1])
+                checkpoint_result = task.checkpoint_store.match(
+                    [checkpoint_hash], timeout=1.0
+                )
+                if checkpoint_result != 1:
+                    checkpoint_result = task.checkpoint_store.write_snapshot(
+                        checkpoint_hash,
+                        task.checkpoint_snapshot,
+                        timeout=1.0,
+                        params=task.params,
+                    )
                 result = confirmed_pages if checkpoint_result == 1 else -1
             cache._log_as_result(
                 "write",
@@ -859,8 +1446,13 @@ class SPACacheCoordinator(AttentionStoreCoordinator):
         )
 
 
-class KDACacheCoordinator(AttentionStoreCoordinator):
+class KDACacheCoordinator(CheckpointedPageCacheCoordinator):
     """Coordinate full-attention pages and recurrent KDA endpoint checkpoints."""
+
+    def create_binding(
+        self, context: AttentionStoreInitContext
+    ) -> AttentionStoreBinding:
+        return create_kda_binding(context)
 
     write_thread_name = "as_kda_writer"
 
@@ -914,42 +1506,37 @@ class KDACacheCoordinator(AttentionStoreCoordinator):
         task = None
         cache_len = 0
         try:
-            from attentionstore_sdk.sdk import Tokens
-
             if not isinstance(token_ids, array) or token_ids.typecode != "q":
                 token_ids = array("q", token_ids)
-            match = MambaRadixCache.match_prefix(
+            match = UnifiedRadixCache.match_prefix(
                 cache,
                 MatchPrefixParams(key=RadixKey(token_ids, req.extra_key)),
             )
             cache_len = len(match.device_indices)
             node = match.last_device_node
+            mamba_data = (
+                node.component_data[ComponentType.MAMBA] if node is not None else None
+            )
             if (
                 cache_len < cache.page_size
                 or cache_len % cache.page_size != 0
                 or node is None
-                or node.mamba_value is None
+                or mamba_data.value is None
                 or len(snapshot) < cache_len
             ):
                 self.enqueue_dummy(cache)
                 return
 
-            hashes = Tokens(token_ids[:cache_len], cache.page_size).hash_ids
-            try:
-                page_ids = _contiguous_page_ids(snapshot[:cache_len], cache.page_size)
-            except ValueError as exc:
-                cache._log_as_failure(
-                    "write",
-                    rid=req.rid,
-                    requested=cache_len // cache.page_size,
-                    error=exc,
-                )
-                self.enqueue_dummy(cache)
-                return
-
-            endpoint_hash = int(hashes[-1])
-            if getattr(node, "_as_kda_pending_hash", None) is not None or (
-                endpoint_hash == getattr(node, "_as_kda_published_hash", None)
+            page_count = cache_len // cache.page_size
+            hashes = _request_block_hash_ids(
+                req,
+                token_ids,
+                cache.page_size,
+                page_count,
+            )
+            endpoint_hash = hashes[-1]
+            if mamba_data.metadata.get(_KDA_PENDING_HASH) is not None or (
+                endpoint_hash == mamba_data.metadata.get(_KDA_PUBLISHED_HASH)
             ):
                 self.enqueue_dummy(cache)
                 return
@@ -957,25 +1544,27 @@ class KDACacheCoordinator(AttentionStoreCoordinator):
             if getattr(req, "_as_kda_last_submitted_write", None) == write_key:
                 self.enqueue_dummy(cache)
                 return
-            checkpoint_slot = int(node.mamba_value.item())
+            checkpoint_slot = int(mamba_data.value.item())
+            page_ids = self.prepare_page_ids(cache, snapshot[:cache_len])
             task = _KDAWriteTask(
                 rid=req.rid,
                 node=node,
-                block_hash_ids=tuple(map(int, hashes)),
+                block_hash_ids=hashes,
                 page_ids=page_ids,
                 checkpoint_slot=checkpoint_slot,
                 params=getattr(req, "as_kv_cache_params", None) or {},
                 request=req,
                 write_key=write_key,
+                release_after_write=page_ids.release,
             )
             task.release = _acquire_node_release(cache, node)
-            node._as_kda_pending_hash = endpoint_hash
+            mamba_data.metadata[_KDA_PENDING_HASH] = endpoint_hash
             req._as_kda_last_submitted_write = write_key
             try:
                 self.submit_write(cache, task)
             except Exception:
-                if getattr(node, "_as_kda_pending_hash", None) == endpoint_hash:
-                    del node._as_kda_pending_hash
+                if mamba_data.metadata.get(_KDA_PENDING_HASH) == endpoint_hash:
+                    del mamba_data.metadata[_KDA_PENDING_HASH]
                 if getattr(req, "_as_kda_last_submitted_write", None) == write_key:
                     del req._as_kda_last_submitted_write
                 raise
@@ -994,9 +1583,10 @@ class KDACacheCoordinator(AttentionStoreCoordinator):
         """Write KDA pages and recurrent state through the composite store."""
         started = time.perf_counter()
         try:
+            page_ids = task.page_ids.materialize()
             written = cache.ascli.write(
                 task.block_hash_ids,
-                task.page_ids,
+                page_ids,
                 {"checkpoint": task.checkpoint_slot},
                 timeout=1.0,
                 params=task.params,
@@ -1023,15 +1613,211 @@ class KDACacheCoordinator(AttentionStoreCoordinator):
         """Publish or clear the endpoint hash after KDA write completion."""
         if task.endpoint_hash == 0:
             return
-        if getattr(task.node, "_as_kda_pending_hash", None) == task.endpoint_hash:
-            del task.node._as_kda_pending_hash
+        metadata = task.node.component_data[ComponentType.MAMBA].metadata
+        if metadata.get(_KDA_PENDING_HASH) == task.endpoint_hash:
+            del metadata[_KDA_PENDING_HASH]
         if result == task.requested_blocks:
-            task.node._as_kda_published_hash = task.endpoint_hash
+            metadata[_KDA_PUBLISHED_HASH] = task.endpoint_hash
         elif task.request is not None and (
             getattr(task.request, "_as_kda_last_submitted_write", None)
             == task.write_key
         ):
             del task.request._as_kda_last_submitted_write
+
+    def init_load_back(
+        self,
+        cache,
+        params: InitLoadBackParams,
+    ) -> Tuple[torch.Tensor, Any]:
+        """Load matched KDA pages and recurrent state into unified storage."""
+        anchor = params.best_match_node
+        empty = torch.empty((0,), dtype=torch.int64, device=cache.device)
+        if params.host_hit_length <= 0:
+            return empty, anchor
+
+        anchor, load_info, req = cache._take_attention_store_load_context(params)
+        if cache.ascli is None or load_info is None or req is None:
+            return empty, anchor
+
+        loaded = self._read_blocks(cache, load_info)
+        if loaded is None:
+            return empty, anchor
+        loaded_indices, value_transaction, checkpoint_allocation = loaded
+        req.ever_read_as = True
+        return self._insert_loaded(
+            cache,
+            req,
+            anchor,
+            load_info,
+            loaded_indices,
+            value_transaction,
+            checkpoint_allocation,
+        )
+
+    def _read_blocks(self, cache, load_info):
+        block_count = int(load_info["block_count"])
+        rid = load_info.get("rid", "-")
+        started = time.perf_counter()
+        token_count = block_count * cache.page_size
+        value_transaction = cache.component_value_transaction()
+        try:
+            full_allocation = value_transaction.allocate(
+                ComponentType.FULL, token_count
+            )
+            alloc_indices = full_allocation.value
+        except Exception as exc:
+            value_transaction.close()
+            cache._log_as_failure(
+                "load_back",
+                rid=rid,
+                requested=block_count,
+                error=exc,
+                started=started,
+            )
+            return None
+        if len(alloc_indices) != token_count:
+            value_transaction.close()
+            cache._log_as_failure(
+                "load_back",
+                rid=rid,
+                requested=block_count,
+                error=RuntimeError(
+                    f"allocated {len(alloc_indices)} of {token_count} tokens"
+                ),
+                started=started,
+            )
+            return None
+
+        try:
+            page_ids = _contiguous_page_ids(alloc_indices, cache.page_size)
+        except ValueError as exc:
+            value_transaction.close()
+            cache._log_as_failure(
+                "load_back",
+                rid=rid,
+                requested=block_count,
+                error=exc,
+                started=started,
+            )
+            return None
+
+        try:
+            checkpoint_allocation = value_transaction.allocate(ComponentType.MAMBA)
+        except Exception as exc:
+            value_transaction.close()
+            cache._log_as_failure(
+                "load_back",
+                rid=rid,
+                requested=block_count,
+                error=exc,
+                started=started,
+            )
+            return None
+        checkpoint_slot = checkpoint_allocation.value
+        keep_transaction = False
+        try:
+            state_id = int(checkpoint_slot.item())
+            read_error = None
+            try:
+                read_count = cache.ascli.read(
+                    load_info["hashes"],
+                    page_ids,
+                    {"checkpoint": state_id},
+                    timeout=1.0,
+                    remote_addrs=load_info.get("remote_addrs") or None,
+                )
+            except Exception as exc:
+                read_error = exc
+                read_count = 0
+
+            read_count = cache._tp_min(read_count)
+
+            if read_error is None:
+                cache._log_as_result(
+                    "load_back",
+                    rid=rid,
+                    requested=block_count,
+                    result=read_count,
+                    started=started,
+                )
+            else:
+                cache._log_as_failure(
+                    "load_back",
+                    rid=rid,
+                    requested=block_count,
+                    error=read_error,
+                    started=started,
+                )
+
+            if read_count != block_count:
+                return None
+            keep_transaction = True
+            return alloc_indices, value_transaction, checkpoint_allocation
+        finally:
+            if not keep_transaction:
+                value_transaction.close()
+
+    def _insert_loaded(
+        self,
+        cache,
+        req,
+        anchor,
+        load_info,
+        loaded_indices: torch.Tensor,
+        value_transaction,
+        checkpoint_allocation,
+    ) -> Tuple[torch.Tensor, Any]:
+        local_hit_len = load_info["start_block"] * cache.page_size
+        total_prefix_len = local_hit_len + len(loaded_indices)
+        assert len(req.prefix_indices) == local_hit_len, (
+            f"prefix_indices length {len(req.prefix_indices)} != "
+            f"local_hit_len {local_hit_len} (start_block={load_info['start_block']}, "
+            f"page_size={cache.page_size})"
+        )
+        token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
+        values = torch.cat([req.prefix_indices, loaded_indices]).to(
+            dtype=torch.int64, copy=True
+        )
+        try:
+            result = cache.insert(
+                InsertParams(
+                    key=RadixKey(token_ids, req.extra_key),
+                    value=values,
+                    mamba_value=checkpoint_allocation.value,
+                    prev_prefix_len=local_hit_len,
+                ),
+                value_transaction=value_transaction,
+            )
+            value_transaction.commit_insert(result)
+        finally:
+            # Release values not adopted by the tree.
+            value_transaction.close()
+
+        match = UnifiedRadixCache.match_prefix(
+            cache,
+            MatchPrefixParams(
+                key=RadixKey(token_ids, req.extra_key),
+                cow_mamba=True,
+                req=req,
+            ),
+        )
+        tree_indices = match.device_indices[local_hit_len:total_prefix_len].to(
+            dtype=loaded_indices.dtype
+        )
+        if len(tree_indices) != len(loaded_indices):
+            logger.warning(
+                "AS cache insert: cache_plan=%s rid=%s status=error "
+                "reason=shortened_prefix expected_tokens=%s actual_tokens=%s",
+                cache.attention_store_plan.name,
+                req.rid,
+                len(loaded_indices),
+                len(tree_indices),
+            )
+        elif load_info["hashes"]:
+            match.last_device_node.component_data[ComponentType.MAMBA].metadata[
+                _KDA_PUBLISHED_HASH
+            ] = int(load_info["hashes"][-1])
+        return tree_indices, match.last_device_node
 
     def enqueue_dummy(self, cache) -> None:
         """Queue a no-op KDA task to preserve TP retirement ordering."""
@@ -1051,23 +1837,26 @@ class KDACacheCoordinator(AttentionStoreCoordinator):
 
 @dataclass(frozen=True)
 class AttentionStoreCachePlan:
-    """Map an attention capability to cache topology, binding, and coordination."""
+    """Map an attention capability to components and a coordinator."""
 
     name: str
-    topology: AttentionStoreCacheTopology
-    binding_factory: Callable[[AttentionStoreInitContext], AttentionStoreBinding]
-    coordinator_factory: Callable[[], AttentionStoreCoordinator]
+    coordinator_type: type[AttentionStoreCoordinator]
+    tree_components: tuple[ComponentType, ...]
 
     def __post_init__(self) -> None:
         """Validate the cache plan name."""
         if not self.name:
             raise ValueError("AttentionStore cache plan name must not be empty")
+        if (
+            not self.tree_components
+            or self.tree_components[0] is not ComponentType.FULL
+        ):
+            raise ValueError("AttentionStore plans must start with the FULL component")
 
 
 class AttentionStoreIntegrationMixin:
-    """Connect one topology cache to its selected AttentionStore plan."""
+    """Connect UnifiedRadixCache to its selected AttentionStore plan."""
 
-    attention_store_topology: AttentionStoreCacheTopology
     _as_coordinator: Optional[AttentionStoreCoordinator] = None
     _as_plan: Optional[AttentionStoreCachePlan] = None
 
@@ -1089,6 +1878,7 @@ class AttentionStoreIntegrationMixin:
         self.configure_attention_store(plan)
         self.binding: Optional[AttentionStoreBinding] = None
         self.ascli = None
+        self.disable_finished_insert = params.disable_finished_insert
         self._disagg_mode = server_args.disaggregation_mode
         self.tp_group = params.tp_cache_group
         self.tp_world_size = (
@@ -1161,14 +1951,10 @@ class AttentionStoreIntegrationMixin:
         self, params: InitLoadBackParams
     ) -> tuple[Any, Any, Any]:
         anchor = params.best_match_node
-        load_info = getattr(anchor, "_as_load_info", None)
-        req = getattr(anchor, "_as_load_req", None)
-        if req is None:
-            req = params.req
-        if hasattr(anchor, "_as_load_info"):
-            del anchor._as_load_info
-        if hasattr(anchor, "_as_load_req"):
-            del anchor._as_load_req
+        req = params.req
+        load_info = getattr(req, "_as_load_info", None) if req is not None else None
+        if req is not None and hasattr(req, "_as_load_info"):
+            del req._as_load_info
         return anchor, load_info, req
 
     def _match_checkpointed_page_prefix(
@@ -1231,8 +2017,7 @@ class AttentionStoreIntegrationMixin:
             return None
 
         anchor = local_result.last_device_node
-        anchor._as_load_req = req
-        anchor._as_load_info = {
+        req._as_load_info = {
             "rid": req.rid,
             "start_block": start_block,
             "block_count": match_count,
@@ -1248,17 +2033,11 @@ class AttentionStoreIntegrationMixin:
         )
 
     def configure_attention_store(self, plan: AttentionStoreCachePlan) -> None:
-        """Attach a topology-compatible AttentionStore plan."""
+        """Attach an AttentionStore plan and its payload coordinator."""
         if self._as_plan is not None:
             raise RuntimeError("AttentionStore cache plan is already configured")
-        if plan.topology is not self.attention_store_topology:
-            raise ValueError(
-                "AttentionStore cache topology mismatch: "
-                f"cache={self.attention_store_topology.value} "
-                f"plan={plan.topology.value}"
-            )
         self._as_plan = plan
-        self._as_coordinator = plan.coordinator_factory()
+        self._as_coordinator = plan.coordinator_type()
 
     @property
     def attention_store_coordinator(self) -> AttentionStoreCoordinator:
@@ -1277,8 +2056,8 @@ class AttentionStoreIntegrationMixin:
     def create_attention_store_binding(
         self, context: AttentionStoreInitContext
     ) -> AttentionStoreBinding:
-        """Create a runtime binding from the configured plan."""
-        return self.attention_store_plan.binding_factory(context)
+        """Create the configured coordinator's binding."""
+        return self.attention_store_coordinator.create_binding(context)
 
     def ref_as_binding(self, binding: AttentionStoreBinding) -> None:
         """Attach a validated runtime binding and its cache store."""
@@ -2463,17 +3242,17 @@ def _split_kda_namespace_chunks(total_chunks: int) -> tuple[int, int]:
         raise ValueError(
             "KDA page/state namespaces require at least two Agent memory chunks"
         )
-    raw_checkpoint_chunks = os.getenv(AS_KDA_CHECKPOINT_GPU_COUNT_ENV, "1")
+    raw_checkpoint_chunks = os.getenv("AS_KDA_CHECKPOINT_GPU_COUNT", "1")
     try:
         checkpoint_chunks = int(raw_checkpoint_chunks)
     except ValueError:
         raise ValueError(
-            f"{AS_KDA_CHECKPOINT_GPU_COUNT_ENV} must be an integer, "
+            "AS_KDA_CHECKPOINT_GPU_COUNT must be an integer, "
             f"got {raw_checkpoint_chunks!r}"
         ) from None
     if not 1 <= checkpoint_chunks < total_chunks:
         raise ValueError(
-            f"{AS_KDA_CHECKPOINT_GPU_COUNT_ENV} must be in "
+            "AS_KDA_CHECKPOINT_GPU_COUNT must be in "
             f"[1, {total_chunks - 1}], got {checkpoint_chunks}"
         )
     return total_chunks - checkpoint_chunks, checkpoint_chunks
@@ -2865,6 +3644,7 @@ def create_spa_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
         BufferBindings,
         SPAConfig,
     )
+
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
         DeepSeekV4TokenToKVPool,
     )
@@ -2985,718 +3765,65 @@ def create_spa_binding(ctx: AttentionStoreInitContext) -> AttentionStoreBinding:
         raise
 
 
-class AttentionStoreRadixCache(AttentionStoreIntegrationMixin, RadixCache):
-    """RadixCache subclass with AttentionStore secondary cache integration."""
+class AttentionStoreUnifiedRadixCache(
+    AttentionStoreIntegrationMixin, UnifiedRadixCache
+):
+    """Component-driven UnifiedRadixCache with an AttentionStore L2."""
 
-    attention_store_topology = AttentionStoreCacheTopology.RADIX
-
-    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Match prefix in local radix tree, then extend with AS match if applicable."""
-        req = params.req
-
-        result = super().match_prefix(params)
-
-        if req is None or not self._should_as_match(req):
-            return result
-
-        max_hit_length = len(params.key) // self.page_size * self.page_size
-
-        if result.device_indices.numel() == max_hit_length:
-            return result
-
-        as_result = self._as_match(req, result)
-        if as_result is not None and as_result.host_hit_length > 0:
-            return as_result
-        return result
-
-    def init_load_back(
+    def __init__(
         self,
-        params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Any]:
-        """Allocate HBM and prepare for AS -> GPU DMA read.
-
-        Called by schedule_policy when host_hit_length > 0.
-        The last_host_node here is the node with _as_load_info attached by _as_match().
-        """
-        last_host_node = params.best_match_node
-        host_hit_length = params.host_hit_length
-
-        empty = torch.empty((0,), dtype=torch.int64, device=self.device)
-
-        if host_hit_length <= 0:
-            return empty, last_host_node
-
-        last_host_node, load_info, req = self._take_attention_store_load_context(params)
-        if self.ascli is None or load_info is None or req is None:
-            return empty, last_host_node
-
-        loaded_indices = self._do_as_load(load_info, host_hit_length)
-        if loaded_indices is not None and len(loaded_indices) > 0:
-            req.ever_read_as = True
-
-            # Publish loaded slots into the radix tree before schedule-policy
-            # rejection can leave them allocated but untracked.
-            loaded_indices, new_last_node = self._insert_as_loaded(
-                req, last_host_node, load_info, loaded_indices
-            )
-            return loaded_indices, new_last_node
-
-        return empty, last_host_node
-
-    def _insert_as_loaded(self, req, last_host_node, load_info, loaded_indices):
-        """Insert AS-loaded KV data into the radix tree for proper memory tracking.
-
-        After a successful AS DMA read, inserts the loaded prefix into the tree
-        so the tokens are tracked by evictable_size_. This prevents the memory
-        leak where tokens allocated by init_load_back are untracked if the
-        request is rejected by schedule_policy (early return after init_load_back).
-
-        If the request IS scheduled, _req_inc_lock_ref will lock the node.
-        If the request is rejected, the tokens remain as evictable tree entries.
-
-        Returns (truncated_loaded_indices, new_last_node). The returned indices
-        only cover the portion actually inserted into the tree (page-aligned
-        after EAGLE bigram conversion). The tail is freed back to the allocator.
-        """
-        local_hit_len = load_info["start_block"] * self.page_size
-        total_prefix_len = local_hit_len + len(loaded_indices)
-
-        assert len(req.prefix_indices) == local_hit_len, (
-            f"prefix_indices length {len(req.prefix_indices)} != "
-            f"local_hit_len {local_hit_len} (start_block={load_info['start_block']}, "
-            f"page_size={self.page_size})"
-        )
-
-        # RadixKey must receive raw tokens; pre-pairing EAGLE tokens here would
-        # apply the bigram transform twice and create a second tree branch.
-        token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
-
-        bigram_len = max(0, len(token_ids) - 1) if self.is_eagle else len(token_ids)
-        final_key_len = bigram_len // self.page_size * self.page_size
-
-        if final_key_len == 0:
-            self.token_to_kv_pool_allocator.free(loaded_indices)
-            return (
-                torch.empty(
-                    (0,), dtype=loaded_indices.dtype, device=loaded_indices.device
-                ),
-                last_host_node,
-            )
-
-        full_values = torch.cat([req.prefix_indices, loaded_indices])
-        values = full_values[:final_key_len].to(dtype=torch.int64, copy=True)
-
-        # Free the EAGLE/page-alignment tail that the tree will not own.
-        tail_start = max(final_key_len - local_hit_len, 0)
-        if tail_start < len(loaded_indices):
-            self.token_to_kv_pool_allocator.free(loaded_indices[tail_start:])
-            loaded_indices = loaded_indices[:tail_start]
-
-        self.insert(
-            InsertParams(
-                key=RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle),
-                value=values,
-            )
-        )
-
-        # Re-match because an existing tree prefix may retain its old slots;
-        # freshly allocated slots displaced by that prefix must be freed.
-        match_result = super().match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle),
-            )
-        )
-
-        if match_result.last_device_node is None:
-            logger.warning(
-                "AS cache insert: cache_plan=%s rid=%s status=error "
-                "reason=no_last_node loaded_tokens=%s final_key_tokens=%s",
-                self.attention_store_plan.name,
-                req.rid,
-                len(loaded_indices),
-                final_key_len,
-            )
-            return loaded_indices, last_host_node
-
-        tree_full_indices = match_result.device_indices
-        if len(tree_full_indices) >= final_key_len:
-            tree_as_indices = tree_full_indices[local_hit_len:].to(
-                dtype=loaded_indices.dtype
-            )
-            if tree_as_indices.numel() == loaded_indices.numel():
-                displaced_mask = tree_as_indices != loaded_indices
-                if bool(displaced_mask.any()):
-                    self.token_to_kv_pool_allocator.free(loaded_indices[displaced_mask])
-                    loaded_indices = tree_as_indices
-
-        logger.debug(
-            "AS cache insert: cache_plan=%s rid=%s status=ok inserted_tokens=%s",
-            self.attention_store_plan.name,
-            req.rid,
-            len(loaded_indices),
-        )
-        return loaded_indices, match_result.last_device_node
-
-    def _should_as_match(self, req) -> bool:
-        """Determine if AS match should be attempted for this request."""
-        if req.ever_read_as:
-            return False
-        if not req.as_block_hashs:
-            return False
-        if self.ascli is None:
-            return False
-        return True
-
-    def _as_match(self, req, local_result: MatchResult) -> Optional[MatchResult]:
-        """Query AS for additional prefix hits beyond local radix tree match.
-
-        Maps AS hit to host_hit_length semantics so the scheduler's existing
-        host-hit processing path can handle it transparently.
-        """
-        local_hit_len = len(local_result.device_indices)
-        as_block_hashs = req.as_block_hashs
-        start_block = local_hit_len // self.page_size
-
-        remote_addrs = req.as_max_hit_host_ip
-        remote_len = req.as_max_hit_token_len
-
-        if remote_len and len(remote_len) == 1 and remote_len[0] > 0:
-            as_hit_tokens = (
-                (remote_len[0] - local_hit_len) // self.page_size
-            ) * self.page_size
-            if as_hit_tokens <= 0:
-                return None
-        else:
-            requested_hashes = as_block_hashs.hash_ids[start_block:]
-            requested = len(requested_hashes)
-            started = time.perf_counter()
-            match_error = None
-            try:
-                as_match_count = self.ascli.match(requested_hashes, timeout=1.0)
-            except Exception as exc:
-                match_error = exc
-                as_match_count = 0
-
-            as_match_count = self._tp_min(as_match_count)
-
-            max_blocks = max(
-                (len(req.full_untruncated_fill_ids) - local_hit_len - 1)
-                // self.page_size,
-                0,
-            )
-            as_match_count = min(as_match_count, max_blocks)
-            if as_match_count < AS_MIN_MATCH_BLOCKS:
-                as_match_count = 0
-            if match_error is None:
-                self._log_as_result(
-                    "match",
-                    rid=req.rid,
-                    requested=requested,
-                    result=as_match_count,
-                    started=started,
-                )
-            else:
-                self._log_as_failure(
-                    "match",
-                    rid=req.rid,
-                    requested=requested,
-                    error=match_error,
-                    started=started,
-                )
-            if as_match_count == 0:
-                return None
-
-            as_hit_tokens = as_match_count * self.page_size
-
-        # Cap AS hit so that at least 1 token remains for extend forward pass.
-        # Without this, local_hit + AS_hit could cover all fill_ids, making
-        # extend_input_len=0 and causing an empty-tensor crash in model forward.
-        max_as_tokens = (
-            (len(req.full_untruncated_fill_ids) - local_hit_len - 1)
-            // self.page_size
-            * self.page_size
-        )
-        if max_as_tokens <= 0:
-            return None
-        as_hit_tokens = min(as_hit_tokens, max_as_tokens)
-
-        last_node = local_result.last_device_node
-        last_node._as_load_req = req
-        last_node._as_load_info = {
-            "rid": req.rid,
-            "start_block": start_block,
-            "as_hit_tokens": as_hit_tokens,
-            "as_block_hashs": as_block_hashs,
-            "remote_addrs": remote_addrs,
-            "remote_len": remote_len,
-        }
-
-        return MatchResult(
-            device_indices=local_result.device_indices,
-            last_device_node=local_result.last_device_node,
-            last_host_node=last_node,  # used as load_back anchor
-            best_match_node=last_node,
-            host_hit_length=as_hit_tokens,
-        )
-
-    def _do_as_load(
-        self, load_info: dict, host_hit_length: int
-    ) -> Optional[torch.Tensor]:
-        """Execute the actual AS -> GPU DMA read.
-
-        Allocates HBM slots and calls ascli.read() to DMA load KV data.
-        """
-        rid = load_info.get("rid", "-")
-        requested = host_hit_length // self.page_size
-        started = time.perf_counter()
-        as_block_hashs = load_info["as_block_hashs"]
-        start_block = load_info["start_block"]
-        as_hit_tokens = load_info["as_hit_tokens"]
-        remote_addrs = load_info.get("remote_addrs", [])
-
-        available = self.token_to_kv_pool_allocator.available_size()
-        if available < as_hit_tokens:
-            evictable = self.evictable_size()
-            if evictable > 0:
-                evict_tokens = max(as_hit_tokens - available, 0) + self.page_size
-                logger.debug(
-                    "AS cache eviction: cache_plan=%s rid=%s evicted_tokens=%s "
-                    "requested_tokens=%s available_tokens=%s evictable_tokens=%s",
-                    self.attention_store_plan.name,
-                    rid,
-                    evict_tokens,
-                    as_hit_tokens,
-                    available,
-                    evictable,
-                )
-                self.evict(EvictParams(num_tokens=evict_tokens))
-
-        try:
-            alloc_indices = self.token_to_kv_pool_allocator.alloc(as_hit_tokens)
-        except Exception as exc:
-            self._log_as_failure(
-                "load_back",
-                rid=rid,
-                requested=requested,
-                error=exc,
-                started=started,
-            )
-            return None
-
-        if alloc_indices is None or len(alloc_indices) == 0:
-            self._log_as_failure(
-                "load_back",
-                rid=rid,
-                requested=requested,
-                error=RuntimeError(
-                    "allocation failed: "
-                    f"need={as_hit_tokens}, "
-                    f"available={self.token_to_kv_pool_allocator.available_size()}, "
-                    f"evictable={self.evictable_size()}"
-                ),
-                started=started,
-            )
-            return None
-
-        try:
-            data_id_list = list(_contiguous_page_ids(alloc_indices, self.page_size))
-        except ValueError as exc:
-            self.token_to_kv_pool_allocator.free(alloc_indices)
-            self._log_as_failure(
-                "load_back",
-                rid=rid,
-                requested=requested,
-                error=exc,
-                started=started,
-            )
-            return None
-
-        # Determine remote address – SDK rejects None; pass empty string for local read
-        remote_addr = remote_addrs[0] if remote_addrs else ""
-
-        block_hash_ids = as_block_hashs.hash_ids[
-            start_block : start_block + len(data_id_list)
-        ]
-        requested = len(block_hash_ids)
-        read_error = None
-
-        try:
-            read_count = self.ascli.read(
-                block_hash_ids,
-                data_id_list,
-                timeout=1.0,
-                remote_addrs=(remote_addr,) if remote_addr else (),
-                logical_start=start_block,
-            )
-        except Exception as exc:
-            read_error = exc
-            read_count = 0
-
-        read_count = self._tp_min(read_count)
-
-        if read_error is None:
-            self._log_as_result(
-                "load_back",
-                rid=rid,
-                requested=requested,
-                result=read_count,
-                started=started,
-            )
-        else:
-            self._log_as_failure(
-                "load_back",
-                rid=rid,
-                requested=requested,
-                error=read_error,
-                started=started,
-            )
-
-        if read_count <= 0:
-            self.token_to_kv_pool_allocator.free(alloc_indices)
-            return None
-
-        loaded_tokens = read_count * self.page_size
-        loaded_indices = alloc_indices[:loaded_tokens]
-
-        if loaded_tokens < len(alloc_indices):
-            self.token_to_kv_pool_allocator.free(alloc_indices[loaded_tokens:])
-
-        return loaded_indices
-
-
-class AttentionStoreSWARadixCache(AttentionStoreIntegrationMixin, SWARadixCache):
-    """SWARadixCache with checkpointed-page AttentionStore integration."""
-
-    attention_store_topology = AttentionStoreCacheTopology.SWA
+        params: CacheInitParams,
+        server_args,
+        plan: Optional[AttentionStoreCachePlan] = None,
+    ) -> None:
+        """Select the component set declared by the AttentionStore plan."""
+        if plan is None:
+            raise ValueError(f"{type(self).__name__} requires a cache plan")
+        params.tree_components = plan.tree_components
+        super().__init__(params=params, server_args=server_args, plan=plan)
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Extend the local SWA prefix match with remote checkpointed pages."""
-        result = super().match_prefix(params)
-        remote = self._match_checkpointed_page_prefix(params, result)
-        return remote if remote is not None else result
+        """Extend a local component-consistent match through its coordinator."""
+        if params.req is not None and hasattr(params.req, "_as_load_info"):
+            del params.req._as_load_info
+        local_result = super().match_prefix(params)
+        remote = self.attention_store_coordinator.extend_match(
+            self,
+            params,
+            local_result,
+        )
+        return remote if remote is not None else local_result
 
     def init_load_back(self, params: InitLoadBackParams) -> Tuple[torch.Tensor, Any]:
-        """Load matched SPA pages and checkpoint state into local storage."""
-        anchor = params.best_match_node
-        empty = torch.empty((0,), dtype=torch.int64, device=self.device)
-        if params.host_hit_length <= 0:
-            return empty, anchor
-
-        anchor, load_info, req = self._take_attention_store_load_context(params)
-        if self.ascli is None or load_info is None or req is None:
-            return empty, anchor
-
-        requested = int(load_info["block_count"])
-        started = time.perf_counter()
-        token_count = int(load_info["block_count"]) * self.page_size
-        available = self.token_to_kv_pool_allocator.available_size()
-        if available < token_count and self.full_evictable_size() > 0:
-            self.evict(
-                EvictParams(
-                    num_tokens=token_count - available + self.page_size,
-                    swa_num_tokens=self.page_size,
-                )
-            )
-        local_hit_len = int(load_info["start_block"]) * self.page_size
-        device = self.token_to_kv_pool_allocator.device
-        prefix_cpu = torch.tensor([local_hit_len], dtype=torch.int64)
-        seq_cpu = torch.tensor([local_hit_len + token_count], dtype=torch.int64)
-        last_loc_value = int(req.prefix_indices[-1].item()) if local_hit_len else -1
-        loaded = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-            prefix_cpu.to(device),
-            prefix_cpu,
-            seq_cpu.to(device),
-            seq_cpu,
-            torch.tensor([last_loc_value], dtype=torch.int64, device=device),
-            token_count,
-            min(token_count, self.page_size),
-        )
-        if loaded is None:
-            self._log_as_failure(
-                "load_back",
-                rid=req.rid,
-                requested=requested,
-                error=RuntimeError(f"cannot allocate {token_count} tokens"),
-                started=started,
-            )
-            return empty, anchor
-        try:
-            page_ids = _contiguous_page_ids(loaded, self.page_size)
-        except ValueError as exc:
-            self.token_to_kv_pool_allocator.free(loaded)
-            self._log_as_failure(
-                "load_back",
-                rid=req.rid,
-                requested=requested,
-                error=exc,
-                started=started,
-            )
-            return empty, anchor
-        swa_indices = self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            loaded[-self.page_size :]
-        )
-        swa_page_id = int(swa_indices[0].item()) // self.page_size
-        state_slots = self.attention_store_coordinator.state_slots(
-            self, req.req_pool_idx, swa_page_id
-        )
-        read_error = None
-        try:
-            read_count = self.ascli.read(
-                load_info["hashes"],
-                page_ids,
-                state_slots,
-                timeout=1.0,
-                remote_addrs=load_info.get("remote_addrs") or None,
-            )
-        except Exception as exc:
-            read_error = exc
-            read_count = 0
-        read_count = self._tp_min(read_count)
-        if read_error is None:
-            self._log_as_result(
-                "load_back",
-                rid=req.rid,
-                requested=requested,
-                result=read_count,
-                started=started,
-            )
-        else:
-            self._log_as_failure(
-                "load_back",
-                rid=req.rid,
-                requested=requested,
-                error=read_error,
-                started=started,
-            )
-        if read_count != load_info["block_count"]:
-            self.token_to_kv_pool_allocator.free(loaded)
-            return empty, anchor
-
-        total_prefix_len = local_hit_len + token_count
-        token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
-        values = torch.cat([req.prefix_indices, loaded]).to(
-            dtype=torch.int64, copy=True
-        )
-        self.insert(
-            InsertParams(
-                key=RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle),
-                value=values,
-                prev_prefix_len=local_hit_len,
-                swa_evicted_seqlen=local_hit_len + max(0, token_count - self.page_size),
-            )
-        )
-        match = super().match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle),
-                req=req,
-            )
-        )
-        req.ever_read_as = True
-        return loaded, match.last_device_node
-
-
-class AttentionStoreMambaRadixCache(AttentionStoreIntegrationMixin, MambaRadixCache):
-    """MambaRadixCache with a self-contained KDA AttentionStore L2."""
-
-    attention_store_topology = AttentionStoreCacheTopology.MAMBA
-
-    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Extend the local Mamba prefix match with remote KDA pages."""
-        result = super().match_prefix(params)
-        remote = self._match_checkpointed_page_prefix(params, result)
-        return remote if remote is not None else result
-
-    def init_load_back(self, params: InitLoadBackParams) -> Tuple[torch.Tensor, Any]:
-        """Load matched KDA pages and recurrent state into local storage."""
-        anchor = params.best_match_node
-        empty = torch.empty((0,), dtype=torch.int64, device=self.device)
-        if params.host_hit_length <= 0:
-            return empty, anchor
-
-        anchor, load_info, req = self._take_attention_store_load_context(params)
-        if self.ascli is None or load_info is None or req is None:
-            return empty, anchor
-
-        loaded = self._read_kda_blocks(load_info)
-        if loaded is None:
-            return empty, anchor
-        loaded_indices, checkpoint_slot = loaded
-        req.ever_read_as = True
-        return self._insert_as_loaded(
-            req, anchor, load_info, loaded_indices, checkpoint_slot
-        )
-
-    def _read_kda_blocks(self, load_info):
-        block_count = int(load_info["block_count"])
-        rid = load_info.get("rid", "-")
-        started = time.perf_counter()
-        token_count = block_count * self.page_size
-        available = self.token_to_kv_pool_allocator.available_size()
-        if available < token_count:
-            evictable = self.full_evictable_size()
-            if evictable > 0:
-                self.evict(
-                    EvictParams(num_tokens=token_count - available + self.page_size)
-                )
-
-        alloc_indices = self.token_to_kv_pool_allocator.alloc(token_count)
-        if alloc_indices is None or len(alloc_indices) != token_count:
-            if alloc_indices is not None and len(alloc_indices):
-                self.token_to_kv_pool_allocator.free(alloc_indices)
-            self._log_as_failure(
-                "load_back",
-                rid=rid,
-                requested=block_count,
-                error=RuntimeError(f"cannot allocate {token_count} tokens"),
-                started=started,
-            )
-            return None
-
-        try:
-            page_ids = _contiguous_page_ids(alloc_indices, self.page_size)
-        except ValueError as exc:
-            self.token_to_kv_pool_allocator.free(alloc_indices)
-            self._log_as_failure(
-                "load_back",
-                rid=rid,
-                requested=block_count,
-                error=exc,
-                started=started,
-            )
-            return None
-
-        checkpoint_slot = (
-            self._alloc_int8_ckpt_slot()
-            if self.int8_ckpt_pool is not None
-            else self._alloc_mamba_slot()
-        )
-        state_id = int(checkpoint_slot.item())
-        read_error = None
-        try:
-            read_count = self.ascli.read(
-                load_info["hashes"],
-                page_ids,
-                {"checkpoint": state_id},
-                timeout=1.0,
-                remote_addrs=load_info.get("remote_addrs") or None,
-            )
-        except Exception as exc:
-            read_error = exc
-            read_count = 0
-
-        read_count = self._tp_min(read_count)
-
-        if read_error is None:
-            self._log_as_result(
-                "load_back",
-                rid=rid,
-                requested=block_count,
-                result=read_count,
-                started=started,
-            )
-        else:
-            self._log_as_failure(
-                "load_back",
-                rid=rid,
-                requested=block_count,
-                error=read_error,
-                started=started,
-            )
-
-        # Reject partial reads to keep TP recurrent checkpoints aligned.
-        if read_count != block_count:
-            self.token_to_kv_pool_allocator.free(alloc_indices)
-            self._free_mamba_value(checkpoint_slot)
-            return None
-        return alloc_indices, checkpoint_slot
-
-    def _insert_as_loaded(
-        self,
-        req,
-        anchor,
-        load_info,
-        loaded_indices: torch.Tensor,
-        checkpoint_slot: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Any]:
-        local_hit_len = load_info["start_block"] * self.page_size
-        total_prefix_len = local_hit_len + len(loaded_indices)
-        token_ids = req.full_untruncated_fill_ids[:total_prefix_len]
-        values = torch.cat([req.prefix_indices, loaded_indices]).to(
-            dtype=torch.int64, copy=True
-        )
-        result = self.insert(
-            InsertParams(
-                key=RadixKey(token_ids, req.extra_key),
-                value=values,
-                mamba_value=checkpoint_slot,
-                prev_prefix_len=local_hit_len,
-            )
-        )
-        if result.mamba_exist:
-            self._free_mamba_value(checkpoint_slot)
-
-        match = super().match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(token_ids, req.extra_key),
-                cow_mamba=True,
-                req=req,
-            )
-        )
-        if len(match.device_indices) < total_prefix_len:
-            logger.warning(
-                "AS cache insert: cache_plan=%s rid=%s status=error "
-                "reason=shortened_prefix expected_tokens=%s actual_tokens=%s",
-                self.attention_store_plan.name,
-                req.rid,
-                total_prefix_len,
-                len(match.device_indices),
-            )
-            return loaded_indices, anchor
-        if load_info["hashes"]:
-            match.last_device_node._as_kda_published_hash = int(load_info["hashes"][-1])
-        tree_indices = match.device_indices[local_hit_len:total_prefix_len].to(
-            dtype=loaded_indices.dtype
-        )
-        return tree_indices, match.last_device_node
-
-
-_CACHE_CLASSES_BY_TOPOLOGY = {
-    AttentionStoreCacheTopology.RADIX: AttentionStoreRadixCache,
-    AttentionStoreCacheTopology.SWA: AttentionStoreSWARadixCache,
-    AttentionStoreCacheTopology.MAMBA: AttentionStoreMambaRadixCache,
-}
+        """Delegate type-specific payload restoration to the plan coordinator."""
+        return self.attention_store_coordinator.init_load_back(self, params)
 
 
 _ATTENTION_STORE_CACHE_PLANS = {
     "MHA": AttentionStoreCachePlan(
         "MHA",
-        AttentionStoreCacheTopology.RADIX,
-        create_mha_binding,
-        PageWriteCoordinator,
+        MHACacheCoordinator,
+        tree_components=(ComponentType.FULL,),
     ),
     "MLA": AttentionStoreCachePlan(
         "MLA",
-        AttentionStoreCacheTopology.RADIX,
-        create_mla_binding,
-        PageWriteCoordinator,
+        MLACacheCoordinator,
+        tree_components=(ComponentType.FULL,),
     ),
     "DSA": AttentionStoreCachePlan(
         "DSA",
-        AttentionStoreCacheTopology.RADIX,
-        create_dsa_binding,
-        PageWriteCoordinator,
+        DSACacheCoordinator,
+        tree_components=(ComponentType.FULL,),
     ),
     "SPA": AttentionStoreCachePlan(
         "SPA",
-        AttentionStoreCacheTopology.SWA,
-        create_spa_binding,
         SPACacheCoordinator,
+        tree_components=(ComponentType.FULL, ComponentType.SWA),
     ),
     "KDA": AttentionStoreCachePlan(
         "KDA",
-        AttentionStoreCacheTopology.MAMBA,
-        create_kda_binding,
         KDACacheCoordinator,
+        tree_components=(ComponentType.FULL, ComponentType.MAMBA),
     ),
 }
 
@@ -3733,9 +3860,8 @@ def create_attention_store_cache(
     params: CacheInitParams,
     server_args,
 ):
-    """Create the radix-cache implementation selected by a cache plan."""
-    cache_class = _CACHE_CLASSES_BY_TOPOLOGY[plan.topology]
-    return cache_class(
+    """Create the component-driven UnifiedRadixCache for an AS plan."""
+    return AttentionStoreUnifiedRadixCache(
         params=params,
         server_args=server_args,
         plan=plan,

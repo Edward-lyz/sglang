@@ -101,10 +101,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
-    # AttentionStore owns its cache implementation and must take precedence
-    # over the generic unified/hybrid routing below.  In particular, KDA
-    # models are hybrid SSM models and would otherwise return UnifiedRadixCache
-    # before the AttentionStore plan can select AttentionStoreMambaRadixCache.
+    # AttentionStore uses the unified cache adapter.
     if server_args.enable_asradix_cache:
         from sglang.srt.mem_cache.asradix_cache import (
             create_attention_store_cache,
